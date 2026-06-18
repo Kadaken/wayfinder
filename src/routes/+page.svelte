@@ -237,6 +237,7 @@
 
   function ctx(ev, e){
     ev.preventDefault();
+    ev.stopPropagation();
     if (e && !selectedSet.has(e.path)) { selectedSet = new Set([e.path]); selected = e; }
     owApps = null;
     menu = { x: ev.clientX, y: ev.clientY, onEntry: !!e, entry: e };
