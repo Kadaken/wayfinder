@@ -64,6 +64,7 @@
   let dropTarget = $state("");
   // open-with apps (loaded when right-clicking a file)
   let owApps = $state(null);
+  let owOpen = $state(false);
 
   function syncTab(){ tabs[activeIdx] = { path: cwd, label: basename(cwd) || "/", history: [...history], hidx }; tabs = tabs; }
   function newTab(path){ tabs = [...tabs, { path: path||cwd, label:"", history:[], hidx:-1 }]; activeIdx = tabs.length-1; history = []; hidx = -1; menu = null; navigate(path || cwd); }
@@ -239,9 +240,9 @@
     ev.preventDefault();
     ev.stopPropagation();
     if (e && !selectedSet.has(e.path)) { selectedSet = new Set([e.path]); selected = e; }
-    owApps = null;
+    owApps = null; owOpen = false;
     menu = { x: ev.clientX, y: ev.clientY, onEntry: !!e, entry: e };
-    if (e && !e.is_dir) invoke("open_with_apps", { path: e.path }).then(a => { owApps = a; }).catch(()=>{});
+    if (e && !e.is_dir) invoke("open_with_apps", { path: e.path }).then(a => { const seen=new Set(); owApps = (a||[]).filter(x => !seen.has(x.name) && seen.add(x.name)); }).catch(()=>{});
   }
 
   function onKey(ev){
@@ -441,13 +442,13 @@
         {#if menu.entry?.is_dir}
           <button onclick={()=>newTab(menu.entry.path)}>Open in New Tab</button>
           <button onclick={()=>newWindow(menu.entry.path)}>Open in New Window</button>
-        {:else}
-          {#if owApps && owApps.length}
-            {#each owApps.slice(0,6) as a}
-              <button class="sub" onclick={()=>runOpenWith(a.id, menu.entry.path)}>Open with {a.name}</button>
+        {:else if owApps && owApps.length}
+          <button onclick={(e)=>{ e.stopPropagation(); owOpen = !owOpen; }}>Open With&nbsp; {owOpen ? '▾' : '▸'}</button>
+          {#if owOpen}
+            {#each owApps as a}
+              <button class="sub" onclick={()=>runOpenWith(a.id, menu.entry.path)}>{a.name}</button>
             {/each}
           {/if}
-          <button onclick={()=>invoke('open_path',{path:menu.entry.path})}>Open With default…</button>
         {/if}
         <hr/>
         <button onclick={doCut}>Cut</button>
