@@ -554,6 +554,109 @@ fn icon_svg(name: String) -> Result<String, String> {
     Err(format!("icon not found: {}", name))
 }
 
+#[derive(Serialize)]
+struct Dir {
+    name: String,
+    path: String,
+    has_children: bool,
+}
+
+#[tauri::command]
+fn list_subdirs(path: String, show_hidden: bool) -> Vec<Dir> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&path) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let p = ent.path();
+            if p.is_dir() {
+                let has = fs::read_dir(&p)
+                    .map(|r| r.flatten().any(|e| e.path().is_dir()))
+                    .unwrap_or(false);
+                out.push(Dir {
+                    name,
+                    path: p.to_string_lossy().to_string(),
+                    has_children: has,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+#[tauri::command]
+fn compress_zip(paths: Vec<String>, dest_dir: String) -> Result<String, String> {
+    if paths.is_empty() {
+        return Err("nothing to compress".into());
+    }
+    let stem = Path::new(&paths[0])
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Archive");
+    let zip_name = if paths.len() == 1 {
+        format!("{}.zip", stem)
+    } else {
+        "Archive.zip".to_string()
+    };
+    let zip_path = format!("{}/{}", dest_dir.trim_end_matches('/'), zip_name);
+    let mut args = vec!["-r".to_string(), zip_path.clone()];
+    for p in &paths {
+        if let Some(name) = Path::new(p).file_name().and_then(|s| s.to_str()) {
+            args.push(name.to_string());
+        }
+    }
+    let o = std::process::Command::new("zip")
+        .current_dir(&dest_dir)
+        .args(&args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if o.status.success() {
+        Ok(zip_path)
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+fn extract_archive(path: String, dest_dir: String) -> Result<(), String> {
+    let l = path.to_lowercase();
+    if l.ends_with(".zip") {
+        run_cmd("unzip", &["-o", &path, "-d", &dest_dir])
+    } else if l.ends_with(".tar.gz")
+        || l.ends_with(".tgz")
+        || l.ends_with(".tar.bz2")
+        || l.ends_with(".tar.xz")
+        || l.ends_with(".tar")
+    {
+        run_cmd("tar", &["-xf", &path, "-C", &dest_dir])
+    } else if l.ends_with(".7z") {
+        run_cmd("7z", &["x", &format!("-o{}", dest_dir), &path])
+    } else {
+        Err("unsupported archive type".into())
+    }
+}
+
+#[tauri::command]
+fn new_file(parent: String, name: String) -> Result<String, String> {
+    if name.contains('/') || name.is_empty() {
+        return Err("invalid name".into());
+    }
+    let p = Path::new(&parent).join(&name);
+    if p.exists() {
+        return Err("already exists".into());
+    }
+    fs::File::create(&p).map_err(|e| e.to_string())?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn empty_trash() -> Result<(), String> {
+    run_cmd("gio", &["trash", "--empty"])
+}
+
 #[tauri::command]
 fn open_terminal(path: String) -> Result<(), String> {
     std::process::Command::new("konsole")
@@ -587,6 +690,11 @@ pub fn run() {
             start_path,
             open_with_apps,
             open_with,
+            list_subdirs,
+            compress_zip,
+            extract_archive,
+            new_file,
+            empty_trash,
             open_terminal
         ])
         .run(tauri::generate_context!())

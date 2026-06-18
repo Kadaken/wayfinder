@@ -91,6 +91,43 @@
   function togglePreview(){ showPreview = !showPreview; savePanes(); }
   function editAddr(){ editingAddr = true; queueMicrotask(()=>{ const el=document.getElementById("addr"); el?.focus(); el?.select(); }); }
 
+  // folder tree
+  let treeRoots = $state([]);
+  let treeChildren = $state({});
+  let treeExpanded = $state(new Set());
+  let creatingFile = $state(false);
+  let typeBuf = "";
+  let typeTimer = null;
+
+  const isArchive = (name) => /\.(zip|tar|tgz|7z)$|\.tar\.(gz|bz2|xz)$/i.test(name);
+
+  async function loadTreeRoots(){
+    const home = places[0]?.[1] || "/";
+    try {
+      const hk = await invoke("list_subdirs", { path: home, showHidden });
+      treeRoots = [{ name: "Home", path: home, has_children: true }];
+      treeChildren = { ...treeChildren, [home]: hk };
+    } catch {}
+  }
+  async function toggleTree(node){
+    const s = new Set(treeExpanded);
+    if (s.has(node.path)) s.delete(node.path);
+    else { s.add(node.path); if (!treeChildren[node.path]){ try { const kids = await invoke("list_subdirs", { path: node.path, showHidden }); treeChildren = { ...treeChildren, [node.path]: kids }; } catch {} } }
+    treeExpanded = s;
+  }
+  const treeFlat = $derived.by(() => {
+    const out = [];
+    const walk = (node, depth) => { out.push({ ...node, depth }); if (treeExpanded.has(node.path)) for (const c of (treeChildren[node.path]||[])) walk(c, depth+1); };
+    for (const r of treeRoots) walk(r, 0);
+    return out;
+  });
+
+  async function compressSel(){ menu=null; if(!selectedSet.size) return; try { await invoke("compress_zip", { paths:[...selectedSet], destDir: cwd }); flash("Compressed to ZIP"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
+  async function extractSel(path){ menu=null; try { await invoke("extract_archive", { path, destDir: cwd }); flash("Extracted"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
+  function startCreateFile(){ creating=false; creatingFile=true; createVal="new.txt"; menu=null; }
+  async function commitCreateFile(){ if (creatingFile && createVal.trim()){ try { await invoke("new_file", { parent: cwd, name: createVal.trim() }); } catch(e){ flash("⚠ "+e); } } creatingFile=false; navigate(cwd,false); }
+  async function doEmptyTrash(){ menu=null; try { await invoke("empty_trash"); flash("Trash emptied"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
+
   function syncTab(){ tabs[activeIdx] = { path: cwd, label: basename(cwd) || "/", history: [...history], hidx }; tabs = tabs; }
   function newTab(path){ tabs = [...tabs, { path: path||cwd, label:"", history:[], hidx:-1 }]; activeIdx = tabs.length-1; history = []; hidx = -1; menu = null; navigate(path || cwd); }
   function switchTab(i){ if (i===activeIdx) return; syncTab(); activeIdx = i; const t = tabs[i]; history = [...t.history]; hidx = t.hidx; navigate(t.path, false); }
@@ -251,7 +288,7 @@
     }
     renaming = null; navigate(cwd, false);
   }
-  function startCreate(){ creating = true; createVal = "New Folder"; menu = null; }
+  function startCreate(){ creatingFile=false; creating = true; createVal = "New Folder"; menu = null; }
   async function commitCreate(){
     if (creating && createVal.trim()) {
       try { await invoke("make_dir", { parent: cwd, name: createVal.trim() }); }
@@ -285,6 +322,18 @@
     else if (ev.ctrlKey && ev.key === "t") { ev.preventDefault(); newTab(cwd); }
     else if (ev.ctrlKey && ev.key === "w") { ev.preventDefault(); closeTab(activeIdx); }
     else if (ev.key === "Enter" && selected) activate(selected);
+    else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      const idx = selected ? rows.findIndex(r => r.path === selected.path) : -1;
+      const n = clamp(ev.key === "ArrowDown" ? idx + 1 : idx - 1, 0, rows.length - 1);
+      if (rows[n]) { select(rows[n], n, {}); queueMicrotask(()=>document.querySelector('tr.sel,.cell.sel')?.scrollIntoView({block:'nearest'})); }
+    }
+    else if (ev.key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      typeBuf += ev.key.toLowerCase();
+      clearTimeout(typeTimer); typeTimer = setTimeout(()=>{ typeBuf = ""; }, 800);
+      const i = rows.findIndex(r => r.name.toLowerCase().startsWith(typeBuf));
+      if (i >= 0) { select(rows[i], i, {}); queueMicrotask(()=>document.querySelector('tr.sel,.cell.sel')?.scrollIntoView({block:'nearest'})); }
+    }
     else if (ev.ctrlKey && ev.key === "l") { ev.preventDefault(); editAddr(); }
     else if (ev.key === "F5") navigate(cwd, false);
     else if (ev.key === "Escape") { menu = null; propsData = null; confirmDel = false; selectedSet = new Set(); }
@@ -297,6 +346,7 @@
     let sp = null;
     try { sp = await invoke("start_path"); } catch {}
     navigate(sp || places[0]?.[1] || "/");
+    loadTreeRoots();
   });
 </script>
 
@@ -368,6 +418,20 @@
           {#if !d.mountpoint}<span class="badge">mount</span>{:else if d.size}<span class="dsz">{fmtSize(d.size)}</span>{/if}
         </button>
       {/each}
+      <div class="sec">Folders</div>
+      <div class="tree">
+        {#each treeFlat as n}
+          <div class="treerow" class:sel={cwd===n.path} class:drop={dropTarget===n.path}
+               style="padding-left:{6 + n.depth*14}px"
+               onclick={()=>navigate(n.path)} oncontextmenu={(e)=>placeMenu(e,n.path,false)}
+               ondragover={(e)=>allowDrop(e,true,n.path)} ondrop={(e)=>onDropFolder(e,n.path)} ondragleave={()=>dropTarget=''}>
+            {#if n.has_children}
+              <button class="twist" onclick={(e)=>{ e.stopPropagation(); toggleTree(n); }}>{treeExpanded.has(n.path)?'▾':'▸'}</button>
+            {:else}<span class="twist"></span>{/if}
+            <span class="ic">📁</span><span class="dname">{n.name}</span>
+          </div>
+        {/each}
+      </div>
       {#if recents.length}
         <div class="sec">Recent</div>
         {#each recents.slice(0,10) as r}
@@ -384,10 +448,10 @@
     <div class="splitter" onmousedown={(e)=>startResize('sidebar',e)}></div>
 
     <main class="files {view}" style="--zoom:{iconZoom}" onwheel={wheelFiles} oncontextmenu={(e)=>ctx(e,null)}>
-      {#if creating}
-        <div class="createbar">📁 <input autofocus bind:value={createVal}
-             onkeydown={(e)=> e.key==='Enter'?commitCreate(): e.key==='Escape'?(creating=false):null}
-             onblur={commitCreate} /></div>
+      {#if creating || creatingFile}
+        <div class="createbar">{creatingFile ? '📄' : '📁'} <input autofocus bind:value={createVal}
+             onkeydown={(e)=> e.key==='Enter' ? (creatingFile?commitCreateFile():commitCreate()) : e.key==='Escape' ? (creating=false,creatingFile=false) : null}
+             onblur={creatingFile?commitCreateFile:commitCreate} /></div>
       {/if}
       {#if loading}
         <div class="empty">Loading…</div>
@@ -501,6 +565,8 @@
           <button onclick={()=>addFavorite(menu.entry.path)}>★ Add to Favorites</button>
         {/if}
         <button onclick={()=>startRename(menu.entry)}>Rename</button>
+        <button onclick={compressSel}>Compress to ZIP</button>
+        {#if isArchive(menu.entry.name)}<button onclick={()=>extractSel(menu.entry.path)}>Extract Here</button>{/if}
         <hr/>
         <button class="danger" onclick={del}>Move to Trash</button>
         <button class="danger" onclick={askDelete}>Delete permanently</button>
@@ -510,7 +576,9 @@
       {:else}
         <!-- empty-area menu -->
         <button onclick={startCreate}>New Folder</button>
+        <button onclick={startCreateFile}>New File</button>
         <button disabled={!clipboard} onclick={paste}>Paste</button>
+        {#if cwd.includes('/Trash/files')}<hr/><button class="danger" onclick={doEmptyTrash}>Empty Trash</button>{/if}
         <hr/>
         <button onclick={()=>openProps(cwd)}>Properties</button>
         <button onclick={termHere}>Open Terminal Here</button>
@@ -596,6 +664,13 @@
   .place.sel{ background:#3a6df0; color:#fff; }
   .place .ic{ width:18px; text-align:center; flex:none; font-size:13px; }
   .place.recent{ color:#9aa0aa; }
+  .tree{ display:flex; flex-direction:column; }
+  .treerow{ display:flex; align-items:center; gap:4px; padding:4px 6px; border-radius:6px; cursor:default; color:#c4c8cf; white-space:nowrap; overflow:hidden; }
+  .treerow:hover{ background:#2c3038; }
+  .treerow.sel{ background:#3a6df0; color:#fff; }
+  .twist{ background:none; border:none; color:#8b909a; cursor:pointer; width:16px; flex:none; font-size:10px; padding:0; }
+  .twist:hover{ color:#fff; }
+  .treerow .dname{ flex:1; overflow:hidden; text-overflow:ellipsis; }
   .dname{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .badge{ font-size:10px; background:#3a6df0; color:#fff; border-radius:4px; padding:1px 5px; }
   .dsz{ font-size:10px; color:#6b7079; }
