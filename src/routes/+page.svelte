@@ -53,7 +53,7 @@
   const isFav = (path) => favorites.some(f => f.path === path);
   function addFavorite(path){ if (!isFav(path)){ favorites = [...favorites, { name: basename(path), path }]; saveFav(); flash("★ Added to Favorites"); } menu = null; }
   function removeFavorite(path){ favorites = favorites.filter(f => f.path !== path); saveFav(); menu = null; }
-  function pushRecent(path){ recents = [{ name: basename(path), path }, ...recents.filter(r => r.path !== path)].slice(0, 12); saveRec(); }
+  function pushRecent(path){ if (recents.some(r => r.path === path)) return; recents = [{ name: basename(path), path }, ...recents].slice(0, 12); saveRec(); }
   let propsData = $state(null);
   let confirmDel = $state(false);
   // tabs
