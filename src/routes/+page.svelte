@@ -47,6 +47,7 @@
     try { favorites = JSON.parse(localStorage.getItem("zf_favorites") || "[]"); } catch { favorites = []; }
     try { recents = JSON.parse(localStorage.getItem("zf_recents") || "[]"); } catch { recents = []; }
     try { const z = parseFloat(localStorage.getItem("zf_zoom")); if (z) iconZoom = z; } catch {}
+    try { const p = JSON.parse(localStorage.getItem("zf_panes") || "null"); if (p){ sidebarW = p.sidebarW ?? sidebarW; previewW = p.previewW ?? previewW; showPreview = p.showPreview ?? true; } } catch {}
   }
   const saveFav = () => { try { localStorage.setItem("zf_favorites", JSON.stringify(favorites)); } catch {} };
   const saveRec = () => { try { localStorage.setItem("zf_recents", JSON.stringify(recents)); } catch {} };
@@ -65,6 +66,30 @@
   // open-with apps (loaded when right-clicking a file)
   let owApps = $state(null);
   let owOpen = $state(false);
+  // resizable panes + breadcrumb + preview toggle
+  let sidebarW = $state(185);
+  let previewW = $state(320);
+  let showPreview = $state(true);
+  let editingAddr = $state(false);
+  let dragging = null;
+
+  const crumbs = $derived.by(() => {
+    const parts = (cwd || "").split("/").filter(Boolean);
+    const out = [{ name: "Computer", path: "/" }];
+    let acc = "";
+    for (const p of parts){ acc += "/" + p; out.push({ name: p, path: acc }); }
+    return out;
+  });
+  function startResize(which, ev){ dragging = which; ev.preventDefault(); }
+  function onResizeMove(ev){
+    if (!dragging) return;
+    if (dragging === "sidebar") sidebarW = clamp(ev.clientX, 120, 420);
+    else if (dragging === "preview") previewW = clamp(window.innerWidth - ev.clientX, 180, 640);
+  }
+  const savePanes = () => { try { localStorage.setItem("zf_panes", JSON.stringify({ sidebarW, previewW, showPreview })); } catch {} };
+  function endResize(){ if (dragging){ dragging = null; savePanes(); } }
+  function togglePreview(){ showPreview = !showPreview; savePanes(); }
+  function editAddr(){ editingAddr = true; queueMicrotask(()=>{ const el=document.getElementById("addr"); el?.focus(); el?.select(); }); }
 
   function syncTab(){ tabs[activeIdx] = { path: cwd, label: basename(cwd) || "/", history: [...history], hidx }; tabs = tabs; }
   function newTab(path){ tabs = [...tabs, { path: path||cwd, label:"", history:[], hidx:-1 }]; activeIdx = tabs.length-1; history = []; hidx = -1; menu = null; navigate(path || cwd); }
@@ -260,7 +285,7 @@
     else if (ev.ctrlKey && ev.key === "t") { ev.preventDefault(); newTab(cwd); }
     else if (ev.ctrlKey && ev.key === "w") { ev.preventDefault(); closeTab(activeIdx); }
     else if (ev.key === "Enter" && selected) activate(selected);
-    else if (ev.ctrlKey && ev.key === "l") { ev.preventDefault(); document.getElementById("addr")?.select(); }
+    else if (ev.ctrlKey && ev.key === "l") { ev.preventDefault(); editAddr(); }
     else if (ev.key === "F5") navigate(cwd, false);
     else if (ev.key === "Escape") { menu = null; propsData = null; confirmDel = false; selectedSet = new Set(); }
   }
@@ -275,7 +300,7 @@
   });
 </script>
 
-<svelte:window on:keydown={onKey} on:click={() => { menu = null; owApps = null; }} />
+<svelte:window on:keydown={onKey} on:click={() => { menu = null; owApps = null; }} on:mousemove={onResizeMove} on:mouseup={endResize} />
 
 <div class="app" oncontextmenu={(e)=>e.preventDefault()}>
   <div class="tabbar">
@@ -294,17 +319,28 @@
     <button onclick={fwd} disabled={hidx>=history.length-1} title="Forward">›</button>
     <button onclick={up} title="Up">↑</button>
     <button onclick={() => navigate(places[0]?.[1])} title="Home">⌂</button>
-    <input id="addr" class="addr" bind:value={addr}
-           onkeydown={(e)=> e.key==='Enter' && navigate(addr.trim())} spellcheck="false" />
-    <button onclick={copyAddr} title="Copy path to clipboard">📋</button>
+    {#if editingAddr}
+      <input id="addr" class="addr" bind:value={addr}
+             onkeydown={(e)=> { if(e.key==='Enter'){ navigate(addr.trim()); editingAddr=false; } else if(e.key==='Escape'){ editingAddr=false; } }}
+             onblur={()=>editingAddr=false} spellcheck="false" />
+    {:else}
+      <div class="crumbs" ondblclick={editAddr} title="Double-click to edit path">
+        {#each crumbs as c, i}
+          {#if i>0}<span class="crumbsep">›</span>{/if}
+          <button class="crumb" onclick={()=>navigate(c.path)}>{c.name}</button>
+        {/each}
+      </div>
+    {/if}
+    <button onclick={copyAddr} title="Copy path">📋</button>
     <input class="search" placeholder="Search…" bind:value={search} />
+    <button class:active={showPreview} onclick={togglePreview} title="Toggle preview pane">▭</button>
     <button class:active={view==='details'} onclick={()=>view='details'} title="Details">☰</button>
     <button class:active={view==='icons'} onclick={()=>view='icons'} title="Icons">▦</button>
     <button onclick={()=>navigate(cwd,false)} title="Refresh">⟳</button>
   </div>
 
   <div class="body">
-    <aside class="sidebar">
+    <aside class="sidebar" style="width:{sidebarW}px">
       {#if favorites.length}
         <div class="sec">★ Favorites</div>
         {#each favorites as f}
@@ -344,6 +380,8 @@
       {/if}
       <label class="hidden-toggle"><input type="checkbox" checked={showHidden} onchange={()=>{showHidden=!showHidden; navigate(cwd,false);}} /> Hidden files</label>
     </aside>
+
+    <div class="splitter" onmousedown={(e)=>startResize('sidebar',e)}></div>
 
     <main class="files {view}" style="--zoom:{iconZoom}" onwheel={wheelFiles} oncontextmenu={(e)=>ctx(e,null)}>
       {#if creating}
@@ -401,7 +439,9 @@
       {/if}
     </main>
 
-    <aside class="preview" style="--pvzoom:{previewZoom}" onwheel={wheelPreview}>
+    {#if showPreview}
+    <div class="splitter" onmousedown={(e)=>startResize('preview',e)}></div>
+    <aside class="preview" style="--pvzoom:{previewZoom}; width:{previewW}px" onwheel={wheelPreview}>
       {#if selected}
         <div class="pv-image">
           {#if previewSrc}<img src={previewSrc} alt={selected.name} />
@@ -416,6 +456,7 @@
         </div>
       {:else}<div class="pv-placeholder">Select a file</div>{/if}
     </aside>
+    {/if}
   </div>
 
   <div class="status">
@@ -539,10 +580,16 @@
   .toolbar button:disabled{ opacity:.35; cursor:default; }
   .toolbar button.active{ background:#3a6df0; border-color:#3a6df0; color:#fff; }
   .addr{ flex:1; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; font-family:monospace; }
+  .crumbs{ flex:1; display:flex; align-items:center; gap:1px; overflow:hidden; background:#15171b; border:1px solid #3a3f49; border-radius:6px; padding:2px 6px; height:32px; box-sizing:border-box; }
+  .crumb{ background:none; border:none; color:#cfd3da; cursor:pointer; padding:3px 7px; border-radius:4px; white-space:nowrap; font:inherit; }
+  .crumb:hover{ background:#2c3038; color:#fff; }
+  .crumbsep{ color:#6b7079; flex:none; padding:0 1px; }
+  .splitter{ width:6px; cursor:col-resize; background:transparent; flex:none; transition:background .1s; }
+  .splitter:hover{ background:#3a6df0; }
   .search{ width:150px; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; }
 
   .body{ flex:1; display:flex; min-height:0; }
-  .sidebar{ width:185px; background:#202329; border-right:1px solid #000; padding:8px; display:flex; flex-direction:column; gap:1px; overflow:auto; }
+  .sidebar{ width:185px; flex:none; background:#202329; border-right:1px solid #000; padding:8px; display:flex; flex-direction:column; gap:1px; overflow:auto; }
   .sec{ color:#6b7079; font-size:11px; text-transform:uppercase; letter-spacing:.05em; padding:10px 8px 4px; }
   .place{ display:flex; align-items:center; gap:8px; text-align:left; background:none; border:none; color:#c4c8cf; padding:6px 10px; border-radius:6px; cursor:pointer; width:100%; }
   .place:hover{ background:#2c3038; }
@@ -584,7 +631,7 @@
   .cellicon .ph{ width:calc(48px * var(--zoom,1)); height:calc(48px * var(--zoom,1)); display:inline-block; }
   .cellname{ font-size:calc(12px * var(--zoom,1)); word-break:break-word; margin-top:4px; }
 
-  .preview{ width:320px; background:#202329; border-left:1px solid #000; display:flex; flex-direction:column; }
+  .preview{ width:320px; flex:none; background:#202329; border-left:1px solid #000; display:flex; flex-direction:column; }
   .pv-image{ flex:1; display:flex; align-items:center; justify-content:center; padding:12px; min-height:0; overflow:auto; }
   .pv-image img{ max-width:calc(100% * var(--pvzoom,1)); max-height:calc(100% * var(--pvzoom,1)); object-fit:contain; border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,.5); }
   .pv-placeholder{ color:#6b7079; text-align:center; padding:20px; }
