@@ -563,11 +563,17 @@
              onkeydown={(e)=> { if(e.key==='Enter'){ navigate(addr.trim()); editingAddr=false; } else if(e.key==='Escape'){ editingAddr=false; } }}
              onblur={()=>editingAddr=false} spellcheck="false" />
     {:else}
-      <div class="crumbs" ondblclick={editAddr} title="Double-click to edit path">
+      <div class="crumbs"
+           onclick={(e)=>{ if (e.target === e.currentTarget) editAddr(); }}
+           ondblclick={editAddr}
+           oncontextmenu={(e)=>{ e.preventDefault(); e.stopPropagation();
+             navigator.clipboard?.readText().then(t=>{ const p=t?.trim(); if(p&&p.startsWith('/')) navigate(p); else editAddr(); }).catch(()=>editAddr()); }}
+           title="Click empty area or right-click to paste a path">
         {#each crumbs as c, i}
           {#if i>0}<span class="crumbsep">›</span>{/if}
           <span class="crumb" role="button" tabindex="0" onclick={()=>navigate(c.path)} onkeydown={(e)=>crumbKey(e, c.path)}>{c.name}</span>
         {/each}
+        <span class="crumb-paste-hint">›</span>
       </div>
     {/if}
     <button onclick={copyAddr} title="Copy path">📋</button>
@@ -915,6 +921,7 @@
   .crumb:hover{ color:#fff; text-decoration:underline; text-underline-offset:2px; }
   .crumb:focus-visible{ outline:1px solid #687386; outline-offset:2px; border-radius:2px; }
   .crumbsep{ color:#656b75; flex:none; padding:0 5px; font-size:14px; }
+  .crumb-paste-hint{ flex:1; color:transparent; cursor:text; min-width:20px; padding:0 4px; }
   .splitter{ width:6px; cursor:col-resize; background:transparent; flex:none; transition:background .1s; }
   .splitter:hover{ background:#3a6df0; }
   .search{ width:150px; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; }
