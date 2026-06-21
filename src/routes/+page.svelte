@@ -38,6 +38,9 @@
   let iconZoom = $state(1);
   let previewZoom = $state(1);
   const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+  const AUDIO_EXTS = new Set(['mp3','flac','wav','ogg','m4a','aac','opus','wma','aiff','alac']);
+  function fmtTime(s) { if (!s || isNaN(s)) return '0:00'; return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
+  function toggleAudio() { if (audioEl) audioPlaying ? audioEl.pause() : audioEl.play(); }
   function wheelFiles(ev){
     if (!ev.ctrlKey) return;
     ev.preventDefault();
@@ -77,6 +80,12 @@
   let colDate = $state(true);
   let thumbsEnabled = $state(true);
   let thumbCache = $state({});
+  let audioSrc = $state("");
+  let audioPlaying = $state(false);
+  let audioTime = $state(0);
+  let audioDuration = $state(0);
+  /** @type {HTMLAudioElement|null} */
+  let audioEl = $state(null);
 
   const basename = (p) => p === "/" ? "/" : (p.replace(/\/+$/,"").split("/").pop() || p);
   const PLACE_ICONS = { Home:'home', Desktop:'desktop', Documents:'documents', Downloads:'downloads', Pictures:'pictures', Music:'music', Videos:'video', Trash:'trash' };
@@ -414,9 +423,13 @@
       selectedSet = new Set([e.path]);
     }
     lastIndex = idx; selected = e;
-    previewSrc = ""; previewError = ""; previewText = ""; previewZoom = 1;
+    previewSrc = ""; previewError = ""; previewText = ""; audioSrc = ""; audioPlaying = false; audioTime = 0; audioDuration = 0; previewZoom = 1;
+    const ext = e.name.split('.').pop()?.toLowerCase() ?? '';
     if (e.is_image) {
       try { previewSrc = await invoke("read_data_url", { path: e.path }); }
+      catch (err) { previewError = String(err); }
+    } else if (AUDIO_EXTS.has(ext)) {
+      try { audioSrc = await invoke("read_data_url", { path: e.path }); }
       catch (err) { previewError = String(err); }
     } else if (!e.is_dir) {
       // try a text preview; binary/unreadable falls back to the file icon
@@ -709,6 +722,28 @@
       {#if selected}
         {#if previewText}
           <pre class="pv-text">{previewText}</pre>
+        {:else if audioSrc}
+          <div class="pv-audio">
+            <div class="pv-music-art">🎵</div>
+            <div class="pv-audio-title">{selected.name.replace(/\.[^.]+$/, '')}</div>
+            <div class="pv-audio-ext">{selected.name.split('.').pop()?.toUpperCase()}</div>
+            <audio bind:this={audioEl}
+                   src={audioSrc}
+                   onplay={() => audioPlaying = true}
+                   onpause={() => audioPlaying = false}
+                   ontimeupdate={() => { audioTime = audioEl?.currentTime ?? 0; }}
+                   onloadedmetadata={() => { audioDuration = audioEl?.duration ?? 0; }}></audio>
+            <div class="pv-audio-controls">
+              <button class="pv-play" onclick={toggleAudio}>{audioPlaying ? '⏸' : '▶'}</button>
+              <div class="pv-seek-row">
+                <span class="pv-time">{fmtTime(audioTime)}</span>
+                <input type="range" class="pv-seek" min=0 max={audioDuration || 1} step=0.1
+                       value={audioTime}
+                       oninput={(e) => { if (audioEl) audioEl.currentTime = +e.target.value; }} />
+                <span class="pv-time">{fmtTime(audioDuration)}</span>
+              </div>
+            </div>
+          </div>
         {:else}
           <div class="pv-image">
             {#if previewSrc}<img src={previewSrc} alt={selected.name} />
@@ -987,6 +1022,16 @@
             white-space:pre-wrap; word-break:break-word; }
   .pv-placeholder{ color:#6b7079; text-align:center; padding:20px; }
   .pv-placeholder.big{ font-size:80px; }
+  .pv-audio{ display:flex; flex-direction:column; align-items:center; justify-content:center; flex:1; gap:14px; padding:20px; }
+  .pv-music-art{ font-size:72px; line-height:1; user-select:none; }
+  .pv-audio-title{ font-size:14px; font-weight:600; color:#e3e5ea; text-align:center; word-break:break-word; padding:0 8px; }
+  .pv-audio-ext{ font-size:11px; color:#6b7079; text-transform:uppercase; letter-spacing:.08em; }
+  .pv-audio-controls{ width:100%; display:flex; flex-direction:column; align-items:center; gap:10px; }
+  .pv-play{ width:50px; height:50px; border-radius:50%; background:#3b82f6; border:none; color:#fff; font-size:22px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:background .15s; }
+  .pv-play:hover{ background:#2563eb; }
+  .pv-seek-row{ display:flex; align-items:center; gap:8px; width:100%; }
+  .pv-seek{ flex:1; accent-color:#3b82f6; cursor:pointer; }
+  .pv-time{ font-size:11px; color:#8a8f99; min-width:34px; text-align:center; font-variant-numeric:tabular-nums; }
   .pv-meta{ padding:12px 14px; border-top:1px solid #000; font-size:12px; color:#aeb3bb; }
   .pv-name{ font-weight:600; color:#e3e5ea; word-break:break-all; margin-bottom:4px; }
   .pv-date{ color:#6b7079; margin-top:4px; }
