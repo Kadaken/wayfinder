@@ -6,6 +6,12 @@ Wayfinder replaces Dolphin, Nemo, and Nautilus with a single clean app: dark-the
 
 ---
 
+## Screenshot
+
+![Wayfinder](screenshots/screenshot-details.png)
+
+---
+
 ## Download
 
 Grab the latest binary from the [**Releases**](https://github.com/Kadaken/wayfinder/releases) page — no install required.
