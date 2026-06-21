@@ -582,7 +582,7 @@
     <button class:active={view==='details'} onclick={()=>view='details'} title="Details">☰</button>
     <button class:active={view==='icons'} onclick={()=>view='icons'} title="Icons">▦</button>
     <button onclick={()=>navigate(cwd,false)} title="Refresh">⟳</button>
-    <button onclick={()=>showSettings=true} title="Options">⚙</button>
+    <button class="opt-btn" onclick={()=>showSettings=true} title="Options">⚙ Options</button>
   </div>
 
   <div class="body">
@@ -912,6 +912,7 @@
 
   .toolbar{ display:flex; gap:4px; padding:6px 8px; background:#23262d; border-bottom:1px solid #000; align-items:center; }
   .toolbar button{ background:#2c3038; color:#cfd3da; border:1px solid #3a3f49; border-radius:6px; padding:5px 9px; cursor:pointer; min-width:30px; }
+  .opt-btn{ background:#2c3038; border-color:#555b66; color:#dde0e6; font-size:13px; gap:4px; white-space:nowrap; }
   .toolbar button:hover:not(:disabled){ background:#353b45; }
   .toolbar button:disabled{ opacity:.35; cursor:default; }
   .toolbar button.active{ background:#3a6df0; border-color:#3a6df0; color:#fff; }
