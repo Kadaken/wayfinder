@@ -161,7 +161,7 @@ fn b64(bytes: &[u8]) -> String {
 #[tauri::command]
 fn read_data_url(path: String) -> Result<String, String> {
     let md = fs::metadata(&path).map_err(|e| e.to_string())?;
-    if md.len() > 60 * 1024 * 1024 {
+    if md.len() > 100 * 1024 * 1024 {
         return Err("too large to preview".into());
     }
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
@@ -180,6 +180,16 @@ fn read_data_url(path: String) -> Result<String, String> {
         "ico" => "image/x-icon",
         "tif" | "tiff" => "image/tiff",
         "avif" => "image/avif",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "opus" => "audio/ogg",
+        "wma" => "audio/x-ms-wma",
+        "aiff" | "aif" => "audio/aiff",
+        "alac" => "audio/mp4",
         _ => "application/octet-stream",
     };
     Ok(format!("data:{};base64,{}", mime, b64(&bytes)))
