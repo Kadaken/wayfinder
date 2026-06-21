@@ -46,7 +46,7 @@ fn icon_name(p: &Path, is_dir: bool) -> &'static str {
         "sh" | "bash" | "zsh" | "fish" => "text-x-script",
         "py" => "text-x-python",
         "js" | "mjs" | "cjs" | "jsx" => "application-javascript",
-        "ts2" | "tsx" => "application-javascript",
+        "ts" | "tsx" => "application-javascript",
         "rs" => "text-rust",
         "c" | "h" => "text-x-csrc",
         "cpp" | "cc" | "cxx" | "hpp" => "text-x-c++src",
@@ -774,28 +774,23 @@ pub fn run() {
                     .spawn()
                 {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("[udev-watcher] failed to spawn udevadm: {e}");
-                        return;
-                    }
+                    Err(_) => return,
                 };
                 use std::io::BufRead;
-                let stdout = child.stdout.take().unwrap();
+                let stdout = match child.stdout.take() {
+                    Some(s) => s,
+                    None => return,
+                };
                 let reader = std::io::BufReader::new(stdout);
                 for line in reader.lines() {
                     match line {
                         Ok(l) if l.starts_with("UDEV") && l.contains("/devices/") => {
-                            eprintln!("[udev-watcher] event: {l}");
                             let _ = handle.emit("drives-changed", ());
                         }
-                        Err(e) => {
-                            eprintln!("[udev-watcher] read error: {e}");
-                            break;
-                        }
+                        Err(_) => break,
                         _ => {}
                     }
                 }
-                eprintln!("[udev-watcher] udevadm exited, hotplug detection stopped");
             });
             Ok(())
         })
