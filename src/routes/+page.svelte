@@ -41,6 +41,27 @@
   const AUDIO_EXTS = new Set(['mp3','flac','wav','ogg','m4a','aac','opus','wma','aiff','alac']);
   function fmtTime(s) { if (!s || isNaN(s)) return '0:00'; return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
   function toggleAudio() { if (audioEl) audioPlaying ? audioEl.pause() : audioEl.play(); }
+  function lassoStart(ev) {
+    if (ev.button !== 0) return;
+    if (ev.target.closest('tr, button.cell, thead, .createbar, .empty, input, button')) return;
+    if (!ev.ctrlKey) { selectedSet = new Set(); selected = null; }
+    lasso = { x1: ev.clientX, y1: ev.clientY, x2: ev.clientX, y2: ev.clientY };
+  }
+  function lassoMove(ev) {
+    if (!lasso) return;
+    lasso = { ...lasso, x2: ev.clientX, y2: ev.clientY };
+    if (!filesEl) return;
+    const rl = Math.min(lasso.x1, lasso.x2), rr = Math.max(lasso.x1, lasso.x2);
+    const rt = Math.min(lasso.y1, lasso.y2), rb = Math.max(lasso.y1, lasso.y2);
+    const items = filesEl.querySelectorAll('[data-path]');
+    const s = new Set();
+    for (const item of items) {
+      const r = item.getBoundingClientRect();
+      if (r.left < rr && r.right > rl && r.top < rb && r.bottom > rt) s.add(item.dataset.path);
+    }
+    selectedSet = s;
+  }
+  function lassoEnd() { lasso = null; }
   function wheelFiles(ev){
     if (!ev.ctrlKey) return;
     ev.preventDefault();
@@ -86,6 +107,10 @@
   let audioDuration = $state(0);
   /** @type {HTMLAudioElement|null} */
   let audioEl = $state(null);
+  /** @type {{x1:number,y1:number,x2:number,y2:number}|null} */
+  let lasso = $state(null);
+  /** @type {HTMLElement|null} */
+  let filesEl = $state(null);
 
   const basename = (p) => p === "/" ? "/" : (p.replace(/\/+$/,"").split("/").pop() || p);
   const PLACE_ICONS = { Home:'home', Desktop:'desktop', Documents:'documents', Downloads:'downloads', Pictures:'pictures', Music:'music', Videos:'video', Trash:'trash' };
@@ -552,7 +577,7 @@
   });
 </script>
 
-<svelte:window on:click={() => { menu = null; owApps = null; }} on:mousemove={onResizeMove} on:mouseup={endResize} />
+<svelte:window on:click={() => { menu = null; owApps = null; }} on:mousemove={(ev)=>{onResizeMove(ev);lassoMove(ev);}} on:mouseup={()=>{endResize();lassoEnd();}} />
 
 <div class="app" oncontextmenu={(e)=>e.preventDefault()}>
   <div class="tabbar">
@@ -654,7 +679,10 @@
 
     <div class="splitter" onmousedown={(e)=>startResize('sidebar',e)}></div>
 
-    <main class="files {view}" style="--zoom:{iconZoom}" onwheel={wheelFiles} oncontextmenu={(e)=>ctx(e,null)}>
+    <main class="files {view}" style="--zoom:{iconZoom}" bind:this={filesEl} onmousedown={lassoStart} onwheel={wheelFiles} oncontextmenu={(e)=>ctx(e,null)}>
+      {#if lasso}
+        <div class="lasso" style="left:{Math.min(lasso.x1,lasso.x2)}px;top:{Math.min(lasso.y1,lasso.y2)}px;width:{Math.abs(lasso.x2-lasso.x1)}px;height:{Math.abs(lasso.y2-lasso.y1)}px"></div>
+      {/if}
       {#if creating || creatingFile}
         <div class="createbar">{creatingFile ? '📄' : '📁'} <input autofocus bind:value={createVal}
              onkeydown={(e)=> e.key==='Enter' ? (creatingFile?commitCreateFile():commitCreate()) : e.key==='Escape' ? (creating=false,creatingFile=false) : null}
@@ -674,7 +702,7 @@
           </tr></thead>
           <tbody>
             {#each rows as e, i}
-              <tr class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
+              <tr data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
                   draggable="true" ondragstart={(ev)=>onDragStart(ev,e)}
                   ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.path)} ondragleave={()=>dropTarget=''}
                   onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
@@ -696,7 +724,7 @@
       {:else}
         <div class="grid">
           {#each rows as e, i}
-            <button class="cell" class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
+            <button class="cell" data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
                  draggable="true" ondragstart={(ev)=>onDragStart(ev,e)}
                  ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.path)} ondragleave={()=>dropTarget=''}
                  onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
@@ -982,7 +1010,8 @@
   .dsz{ font-size:10px; color:#6b7079; }
   .hidden-toggle{ margin-top:auto; color:#8b909a; font-size:12px; padding:8px 4px; display:flex; gap:6px; align-items:center; }
 
-  .files{ flex:1; overflow:auto; background:#1b1d22; }
+  .files{ flex:1; overflow:auto; background:#1b1d22; position:relative; }
+  .lasso{ position:fixed; pointer-events:none; border:1px solid #3a6df0; background:rgba(58,109,240,0.12); z-index:9999; }
   .empty{ padding:40px; text-align:center; color:#6b7079; }
   .createbar{ padding:8px 10px; background:#23262d; display:flex; gap:8px; align-items:center; }
   .createbar input, .rename{ background:#15171b; color:#fff; border:1px solid #3a6df0; border-radius:4px; padding:3px 6px; font:inherit; }
