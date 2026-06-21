@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use tauri::Emitter;
 
 const IMG_EXT: [&str; 12] = [
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
@@ -184,6 +185,30 @@ fn read_data_url(path: String) -> Result<String, String> {
     Ok(format!("data:{};base64,{}", mime, b64(&bytes)))
 }
 
+// Read a text file for the preview pane. Caps the read, rejects binaries (NUL byte),
+// and lossily decodes UTF-8 so odd encodings still show something readable.
+#[tauri::command]
+fn read_text_preview(path: String) -> Result<String, String> {
+    use std::io::Read;
+    let md = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if !md.is_file() {
+        return Err("not a file".into());
+    }
+    const CAP: usize = 256 * 1024; // preview at most 256 KB
+    let mut f = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; CAP];
+    let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+    buf.truncate(n);
+    if buf.contains(&0) {
+        return Err("binary".into()); // NUL byte => not a text file
+    }
+    let mut s = String::from_utf8_lossy(&buf).into_owned();
+    if md.len() as usize > n {
+        s.push_str("\n\n… (preview truncated — showing the first 256 KB)");
+    }
+    Ok(s)
+}
+
 #[derive(Serialize)]
 struct Drive {
     name: String,
@@ -192,6 +217,7 @@ struct Drive {
     size: u64,
     fstype: String,
     kind: String,        // "drive" | "gdrive" | "network"
+    removable: bool,     // true for USB / hot-pluggable devices (eligible for Eject)
 }
 
 #[tauri::command]
@@ -200,7 +226,7 @@ fn list_drives() -> Vec<Drive> {
 
     // Block devices via lsblk JSON
     if let Ok(o) = std::process::Command::new("lsblk")
-        .args(["-J", "-b", "-o", "NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,PATH,TYPE"])
+        .args(["-J", "-b", "-o", "NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,PATH,TYPE,RM"])
         .output()
     {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
@@ -218,6 +244,8 @@ fn list_drives() -> Vec<Drive> {
                 if (typ == "part" || typ == "disk" || typ == "crypt") && !boring && mp != "/" {
                     let label = dev["label"].as_str().filter(|s| !s.is_empty());
                     let name = dev["name"].as_str().unwrap_or("?");
+                    let removable = dev["rm"].as_bool().unwrap_or(false)
+                        || dev["rm"].as_str() == Some("1");
                     out.push(Drive {
                         name: label.map(|s| s.to_string()).unwrap_or_else(|| name.to_string()),
                         path: dev["path"].as_str().unwrap_or("").to_string(),
@@ -225,6 +253,7 @@ fn list_drives() -> Vec<Drive> {
                         size: dev["size"].as_u64().unwrap_or(0),
                         fstype: fstype.to_string(),
                         kind: "drive".into(),
+                        removable,
                     });
                 }
                 if let Some(children) = dev["children"].as_array() {
@@ -257,6 +286,7 @@ fn list_drives() -> Vec<Drive> {
                     size: 0,
                     fstype: "rclone".into(),
                     kind: "gdrive".into(),
+                    removable: false,
                 });
             } else if (fstype.starts_with("nfs") || fstype == "cifs" || fstype.starts_with("fuse."))
                 && mp.starts_with("/home")
@@ -269,6 +299,7 @@ fn list_drives() -> Vec<Drive> {
                     size: 0,
                     fstype: fstype.to_string(),
                     kind: "network".into(),
+                    removable: false,
                 });
             }
         }
@@ -288,6 +319,69 @@ fn mount_drive(device: String) -> Result<String, String> {
         Ok(s.rsplit(" at ").next().unwrap_or("").trim().trim_end_matches('.').to_string())
     } else {
         Err(String::from_utf8_lossy(&o.stderr).to_string())
+    }
+}
+
+// Resolve the whole-disk device for a partition (/dev/sda1 -> /dev/sda); pass-through if already a disk.
+fn whole_disk_of(device: &str) -> String {
+    if let Ok(o) = std::process::Command::new("lsblk")
+        .args(["-no", "PKNAME", device])
+        .output()
+    {
+        let parent = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !parent.is_empty() {
+            return format!("/dev/{}", parent);
+        }
+    }
+    device.to_string()
+}
+
+#[tauri::command]
+fn unmount_drive(device: String) -> Result<(), String> {
+    let o = std::process::Command::new("udisksctl")
+        .args(["unmount", "-b", &device])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+    }
+}
+
+#[tauri::command]
+fn eject_drive(device: String) -> Result<(), String> {
+    let disk = whole_disk_of(&device);
+    // Unmount every mounted partition on this disk before cutting power.
+    if let Ok(o) = std::process::Command::new("lsblk")
+        .args(["-nro", "PATH,MOUNTPOINT", &disk])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut it = line.split_whitespace();
+            let part = it.next().unwrap_or("");
+            let mp = it.next().unwrap_or("");
+            if !part.is_empty() && !mp.is_empty() {
+                let _ = std::process::Command::new("udisksctl")
+                    .args(["unmount", "-b", part])
+                    .output();
+            }
+        }
+    }
+    // Power off the whole device so it's safe to physically remove.
+    let o = std::process::Command::new("udisksctl")
+        .args(["power-off", "-b", &disk])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
     }
 }
 
@@ -670,14 +764,52 @@ fn open_terminal(path: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut child = match std::process::Command::new("udevadm")
+                    .args(["monitor", "--udev", "--subsystem-match=block"])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[udev-watcher] failed to spawn udevadm: {e}");
+                        return;
+                    }
+                };
+                use std::io::BufRead;
+                let stdout = child.stdout.take().unwrap();
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if l.starts_with("UDEV") && l.contains("/devices/") => {
+                            eprintln!("[udev-watcher] event: {l}");
+                            let _ = handle.emit("drives-changed", ());
+                        }
+                        Err(e) => {
+                            eprintln!("[udev-watcher] read error: {e}");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                eprintln!("[udev-watcher] udevadm exited, hotplug detection stopped");
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_dir,
             standard_dirs,
             parent_dir,
             open_path,
             read_data_url,
+            read_text_preview,
             list_drives,
             mount_drive,
+            unmount_drive,
+            eject_drive,
             copy_paths,
             move_paths,
             delete_paths,
