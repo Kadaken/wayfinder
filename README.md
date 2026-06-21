@@ -6,22 +6,6 @@ Wayfinder replaces Dolphin, Nemo, and Nautilus with a single clean app: dark-the
 
 ---
 
-## Screenshots
-
-**Details view** — file list with preview pane, tabs, and breadcrumb navigation:
-
-![Details View](screenshots/screenshot-details.png)
-
-**Grid / Icons view** — image thumbnails with live relative timestamps:
-
-![Grid View](screenshots/screenshot-grid.png)
-
-**⚙ Options modal** — configure timestamps, column visibility, and thumbnails:
-
-![Options](screenshots/screenshot-options.png)
-
----
-
 ## Download
 
 Grab the latest binary from the [**Releases**](https://github.com/Kadaken/wayfinder/releases) page — no install required.
