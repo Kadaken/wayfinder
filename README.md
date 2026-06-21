@@ -2,50 +2,41 @@
 
 A fast, native file manager for Linux — built with **Tauri 2** + **Svelte 5** + **Rust**.
 
-Wayfinder is a lightweight, Explorer-style file manager with a **docked image preview pane**, system-themed icons, tabs, and full file operations. It was born out of frustration with existing Linux file managers that either lacked a clean always-on preview pane or felt heavy.
+Wayfinder is a lightweight, Explorer-style file manager with a docked preview pane, Windows-style relative timestamps, image thumbnails, tabs, and full file operations — built out of frustration with existing Linux file managers that felt heavy or lacked a clean always-on preview.
 
-> Name: "wayfinding" is the practice of navigating to a destination — and a nod to **Wayland**, the display server it's built for.
+> "Wayfinding" is the practice of navigating to a destination — and a nod to **Wayland**, the display server it targets.
+
+## Download
+
+Grab the latest binary from the [**Releases**](https://github.com/Kadaken/wayfinder/releases) page — no installation required, just run it.
+
+```bash
+chmod +x wayfinder
+./wayfinder
+```
 
 ## Features
 
-- 🖼 **Docked preview pane** — select an image and see it large, always-on, no popups
-- 🗂 **Tabs** — multiple folders in one window (`Ctrl+T` / `Ctrl+W`)
-- 🎨 **System icons** — per-file-type icons pulled from your active icon theme (Breeze, etc.)
-- 📋 **Full file ops** — cut, copy, paste, move, rename, delete-to-trash, permanent delete, new folder
-- 🎯 **Drag & drop** — drag files onto folders, tabs, or sidebar places (Ctrl = copy)
-- 🖱 **Two context menus** — one for sidebar places, one for files (with "Open With" app list)
-- ⭐ **Favorites & Recent** — pin folders, auto-tracked history (persisted)
-- 🔍 **Search**, sortable columns, **Properties** dialog
-- 💾 **Drives & cloud** — auto-detects mounted drives + rclone/Google Drive mounts, mounts on click
-- 🔎 **Per-pane Ctrl+scroll zoom** — zoom file icons or the preview image independently
-- 📐 Details + icon views, address bar, back/forward/up navigation
+- **Docked preview pane** — select any file; images render large, text files show their content
+- **Windows-style timestamps** — "Just now", "5 min ago", "Yesterday, 2:30 PM", or full date — auto-updating every minute
+- **Image thumbnails** — grid view loads real previews for image files (toggle in ⚙ Options)
+- **Tabs** — multiple folders in one window (`Ctrl+T` / `Ctrl+W`)
+- **System icons** — per-file-type icons from your active icon theme (Breeze, Papirus, etc.)
+- **Full file ops** — cut, copy, paste, move, rename, trash, permanent delete, new folder/file, ZIP compress/extract
+- **Drag & drop** — onto folders, tabs, or sidebar places (`Ctrl` = copy)
+- **USB hotplug** — drives appear automatically when plugged in; right-click to unmount or eject
+- **Open With** — per-app submenu for any file type, flyout on hover
+- **Favorites & Recent** — pin folders, auto-tracked recents (persisted across sessions)
+- **Search**, sortable columns, Properties dialog
+- **Resizable panes** — drag the splitter handles; layout saved per session
+- **Ctrl+scroll zoom** — zoom icons or the preview image independently
+- **Options (⚙)** — configure "Just now" duration, column visibility, thumbnail toggle
 
 ## Requirements
 
-- A Linux desktop (developed on Fedora KDE / Wayland)
-- `xdg-utils`, `gio` (glib2), `udisks2` — for opening files, trash, and mounting
-- A standard freedesktop icon theme (e.g. `breeze-icons`)
-
-## Build from source
-
-Prerequisites: [Rust](https://rustup.rs), [Node.js](https://nodejs.org) 20+, and the
-[Tauri 2 Linux dependencies](https://v2.tauri.app/start/prerequisites/) (`webkit2gtk4.1`, etc.).
-
-```bash
-git clone <your-repo-url> wayfinder
-cd wayfinder
-npm install
-
-# run in dev (hot-reload)
-npm run tauri dev
-
-# build a release binary
-npm run tauri build -- --no-bundle
-# binary -> src-tauri/target/release/wayfinder
-
-# or build installable packages (rpm/deb)
-npm run tauri build -- --bundles rpm,deb
-```
+- Linux with a desktop session (Wayland or X11)
+- `xdg-utils`, `gio` (glib2), `udisks2` — for opening files, trash, and mounting drives
+- A freedesktop icon theme (e.g. `breeze-icons`, `papirus-icon-theme`)
 
 ## Keyboard shortcuts
 
@@ -56,13 +47,35 @@ npm run tauri build -- --bundles rpm,deb
 | `Ctrl+A` | Select all |
 | `F2` | Rename |
 | `Delete` | Move to Trash |
-| `Backspace` | Up a folder |
+| `Backspace` | Back in history |
+| `Alt+Up` | Go up to parent folder |
 | `Alt+←` / `Alt+→` | Back / forward |
 | `Ctrl+L` | Focus address bar |
 | `F5` | Refresh |
-| `Ctrl+H` | Toggle hidden files |
-| `Ctrl + scroll` | Zoom icons (file pane) or image (preview pane) |
+| `Ctrl+scroll` | Zoom icons or preview image |
+| `Escape` | Deselect / close menus |
+
+## Build from source
+
+Prerequisites: [Rust](https://rustup.rs), Node.js 20+, and the
+[Tauri 2 Linux dependencies](https://v2.tauri.app/start/prerequisites/) (`webkit2gtk4.1`, etc.).
+
+```bash
+git clone https://github.com/Kadaken/wayfinder.git
+cd wayfinder
+npm install
+
+# dev mode with hot-reload
+npm run tauri dev
+
+# release binary (no installer)
+npm run tauri build -- --no-bundle
+# binary → src-tauri/target/release/wayfinder
+
+# installable packages (rpm / deb)
+npm run tauri build -- --bundles rpm,deb
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+© 2026 Kadaken — All Rights Reserved. Personal use only. Modification and redistribution are prohibited. See [LICENSE](LICENSE) for full terms.

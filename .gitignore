@@ -1,4 +1,6 @@
 .DS_Store
+.agent-workbench/
+AGENT_STATE.md
 node_modules
 /build
 /.svelte-kit

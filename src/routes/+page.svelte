@@ -1,22 +1,39 @@
 <script>
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount, tick } from "svelte";
 
+  /** @type {Array<[string, string]>} */
   let places = $state([]);
+  /** @type {Array<any>} */
   let drives = $state([]);
+  /** @type {string} */
   let cwd = $state("");
+  /** @type {Array<any>} */
   let entries = $state([]);
+  /** @type {Set<string>} */
   let selectedSet = $state(new Set());
+  /** @type {any} */
   let selected = $state(null);      // last-clicked, drives the preview
   let lastIndex = $state(-1);
+  /** @type {string} */
   let previewSrc = $state("");
+  /** @type {string} */
   let previewError = $state("");
+  /** @type {string} */
+  let previewText = $state("");
+  /** @type {string} */
   let view = $state("details");
+  /** @type {boolean} */
   let showHidden = $state(false);
+  /** @type {string} */
   let addr = $state("");
+  /** @type {Array<string>} */
   let history = $state([]);
   let hidx = $state(-1);
+  /** @type {boolean} */
   let loading = $state(false);
+  /** @type {string} */
   let search = $state("");
   let iconZoom = $state(1);
   let previewZoom = $state(1);
@@ -32,46 +49,98 @@
     ev.preventDefault();
     previewZoom = clamp(+(previewZoom * (ev.deltaY < 0 ? 1.15 : 0.87)).toFixed(3), 0.25, 10);
   }
+  /** @type {any} */
   let clipboard = $state(null);     // { mode:"copy"|"cut", paths:[] }
+  /** @type {any} */
   let menu = $state(null);          // { x, y, onEntry }
+  /** @type {HTMLDivElement | null} */
+  let menuEl = $state(null);        // bound to the context-menu div, for edge-clamping
+  /** @type {any} */
   let renaming = $state(null);      // path being renamed
+  /** @type {string} */
   let renameVal = $state("");
+  /** @type {boolean} */
   let creating = $state(false);
+  /** @type {string} */
   let createVal = $state("");
+  /** @type {string} */
   let toast = $state("");
+  /** @type {Array<{name: string, path: string}>} */
   let favorites = $state([]);
+  /** @type {Array<{name: string, path: string}>} */
   let recents = $state([]);
+  let justNowMins = $state(2);
+  let showSettings = $state(false);
+  let nowTick = $state(Date.now());
+  let colSize = $state(true);
+  let colType = $state(true);
+  let colDate = $state(true);
+  let thumbsEnabled = $state(true);
+  let thumbCache = $state({});
 
   const basename = (p) => p === "/" ? "/" : (p.replace(/\/+$/,"").split("/").pop() || p);
+  const PLACE_ICONS = { Home:'home', Desktop:'desktop', Documents:'documents', Downloads:'downloads', Pictures:'pictures', Music:'music', Videos:'video', Trash:'trash' };
+  const placeIcon = (name) => PLACE_ICONS[name] || null;
   function loadStore(){
     try { favorites = JSON.parse(localStorage.getItem("zf_favorites") || "[]"); } catch { favorites = []; }
     try { recents = JSON.parse(localStorage.getItem("zf_recents") || "[]"); } catch { recents = []; }
     try { const z = parseFloat(localStorage.getItem("zf_zoom")); if (z) iconZoom = z; } catch {}
     try { const p = JSON.parse(localStorage.getItem("zf_panes") || "null"); if (p){ sidebarW = p.sidebarW ?? sidebarW; previewW = p.previewW ?? previewW; showPreview = p.showPreview ?? true; } } catch {}
+    try { const jn = parseInt(localStorage.getItem("zf_justnow") ?? "2"); justNowMins = isNaN(jn) ? 2 : jn; } catch {}
+    try { colSize = localStorage.getItem("zf_colSize") !== "false"; } catch {}
+    try { colType = localStorage.getItem("zf_colType") !== "false"; } catch {}
+    try { colDate = localStorage.getItem("zf_colDate") !== "false"; } catch {}
+    try { thumbsEnabled = localStorage.getItem("zf_thumbs") !== "false"; } catch {}
   }
   const saveFav = () => { try { localStorage.setItem("zf_favorites", JSON.stringify(favorites)); } catch {} };
   const saveRec = () => { try { localStorage.setItem("zf_recents", JSON.stringify(recents)); } catch {} };
+  const saveSettings = () => { try { localStorage.setItem("zf_justnow", String(justNowMins)); } catch {} };
+  const saveColVis = () => {
+    try {
+      localStorage.setItem("zf_colSize", String(colSize));
+      localStorage.setItem("zf_colType", String(colType));
+      localStorage.setItem("zf_colDate", String(colDate));
+    } catch {}
+  };
   const isFav = (path) => favorites.some(f => f.path === path);
   function addFavorite(path){ if (!isFav(path)){ favorites = [...favorites, { name: basename(path), path }]; saveFav(); flash("★ Added to Favorites"); } menu = null; }
   function removeFavorite(path){ favorites = favorites.filter(f => f.path !== path); saveFav(); menu = null; }
   function pushRecent(path){ if (recents.some(r => r.path === path)) return; recents = [{ name: basename(path), path }, ...recents].slice(0, 12); saveRec(); }
+  /** @type {any} */
   let propsData = $state(null);
+  /** @type {boolean} */
   let confirmDel = $state(false);
   // tabs
+  /** @type {Array<{path: string, label: string, history: Array<string>, hidx: number}>} */
   let tabs = $state([{ path:"", label:"", history:[], hidx:-1 }]);
   let activeIdx = $state(0);
   // drag & drop
+  /** @type {Array<string>} */
   let dragPaths = $state([]);
+  /** @type {string} */
   let dropTarget = $state("");
   // open-with apps (loaded when right-clicking a file)
+  /** @type {any} */
   let owApps = $state(null);
+  /** @type {boolean} */
   let owOpen = $state(false);
+  /** @type {boolean} */
+  let owFlip = $state(false);       // submenu opens to the left instead of right (near screen edge)
+  /** @type {HTMLDivElement | null} */
+  let owFlyoutEl = $state(null);
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let owCloseTimer = null;
   // resizable panes + breadcrumb + preview toggle
   let sidebarW = $state(185);
   let previewW = $state(320);
+  /** @type {boolean} */
   let showPreview = $state(true);
+  /** @type {boolean} */
   let editingAddr = $state(false);
+  /** @type {null | "sidebar" | "preview"} */
   let dragging = null;
+  /** @type {number} */
+  let navSeq = 0;
 
   const crumbs = $derived.by(() => {
     const parts = (cwd || "").split("/").filter(Boolean);
@@ -90,13 +159,24 @@
   function endResize(){ if (dragging){ dragging = null; savePanes(); } }
   function togglePreview(){ showPreview = !showPreview; savePanes(); }
   function editAddr(){ editingAddr = true; queueMicrotask(()=>{ const el=document.getElementById("addr"); el?.focus(); el?.select(); }); }
+  function crumbKey(ev, path){
+    if (ev.key === "Enter" || ev.key === " "){
+      ev.preventDefault();
+      navigate(path);
+    }
+  }
 
   // folder tree
+  /** @type {Array<any>} */
   let treeRoots = $state([]);
+  /** @type {Record<string, Array<any>>} */
   let treeChildren = $state({});
+  /** @type {Set<string>} */
   let treeExpanded = $state(new Set());
+  /** @type {boolean} */
   let creatingFile = $state(false);
   let typeBuf = "";
+  /** @type {ReturnType<typeof setTimeout> | null} */
   let typeTimer = null;
 
   const isArchive = (name) => /\.(zip|tar|tgz|7z)$|\.tar\.(gz|bz2|xz)$/i.test(name);
@@ -136,9 +216,33 @@
   function onDragStart(ev, e){ if (!selectedSet.has(e.path)){ selectedSet = new Set([e.path]); selected = e; } dragPaths = [...selectedSet]; ev.dataTransfer.effectAllowed = "copyMove"; }
   function allowDrop(ev, isDir, path){ if (isDir && dragPaths.length){ ev.preventDefault(); dropTarget = path; } }
   function onDropFolder(ev, destDir){ ev.preventDefault(); dropTarget=""; const srcs = dragPaths.filter(p => p !== destDir); dragPaths=[]; if (!srcs.length) return; const op = ev.ctrlKey ? "copy_paths" : "move_paths"; invoke(op, { srcs, destDir }).then(()=>{ flash(ev.ctrlKey?"Copied":"Moved"); navigate(cwd,false); }).catch(e=>flash("⚠ "+e)); }
-  function runOpenWith(id, path){ invoke("open_with", { appId:id, path }); menu=null; owApps=null; }
+  function runOpenWith(id, path){ invoke("open_with", { appId:id, path }); menu=null; owApps=null; owOpen=false; }
+  async function owEnter(ev){
+    if (owCloseTimer) clearTimeout(owCloseTimer);
+    const r = ev.currentTarget.getBoundingClientRect();
+    // open to the right by default; flip left if the flyout would run off the right edge
+    owFlip = (r.right + 212) > window.innerWidth - 8;
+    owOpen = true;
+    await tick();
+    if (owFlyoutEl){                       // refine using the real rendered width
+      const f = owFlyoutEl.getBoundingClientRect();
+      if (!owFlip && f.right > window.innerWidth - 6) owFlip = true;
+      else if (owFlip && f.left < 6) owFlip = false;
+    }
+  }
+  function owLeave(){ owCloseTimer = setTimeout(() => { owOpen = false; }, 220); }
 
-  function placeMenu(ev, path, isFav){ ev.preventDefault(); ev.stopPropagation(); owApps=null; menu = { x: ev.clientX, y: ev.clientY, place: { path, isFav } }; }
+  function placeMenu(ev, path, isFav){ ev.preventDefault(); ev.stopPropagation(); owApps=null; menu = { x: ev.clientX, y: ev.clientY, place: { path, isFav } }; clampMenu(); }
+  // Keep the context menu fully on-screen: if it would spill past the right/bottom edge, slide it back in.
+  async function clampMenu(){
+    await tick();
+    if (!menu || !menuEl) return;
+    const pad = 6, r = menuEl.getBoundingClientRect();
+    let x = menu.x, y = menu.y;
+    if (x + r.width  > window.innerWidth  - pad) x = Math.max(pad, window.innerWidth  - r.width  - pad);
+    if (y + r.height > window.innerHeight - pad) y = Math.max(pad, window.innerHeight - r.height - pad);
+    if (x !== menu.x || y !== menu.y) menu = { ...menu, x, y };
+  }
   function newWindow(path){ invoke("new_window", { path }); menu = null; }
   async function openProps(path){ menu = null; try { propsData = await invoke("properties", { path }); } catch(e){ flash("⚠ " + e); } }
   function askDelete(){ menu = null; if (selectedSet.size) confirmDel = true; }
@@ -149,7 +253,36 @@
     while (n >= 1024 && i < u.length-1){ n/=1024; i++; }
     return i===0 ? `${n} B` : `${n.toFixed(1)} ${u[i]}`;
   };
-  const fmtDate = (s) => s ? new Date(s*1000).toLocaleString() : "";
+  function fmtDate(s) {
+    if (!s) return "";
+    void nowTick; // reactive — re-runs each minute tick
+    const date = new Date(s * 1000);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = diffMs / 60000;
+    if (justNowMins > 0 && diffMins >= 0 && diffMins < justNowMins) return "Just now";
+    const timeStr = date.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const yesterdayStart = new Date(todayStart.getTime() - 86400000);
+    const fileDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    if (fileDay.getTime() === todayStart.getTime()) {
+      if (diffMins < 60) return `${Math.max(1, Math.round(diffMins))} min ago`;
+      const h = Math.floor(diffMins / 60);
+      if (h < 12) return `${h} hr ago`;
+      return `Today, ${timeStr}`;
+    }
+    if (fileDay.getTime() === yesterdayStart.getTime()) return `Yesterday, ${timeStr}`;
+    if (diffMs < 7 * 86400000) {
+      const day = date.toLocaleDateString('en-US', { weekday: 'short' });
+      return `${day}, ${timeStr}`;
+    }
+    if (date.getFullYear() === now.getFullYear()) {
+      const d = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      return `${timeStr} · ${d}`;
+    }
+    const d = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    return `${timeStr} · ${d}`;
+  }
   const flash = (m) => { toast = m; setTimeout(() => toast = "", 2600); };
   function copyAddr(){
     const t = cwd;
@@ -158,8 +291,10 @@
       .catch(() => flash("⚠ copy failed"));
   }
 
+  /** @type {string} */
   let sortKey = $state("name");
   let sortDir = $state(1);
+  /** @type {Record<string, string>} */
   let iconCache = $state({});
 
   const filtered = $derived(
@@ -216,9 +351,12 @@
 
   async function navigate(path, record = true) {
     if (!path) return;
+    const seq = ++navSeq;
     loading = true; menu = null; renaming = null; creating = false;
     try {
-      entries = await invoke("list_dir", { path, showHidden });
+      const nextEntries = await invoke("list_dir", { path, showHidden });
+      if (seq !== navSeq) return;
+      entries = nextEntries;
       for (const nm of new Set(entries.map(e=>e.icon))) ensureIcon(nm);
       cwd = path; addr = path; search = "";
       selectedSet = new Set(); selected = null; lastIndex = -1;
@@ -226,8 +364,17 @@
       if (record) { history = [...history.slice(0, hidx+1), path]; hidx = history.length-1; pushRecent(path); }
       refreshDrives();
       syncTab();
+      if (thumbsEnabled) {
+        const imgEntries = entries.filter(e => e.is_image).slice(0, 60);
+        thumbCache = {};
+        for (const e of imgEntries) {
+          invoke("read_data_url", { path: e.path })
+            .then(url => { thumbCache = { ...thumbCache, [e.path]: url }; })
+            .catch(() => {});
+        }
+      }
     } catch (e) { previewError = String(e); flash("⚠ " + e); }
-    finally { loading = false; }
+    finally { if (seq === navSeq) loading = false; }
   }
 
   async function up() { navigate(await invoke("parent_dir", { path: cwd })); }
@@ -239,6 +386,18 @@
     flash("Mounting " + d.name + "…");
     try { const mp = await invoke("mount_drive", { device: d.path }); await refreshDrives(); navigate(mp || d.path); }
     catch (e) { flash("⚠ mount failed: " + e); }
+  }
+  function driveCtx(ev, d){ ev.preventDefault(); ev.stopPropagation(); owApps=null; owOpen=false; menu = { x: ev.clientX, y: ev.clientY, drive: d }; clampMenu(); }
+  const canUnmount = (d) => d?.mountpoint && (d.removable || d.mountpoint.startsWith("/run/media"));
+  async function unmountDrive(d){
+    menu=null; flash("Unmounting " + d.name + "…");
+    try { await invoke("unmount_drive", { device: d.path }); await refreshDrives(); flash("Unmounted " + d.name); }
+    catch (e) { flash("⚠ unmount failed: " + e); }
+  }
+  async function ejectDrive(d){
+    menu=null; flash("Ejecting " + d.name + "…");
+    try { await invoke("eject_drive", { device: d.path }); await refreshDrives(); flash("✅ " + d.name + " — safe to remove"); }
+    catch (e) { flash("⚠ eject failed: " + e); }
   }
 
   async function select(e, idx, ev) {
@@ -255,10 +414,14 @@
       selectedSet = new Set([e.path]);
     }
     lastIndex = idx; selected = e;
-    previewSrc = ""; previewError = ""; previewZoom = 1;
+    previewSrc = ""; previewError = ""; previewText = ""; previewZoom = 1;
     if (e.is_image) {
       try { previewSrc = await invoke("read_data_url", { path: e.path }); }
       catch (err) { previewError = String(err); }
+    } else if (!e.is_dir) {
+      // try a text preview; binary/unreadable falls back to the file icon
+      try { const t = await invoke("read_text_preview", { path: e.path }); if (selected?.path === e.path) previewText = t; }
+      catch { /* not text — leave icon placeholder */ }
     }
   }
 
@@ -304,15 +467,17 @@
     if (e && !selectedSet.has(e.path)) { selectedSet = new Set([e.path]); selected = e; }
     owApps = null; owOpen = false;
     menu = { x: ev.clientX, y: ev.clientY, onEntry: !!e, entry: e };
-    if (e && !e.is_dir) invoke("open_with_apps", { path: e.path }).then(a => { const seen=new Set(); owApps = (a||[]).filter(x => !seen.has(x.name) && seen.add(x.name)); }).catch(()=>{});
+    clampMenu();
+    if (e && !e.is_dir) invoke("open_with_apps", { path: e.path }).then(a => { const seen=new Set(); owApps = (a||[]).filter(x => !seen.has(x.name) && seen.add(x.name)); clampMenu(); }).catch(()=>{});
   }
 
   function onKey(ev){
-    const inInput = ["INPUT"].includes(document.activeElement?.tagName);
+    const inInput = document.activeElement?.tagName === "INPUT";
     if (inInput) return;
-    if (ev.key === "Backspace") { ev.preventDefault(); up(); }
-    else if (ev.altKey && ev.key === "ArrowLeft") back();
-    else if (ev.altKey && ev.key === "ArrowRight") fwd();
+    if (ev.key === "Backspace") { ev.preventDefault(); back(); }
+    else if (ev.altKey && ev.key === "ArrowLeft") { ev.preventDefault(); back(); }
+    else if (ev.altKey && ev.key === "ArrowRight") { ev.preventDefault(); fwd(); }
+    else if (ev.altKey && ev.key === "ArrowUp") { ev.preventDefault(); up(); }
     else if (ev.key === "Delete") del();
     else if (ev.key === "F2" && selected) startRename(selected);
     else if (ev.ctrlKey && ev.key === "c") doCopy();
@@ -330,7 +495,7 @@
     }
     else if (ev.key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
       typeBuf += ev.key.toLowerCase();
-      clearTimeout(typeTimer); typeTimer = setTimeout(()=>{ typeBuf = ""; }, 800);
+      if (typeTimer) clearTimeout(typeTimer); typeTimer = setTimeout(()=>{ typeBuf = ""; }, 800);
       const i = rows.findIndex(r => r.name.toLowerCase().startsWith(typeBuf));
       if (i >= 0) { select(rows[i], i, {}); queueMicrotask(()=>document.querySelector('tr.sel,.cell.sel')?.scrollIntoView({block:'nearest'})); }
     }
@@ -339,18 +504,42 @@
     else if (ev.key === "Escape") { menu = null; propsData = null; confirmDel = false; selectedSet = new Set(); }
   }
 
-  onMount(async () => {
+  onMount(() => {
     loadStore();
-    places = await invoke("standard_dirs");
-    await refreshDrives();
-    let sp = null;
-    try { sp = await invoke("start_path"); } catch {}
-    navigate(sp || places[0]?.[1] || "/");
-    loadTreeRoots();
+    /** @type {null | (() => void)} */
+    let unlistenDrives = null;
+    (async () => {
+      places = await invoke("standard_dirs");
+      await refreshDrives();
+      let sp = null;
+      try { sp = await invoke("start_path"); } catch {}
+      navigate(sp || places[0]?.[1] || "/");
+      loadTreeRoots();
+
+      // Hotplug: coalesce rapid udev bursts (one plug fires disk + partition events)
+      /** @type {ReturnType<typeof setTimeout> | null} */
+      let driveDebounce = null;
+      unlistenDrives = await listen("drives-changed", () => {
+        if (driveDebounce) clearTimeout(driveDebounce);
+        driveDebounce = setTimeout(() => refreshDrives(), 400);
+      });
+    })();
+
+    /** @type {(ev: KeyboardEvent) => void} */
+    const keyHandler = (ev) => {
+      onKey(ev);
+    };
+    window.addEventListener("keydown", keyHandler, true);
+    const tickId = setInterval(() => { nowTick = Date.now(); }, 60000);
+    return () => {
+      unlistenDrives?.();
+      window.removeEventListener("keydown", keyHandler, true);
+      clearInterval(tickId);
+    };
   });
 </script>
 
-<svelte:window on:keydown={onKey} on:click={() => { menu = null; owApps = null; }} on:mousemove={onResizeMove} on:mouseup={endResize} />
+<svelte:window on:click={() => { menu = null; owApps = null; }} on:mousemove={onResizeMove} on:mouseup={endResize} />
 
 <div class="app" oncontextmenu={(e)=>e.preventDefault()}>
   <div class="tabbar">
@@ -377,7 +566,7 @@
       <div class="crumbs" ondblclick={editAddr} title="Double-click to edit path">
         {#each crumbs as c, i}
           {#if i>0}<span class="crumbsep">›</span>{/if}
-          <button class="crumb" onclick={()=>navigate(c.path)}>{c.name}</button>
+          <span class="crumb" role="button" tabindex="0" onclick={()=>navigate(c.path)} onkeydown={(e)=>crumbKey(e, c.path)}>{c.name}</span>
         {/each}
       </div>
     {/if}
@@ -387,6 +576,7 @@
     <button class:active={view==='details'} onclick={()=>view='details'} title="Details">☰</button>
     <button class:active={view==='icons'} onclick={()=>view='icons'} title="Icons">▦</button>
     <button onclick={()=>navigate(cwd,false)} title="Refresh">⟳</button>
+    <button onclick={()=>showSettings=true} title="Options">⚙</button>
   </div>
 
   <div class="body">
@@ -406,14 +596,14 @@
         <button class="place" class:sel={cwd===p[1]} class:drop={dropTarget===p[1]}
                 ondragover={(e)=>allowDrop(e,true,p[1])} ondrop={(e)=>onDropFolder(e,p[1])} ondragleave={()=>dropTarget=''}
                 onclick={()=>navigate(p[1])} oncontextmenu={(e)=>placeMenu(e,p[1],false)}>
-          <span class="ic">📁</span><span class="dname">{p[0]}</span>
+          {#if placeIcon(p[0])}<img class="ic img" src={`/icons/${placeIcon(p[0])}.png`} alt="" />{:else}<span class="ic">📁</span>{/if}<span class="dname">{p[0]}</span>
         </button>
       {/each}
       <div class="sec">Devices</div>
       {#each drives as d}
         <button class="place drive" class:sel={cwd===d.mountpoint && d.mountpoint}
-                onclick={()=>openDrive(d)} title={d.path}>
-          <span>{d.kind==='gdrive' ? '☁' : d.kind==='network' ? '🌐' : '🖴'}</span>
+                onclick={()=>openDrive(d)} oncontextmenu={(e)=>driveCtx(e,d)} title={d.path}>
+          <img class="ic img" src={`/icons/${d.kind==='gdrive' ? 'gdrive' : d.kind==='network' ? 'network' : 'storage'}.png`} alt="" />
           <span class="dname">{d.name}</span>
           {#if !d.mountpoint}<span class="badge">mount</span>{:else if d.size}<span class="dsz">{fmtSize(d.size)}</span>{/if}
         </button>
@@ -423,11 +613,9 @@
         {#each treeFlat as n}
           <div class="treerow" class:sel={cwd===n.path} class:drop={dropTarget===n.path}
                style="padding-left:{6 + n.depth*14}px"
-               onclick={()=>navigate(n.path)} oncontextmenu={(e)=>placeMenu(e,n.path,false)}
+               onclick={()=>{ if (n.has_children) toggleTree(n); navigate(n.path); }} oncontextmenu={(e)=>placeMenu(e,n.path,false)}
                ondragover={(e)=>allowDrop(e,true,n.path)} ondrop={(e)=>onDropFolder(e,n.path)} ondragleave={()=>dropTarget=''}>
-            {#if n.has_children}
-              <button class="twist" onclick={(e)=>{ e.stopPropagation(); toggleTree(n); }}>{treeExpanded.has(n.path)?'▾':'▸'}</button>
-            {:else}<span class="twist"></span>{/if}
+            <span class="twist">{n.has_children ? (treeExpanded.has(n.path) ? '▾' : '▸') : ''}</span>
             <span class="ic">📁</span><span class="dname">{n.name}</span>
           </div>
         {/each}
@@ -438,7 +626,7 @@
           <button class="place recent" class:sel={cwd===r.path} class:drop={dropTarget===r.path}
                   ondragover={(e)=>allowDrop(e,true,r.path)} ondrop={(e)=>onDropFolder(e,r.path)} ondragleave={()=>dropTarget=''}
                   onclick={()=>navigate(r.path)} oncontextmenu={(e)=>placeMenu(e,r.path,false)} title={r.path}>
-            <span class="ic">🕘</span><span class="dname">{r.name}</span>
+            <img class="ic img" src={`/icons/recent.png`} alt="" /><span class="dname">{r.name}</span>
           </button>
         {/each}
       {/if}
@@ -461,9 +649,9 @@
         <table>
           <thead><tr>
             <th class="sortable" onclick={()=>setSort('name')}>Name{arrow('name')}</th>
-            <th class="num sortable" onclick={()=>setSort('size')}>Size{arrow('size')}</th>
-            <th class="sortable" onclick={()=>setSort('type')}>Type{arrow('type')}</th>
-            <th class="sortable" onclick={()=>setSort('modified')}>Modified{arrow('modified')}</th>
+            {#if colSize}<th class="num sortable" onclick={()=>setSort('size')}>Size{arrow('size')}</th>{/if}
+            {#if colType}<th class="sortable" onclick={()=>setSort('type')}>Type{arrow('type')}</th>{/if}
+            {#if colDate}<th class="sortable" onclick={()=>setSort('modified')}>Modified{arrow('modified')}</th>{/if}
           </tr></thead>
           <tbody>
             {#each rows as e, i}
@@ -479,9 +667,9 @@
                       onblur={commitRename} onclick={(ev)=>ev.stopPropagation()} />
                   {:else}{e.name}{/if}
                 </td>
-                <td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>
-                <td class="type">{typeLabel(e)}</td>
-                <td class="date">{fmtDate(e.modified)}</td>
+                {#if colSize}<td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>{/if}
+                {#if colType}<td class="type">{typeLabel(e)}</td>{/if}
+                {#if colDate}<td class="date">{fmtDate(e.modified)}</td>{/if}
               </tr>
             {/each}
           </tbody>
@@ -494,7 +682,13 @@
                  ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.path)} ondragleave={()=>dropTarget=''}
                  onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
               <div class="cellicon">
-                {#if iconCache[e.icon]}<img src={iconCache[e.icon]} alt="" />{:else}<span class="ph"></span>{/if}
+                {#if thumbsEnabled && thumbCache[e.path]}
+                  <img class="thumb" src={thumbCache[e.path]} alt="" />
+                {:else if iconCache[e.icon]}
+                  <img src={iconCache[e.icon]} alt="" />
+                {:else}
+                  <span class="ph"></span>
+                {/if}
               </div>
               <div class="cellname">{e.name}</div>
             </button>
@@ -507,11 +701,15 @@
     <div class="splitter" onmousedown={(e)=>startResize('preview',e)}></div>
     <aside class="preview" style="--pvzoom:{previewZoom}; width:{previewW}px" onwheel={wheelPreview}>
       {#if selected}
-        <div class="pv-image">
-          {#if previewSrc}<img src={previewSrc} alt={selected.name} />
-          {:else if previewError}<div class="pv-placeholder">⚠ {previewError}</div>
-          {:else}<div class="pv-placeholder big">{selected.is_dir ? '📁' : '📄'}</div>{/if}
-        </div>
+        {#if previewText}
+          <pre class="pv-text">{previewText}</pre>
+        {:else}
+          <div class="pv-image">
+            {#if previewSrc}<img src={previewSrc} alt={selected.name} />
+            {:else if previewError}<div class="pv-placeholder">⚠ {previewError}</div>
+            {:else}<div class="pv-placeholder big">{selected.is_dir ? '📁' : '📄'}</div>{/if}
+          </div>
+        {/if}
         <div class="pv-meta">
           <div class="pv-name">{selected.name}</div>
           <div>{selected.is_dir ? 'Folder' : (selected.path.split('.').pop().toUpperCase()+' file')}</div>
@@ -531,8 +729,18 @@
   {#if toast}<div class="toast">{toast}</div>{/if}
 
   {#if menu}
-    <div class="ctxmenu" style="left:{menu.x}px; top:{menu.y}px" oncontextmenu={(e)=>e.preventDefault()}>
-      {#if menu.place}
+    <div class="ctxmenu" bind:this={menuEl} style="left:{menu.x}px; top:{menu.y}px" oncontextmenu={(e)=>e.preventDefault()}>
+      {#if menu.drive}
+        <!-- DRIVE menu (sidebar devices) -->
+        <button onclick={()=>openDrive(menu.drive)}>{menu.drive.mountpoint ? 'Open' : 'Mount & Open'}</button>
+        {#if canUnmount(menu.drive)}
+          <button onclick={()=>unmountDrive(menu.drive)}>⏏ Unmount</button>
+        {/if}
+        {#if menu.drive.removable}
+          <hr/>
+          <button onclick={()=>ejectDrive(menu.drive)}>⏏ Eject — safe to remove</button>
+        {/if}
+      {:else if menu.place}
         <!-- SIDEBAR place menu (folder paths) -->
         <button onclick={()=>navigate(menu.place.path)}>Open</button>
         <button onclick={()=>newTab(menu.place.path)}>Open in New Tab</button>
@@ -548,12 +756,16 @@
           <button onclick={()=>newTab(menu.entry.path)}>Open in New Tab</button>
           <button onclick={()=>newWindow(menu.entry.path)}>Open in New Window</button>
         {:else if owApps && owApps.length}
-          <button onclick={(e)=>{ e.stopPropagation(); owOpen = !owOpen; }}>Open With&nbsp; {owOpen ? '▾' : '▸'}</button>
-          {#if owOpen}
-            {#each owApps as a}
-              <button class="sub" onclick={()=>runOpenWith(a.id, menu.entry.path)}>{a.name}</button>
-            {/each}
-          {/if}
+          <div class="ow-item" onmouseenter={owEnter} onmouseleave={owLeave}>
+            <button class="ow-parent" class:open={owOpen}>Open With <span class="ow-arrow">▸</span></button>
+            {#if owOpen}
+              <div class="ow-flyout" class:left={owFlip} bind:this={owFlyoutEl}>
+                {#each owApps as a}
+                  <button onclick={()=>runOpenWith(a.id, menu.entry.path)}>{a.name}</button>
+                {/each}
+              </div>
+            {/if}
+          </div>
         {/if}
         <hr/>
         <button onclick={doCut}>Cut</button>
@@ -621,6 +833,48 @@
       </div>
     </div>
   {/if}
+
+  {#if showSettings}
+    <div class="modal-overlay" onclick={()=>showSettings=false}>
+      <div class="modal settings-modal" onclick={(e)=>e.stopPropagation()}>
+        <h3>Options</h3>
+        <div class="opt-section">Timestamps</div>
+        <table class="proptbl">
+          <tbody>
+            <tr>
+              <td>"Just now" duration</td>
+              <td>
+                <select class="set-select" bind:value={justNowMins} onchange={saveSettings}>
+                  <option value={0}>Off — always show exact time</option>
+                  <option value={1}>1 minute</option>
+                  <option value={2}>2 minutes (default)</option>
+                  <option value={5}>5 minutes</option>
+                  <option value={10}>10 minutes</option>
+                  <option value={30}>30 minutes</option>
+                  <option value={60}>1 hour</option>
+                </select>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="opt-section">Details View — Columns</div>
+        <table class="proptbl">
+          <tbody>
+            <tr><td>Show Size</td><td><label class="opt-toggle"><input type="checkbox" bind:checked={colSize} onchange={saveColVis} /> Visible</label></td></tr>
+            <tr><td>Show Type</td><td><label class="opt-toggle"><input type="checkbox" bind:checked={colType} onchange={saveColVis} /> Visible</label></td></tr>
+            <tr><td>Show Modified</td><td><label class="opt-toggle"><input type="checkbox" bind:checked={colDate} onchange={saveColVis} /> Visible</label></td></tr>
+          </tbody>
+        </table>
+        <div class="opt-section">Grid / Icons View</div>
+        <table class="proptbl">
+          <tbody>
+            <tr><td>Image thumbnails</td><td><label class="opt-toggle"><input type="checkbox" bind:checked={thumbsEnabled} onchange={()=>{ try{localStorage.setItem("zf_thumbs",String(thumbsEnabled));}catch{} navigate(cwd,false); }} /> Show previews for images</label></td></tr>
+          </tbody>
+        </table>
+        <div class="modal-actions"><button onclick={()=>showSettings=false}>Close</button></div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -640,7 +894,15 @@
   .tabadd{ background:none; border:none; color:#8b909a; cursor:pointer; font-size:18px; padding:0 10px; border-radius:6px; }
   .tabadd:hover{ background:#2c3038; color:#fff; }
   tr.drop, .place.drop, .cell.drop, .tab.drop{ outline:2px solid #3a6df0 !important; outline-offset:-2px; background:#2a3550 !important; }
-  .ctxmenu .sub{ padding-left:22px; color:#c4c9d1; font-size:12.5px; }
+  .ow-item{ position:relative; display:flex; }
+  .ow-item > .ow-parent{ width:100%; display:flex; align-items:center; justify-content:space-between; }
+  .ow-parent .ow-arrow{ opacity:.55; font-size:11px; margin-left:10px; }
+  .ow-item:hover > .ow-parent, .ow-parent.open{ background:#3a6df0; color:#fff; }
+  .ow-flyout{ position:absolute; top:-5px; left:100%; min-width:172px; max-width:240px; max-height:60vh; overflow-y:auto;
+              background:#2c3038; border:1px solid #444a55; border-radius:8px; padding:4px;
+              box-shadow:0 8px 28px rgba(0,0,0,.6); z-index:101; display:flex; flex-direction:column; }
+  .ow-flyout.left{ left:auto; right:100%; }
+  .ow-flyout button{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
   .toolbar{ display:flex; gap:4px; padding:6px 8px; background:#23262d; border-bottom:1px solid #000; align-items:center; }
   .toolbar button{ background:#2c3038; color:#cfd3da; border:1px solid #3a3f49; border-radius:6px; padding:5px 9px; cursor:pointer; min-width:30px; }
@@ -648,10 +910,11 @@
   .toolbar button:disabled{ opacity:.35; cursor:default; }
   .toolbar button.active{ background:#3a6df0; border-color:#3a6df0; color:#fff; }
   .addr{ flex:1; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; font-family:monospace; }
-  .crumbs{ flex:1; display:flex; align-items:center; gap:1px; overflow:hidden; background:#15171b; border:1px solid #3a3f49; border-radius:6px; padding:2px 6px; height:32px; box-sizing:border-box; }
-  .crumb{ background:none; border:none; color:#cfd3da; cursor:pointer; padding:3px 7px; border-radius:4px; white-space:nowrap; font:inherit; }
-  .crumb:hover{ background:#2c3038; color:#fff; }
-  .crumbsep{ color:#6b7079; flex:none; padding:0 1px; }
+  .crumbs{ flex:1; display:flex; align-items:center; gap:0; overflow:hidden; min-width:0; padding:0 4px; color:#aeb3bb; }
+  .crumb{ color:#c4c8cf; cursor:pointer; min-width:0; padding:0 1px; white-space:nowrap; font:inherit; font-size:14px; line-height:1.2; }
+  .crumb:hover{ color:#fff; text-decoration:underline; text-underline-offset:2px; }
+  .crumb:focus-visible{ outline:1px solid #687386; outline-offset:2px; border-radius:2px; }
+  .crumbsep{ color:#656b75; flex:none; padding:0 5px; font-size:14px; }
   .splitter{ width:6px; cursor:col-resize; background:transparent; flex:none; transition:background .1s; }
   .splitter:hover{ background:#3a6df0; }
   .search{ width:150px; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; }
@@ -663,13 +926,13 @@
   .place:hover{ background:#2c3038; }
   .place.sel{ background:#3a6df0; color:#fff; }
   .place .ic{ width:18px; text-align:center; flex:none; font-size:13px; }
+  .ic.img{ width:18px; height:18px; object-fit:contain; flex:none; vertical-align:middle; }
   .place.recent{ color:#9aa0aa; }
   .tree{ display:flex; flex-direction:column; }
-  .treerow{ display:flex; align-items:center; gap:4px; padding:4px 6px; border-radius:6px; cursor:default; color:#c4c8cf; white-space:nowrap; overflow:hidden; }
+  .treerow{ display:flex; align-items:center; gap:4px; padding:4px 6px; border-radius:6px; cursor:pointer; color:#c4c8cf; white-space:nowrap; overflow:hidden; }
   .treerow:hover{ background:#2c3038; }
   .treerow.sel{ background:#3a6df0; color:#fff; }
-  .twist{ background:none; border:none; color:#8b909a; cursor:pointer; width:16px; flex:none; font-size:10px; padding:0; }
-  .twist:hover{ color:#fff; }
+  .twist{ width:16px; flex:none; font-size:10px; text-align:center; opacity:.7; }
   .treerow .dname{ flex:1; overflow:hidden; text-overflow:ellipsis; }
   .dname{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .badge{ font-size:10px; background:#3a6df0; color:#fff; border-radius:4px; padding:1px 5px; }
@@ -704,11 +967,16 @@
   .cellicon{ line-height:1.2; height:calc(52px * var(--zoom,1)); display:flex; align-items:center; justify-content:center; }
   .cellicon img{ width:calc(48px * var(--zoom,1)); height:calc(48px * var(--zoom,1)); }
   .cellicon .ph{ width:calc(48px * var(--zoom,1)); height:calc(48px * var(--zoom,1)); display:inline-block; }
+  .cellicon .thumb{ width:calc(72px * var(--zoom,1)); height:calc(72px * var(--zoom,1)); object-fit:cover; border-radius:4px; }
   .cellname{ font-size:calc(12px * var(--zoom,1)); word-break:break-word; margin-top:4px; }
 
   .preview{ width:320px; flex:none; background:#202329; border-left:1px solid #000; display:flex; flex-direction:column; }
   .pv-image{ flex:1; display:flex; align-items:center; justify-content:center; padding:12px; min-height:0; overflow:auto; }
   .pv-image img{ max-width:calc(100% * var(--pvzoom,1)); max-height:calc(100% * var(--pvzoom,1)); object-fit:contain; border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,.5); }
+  .pv-text{ flex:1; min-height:0; width:100%; margin:0; padding:10px 12px; box-sizing:border-box; overflow:auto;
+            background:#16181c; border-radius:6px; color:#cdd2da;
+            font:12px/1.5 ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+            white-space:pre-wrap; word-break:break-word; }
   .pv-placeholder{ color:#6b7079; text-align:center; padding:20px; }
   .pv-placeholder.big{ font-size:80px; }
   .pv-meta{ padding:12px 14px; border-top:1px solid #000; font-size:12px; color:#aeb3bb; }
@@ -739,4 +1007,9 @@
   .modal-actions button:hover{ background:#353b45; }
   .modal-actions button.danger{ background:#c0392b; border-color:#c0392b; }
   .modal-actions button.danger:hover{ background:#e74c3c; }
+  .set-select{ background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:5px; padding:4px 8px; font:inherit; cursor:pointer; }
+  .set-select:focus{ outline:1px solid #3a6df0; }
+  .settings-modal{ min-width:420px; }
+  .opt-section{ font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#6b7079; padding:12px 0 4px; }
+  .opt-toggle{ display:flex; align-items:center; gap:7px; cursor:pointer; }
 </style>
