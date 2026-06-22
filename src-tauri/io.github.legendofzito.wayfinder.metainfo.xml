@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.kadaken.wayfinder</id>
+  <name>Wayfinder</name>
+  <summary>Fast, native Linux file manager with a docked preview pane</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>LicenseRef-Proprietary</project_license>
+
+  <description>
+    <p>
+      Wayfinder is a keyboard-friendly Linux file manager built with a permanent side-by-side
+      preview pane so you never lose context while browsing. Click an image to preview it inline,
+      click an audio file to play it right in the panel, or click a text file to read the first
+      few kilobytes — all without opening a separate app.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Docked preview pane with inline image, audio, and text preview</li>
+      <li>Details and Icons view with adjustable zoom</li>
+      <li>Click-and-drag rubber-band multi-select for batch operations</li>
+      <li>Cut, copy, paste, rename, and permanent delete</li>
+      <li>Tabbed browsing — open multiple directories at once</li>
+      <li>Folder tree in the sidebar with collapsible sections</li>
+      <li>Bookmarks and Recent files quick-access</li>
+      <li>Hidden file toggle</li>
+      <li>Dark theme with a compact, information-dense layout</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.kadaken.wayfinder.desktop</launchable>
+
+  <url type="homepage">https://github.com/Kadaken/wayfinder</url>
+  <url type="bugtracker">https://github.com/Kadaken/wayfinder/issues</url>
+  <url type="vcs-browser">https://github.com/Kadaken/wayfinder</url>
+
+  <developer>
+    <name>Kadaken</name>
+    <url>https://github.com/Kadaken</url>
+  </developer>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Browse files with a docked preview pane</caption>
+      <image type="source">https://raw.githubusercontent.com/Kadaken/wayfinder/main/screenshots/screenshot-details.png</image>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.1.0" date="2026-06-21">
+      <description>
+        <p>Initial release. Core file management, preview pane, tabbed browsing, audio playback, and rubber-band multi-select.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1" />
+
+  <categories>
+    <category>System</category>
+    <category>FileManager</category>
+  </categories>
+
+  <keywords>
+    <keyword>files</keyword>
+    <keyword>file manager</keyword>
+    <keyword>preview</keyword>
+    <keyword>browser</keyword>
+  </keywords>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">800</display_length>
+  </requires>
+</component>
