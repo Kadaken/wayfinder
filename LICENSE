@@ -7,12 +7,19 @@ copy of this software and its compiled binaries ("the Software"), to use the
 Software for personal, non-commercial purposes only, subject to the following
 conditions:
 
+DISTRIBUTION GRANT
+Distribution of the Software (in compiled binary form only) through the
+Flathub software repository (flathub.org) is explicitly permitted, including
+automatic delivery of updates to end users via their system package manager.
+No other third-party redistribution is authorized.
+
 RESTRICTIONS — THE FOLLOWING ARE STRICTLY PROHIBITED:
   1. Modifying, adapting, translating, or creating derivative works of the
      Software or its source code.
   2. Redistributing, sublicensing, selling, renting, or otherwise transferring
-     the Software or any portion thereof to any third party, except by linking
-     to the official release page at github.com/Kadaken/wayfinder.
+     the Software or any portion thereof to any third party, except (a) by
+     linking to the official release page at github.com/Kadaken/wayfinder,
+     or (b) through the Flathub repository as granted above.
   3. Using the Software for any commercial purpose or for any public display
      (commercial or non-commercial) without prior written permission.
   4. Reverse engineering, decompiling, or disassembling the Software, except
