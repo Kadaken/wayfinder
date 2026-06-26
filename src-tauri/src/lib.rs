@@ -1,7 +1,24 @@
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 use tauri::Emitter;
+
+#[derive(Clone, Serialize)]
+struct PickerConfig {
+    multiple: bool,
+    directory: bool,
+    starting_dir: Option<String>,
+    filter: Option<String>,
+}
+
+#[derive(Clone)]
+struct PickerState {
+    config: PickerConfig,
+    out_file: String,
+}
+
+static PICKER_STATE: OnceLock<Option<PickerState>> = OnceLock::new();
 
 const IMG_EXT: [&str; 12] = [
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
@@ -627,9 +644,43 @@ fn new_window(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn start_path() -> Option<String> {
+    if let Some(Some(state)) = PICKER_STATE.get() {
+        if let Some(dir) = state.config.starting_dir.clone() {
+            return Some(dir);
+        }
+    }
     std::env::args()
         .nth(1)
         .filter(|a| !a.starts_with('-') && Path::new(a).is_dir())
+}
+
+#[tauri::command]
+fn picker_options() -> Option<PickerConfig> {
+    PICKER_STATE
+        .get()
+        .and_then(|state| state.as_ref().map(|value| value.config.clone()))
+}
+
+#[tauri::command]
+fn picker_confirm(paths: Vec<String>) -> Result<(), String> {
+    let Some(Some(state)) = PICKER_STATE.get() else {
+        return Err("picker mode is not active".into());
+    };
+    let mut output = String::new();
+    for path in paths {
+        output.push_str(path.trim());
+        output.push('\n');
+    }
+    fs::write(&state.out_file, output).map_err(|e| e.to_string())?;
+    std::process::exit(0);
+}
+
+#[tauri::command]
+fn picker_cancel() -> Result<(), String> {
+    if let Some(Some(state)) = PICKER_STATE.get() {
+        let _ = fs::write(&state.out_file, "");
+    }
+    std::process::exit(1);
 }
 
 #[tauri::command]
@@ -770,8 +821,47 @@ fn open_terminal(path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+fn parse_picker_state() -> Option<PickerState> {
+    let mut args = std::env::args().skip(1);
+    let mut pick = false;
+    let mut multiple = false;
+    let mut directory = false;
+    let mut starting_dir = None;
+    let mut filter = None;
+    let mut out_file = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--pick" => pick = true,
+            "--multiple" => multiple = true,
+            "--directory" => directory = true,
+            "--out" => out_file = args.next(),
+            "--starting-dir" => starting_dir = args.next(),
+            "--filter" => filter = args.next(),
+            _ => {}
+        }
+    }
+    if !pick {
+        return None;
+    }
+    let out_file = out_file?;
+    Some(PickerState {
+        config: PickerConfig {
+            multiple,
+            directory,
+            starting_dir,
+            filter,
+        },
+        out_file,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args().any(|arg| arg == "--pick-capable") {
+        std::process::exit(0);
+    }
+    let picker_state = parse_picker_state();
+    let _ = PICKER_STATE.set(picker_state.clone());
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -808,6 +898,9 @@ pub fn run() {
             list_dir,
             standard_dirs,
             parent_dir,
+            picker_options,
+            picker_confirm,
+            picker_cancel,
             open_path,
             read_data_url,
             read_text_preview,
