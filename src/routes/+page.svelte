@@ -924,7 +924,8 @@
                   {#if renaming===e.path}
                     <input class="rename" autofocus bind:value={renameVal}
                       onkeydown={(ev)=> ev.key==='Enter'?commitRename(): ev.key==='Escape'?(renaming=null):null}
-                      onblur={commitRename} onclick={(ev)=>ev.stopPropagation()} />
+                      onblur={commitRename} onclick={(ev)=>ev.stopPropagation()}
+                      onmousedown={(ev)=>ev.stopPropagation()} ondragstart={(ev)=>ev.preventDefault()} />
                   {:else}{e.name}{/if}
                 </td>
                 {#if colSize}<td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>{/if}
