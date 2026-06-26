@@ -915,11 +915,11 @@
           <tbody>
             {#each rows as e, i}
               <tr data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
-                  draggable={renaming===e.path ? "false" : "true"} ondragstart={(ev)=>onDragStart(ev,e)}
+                  draggable={renaming===e.path ? "false" : "true"} ondragstart={(ev)=>{ if (renaming===e.path) { ev.preventDefault(); ev.stopPropagation(); return; } onDragStart(ev,e); }}
                   ondragend={onDragEnd}
                   ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
                   onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
-                <td class="name">
+                <td class="name" onmousedown={(ev)=>{ if (renaming===e.path) ev.stopPropagation(); }}>
                   {#if iconCache[e.icon]}<img class="ficon" src={iconCache[e.icon]} alt="" />{:else}<span class="ficon ph"></span>{/if}
                   {#if renaming===e.path}
                     <input class="rename" autofocus bind:value={renameVal}
