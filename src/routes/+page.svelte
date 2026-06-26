@@ -24,6 +24,8 @@
   let previewText = $state("");
   /** @type {string} */
   let view = $state("details");
+  /** @type {{multiple:boolean,directory:boolean,starting_dir?:string|null,filter?:string|null} | null} */
+  let pickerMode = $state(null);
   /** @type {boolean} */
   let showHidden = $state(false);
   /** @type {string} */
@@ -41,6 +43,27 @@
   const AUDIO_EXTS = new Set(['mp3','flac','wav','ogg','m4a','aac','opus','wma','aiff','alac']);
   function fmtTime(s) { if (!s || isNaN(s)) return '0:00'; return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
   function toggleAudio() { if (audioEl) audioPlaying ? audioEl.pause() : audioEl.play(); }
+  function pickerEligiblePaths() {
+    if (!pickerMode) return [];
+    const selectedPaths = selectedSet.size ? [...selectedSet] : (selected ? [selected.path] : []);
+    const eligible = rows
+      .filter((entry) => selectedPaths.includes(entry.path))
+      .filter((entry) => pickerMode.directory ? entry.is_dir : !entry.is_dir)
+      .map((entry) => entry.path);
+    if (!pickerMode.multiple) {
+      if (selected && eligible.includes(selected.path)) return [selected.path];
+      return eligible.slice(0, 1);
+    }
+    return eligible;
+  }
+  async function pickerSubmit(paths = pickerEligiblePaths()) {
+    if (!pickerMode || !paths.length) return;
+    await invoke("picker_confirm", { paths });
+  }
+  async function pickerAbort() {
+    if (!pickerMode) return;
+    await invoke("picker_cancel");
+  }
   function lassoStart(ev) {
     if (ev.button !== 0) return;
     if (ev.target.closest('tr, button.cell, thead, .createbar, .empty, input, button')) return;
@@ -153,6 +176,12 @@
   let dragPaths = $state([]);
   /** @type {string} */
   let dropTarget = $state("");
+  /** @type {HTMLDivElement | null} */
+  let dragGhostEl = null;
+  /** @type {{dir: string, at: number} | null} */
+  let pendingExternalDrop = null;
+  /** @type {{key: string, at: number} | null} */
+  let lastNativeDrop = null;
   // open-with apps (loaded when right-clicking a file)
   /** @type {any} */
   let owApps = $state(null);
@@ -247,9 +276,115 @@
   function switchTab(i){ if (i===activeIdx) return; syncTab(); activeIdx = i; const t = tabs[i]; history = [...t.history]; hidx = t.hidx; navigate(t.path, false); }
   function closeTab(i, ev){ if (ev) ev.stopPropagation(); if (tabs.length===1) return; const wasActive = i===activeIdx; tabs = tabs.filter((_,j)=>j!==i); if (activeIdx > i || activeIdx >= tabs.length) activeIdx = Math.max(0, activeIdx-1); if (wasActive){ const t = tabs[activeIdx]; history=[...t.history]; hidx=t.hidx; navigate(t.path,false); } }
 
-  function onDragStart(ev, e){ if (!selectedSet.has(e.path)){ selectedSet = new Set([e.path]); selected = e; } dragPaths = [...selectedSet]; ev.dataTransfer.effectAllowed = "copyMove"; }
-  function allowDrop(ev, isDir, path){ if (isDir && dragPaths.length){ ev.preventDefault(); dropTarget = path; } }
-  function onDropFolder(ev, destDir){ ev.preventDefault(); dropTarget=""; const srcs = dragPaths.filter(p => p !== destDir); dragPaths=[]; if (!srcs.length) return; const op = ev.ctrlKey ? "copy_paths" : "move_paths"; invoke(op, { srcs, destDir }).then(()=>{ flash(ev.ctrlKey?"Copied":"Moved"); navigate(cwd,false); }).catch(e=>flash("⚠ "+e)); }
+  function hasExternalFiles(ev){ return Array.from(ev.dataTransfer?.types || []).includes("Files"); }
+  function pathToFileUri(path){
+    return "file://" + path.split("/").map(encodeURIComponent).join("/");
+  }
+  function clearCompactDragImage(){
+    dragGhostEl?.remove();
+    dragGhostEl = null;
+  }
+  function setCompactDragImage(ev, entry){
+    if (!ev.dataTransfer?.setDragImage) return;
+    clearCompactDragImage();
+    const ghost = document.createElement("div");
+    const count = dragPaths.length;
+    const label = document.createElement("span");
+    label.textContent = count === 1 ? basename(dragPaths[0]) : `${count} items`;
+    if (count === 1 && entry && iconCache[entry.icon]) {
+      const img = document.createElement("img");
+      img.src = iconCache[entry.icon];
+      Object.assign(img.style, {
+        width: "18px",
+        height: "18px",
+        flex: "0 0 auto",
+        objectFit: "contain"
+      });
+      ghost.appendChild(img);
+    }
+    ghost.appendChild(label);
+    Object.assign(ghost.style, {
+      position: "fixed",
+      left: "-1000px",
+      top: "-1000px",
+      display: "flex",
+      alignItems: "center",
+      gap: "8px",
+      maxWidth: "220px",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap",
+      padding: "7px 10px",
+      borderRadius: "8px",
+      border: "1px solid rgba(255,255,255,.28)",
+      background: "rgba(24,28,36,.94)",
+      color: "#f5f7fb",
+      font: "12px system-ui, sans-serif",
+      boxShadow: "0 8px 22px rgba(0,0,0,.35)",
+      pointerEvents: "none",
+      zIndex: "2147483647"
+    });
+    document.body.appendChild(ghost);
+    ev.dataTransfer.setDragImage(ghost, 12, 12);
+    dragGhostEl = ghost;
+  }
+  function onDragStart(ev, e){
+    if (!selectedSet.has(e.path)){ selectedSet = new Set([e.path]); selected = e; }
+    dragPaths = [...selectedSet];
+    ev.dataTransfer.effectAllowed = "copyMove";
+    const uriList = dragPaths.map(pathToFileUri).join("\r\n");
+    ev.dataTransfer.setData("text/plain", dragPaths.join("\n"));
+    ev.dataTransfer.setData("text/uri-list", uriList);
+    if (dragPaths.length === 1) {
+      ev.dataTransfer.setData("DownloadURL", `application/octet-stream:${basename(dragPaths[0])}:${pathToFileUri(dragPaths[0])}`);
+    }
+    setCompactDragImage(ev, e);
+  }
+  function onDragEnd(){
+    clearCompactDragImage();
+    dragPaths = [];
+    dropTarget = "";
+  }
+  function allowDrop(ev, isDir, path){
+    if (dragPaths.length || hasExternalFiles(ev)){
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.dataTransfer.dropEffect = dragPaths.length ? (ev.ctrlKey ? "copy" : "move") : "copy";
+      dropTarget = isDir ? path : cwd;
+    }
+  }
+  async function copyExternalPaths(paths, destDir){
+    if (!paths.length || !destDir) return;
+    try {
+      await invoke("copy_paths", { srcs: paths, destDir });
+      flash(`Copied ${paths.length}`);
+      navigate(cwd, false);
+    } catch(e) {
+      flash("⚠ " + e);
+    }
+  }
+  function alreadyHandledNativeDrop(paths, destDir){
+    const key = `${destDir}\0${paths.slice().sort().join("\0")}`;
+    const now = Date.now();
+    const previous = lastNativeDrop;
+    lastNativeDrop = { key, at: now };
+    return !!previous && previous.key === key && now - previous.at < 1800;
+  }
+  function onDropFolder(ev, destDir){
+    ev.preventDefault();
+    ev.stopPropagation();
+    destDir = destDir || cwd;
+    dropTarget="";
+    if (!dragPaths.length){
+      pendingExternalDrop = { dir: destDir, at: Date.now() };
+      return;
+    }
+    const srcs = dragPaths.filter(p => p !== destDir);
+    dragPaths=[];
+    if (!srcs.length) return;
+    const op = ev.ctrlKey ? "copy_paths" : "move_paths";
+    invoke(op, { srcs, destDir }).then(()=>{ flash(ev.ctrlKey?"Copied":"Moved"); navigate(cwd,false); }).catch(e=>flash("⚠ "+e));
+  }
   function runOpenWith(id, path){ invoke("open_with", { appId:id, path }); menu=null; owApps=null; owOpen=false; }
   async function owEnter(ev){
     if (owCloseTimer) clearTimeout(owCloseTimer);
@@ -463,7 +598,24 @@
     }
   }
 
-  function activate(e) { if (e.is_dir) navigate(e.path); else invoke("open_path", { path: e.path }); }
+  function activate(e) {
+    if (pickerMode) {
+      if (pickerMode.directory && e.is_dir) {
+        pickerSubmit([e.path]);
+        return;
+      }
+      if (!pickerMode.directory && !e.is_dir) {
+        pickerSubmit([e.path]);
+        return;
+      }
+      if (e.is_dir) {
+        navigate(e.path);
+      }
+      return;
+    }
+    if (e.is_dir) navigate(e.path);
+    else invoke("open_path", { path: e.path });
+  }
 
   // ---- file ops ----
   function doCopy(){ if (selectedSet.size) { clipboard = { mode:"copy", paths:[...selectedSet] }; flash(`Copied ${selectedSet.size}`); } }
@@ -539,14 +691,31 @@
     }
     else if (ev.ctrlKey && ev.key === "l") { ev.preventDefault(); editAddr(); }
     else if (ev.key === "F5") navigate(cwd, false);
-    else if (ev.key === "Escape") { menu = null; propsData = null; confirmDel = false; selectedSet = new Set(); }
+    else if (ev.key === "Escape") {
+      if (pickerMode) {
+        ev.preventDefault();
+        pickerAbort();
+        return;
+      }
+      menu = null; propsData = null; confirmDel = false; selectedSet = new Set();
+    }
+    else if (pickerMode && ev.key === "Enter") {
+      const paths = pickerEligiblePaths();
+      if (paths.length) {
+        ev.preventDefault();
+        pickerSubmit(paths);
+      }
+    }
   }
 
   onMount(() => {
     loadStore();
     /** @type {null | (() => void)} */
     let unlistenDrives = null;
+    /** @type {Array<() => void>} */
+    const nativeDropUnlisteners = [];
     (async () => {
+      try { pickerMode = await invoke("picker_options"); } catch {}
       places = await invoke("standard_dirs");
       await refreshDrives();
       let sp = null;
@@ -561,6 +730,33 @@
         if (driveDebounce) clearTimeout(driveDebounce);
         driveDebounce = setTimeout(() => refreshDrives(), 400);
       });
+
+      const nativeDropHandler = (event) => {
+        const p = event.payload || {};
+        if (p.type === "enter" || p.type === "over") {
+          if (!dragPaths.length) dropTarget = cwd;
+        } else if (p.type === "drop") {
+          const paths = p.paths || [];
+          const pending = pendingExternalDrop;
+          const destDir = pending && Date.now() - pending.at < 1800 ? pending.dir : cwd;
+          pendingExternalDrop = null;
+          dropTarget = "";
+          dragPaths = [];
+          if (alreadyHandledNativeDrop(paths, destDir)) return;
+          copyExternalPaths(paths, destDir);
+        } else {
+          pendingExternalDrop = null;
+          dropTarget = "";
+        }
+      };
+      try {
+        const [{ getCurrentWindow }, { getCurrentWebview }] = await Promise.all([
+          import("@tauri-apps/api/window"),
+          import("@tauri-apps/api/webview")
+        ]);
+        nativeDropUnlisteners.push(await getCurrentWindow().onDragDropEvent(nativeDropHandler));
+        nativeDropUnlisteners.push(await getCurrentWebview().onDragDropEvent(nativeDropHandler));
+      } catch {}
     })();
 
     /** @type {(ev: KeyboardEvent) => void} */
@@ -571,13 +767,20 @@
     const tickId = setInterval(() => { nowTick = Date.now(); }, 60000);
     return () => {
       unlistenDrives?.();
+      nativeDropUnlisteners.forEach((fn) => fn());
       window.removeEventListener("keydown", keyHandler, true);
       clearInterval(tickId);
     };
   });
 </script>
 
-<svelte:window on:click={() => { menu = null; owApps = null; }} on:mousemove={(ev)=>{onResizeMove(ev);lassoMove(ev);}} on:mouseup={()=>{endResize();lassoEnd();}} />
+<svelte:window
+  on:click={() => { menu = null; owApps = null; }}
+  on:mousemove={(ev)=>{onResizeMove(ev);lassoMove(ev);}}
+  on:mouseup={()=>{endResize();lassoEnd();}}
+  on:dragover={(ev)=>{ if (dragPaths.length) allowDrop(ev, false, cwd); }}
+  on:dragend={onDragEnd}
+/>
 
 <div class="app" oncontextmenu={(e)=>e.preventDefault()}>
   <div class="tabbar">
@@ -616,6 +819,13 @@
     {/if}
     <button onclick={copyAddr} title="Copy path">📋</button>
     <input class="search" placeholder="Search…" bind:value={search} />
+    {#if pickerMode}
+      <button onclick={pickerAbort} title="Cancel picker">Cancel</button>
+      <button class="opt-btn active" disabled={!pickerEligiblePaths().length} onclick={() => pickerSubmit()}
+              title={pickerMode.directory ? "Select folder" : "Select file"}>
+        {pickerEligiblePaths().length ? `Select ${pickerEligiblePaths().length}` : (pickerMode.directory ? 'Select folder' : 'Select file')}
+      </button>
+    {/if}
     <button class:active={showPreview} onclick={togglePreview} title="Toggle preview pane">▭</button>
     <button class:active={view==='details'} onclick={()=>view='details'} title="Details">☰</button>
     <button class:active={view==='icons'} onclick={()=>view='icons'} title="Icons">▦</button>
@@ -679,7 +889,9 @@
 
     <div class="splitter" onmousedown={(e)=>startResize('sidebar',e)}></div>
 
-    <main class="files {view}" style="--zoom:{iconZoom}" bind:this={filesEl} onmousedown={lassoStart} onwheel={wheelFiles} oncontextmenu={(e)=>ctx(e,null)}>
+    <main class="files {view}" class:drop={dropTarget===cwd} style="--zoom:{iconZoom}" bind:this={filesEl}
+          ondragover={(e)=>allowDrop(e,true,cwd)} ondrop={(e)=>onDropFolder(e,cwd)} ondragleave={()=>{ if (dropTarget===cwd) dropTarget=''; }}
+          onmousedown={lassoStart} onwheel={wheelFiles} oncontextmenu={(e)=>ctx(e,null)}>
       {#if lasso}
         <div class="lasso" style="left:{Math.min(lasso.x1,lasso.x2)}px;top:{Math.min(lasso.y1,lasso.y2)}px;width:{Math.abs(lasso.x2-lasso.x1)}px;height:{Math.abs(lasso.y2-lasso.y1)}px"></div>
       {/if}
@@ -704,7 +916,8 @@
             {#each rows as e, i}
               <tr data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
                   draggable="true" ondragstart={(ev)=>onDragStart(ev,e)}
-                  ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.path)} ondragleave={()=>dropTarget=''}
+                  ondragend={onDragEnd}
+                  ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
                   onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
                 <td class="name">
                   {#if iconCache[e.icon]}<img class="ficon" src={iconCache[e.icon]} alt="" />{:else}<span class="ficon ph"></span>{/if}
@@ -726,7 +939,8 @@
           {#each rows as e, i}
             <button class="cell" data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
                  draggable="true" ondragstart={(ev)=>onDragStart(ev,e)}
-                 ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.path)} ondragleave={()=>dropTarget=''}
+                 ondragend={onDragEnd}
+                 ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
                  onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
               <div class="cellicon">
                 {#if thumbsEnabled && thumbCache[e.path]}
@@ -962,7 +1176,7 @@
   .tabclose:hover{ background:#d33; color:#fff; }
   .tabadd{ background:none; border:none; color:#8b909a; cursor:pointer; font-size:18px; padding:0 10px; border-radius:6px; }
   .tabadd:hover{ background:#2c3038; color:#fff; }
-  tr.drop, .place.drop, .cell.drop, .tab.drop{ outline:2px solid #3a6df0 !important; outline-offset:-2px; background:#2a3550 !important; }
+  tr.drop, .place.drop, .cell.drop, .tab.drop, .files.drop{ outline:2px solid #3a6df0 !important; outline-offset:-2px; background:#2a3550 !important; }
   .ow-item{ position:relative; display:flex; }
   .ow-item > .ow-parent{ width:100%; display:flex; align-items:center; justify-content:space-between; }
   .ow-parent .ow-arrow{ opacity:.55; font-size:11px; margin-left:10px; }
