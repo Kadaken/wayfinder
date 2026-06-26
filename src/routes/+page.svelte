@@ -915,7 +915,7 @@
           <tbody>
             {#each rows as e, i}
               <tr data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
-                  draggable="true" ondragstart={(ev)=>onDragStart(ev,e)}
+                  draggable={renaming===e.path ? "false" : "true"} ondragstart={(ev)=>onDragStart(ev,e)}
                   ondragend={onDragEnd}
                   ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
                   onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
@@ -1229,7 +1229,7 @@
   .lasso{ position:fixed; pointer-events:none; border:1px solid #3a6df0; background:rgba(58,109,240,0.12); z-index:9999; }
   .empty{ padding:40px; text-align:center; color:#6b7079; }
   .createbar{ padding:8px 10px; background:#23262d; display:flex; gap:8px; align-items:center; }
-  .createbar input, .rename{ background:#15171b; color:#fff; border:1px solid #3a6df0; border-radius:4px; padding:3px 6px; font:inherit; }
+  .createbar input, .rename{ background:#15171b; color:#fff; border:1px solid #3a6df0; border-radius:4px; padding:3px 6px; font:inherit; user-select:text; -webkit-user-select:text; cursor:text; }
 
   table{ width:100%; border-collapse:collapse; font-size:calc(14.5px * var(--zoom,1)); }
   thead th{ position:sticky; top:0; background:#23262d; text-align:left; padding:8px 14px; color:#b8bdc6; font-weight:600; border-bottom:1px solid #000; font-size:14.5px; }
