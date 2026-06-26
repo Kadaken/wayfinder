@@ -914,24 +914,35 @@
           </tr></thead>
           <tbody>
             {#each rows as e, i}
-              <tr data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
-                  draggable={renaming===e.path ? "false" : "true"} ondragstart={(ev)=>{ if (renaming===e.path) { ev.preventDefault(); ev.stopPropagation(); return; } onDragStart(ev,e); }}
-                  ondragend={onDragEnd}
+              {#if renaming===e.path}
+              <tr data-path={e.path} class:sel={selectedSet.has(e.path)}
                   ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
                   onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
-                <td class="name" onmousedown={(ev)=>{ if (renaming===e.path) ev.stopPropagation(); }}>
-                  {#if iconCache[e.icon]}<img class="ficon" src={iconCache[e.icon]} alt="" />{:else}<span class="ficon ph"></span>{/if}
-                  {#if renaming===e.path}
-                    <input class="rename" autofocus bind:value={renameVal}
-                      onkeydown={(ev)=> ev.key==='Enter'?commitRename(): ev.key==='Escape'?(renaming=null):null}
-                      onblur={commitRename} onclick={(ev)=>ev.stopPropagation()}
-                      onmousedown={(ev)=>ev.stopPropagation()} ondragstart={(ev)=>ev.preventDefault()} />
-                  {:else}{e.name}{/if}
+                <td class="name">
+                  {#if iconCache[e.icon]}<img class="ficon" src={iconCache[e.icon]} alt="" draggable="false" />{:else}<span class="ficon ph"></span>{/if}
+                  <input class="rename" autofocus bind:value={renameVal}
+                    onkeydown={(ev)=> ev.key==='Enter'?commitRename(): ev.key==='Escape'?(renaming=null):null}
+                    onblur={commitRename} onclick={(ev)=>ev.stopPropagation()} />
                 </td>
                 {#if colSize}<td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>{/if}
                 {#if colType}<td class="type">{typeLabel(e)}</td>{/if}
                 {#if colDate}<td class="date">{fmtDate(e.modified)}</td>{/if}
               </tr>
+              {:else}
+              <tr data-path={e.path} class:sel={selectedSet.has(e.path)} class:drop={dropTarget===e.path && e.is_dir}
+                  draggable="true" ondragstart={(ev)=>onDragStart(ev,e)}
+                  ondragend={onDragEnd}
+                  ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
+                  onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
+                <td class="name">
+                  {#if iconCache[e.icon]}<img class="ficon" src={iconCache[e.icon]} alt="" />{:else}<span class="ficon ph"></span>{/if}
+                  {e.name}
+                </td>
+                {#if colSize}<td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>{/if}
+                {#if colType}<td class="type">{typeLabel(e)}</td>{/if}
+                {#if colDate}<td class="date">{fmtDate(e.modified)}</td>{/if}
+              </tr>
+              {/if}
             {/each}
           </tbody>
         </table>
