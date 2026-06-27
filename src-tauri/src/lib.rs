@@ -1046,6 +1046,70 @@ fn empty_trash() -> Result<(), String> {
     run_cmd("gio", &["trash", "--empty"])
 }
 
+fn percent_encode_segment(seg: &str) -> String {
+    seg.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{:02X}", b)
+            }
+        })
+        .collect()
+}
+
+// Restore trashed items back to their original locations (used by Undo and the
+// Trash view). Each input is the ORIGINAL path the file had before deletion.
+// We read the XDG trashinfo metadata to find the matching trash entry with the
+// most recent deletion date, then restore it via gio.
+#[tauri::command]
+fn restore_from_trash(paths: Vec<String>) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let info_dir = format!("{}/.local/share/Trash/info", home);
+    for orig in &paths {
+        let mut best: Option<(String, String)> = None; // (trash name, deletion date)
+        if let Ok(rd) = fs::read_dir(&info_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("trashinfo") {
+                    continue;
+                }
+                let content = match fs::read_to_string(&p) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut orig_path = None;
+                let mut del_date = String::new();
+                for line in content.lines() {
+                    if let Some(v) = line.strip_prefix("Path=") {
+                        orig_path = Some(percent_decode(v.trim()));
+                    } else if let Some(v) = line.strip_prefix("DeletionDate=") {
+                        del_date = v.trim().to_string();
+                    }
+                }
+                if orig_path.as_deref() == Some(orig.as_str()) {
+                    let name = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if best.as_ref().map(|(_, d)| del_date > *d).unwrap_or(true) {
+                        best = Some((name, del_date));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((name, _)) => {
+                let uri = format!("trash:///{}", percent_encode_segment(&name));
+                run_cmd("gio", &["trash", "--restore", &uri])?;
+            }
+            None => return Err(format!("not found in trash: {}", orig)),
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn open_terminal(path: String) -> Result<(), String> {
     std::process::Command::new("konsole")
@@ -1162,6 +1226,7 @@ pub fn run() {
             extract_archive,
             new_file,
             empty_trash,
+            restore_from_trash,
             open_terminal
         ])
         .run(tauri::generate_context!())
