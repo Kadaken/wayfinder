@@ -270,7 +270,7 @@
   async function compressSel(){ menu=null; if(!selectedSet.size) return; try { await invoke("compress_zip", { paths:[...selectedSet], destDir: cwd }); flash("Compressed to ZIP"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
   async function extractSel(path){ menu=null; try { await invoke("extract_archive", { path, destDir: cwd }); flash("Extracted"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
   function startCreateFile(){ creating=false; creatingFile=true; createVal="new.txt"; menu=null; }
-  async function commitCreateFile(){ if (creatingFile && createVal.trim()){ try { await invoke("new_file", { parent: cwd, name: createVal.trim() }); } catch(e){ flash("⚠ "+e); } } creatingFile=false; navigate(cwd,false); }
+  async function commitCreateFile(){ if (creatingFile && createVal.trim()){ const name=createVal.trim(); try { await invoke("new_file", { parent: cwd, name }); pushUndo({ type:'create', path: joinPath(cwd, name), label:`new file ${name}` }); } catch(e){ flash("⚠ "+e); } } creatingFile=false; navigate(cwd,false); }
   async function doEmptyTrash(){ menu=null; try { await invoke("empty_trash"); flash("Trash emptied"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
 
   function syncTab(){ tabs[activeIdx] = { path: cwd, label: basename(cwd) || "/", history: [...history], hidx }; tabs = tabs; }
@@ -384,8 +384,13 @@
     const srcs = dragPaths.filter(p => p !== destDir);
     dragPaths=[];
     if (!srcs.length) return;
-    const op = ev.ctrlKey ? "copy_paths" : "move_paths";
-    invoke(op, { srcs, destDir }).then(()=>{ flash(ev.ctrlKey?"Copied":"Moved"); navigate(cwd,false); }).catch(e=>flash("⚠ "+e));
+    const isCopy = ev.ctrlKey;
+    const op = isCopy ? "copy_paths" : "move_paths";
+    invoke(op, { srcs, destDir }).then(()=>{
+      if (isCopy) pushUndo({ type:'copy', created: srcs.map(p => joinPath(destDir, basename(p))), label:`copy of ${srcs.length}` });
+      else pushUndo({ type:'move', items: srcs.map(p => ({ from: p, to: joinPath(destDir, basename(p)) })), label:`move of ${srcs.length}` });
+      flash(isCopy?"Copied":"Moved"); navigate(cwd,false);
+    }).catch(e=>flash("⚠ "+e));
   }
   function runOpenWith(id, path){ invoke("open_with", { appId:id, path }); menu=null; owApps=null; owOpen=false; }
   async function owEnter(ev){
@@ -634,20 +639,63 @@
     else invoke("open_path", { path: e.path });
   }
 
+  // ---- undo stack ----
+  /** @type {Array<any>} */
+  let undoStack = $state([]);
+  const dirname = (p) => { const t = p.replace(/\/+$/,''); const i = t.lastIndexOf('/'); return i <= 0 ? '/' : t.slice(0, i); };
+  const joinPath = (dir, name) => (dir === '/' ? '/' + name : dir.replace(/\/+$/,'') + '/' + name);
+  function pushUndo(action){ undoStack = [...undoStack, action].slice(-100); }
+  async function undo(){
+    const a = undoStack[undoStack.length-1];
+    if (!a) { flash("Nothing to undo"); return; }
+    undoStack = undoStack.slice(0, -1);
+    try {
+      if (a.type === 'move') {
+        for (const it of a.items) await invoke("move_paths", { srcs: [it.to], destDir: dirname(it.from) });
+      } else if (a.type === 'copy') {
+        await invoke("delete_paths", { paths: a.created });
+      } else if (a.type === 'rename') {
+        await invoke("rename_path", { path: a.to, newName: basename(a.from) });
+      } else if (a.type === 'create') {
+        await invoke("delete_paths", { paths: [a.path] });
+      } else if (a.type === 'trash') {
+        await invoke("restore_from_trash", { paths: a.paths });
+      }
+      flash("↩ Undid " + a.label);
+      navigate(cwd, false);
+    } catch(e){ flash("⚠ undo failed: " + e); }
+  }
+
   // ---- file ops ----
   function doCopy(){ if (selectedSet.size) { clipboard = { mode:"copy", paths:[...selectedSet] }; flash(`Copied ${selectedSet.size}`); } }
+  function copyAsPath(){
+    const paths = selectedSet.size ? [...selectedSet] : (selected ? [selected.path] : [cwd]);
+    const text = paths.join('\n');
+    (navigator.clipboard?.writeText(text) ?? Promise.reject())
+      .then(() => flash(`📋 Copied ${paths.length>1?paths.length+' paths':'path'}`))
+      .catch(() => flash("⚠ copy failed"));
+    menu = null;
+  }
   function doCut(){ if (selectedSet.size) { clipboard = { mode:"cut", paths:[...selectedSet] }; flash(`Cut ${selectedSet.size}`); } }
   async function paste(){
     if (!clipboard) return;
     try {
-      if (clipboard.mode === "copy") await invoke("copy_paths", { srcs: clipboard.paths, destDir: cwd });
-      else { await invoke("move_paths", { srcs: clipboard.paths, destDir: cwd }); clipboard = null; }
+      if (clipboard.mode === "copy") {
+        await invoke("copy_paths", { srcs: clipboard.paths, destDir: cwd });
+        pushUndo({ type:'copy', created: clipboard.paths.map(p => joinPath(cwd, basename(p))), label:`copy of ${clipboard.paths.length}` });
+      } else {
+        const srcs = clipboard.paths;
+        await invoke("move_paths", { srcs, destDir: cwd });
+        pushUndo({ type:'move', items: srcs.map(p => ({ from: p, to: joinPath(cwd, basename(p)) })), label:`move of ${srcs.length}` });
+        clipboard = null;
+      }
       navigate(cwd, false);
     } catch (e) { flash("⚠ " + e); }
   }
   async function del(){
     if (!selectedSet.size) return;
-    try { await invoke("delete_paths", { paths:[...selectedSet] }); flash("Moved to Trash"); navigate(cwd, false); }
+    const paths = [...selectedSet];
+    try { await invoke("delete_paths", { paths }); pushUndo({ type:'trash', paths, label:`delete of ${paths.length}` }); flash("Moved to Trash"); navigate(cwd, false); }
     catch (e) { flash("⚠ " + e); }
   }
   function startRename(e){
@@ -661,8 +709,9 @@
     });
   }
   async function commitRename(){
-    if (renaming && renameVal.trim()) {
-      try { await invoke("rename_path", { path: renaming, newName: renameVal.trim() }); }
+    if (renaming && renameVal.trim() && renameVal.trim() !== basename(renaming)) {
+      const from = renaming, newName = renameVal.trim();
+      try { await invoke("rename_path", { path: from, newName }); pushUndo({ type:'rename', from, to: joinPath(dirname(from), newName), label:`rename to ${newName}` }); }
       catch (e) { flash("⚠ " + e); }
     }
     renaming = null; navigate(cwd, false);
@@ -670,7 +719,8 @@
   function startCreate(){ creatingFile=false; creating = true; createVal = "New Folder"; menu = null; }
   async function commitCreate(){
     if (creating && createVal.trim()) {
-      try { await invoke("make_dir", { parent: cwd, name: createVal.trim() }); }
+      const name = createVal.trim();
+      try { await invoke("make_dir", { parent: cwd, name }); pushUndo({ type:'create', path: joinPath(cwd, name), label:`new folder ${name}` }); }
       catch (e) { flash("⚠ " + e); }
     }
     creating = false; navigate(cwd, false);
@@ -696,6 +746,8 @@
     else if (ev.altKey && ev.key === "ArrowUp") { ev.preventDefault(); up(); }
     else if (ev.key === "Delete") del();
     else if (ev.key === "F2" && selected) startRename(selected);
+    else if (ev.ctrlKey && ev.key.toLowerCase() === "z") { ev.preventDefault(); undo(); }
+    else if (ev.ctrlKey && ev.shiftKey && ev.key.toLowerCase() === "c") { ev.preventDefault(); copyAsPath(); }
     else if (ev.ctrlKey && ev.key === "c") doCopy();
     else if (ev.ctrlKey && ev.key === "x") doCut();
     else if (ev.ctrlKey && ev.key === "v") paste();
@@ -1109,6 +1161,7 @@
         <hr/>
         <button onclick={doCut}>Cut</button>
         <button onclick={doCopy}>Copy</button>
+        <button onclick={copyAsPath}>Copy as Path</button>
         <button disabled={!clipboard} onclick={paste}>Paste</button>
         {#if isFav(menu.entry.path)}
           <button onclick={()=>removeFavorite(menu.entry.path)}>Remove from Favorites</button>
