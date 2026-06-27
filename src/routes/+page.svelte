@@ -272,6 +272,8 @@
   function startCreateFile(){ creating=false; creatingFile=true; createVal="new.txt"; menu=null; }
   async function commitCreateFile(){ if (creatingFile && createVal.trim()){ const name=createVal.trim(); try { await invoke("new_file", { parent: cwd, name }); pushUndo({ type:'create', path: joinPath(cwd, name), label:`new file ${name}` }); } catch(e){ flash("⚠ "+e); } } creatingFile=false; navigate(cwd,false); }
   async function doEmptyTrash(){ menu=null; try { await invoke("empty_trash"); flash("Trash emptied"); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
+  const inTrash = $derived(cwd.includes('/Trash/files'));
+  async function restoreSel(){ menu=null; const paths = selectedSet.size ? [...selectedSet] : (selected ? [selected.path] : []); if (!paths.length) return; try { await invoke("restore_from_trash", { paths }); flash(`Restored ${paths.length}`); navigate(cwd,false); } catch(e){ flash("⚠ "+e); } }
 
   function syncTab(){ tabs[activeIdx] = { path: cwd, label: basename(cwd) || "/", history: [...history], hidx }; tabs = tabs; }
   function newTab(path){ tabs = [...tabs, { path: path||cwd, label:"", history:[], hidx:-1 }]; activeIdx = tabs.length-1; history = []; hidx = -1; menu = null; navigate(path || cwd); }
@@ -1151,6 +1153,10 @@
       {:else if menu.onEntry}
         <!-- FILE-VIEW item menu -->
         <button onclick={()=>activate(menu.entry)}>Open</button>
+        {#if inTrash}
+          <button onclick={restoreSel}>♻ Restore</button>
+          <hr/>
+        {/if}
         {#if menu.entry?.is_dir}
           <button onclick={()=>newTab(menu.entry.path)}>Open in New Tab</button>
           <button onclick={()=>newWindow(menu.entry.path)}>Open in New Window</button>
