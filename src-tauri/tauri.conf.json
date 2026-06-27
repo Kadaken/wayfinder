@@ -15,7 +15,7 @@
         "title": "Wayfinder",
         "width": 1280,
         "height": 820,
-        "dragDropEnabled": true
+        "dragDropEnabled": false
       }
     ],
     "security": {
