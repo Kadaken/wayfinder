@@ -652,6 +652,8 @@
         await invoke("delete_paths", { paths: a.created });
       } else if (a.type === 'rename') {
         await invoke("rename_path", { path: a.to, newName: basename(a.from) });
+      } else if (a.type === 'batchrename') {
+        for (const it of a.items) await invoke("rename_path", { path: it.to, newName: basename(it.from) });
       } else if (a.type === 'create') {
         await invoke("delete_paths", { paths: [a.path] });
       } else if (a.type === 'trash') {
@@ -708,6 +710,52 @@
     try { await invoke("delete_paths", { paths }); pushUndo({ type:'trash', paths, label:`delete of ${paths.length}` }); flash("Moved to Trash"); navigate(cwd, false); }
     catch (e) { flash("⚠ " + e); }
   }
+  // ---- batch rename ----
+  /** @type {any} */
+  let batchRen = $state(null); // { items:[{path,name,stem,ext}], find, replace, pattern, start }
+  function renameAction(e){
+    if (selectedSet.size > 1) startBatchRename();
+    else startRename(e);
+  }
+  function startBatchRename(){
+    menu = null;
+    const items = [...selectedSet].map(p => {
+      const name = basename(p); const dot = name.lastIndexOf('.');
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : '';
+      return { path: p, name, stem, ext };
+    });
+    batchRen = { items, find:'', replace:'', pattern:'', start:1 };
+  }
+  function batchPreview(){
+    if (!batchRen) return [];
+    const { items, find, replace, pattern, start } = batchRen;
+    const padMatch = pattern.match(/#+/);
+    const padWidth = padMatch ? padMatch[0].length : 0;
+    return items.map((it, i) => {
+      let nn;
+      if (pattern.trim()) {
+        const num = String((+start || 1) + i).padStart(padWidth || 1, '0');
+        nn = pattern.replace(/#+/, num).replace(/\{name\}/g, it.stem) + it.ext;
+      } else if (find) {
+        nn = it.name.split(find).join(replace);
+      } else {
+        nn = it.name;
+      }
+      return { ...it, newName: nn };
+    });
+  }
+  async function applyBatch(){
+    const previews = batchPreview().filter(p => p.newName && p.newName !== p.name && !p.newName.includes('/'));
+    const done = [];
+    for (const p of previews){
+      try { await invoke("rename_path", { path: p.path, newName: p.newName }); done.push({ from: p.path, to: joinPath(dirname(p.path), p.newName) }); }
+      catch(e){ flash("⚠ "+e); }
+    }
+    if (done.length) pushUndo({ type:'batchrename', items: done, label:`batch rename ${done.length}` });
+    batchRen = null; flash(`Renamed ${done.length}`); navigate(cwd,false);
+  }
+
   function startRename(e){
     renaming = e.path; renameVal = e.name; menu = null;
     tick().then(() => {
@@ -755,7 +803,7 @@
     else if (ev.altKey && ev.key === "ArrowRight") { ev.preventDefault(); fwd(); }
     else if (ev.altKey && ev.key === "ArrowUp") { ev.preventDefault(); up(); }
     else if (ev.key === "Delete") del();
-    else if (ev.key === "F2" && selected) startRename(selected);
+    else if (ev.key === "F2" && selected) renameAction(selected);
     else if (ev.ctrlKey && ev.key.toLowerCase() === "z") { ev.preventDefault(); undo(); }
     else if (ev.ctrlKey && ev.shiftKey && ev.key.toLowerCase() === "c") { ev.preventDefault(); copyAsPath(); }
     else if (ev.ctrlKey && ev.key === "c") doCopy();
@@ -1182,7 +1230,7 @@
         {:else}
           <button onclick={()=>addFavorite(menu.entry.path)}>★ Add to Favorites</button>
         {/if}
-        <button onclick={()=>startRename(menu.entry)}>Rename</button>
+        <button onclick={()=>renameAction(menu.entry)}>{selectedSet.size>1 ? `Rename ${selectedSet.size}…` : 'Rename'}</button>
         <button onclick={compressSel}>Compress to ZIP</button>
         {#if isArchive(menu.entry.name)}<button onclick={()=>extractSel(menu.entry.path)}>Extract Here</button>{/if}
         <hr/>
@@ -1241,6 +1289,34 @@
           <button onclick={()=>resolveConflict('skip')}>Skip</button>
           <button onclick={()=>resolveConflict('keepboth')}>Keep Both</button>
           <button class="primary" onclick={()=>resolveConflict('replace')}>Replace</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if batchRen}
+    <div class="modal-overlay" onclick={()=>batchRen=null}>
+      <div class="modal batch-modal" onclick={(e)=>e.stopPropagation()}>
+        <h3>Rename {batchRen.items.length} items</h3>
+        <div class="batch-fields">
+          <label>Find <input bind:value={batchRen.find} placeholder="text to find" spellcheck="false" /></label>
+          <label>Replace <input bind:value={batchRen.replace} placeholder="replacement" spellcheck="false" /></label>
+        </div>
+        <div class="batch-or">— or rename with a pattern —</div>
+        <div class="batch-fields">
+          <label>Pattern <input bind:value={batchRen.pattern} placeholder="e.g. Photo_### or {'{name}'}_###" spellcheck="false" /></label>
+          <label class="batch-start">Start # <input type="number" bind:value={batchRen.start} min="0" /></label>
+        </div>
+        <div class="batch-hint"><code>###</code> = number (zero-padded), <code>{'{name}'}</code> = original name</div>
+        <div class="batch-preview">
+          {#each batchPreview().slice(0,12) as p}
+            <div class="batch-row"><span class="bp-old">{p.name}</span><span class="bp-arrow">→</span><span class="bp-new" class:changed={p.newName!==p.name}>{p.newName}</span></div>
+          {/each}
+          {#if batchRen.items.length>12}<div class="batch-more">…and {batchRen.items.length-12} more</div>{/if}
+        </div>
+        <div class="modal-actions">
+          <button onclick={()=>batchRen=null}>Cancel</button>
+          <button class="primary" onclick={applyBatch}>Rename</button>
         </div>
       </div>
     </div>
@@ -1453,6 +1529,21 @@
   .modal-actions button.primary:hover{ background:#2f5fd8; }
   .conflict-list{ margin:8px 0; padding:8px 10px; max-height:160px; overflow:auto; background:#1b1d22; border-radius:6px; list-style:none; }
   .conflict-list li{ font:12px/1.6 ui-monospace, monospace; color:#cdd2da; word-break:break-all; }
+  .batch-modal{ min-width:520px; }
+  .batch-fields{ display:flex; gap:10px; margin:6px 0; }
+  .batch-fields label{ flex:1; display:flex; flex-direction:column; gap:3px; font-size:12px; color:#8b909a; }
+  .batch-fields label.batch-start{ flex:0 0 90px; }
+  .batch-fields input{ background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:5px; padding:6px 8px; font:inherit; }
+  .batch-or{ text-align:center; color:#6b7079; font-size:11px; margin:8px 0; }
+  .batch-hint{ font-size:11px; color:#6b7079; margin:4px 0 8px; }
+  .batch-hint code{ background:#15171b; padding:1px 4px; border-radius:3px; }
+  .batch-preview{ max-height:200px; overflow:auto; background:#1b1d22; border-radius:6px; padding:6px 8px; }
+  .batch-row{ display:flex; align-items:center; gap:8px; font:12px/1.7 ui-monospace, monospace; }
+  .bp-old{ color:#8b909a; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bp-arrow{ color:#6b7079; flex:none; }
+  .bp-new{ flex:1; color:#cdd2da; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bp-new.changed{ color:#6bd06b; }
+  .batch-more{ color:#6b7079; font-size:11px; padding:4px 0; }
   .set-select{ background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:5px; padding:4px 8px; font:inherit; cursor:pointer; }
   .set-select:focus{ outline:1px solid #3a6df0; }
   .settings-modal{ min-width:420px; }
