@@ -633,7 +633,16 @@
     try { await invoke("delete_paths", { paths:[...selectedSet] }); flash("Moved to Trash"); navigate(cwd, false); }
     catch (e) { flash("⚠ " + e); }
   }
-  function startRename(e){ renaming = e.path; renameVal = e.name; menu = null; }
+  function startRename(e){
+    renaming = e.path; renameVal = e.name; menu = null;
+    tick().then(() => {
+      const input = document.querySelector('input.rename');
+      if (!input) return;
+      input.focus();
+      const dot = e.name.lastIndexOf('.');
+      input.setSelectionRange(0, dot > 0 ? dot : e.name.length);
+    });
+  }
   async function commitRename(){
     if (renaming && renameVal.trim()) {
       try { await invoke("rename_path", { path: renaming, newName: renameVal.trim() }); }
@@ -917,12 +926,14 @@
               {#if renaming===e.path}
               <tr data-path={e.path} class:sel={selectedSet.has(e.path)}
                   ondragover={(ev)=>allowDrop(ev,e.is_dir,e.path)} ondrop={(ev)=>onDropFolder(ev,e.is_dir ? e.path : cwd)} ondragleave={()=>{ const target = e.is_dir ? e.path : cwd; if (dropTarget===target) dropTarget=''; }}
-                  onclick={(ev)=>select(e,i,ev)} ondblclick={()=>activate(e)} oncontextmenu={(ev)=>ctx(ev,e)}>
+                  onclick={(ev)=>select(e,i,ev)} oncontextmenu={(ev)=>ctx(ev,e)}>
                 <td class="name">
                   {#if iconCache[e.icon]}<img class="ficon" src={iconCache[e.icon]} alt="" draggable="false" />{:else}<span class="ficon ph"></span>{/if}
                   <input class="rename" autofocus bind:value={renameVal}
                     onkeydown={(ev)=> ev.key==='Enter'?commitRename(): ev.key==='Escape'?(renaming=null):null}
-                    onblur={commitRename} onclick={(ev)=>ev.stopPropagation()} />
+                    onblur={commitRename}
+                    onclick={(ev)=>ev.stopPropagation()}
+                    ondblclick={(ev)=>ev.stopPropagation()} />
                 </td>
                 {#if colSize}<td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>{/if}
                 {#if colType}<td class="type">{typeLabel(e)}</td>{/if}
