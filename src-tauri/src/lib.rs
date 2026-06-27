@@ -4,6 +4,48 @@ use std::path::Path;
 use std::sync::OnceLock;
 use tauri::Emitter;
 
+// Percent-decode a URI path segment string (handles %XX byte escapes).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = (bytes[i + 1] as char).to_digit(16);
+            let l = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (h, l) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn guess_video_mime(path: &str) -> &'static str {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "wmv" => "video/x-ms-wmv",
+        "flv" => "video/x-flv",
+        "ts" => "video/mp2t",
+        "3gp" => "video/3gpp",
+        "ogv" => "video/ogg",
+        _ => "application/octet-stream",
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct PickerConfig {
     multiple: bool,
@@ -887,6 +929,76 @@ pub fn run() {
     let _ = PICKER_STATE.set(picker_state.clone());
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .register_uri_scheme_protocol("stream", |_ctx, request| {
+            use std::io::{Read, Seek, SeekFrom};
+            use tauri::http::{Response, StatusCode};
+
+            let not_found = || {
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Vec::new())
+                    .unwrap()
+            };
+
+            // URI path is the percent-encoded absolute file path, already starting with "/"
+            // (e.g. stream://localhost/home/user/clip.webm -> "/home/user/clip.webm").
+            let raw = request.uri().path();
+            let path = percent_decode(raw);
+            let mime = guess_video_mime(&path);
+
+            let mut file = match fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => return not_found(),
+            };
+            let total = match file.metadata() {
+                Ok(m) => m.len(),
+                Err(_) => return not_found(),
+            };
+
+            // Parse a Range: bytes=start-end header for seeking support.
+            let range = request
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("bytes="))
+                .map(|v| {
+                    let mut it = v.splitn(2, '-');
+                    let start = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let end = it
+                        .next()
+                        .and_then(|s| if s.is_empty() { None } else { s.parse::<u64>().ok() })
+                        .unwrap_or(total.saturating_sub(1));
+                    (start, end.min(total.saturating_sub(1)))
+                });
+
+            if let Some((start, end)) = range {
+                let len = end.saturating_sub(start) + 1;
+                let mut buf = vec![0u8; len as usize];
+                if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut buf).is_err() {
+                    return not_found();
+                }
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("Content-Type", mime)
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", len.to_string())
+                    .header("Content-Range", format!("bytes {}-{}/{}", start, end, total))
+                    .body(buf)
+                    .unwrap_or_else(|_| not_found())
+            } else {
+                let mut buf = Vec::new();
+                if file.read_to_end(&mut buf).is_err() {
+                    return not_found();
+                }
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", mime)
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", total.to_string())
+                    .body(buf)
+                    .unwrap_or_else(|_| not_found())
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
