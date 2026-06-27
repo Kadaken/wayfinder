@@ -25,6 +25,175 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// --- Local media HTTP server ---------------------------------------------
+// WebKit2GTK's GStreamer media backend can't fetch from Tauri custom URI
+// schemes, so HTML5 <video> on Linux stays black. We run a tiny localhost
+// HTTP/1.1 server with Range support that GStreamer's souphttpsrc CAN read.
+static MEDIA_PORT: OnceLock<u16> = OnceLock::new();
+static MEDIA_TOKEN: OnceLock<String> = OnceLock::new();
+
+fn start_media_server() {
+    use std::net::TcpListener;
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => return,
+    };
+    // A per-run token so other local processes can't trivially read arbitrary files.
+    let token = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}{:x}", t, std::process::id())
+    };
+    let _ = MEDIA_PORT.set(port);
+    let _ = MEDIA_TOKEN.set(token);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let _ = serve_media_conn(stream);
+            });
+        }
+    });
+}
+
+fn serve_media_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    // "GET /<token>/<percent-encoded-abs-path> HTTP/1.1"
+    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+
+    // Read headers; capture Range.
+    let mut range_header: Option<String> = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(v) = trimmed.strip_prefix("Range:").or_else(|| trimmed.strip_prefix("range:")) {
+            range_header = Some(v.trim().to_string());
+        }
+    }
+
+    let write_status = |stream: &mut std::net::TcpStream, code: &str| -> std::io::Result<()> {
+        write!(
+            stream,
+            "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            code
+        )
+    };
+
+    // Validate token, then decode file path.
+    let rest = target.trim_start_matches('/');
+    let (token, encoded_path) = match rest.split_once('/') {
+        Some(parts) => parts,
+        None => return write_status(&mut stream, "400 Bad Request"),
+    };
+    if MEDIA_TOKEN.get().map(|t| t.as_str()) != Some(token) {
+        return write_status(&mut stream, "403 Forbidden");
+    }
+    let path = percent_decode(&format!("/{}", encoded_path));
+    let mime = guess_video_mime(&path);
+
+    let mut file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return write_status(&mut stream, "404 Not Found"),
+    };
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    // Parse "bytes=start-end".
+    let range = range_header
+        .as_deref()
+        .and_then(|v| v.strip_prefix("bytes="))
+        .map(|v| {
+            let mut it = v.splitn(2, '-');
+            let start = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let end = it
+                .next()
+                .and_then(|s| if s.is_empty() { None } else { s.parse::<u64>().ok() })
+                .unwrap_or(total.saturating_sub(1));
+            (start, end.min(total.saturating_sub(1)))
+        });
+
+    if let Some((start, end)) = range {
+        let len = end.saturating_sub(start) + 1;
+        file.seek(SeekFrom::Start(start))?;
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+            mime, len, start, end, total
+        );
+        stream.write_all(header.as_bytes())?;
+        let mut remaining = len;
+        let mut buf = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            if stream.write_all(&buf[..n]).is_err() {
+                break; // client closed (seek/skip) — fine
+            }
+            remaining -= n as u64;
+        }
+    } else {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            mime, total
+        );
+        stream.write_all(header.as_bytes())?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if stream.write_all(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    }
+    let _ = stream.flush();
+    Ok(())
+}
+
+// Returns the localhost URL the <video> element should load, or an error if
+// the media server didn't start.
+#[tauri::command]
+fn media_url(path: String) -> Result<String, String> {
+    let port = MEDIA_PORT.get().ok_or("media server not running")?;
+    let token = MEDIA_TOKEN.get().ok_or("media server not running")?;
+    let encoded: String = path
+        .split('/')
+        .map(|seg| {
+            seg.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{:02X}", b)
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    // path begins with '/', so `encoded` does too -> no double slash after token.
+    Ok(format!("http://127.0.0.1:{}/{}{}", port, token, encoded))
+}
+
 fn guess_video_mime(path: &str) -> &'static str {
     let ext = Path::new(path)
         .extension()
@@ -927,78 +1096,9 @@ pub fn run() {
     }
     let picker_state = parse_picker_state();
     let _ = PICKER_STATE.set(picker_state.clone());
+    start_media_server();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .register_uri_scheme_protocol("stream", |_ctx, request| {
-            use std::io::{Read, Seek, SeekFrom};
-            use tauri::http::{Response, StatusCode};
-
-            let not_found = || {
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Vec::new())
-                    .unwrap()
-            };
-
-            // URI path is the percent-encoded absolute file path, already starting with "/"
-            // (e.g. stream://localhost/home/user/clip.webm -> "/home/user/clip.webm").
-            let raw = request.uri().path();
-            let path = percent_decode(raw);
-            let mime = guess_video_mime(&path);
-
-            let mut file = match fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => return not_found(),
-            };
-            let total = match file.metadata() {
-                Ok(m) => m.len(),
-                Err(_) => return not_found(),
-            };
-
-            // Parse a Range: bytes=start-end header for seeking support.
-            let range = request
-                .headers()
-                .get("range")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("bytes="))
-                .map(|v| {
-                    let mut it = v.splitn(2, '-');
-                    let start = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                    let end = it
-                        .next()
-                        .and_then(|s| if s.is_empty() { None } else { s.parse::<u64>().ok() })
-                        .unwrap_or(total.saturating_sub(1));
-                    (start, end.min(total.saturating_sub(1)))
-                });
-
-            if let Some((start, end)) = range {
-                let len = end.saturating_sub(start) + 1;
-                let mut buf = vec![0u8; len as usize];
-                if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut buf).is_err() {
-                    return not_found();
-                }
-                Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header("Content-Type", mime)
-                    .header("Accept-Ranges", "bytes")
-                    .header("Content-Length", len.to_string())
-                    .header("Content-Range", format!("bytes {}-{}/{}", start, end, total))
-                    .body(buf)
-                    .unwrap_or_else(|_| not_found())
-            } else {
-                let mut buf = Vec::new();
-                if file.read_to_end(&mut buf).is_err() {
-                    return not_found();
-                }
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", mime)
-                    .header("Accept-Ranges", "bytes")
-                    .header("Content-Length", total.to_string())
-                    .body(buf)
-                    .unwrap_or_else(|_| not_found())
-            }
-        })
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -1037,6 +1137,7 @@ pub fn run() {
             picker_confirm,
             picker_cancel,
             open_path,
+            media_url,
             read_data_url,
             read_text_preview,
             list_drives,

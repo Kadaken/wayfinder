@@ -42,14 +42,6 @@
   const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
   const AUDIO_EXTS = new Set(['mp3','flac','wav','ogg','m4a','aac','opus','wma','aiff','alac']);
   const VIDEO_EXTS = new Set(['mp4','mkv','webm','mov','avi','m4v','wmv','flv','ts','3gp']);
-  // Build a URL for our custom Rust "stream" protocol. Linux/macOS use scheme://localhost/,
-  // Windows/Android use http://scheme.localhost/.
-  const streamUrl = (p) => {
-    // p is an absolute path beginning with "/", so enc already starts with "/".
-    const enc = p.split('/').map(encodeURIComponent).join('/');
-    const isWin = navigator.userAgent.includes('Windows');
-    return isWin ? `http://stream.localhost${enc}` : `stream://localhost${enc}`;
-  };
   function fmtTime(s) { if (!s || isNaN(s)) return '0:00'; return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
   function toggleAudio() { if (audioEl) audioPlaying ? audioEl.pause() : audioEl.play(); }
   function pickerEligiblePaths() {
@@ -611,7 +603,8 @@
       try { previewSrc = await invoke("read_data_url", { path: e.path }); }
       catch (err) { previewError = String(err); }
     } else if (VIDEO_EXTS.has(ext)) {
-      videoSrc = streamUrl(e.path);
+      try { const url = await invoke("media_url", { path: e.path }); if (selected?.path === e.path) videoSrc = url; }
+      catch (err) { previewError = String(err); }
     } else if (AUDIO_EXTS.has(ext)) {
       try { audioSrc = await invoke("read_data_url", { path: e.path }); }
       catch (err) { previewError = String(err); }
