@@ -357,6 +357,96 @@ fn list_dir(path: String, show_hidden: bool) -> Result<Vec<Entry>, String> {
     Ok(out)
 }
 
+fn file_contains(p: &Path, q_lower: &str) -> bool {
+    use std::io::Read;
+    let md = match fs::metadata(p) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if md.len() > 5 * 1024 * 1024 {
+        return false; // skip large files for content search
+    }
+    let f = match fs::File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = Vec::new();
+    if f.take(5 * 1024 * 1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    if buf.contains(&0) {
+        return false; // looks binary
+    }
+    String::from_utf8_lossy(&buf).to_lowercase().contains(q_lower)
+}
+
+// Recursively search under `root` for entries whose name (and optionally text
+// content) contains `query`. Case-insensitive, capped to keep the UI responsive.
+#[tauri::command]
+fn search_dir(
+    root: String,
+    query: String,
+    content: bool,
+    show_hidden: bool,
+) -> Result<Vec<Entry>, String> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    const MAX_RESULTS: usize = 2000;
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(&root)];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= MAX_RESULTS {
+            break;
+        }
+        let rd = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let md = match ent.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let p = ent.path();
+            let is_dir = md.is_dir();
+            let mut matched = name.to_lowercase().contains(&q);
+            if !matched && content && !is_dir {
+                matched = file_contains(&p, &q);
+            }
+            if matched {
+                let modified = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                out.push(Entry {
+                    name,
+                    path: p.to_string_lossy().to_string(),
+                    is_dir,
+                    size: md.len(),
+                    modified,
+                    is_image: is_image(&p),
+                    icon: icon_name(&p, is_dir).to_string(),
+                });
+                if out.len() >= MAX_RESULTS {
+                    break;
+                }
+            }
+            if is_dir {
+                stack.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 fn standard_dirs() -> Vec<(String, String)> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
@@ -1323,6 +1413,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_dir,
+            search_dir,
             standard_dirs,
             parent_dir,
             picker_options,
