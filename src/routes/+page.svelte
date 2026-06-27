@@ -384,13 +384,7 @@
     const srcs = dragPaths.filter(p => p !== destDir);
     dragPaths=[];
     if (!srcs.length) return;
-    const isCopy = ev.ctrlKey;
-    const op = isCopy ? "copy_paths" : "move_paths";
-    invoke(op, { srcs, destDir }).then(()=>{
-      if (isCopy) pushUndo({ type:'copy', created: srcs.map(p => joinPath(destDir, basename(p))), label:`copy of ${srcs.length}` });
-      else pushUndo({ type:'move', items: srcs.map(p => ({ from: p, to: joinPath(destDir, basename(p)) })), label:`move of ${srcs.length}` });
-      flash(isCopy?"Copied":"Moved"); navigate(cwd,false);
-    }).catch(e=>flash("⚠ "+e));
+    startPaste(srcs, destDir, ev.ctrlKey);
   }
   function runOpenWith(id, path){ invoke("open_with", { appId:id, path }); menu=null; owApps=null; owOpen=false; }
   async function owEnter(ev){
@@ -677,20 +671,34 @@
     menu = null;
   }
   function doCut(){ if (selectedSet.size) { clipboard = { mode:"cut", paths:[...selectedSet] }; flash(`Cut ${selectedSet.size}`); } }
+  /** @type {any} */
+  let conflict = $state(null); // { srcs, destDir, isCopy, names, clearClipboard }
+  async function startPaste(srcs, destDir, isCopy, clearClipboard=false){
+    try {
+      const names = await invoke("check_conflicts", { srcs, destDir });
+      if (names.length) { conflict = { srcs, destDir, isCopy, names, clearClipboard }; return; }
+      await doResolvedPaste(srcs, destDir, isCopy, "keepboth", clearClipboard);
+    } catch(e){ flash("⚠ " + e); }
+  }
+  async function doResolvedPaste(srcs, destDir, isCopy, mode, clearClipboard=false){
+    try {
+      const items = await invoke("resolve_paste", { srcs, destDir, mode, isCopy });
+      if (items.length) {
+        if (isCopy) pushUndo({ type:'copy', created: items.map(it => it.to), label:`copy of ${items.length}` });
+        else pushUndo({ type:'move', items, label:`move of ${items.length}` });
+      }
+      if (clearClipboard) clipboard = null;
+      flash(isCopy ? `Copied ${items.length}` : `Moved ${items.length}`);
+      navigate(cwd, false);
+    } catch(e){ flash("⚠ " + e); }
+  }
+  function resolveConflict(mode){
+    const c = conflict; conflict = null;
+    if (c) doResolvedPaste(c.srcs, c.destDir, c.isCopy, mode, c.clearClipboard);
+  }
   async function paste(){
     if (!clipboard) return;
-    try {
-      if (clipboard.mode === "copy") {
-        await invoke("copy_paths", { srcs: clipboard.paths, destDir: cwd });
-        pushUndo({ type:'copy', created: clipboard.paths.map(p => joinPath(cwd, basename(p))), label:`copy of ${clipboard.paths.length}` });
-      } else {
-        const srcs = clipboard.paths;
-        await invoke("move_paths", { srcs, destDir: cwd });
-        pushUndo({ type:'move', items: srcs.map(p => ({ from: p, to: joinPath(cwd, basename(p)) })), label:`move of ${srcs.length}` });
-        clipboard = null;
-      }
-      navigate(cwd, false);
-    } catch (e) { flash("⚠ " + e); }
+    startPaste(clipboard.paths, cwd, clipboard.mode === "copy", clipboard.mode === "cut");
   }
   async function del(){
     if (!selectedSet.size) return;
@@ -1213,6 +1221,25 @@
     </div>
   {/if}
 
+  {#if conflict}
+    <div class="modal-overlay" onclick={()=>conflict=null}>
+      <div class="modal" onclick={(e)=>e.stopPropagation()}>
+        <h3>{conflict.names.length} item{conflict.names.length>1?'s':''} already exist{conflict.names.length>1?'':'s'}</h3>
+        <p>The destination already has {conflict.names.length>1 ? 'these names' : 'this name'}:</p>
+        <ul class="conflict-list">
+          {#each conflict.names.slice(0,8) as n}<li>{n}</li>{/each}
+          {#if conflict.names.length>8}<li>…and {conflict.names.length-8} more</li>{/if}
+        </ul>
+        <div class="modal-actions">
+          <button onclick={()=>conflict=null}>Cancel</button>
+          <button onclick={()=>resolveConflict('skip')}>Skip</button>
+          <button onclick={()=>resolveConflict('keepboth')}>Keep Both</button>
+          <button class="primary" onclick={()=>resolveConflict('replace')}>Replace</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if confirmDel}
     <div class="modal-overlay" onclick={()=>confirmDel=false}>
       <div class="modal" onclick={(e)=>e.stopPropagation()}>
@@ -1416,6 +1443,10 @@
   .modal-actions button:hover{ background:#353b45; }
   .modal-actions button.danger{ background:#c0392b; border-color:#c0392b; }
   .modal-actions button.danger:hover{ background:#e74c3c; }
+  .modal-actions button.primary{ background:#3a6df0; border-color:#3a6df0; color:#fff; }
+  .modal-actions button.primary:hover{ background:#2f5fd8; }
+  .conflict-list{ margin:8px 0; padding:8px 10px; max-height:160px; overflow:auto; background:#1b1d22; border-radius:6px; list-style:none; }
+  .conflict-list li{ font:12px/1.6 ui-monospace, monospace; color:#cdd2da; word-break:break-all; }
   .set-select{ background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:5px; padding:4px 8px; font:inherit; cursor:pointer; }
   .set-select:focus{ outline:1px solid #3a6df0; }
   .settings-modal{ min-width:420px; }

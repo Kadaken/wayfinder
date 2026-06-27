@@ -635,6 +635,105 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[derive(Serialize)]
+struct ResolvedItem {
+    from: String,
+    to: String,
+}
+
+// Return the basenames of srcs that already exist in dest_dir (paste/drop conflicts).
+#[tauri::command]
+fn check_conflicts(srcs: Vec<String>, dest_dir: String) -> Vec<String> {
+    srcs.iter()
+        .filter_map(|s| {
+            let name = Path::new(s).file_name()?.to_str()?.to_string();
+            if Path::new(&dest_dir).join(&name).exists() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// Find a non-colliding "name (1).ext" style target inside dest_dir.
+fn unique_target(dest_dir: &str, name: &str) -> std::path::PathBuf {
+    let base = Path::new(dest_dir);
+    let first = base.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let mut n = 1;
+    loop {
+        let cand = base.join(format!("{} ({}){}", stem, n, ext));
+        if !cand.exists() {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+// Copy or move srcs into dest_dir, resolving name conflicts by mode:
+// "replace" overwrites, "skip" leaves the existing file, "keepboth" adds a suffix.
+// Returns what ended up where so the caller can build an accurate undo entry.
+#[tauri::command]
+fn resolve_paste(
+    srcs: Vec<String>,
+    dest_dir: String,
+    mode: String,
+    is_copy: bool,
+) -> Result<Vec<ResolvedItem>, String> {
+    let mut out = Vec::new();
+    for s in &srcs {
+        let name = Path::new(s)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("bad name")?
+            .to_string();
+        let target = Path::new(&dest_dir).join(&name);
+        let dest_path = if target.exists() {
+            match mode.as_str() {
+                "skip" => continue,
+                "keepboth" => unique_target(&dest_dir, &name),
+                _ => {
+                    // replace: remove the existing target first for a clean swap
+                    if target.is_dir() {
+                        fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+                    } else {
+                        fs::remove_file(&target).map_err(|e| e.to_string())?;
+                    }
+                    target.clone()
+                }
+            }
+        } else {
+            target.clone()
+        };
+        let dest_str = dest_path.to_string_lossy().to_string();
+        let o = if is_copy {
+            std::process::Command::new("cp")
+                .args(["-a", "-T", "--", s, &dest_str])
+                .output()
+        } else {
+            std::process::Command::new("mv")
+                .args(["-T", "--", s, &dest_str])
+                .output()
+        }
+        .map_err(|e| e.to_string())?;
+        if !o.status.success() {
+            return Err(String::from_utf8_lossy(&o.stderr).to_string());
+        }
+        out.push(ResolvedItem {
+            from: s.clone(),
+            to: dest_str,
+        });
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 fn copy_paths(srcs: Vec<String>, dest_dir: String) -> Result<(), String> {
     let dest_slash = format!("{}/", dest_dir.trim_end_matches('/'));
@@ -1210,6 +1309,8 @@ pub fn run() {
             eject_drive,
             copy_paths,
             move_paths,
+            check_conflicts,
+            resolve_paste,
             delete_paths,
             rename_path,
             make_dir,
