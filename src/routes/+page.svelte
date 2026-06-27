@@ -41,6 +41,7 @@
   let previewZoom = $state(1);
   const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
   const AUDIO_EXTS = new Set(['mp3','flac','wav','ogg','m4a','aac','opus','wma','aiff','alac']);
+  const VIDEO_EXTS = new Set(['mp4','mkv','webm','mov','avi','m4v','wmv','flv','ts','3gp']);
   function fmtTime(s) { if (!s || isNaN(s)) return '0:00'; return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
   function toggleAudio() { if (audioEl) audioPlaying ? audioEl.pause() : audioEl.play(); }
   function pickerEligiblePaths() {
@@ -130,6 +131,7 @@
   let audioDuration = $state(0);
   /** @type {HTMLAudioElement|null} */
   let audioEl = $state(null);
+  let videoSrc = $state("");
   /** @type {{x1:number,y1:number,x2:number,y2:number}|null} */
   let lasso = $state(null);
   /** @type {HTMLElement|null} */
@@ -595,11 +597,13 @@
       selectedSet = new Set([e.path]);
     }
     lastIndex = idx; selected = e;
-    previewSrc = ""; previewError = ""; previewText = ""; audioSrc = ""; audioPlaying = false; audioTime = 0; audioDuration = 0; previewZoom = 1;
+    previewSrc = ""; previewError = ""; previewText = ""; audioSrc = ""; audioPlaying = false; audioTime = 0; audioDuration = 0; videoSrc = ""; previewZoom = 1;
     const ext = e.name.split('.').pop()?.toLowerCase() ?? '';
     if (e.is_image) {
       try { previewSrc = await invoke("read_data_url", { path: e.path }); }
       catch (err) { previewError = String(err); }
+    } else if (VIDEO_EXTS.has(ext)) {
+      videoSrc = "file://" + e.path.split('/').map(s => encodeURIComponent(s)).join('/');
     } else if (AUDIO_EXTS.has(ext)) {
       try { audioSrc = await invoke("read_data_url", { path: e.path }); }
       catch (err) { previewError = String(err); }
@@ -1009,6 +1013,12 @@
       {#if selected}
         {#if previewText}
           <pre class="pv-text">{previewText}</pre>
+        {:else if videoSrc}
+          <div class="pv-video">
+            <video src={videoSrc} controls preload="metadata" class="pv-vid-el">
+              <track kind="captions" />
+            </video>
+          </div>
         {:else if audioSrc}
           <div class="pv-audio">
             <div class="pv-music-art">🎵</div>
@@ -1322,6 +1332,8 @@
   .pv-seek-row{ display:flex; align-items:center; gap:8px; width:100%; }
   .pv-seek{ flex:1; accent-color:#3b82f6; cursor:pointer; }
   .pv-time{ font-size:11px; color:#8a8f99; min-width:34px; text-align:center; font-variant-numeric:tabular-nums; }
+  .pv-video{ flex:1; display:flex; align-items:center; justify-content:center; padding:8px; min-height:0; background:#000; }
+  .pv-vid-el{ max-width:100%; max-height:100%; border-radius:4px; outline:none; }
   .pv-meta{ padding:12px 14px; border-top:1px solid #000; font-size:12px; color:#aeb3bb; }
   .pv-name{ font-weight:600; color:#e3e5ea; word-break:break-all; margin-bottom:4px; }
   .pv-date{ color:#6b7079; margin-top:4px; }
