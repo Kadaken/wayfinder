@@ -31,6 +31,19 @@ fn percent_decode(s: &str) -> String {
 // HTTP/1.1 server with Range support that GStreamer's souphttpsrc CAN read.
 static MEDIA_PORT: OnceLock<u16> = OnceLock::new();
 static MEDIA_TOKEN: OnceLock<String> = OnceLock::new();
+// Only files explicitly registered via media_url() may be served. This stops the
+// local server from being a read-anything-on-disk oracle even if the token leaks.
+static MEDIA_ALLOW: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+// 32 hex chars of cryptographically-strong randomness from the OS RNG.
+fn random_token() -> String {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut buf);
+    }
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 fn start_media_server() {
     use std::net::TcpListener;
@@ -42,15 +55,8 @@ fn start_media_server() {
         Ok(a) => a.port(),
         Err(_) => return,
     };
-    // A per-run token so other local processes can't trivially read arbitrary files.
-    let token = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{:x}{:x}", t, std::process::id())
-    };
+    let token = random_token();
+    let _ = MEDIA_ALLOW.set(std::sync::Mutex::new(std::collections::HashSet::new()));
     let _ = MEDIA_PORT.set(port);
     let _ = MEDIA_TOKEN.set(token);
     std::thread::spawn(move || {
@@ -105,6 +111,14 @@ fn serve_media_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
         return write_status(&mut stream, "403 Forbidden");
     }
     let path = percent_decode(&format!("/{}", encoded_path));
+    // Only serve files the app explicitly opened for preview.
+    let allowed = MEDIA_ALLOW
+        .get()
+        .and_then(|m| m.lock().ok().map(|s| s.contains(&path)))
+        .unwrap_or(false);
+    if !allowed {
+        return write_status(&mut stream, "403 Forbidden");
+    }
     let mime = guess_video_mime(&path);
 
     let mut file = match fs::File::open(&path) {
@@ -175,6 +189,12 @@ fn serve_media_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
 fn media_url(path: String) -> Result<String, String> {
     let port = MEDIA_PORT.get().ok_or("media server not running")?;
     let token = MEDIA_TOKEN.get().ok_or("media server not running")?;
+    // Whitelist this exact path so the server will serve it.
+    if let Some(allow) = MEDIA_ALLOW.get() {
+        if let Ok(mut set) = allow.lock() {
+            set.insert(path.clone());
+        }
+    }
     let encoded: String = path
         .split('/')
         .map(|seg| {
