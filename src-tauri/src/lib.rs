@@ -1166,6 +1166,15 @@ fn restore_from_trash(paths: Vec<String>) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let info_dir = format!("{}/.local/share/Trash/info", home);
     for orig in &paths {
+        // Trash-view path (…/Trash/files/NAME): restore that exact entry by name.
+        if let Some(idx) = orig.find("/Trash/files/") {
+            let name = &orig[idx + "/Trash/files/".len()..];
+            if !name.is_empty() && !name.contains('/') {
+                let uri = format!("trash:///{}", percent_encode_segment(name));
+                run_cmd("gio", &["trash", "--restore", &uri])?;
+                continue;
+            }
+        }
         let mut best: Option<(String, String)> = None; // (trash name, deletion date)
         if let Ok(rd) = fs::read_dir(&info_dir) {
             for entry in rd.flatten() {
