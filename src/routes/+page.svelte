@@ -954,7 +954,8 @@
                     onkeydown={(ev)=> ev.key==='Enter'?commitRename(): ev.key==='Escape'?(renaming=null):null}
                     onblur={commitRename}
                     onclick={(ev)=>ev.stopPropagation()}
-                    ondblclick={(ev)=>ev.stopPropagation()} />
+                    ondblclick={(ev)=>ev.stopPropagation()}
+                    ondragstart={(ev)=>ev.preventDefault()} />
                 </td>
                 {#if colSize}<td class="num">{e.is_dir ? '' : fmtSize(e.size)}</td>{/if}
                 {#if colType}<td class="type">{typeLabel(e)}</td>{/if}
@@ -1273,6 +1274,8 @@
   .empty{ padding:40px; text-align:center; color:#6b7079; }
   .createbar{ padding:8px 10px; background:#23262d; display:flex; gap:8px; align-items:center; }
   .createbar input, .rename{ background:#15171b; color:#fff; border:1px solid #3a6df0; border-radius:4px; padding:3px 6px; font:inherit; user-select:text; -webkit-user-select:text; cursor:text; }
+  .rename::selection{ background:#3a6df0; color:#fff; }
+  .rename::-webkit-selection{ background:#3a6df0; color:#fff; }
 
   table{ width:100%; border-collapse:collapse; font-size:calc(14.5px * var(--zoom,1)); }
   thead th{ position:sticky; top:0; background:#23262d; text-align:left; padding:8px 14px; color:#b8bdc6; font-weight:600; border-bottom:1px solid #000; font-size:14.5px; }
