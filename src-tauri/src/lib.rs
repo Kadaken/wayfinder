@@ -649,9 +649,32 @@ fn start_path() -> Option<String> {
             return Some(dir);
         }
     }
-    std::env::args()
+    let arg = std::env::args()
         .nth(1)
-        .filter(|a| !a.starts_with('-') && Path::new(a).is_dir())
+        .filter(|a| !a.starts_with('-'))?;
+    let p = Path::new(&arg);
+    if p.is_dir() {
+        Some(arg)
+    } else if p.is_file() {
+        // launched with a file path (e.g. browser "Show in folder") — open the parent
+        p.parent().map(|d| d.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+// Returns the file to select after navigating (when launched with a file path arg)
+#[tauri::command]
+fn start_select() -> Option<String> {
+    let arg = std::env::args()
+        .nth(1)
+        .filter(|a| !a.starts_with('-'))?;
+    let p = Path::new(&arg);
+    if p.is_file() {
+        Some(arg)
+    } else {
+        None
+    }
 }
 
 #[tauri::command]
@@ -918,6 +941,7 @@ pub fn run() {
             delete_permanent,
             new_window,
             start_path,
+            start_select,
             open_with_apps,
             open_with,
             list_subdirs,

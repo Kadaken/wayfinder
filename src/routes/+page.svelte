@@ -533,6 +533,11 @@
       if (record) { history = [...history.slice(0, hidx+1), path]; hidx = history.length-1; pushRecent(path); }
       refreshDrives();
       syncTab();
+      const downloadsPath = places.find(p => p[0] === 'Downloads')?.[1];
+      if (downloadsPath && path === downloadsPath) {
+        const newest = [...nextEntries].filter(e => !e.is_dir && e.modified).sort((a,b) => b.modified - a.modified)[0];
+        if (newest) { await tick(); const idx = rows.findIndex(r => r.path === newest.path); if (idx >= 0) { select(newest, idx, {}); document.querySelector('tr.sel')?.scrollIntoView({block:'nearest'}); } }
+      }
       if (thumbsEnabled) {
         const imgEntries = entries.filter(e => e.is_image).slice(0, 60);
         thumbCache = {};
@@ -544,6 +549,13 @@
       }
     } catch (e) { previewError = String(e); flash("⚠ " + e); }
     finally { if (seq === navSeq) loading = false; }
+  }
+
+  function autoSelectNewest() {
+    const downloadsPath = places.find(p => p[0] === 'Downloads')?.[1];
+    if (!downloadsPath || cwd !== downloadsPath) return;
+    const newest = [...entries].filter(e => !e.is_dir && e.modified).sort((a,b) => b.modified - a.modified)[0];
+    if (newest) { const idx = rows.findIndex(r => r.path === newest.path); select(newest, idx < 0 ? 0 : idx, {}); }
   }
 
   async function up() { navigate(await invoke("parent_dir", { path: cwd })); }
@@ -728,8 +740,17 @@
       places = await invoke("standard_dirs");
       await refreshDrives();
       let sp = null;
+      let sf = null;
       try { sp = await invoke("start_path"); } catch {}
-      navigate(sp || places[0]?.[1] || "/");
+      try { sf = await invoke("start_select"); } catch {}
+      await navigate(sp || places[0]?.[1] || "/");
+      if (sf) {
+        // launched with a file arg (e.g. browser "Show in folder") — highlight it
+        const entry = entries.find(e => e.path === sf);
+        if (entry) { const idx = rows.indexOf(entry); select(entry, idx < 0 ? 0 : idx, {}); }
+      } else {
+        autoSelectNewest();
+      }
       loadTreeRoots();
 
       // Hotplug: coalesce rapid udev bursts (one plug fires disk + partition events)
