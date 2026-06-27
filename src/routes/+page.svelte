@@ -469,11 +469,30 @@
   /** @type {Record<string, string>} */
   let iconCache = $state({});
 
+  /** @type {Array<any>|null} */
+  let searchResults = $state(null);   // recursive search results (overrides folder view)
+  let searchContent = $state(false);  // also match inside text files
+  let searching = $state(false);
   const filtered = $derived(
-    search.trim()
-      ? entries.filter(e => e.name.toLowerCase().includes(search.toLowerCase()))
-      : entries
+    searchResults
+      ? searchResults
+      : search.trim()
+        ? entries.filter(e => e.name.toLowerCase().includes(search.toLowerCase()))
+        : entries
   );
+  async function doRecursiveSearch(){
+    const q = search.trim();
+    if (!q) { searchResults = null; return; }
+    searching = true;
+    const root = cwd;
+    try {
+      const res = await invoke("search_dir", { root, query: q, content: searchContent, showHidden });
+      searchResults = res;
+      flash(`${res.length} result${res.length===1?'':'s'} for "${q}"`);
+    } catch(e){ flash("⚠ " + e); }
+    finally { searching = false; }
+  }
+  function clearSearch(){ search = ""; searchResults = null; }
 
   function typeLabel(e){
     if (e.is_dir) return "Folder";
@@ -530,7 +549,7 @@
       if (seq !== navSeq) return;
       entries = nextEntries;
       for (const nm of new Set(entries.map(e=>e.icon))) ensureIcon(nm);
-      cwd = path; addr = path; search = "";
+      cwd = path; addr = path; search = ""; searchResults = null;
       selectedSet = new Set(); selected = null; lastIndex = -1;
       previewSrc = ""; previewError = "";
       if (record) { history = [...history.slice(0, hidx+1), path]; hidx = history.length-1; pushRecent(path); }
@@ -963,7 +982,12 @@
       </div>
     {/if}
     <button onclick={copyAddr} title="Copy path">📋</button>
-    <input class="search" placeholder="Search…" bind:value={search} />
+    <div class="searchbox">
+      <input class="search" placeholder="Filter here · Enter to search subfolders" bind:value={search}
+             onkeydown={(e)=>{ if(e.key==='Enter'){ e.preventDefault(); doRecursiveSearch(); } else if(e.key==='Escape'){ clearSearch(); } }} />
+      {#if searchResults}<button class="search-clear" onclick={clearSearch} title="Clear search">✕</button>{/if}
+      <label class="search-deep" title="Also search inside text files"><input type="checkbox" bind:checked={searchContent} /> in files</label>
+    </div>
     {#if pickerMode}
       <button onclick={pickerAbort} title="Cancel picker">Cancel</button>
       <button class="opt-btn active" disabled={!pickerEligiblePaths().length} onclick={() => pickerSubmit()}
@@ -1045,10 +1069,10 @@
              onkeydown={(e)=> e.key==='Enter' ? (creatingFile?commitCreateFile():commitCreate()) : e.key==='Escape' ? (creating=false,creatingFile=false) : null}
              onblur={creatingFile?commitCreateFile:commitCreate} /></div>
       {/if}
-      {#if loading}
-        <div class="empty">Loading…</div>
+      {#if loading || searching}
+        <div class="empty">{searching ? 'Searching…' : 'Loading…'}</div>
       {:else if filtered.length === 0}
-        <div class="empty">{search ? 'No matches' : 'Empty folder'}</div>
+        <div class="empty">{searchResults ? 'No results' : search ? 'No matches' : 'Empty folder'}</div>
       {:else if view === 'details'}
         <table>
           <thead><tr>
@@ -1420,7 +1444,11 @@
   .crumb-paste-hint{ flex:1; color:transparent; cursor:text; min-width:20px; padding:0 4px; }
   .splitter{ width:6px; cursor:col-resize; background:transparent; flex:none; transition:background .1s; }
   .splitter:hover{ background:#3a6df0; }
-  .search{ width:150px; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; }
+  .searchbox{ display:flex; align-items:center; gap:6px; }
+  .search{ width:220px; background:#15171b; color:#e3e5ea; border:1px solid #3a3f49; border-radius:6px; padding:6px 9px; }
+  .search-clear{ background:#2c3038; color:#cfd3da; border:1px solid #3a3f49; border-radius:6px; padding:5px 8px; cursor:pointer; }
+  .search-clear:hover{ background:#353b45; }
+  .search-deep{ display:flex; align-items:center; gap:4px; font-size:12px; color:#8b909a; white-space:nowrap; cursor:pointer; }
 
   .body{ flex:1; display:flex; min-height:0; }
   .sidebar{ width:185px; flex:none; background:#202329; border-right:1px solid #000; padding:8px; display:flex; flex-direction:column; gap:1px; overflow:auto; }
