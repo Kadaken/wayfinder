@@ -415,6 +415,9 @@ fn search_dir(
             };
             let p = ent.path();
             let is_dir = md.is_dir();
+            // file_type() reflects the entry itself (not its target), so we can
+            // tell a real directory from a symlink without an extra syscall.
+            let is_symlink = ent.file_type().map(|t| t.is_symlink()).unwrap_or(false);
             let mut matched = name.to_lowercase().contains(&q);
             if !matched && content && !is_dir {
                 matched = file_contains(&p, &q);
@@ -439,7 +442,9 @@ fn search_dir(
                     break;
                 }
             }
-            if is_dir {
+            // Only descend into real directories; following symlinks here can
+            // loop forever (e.g. a link back to an ancestor, or /proc self-refs).
+            if is_dir && !is_symlink {
                 stack.push(p);
             }
         }
@@ -545,7 +550,16 @@ fn read_text_preview(path: String) -> Result<String, String> {
     const CAP: usize = 256 * 1024; // preview at most 256 KB
     let mut f = fs::File::open(&path).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; CAP];
-    let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+    // A single read() may return fewer bytes than requested even for a regular
+    // file, so fill the buffer until it's full or the file ends.
+    let mut n = 0;
+    while n < CAP {
+        match f.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(got) => n += got,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
     buf.truncate(n);
     if buf.contains(&0) {
         return Err("binary".into()); // NUL byte => not a text file
@@ -805,6 +819,18 @@ fn resolve_paste(
             .ok_or("bad name")?
             .to_string();
         let target = Path::new(&dest_dir).join(&name);
+        // Pasting an item onto itself (same source and destination path): for
+        // replace/move this would delete the only copy before the cp/mv runs,
+        // losing the file. Skip it — the file is already where it belongs.
+        if target.exists() && mode != "keepboth" {
+            let same = matches!(
+                (fs::canonicalize(s), fs::canonicalize(&target)),
+                (Ok(a), Ok(b)) if a == b
+            );
+            if same {
+                continue;
+            }
+        }
         let dest_path = if target.exists() {
             match mode.as_str() {
                 "skip" => continue,

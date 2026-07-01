@@ -817,6 +817,13 @@
   function onKey(ev){
     const inInput = document.activeElement?.tagName === "INPUT";
     if (inInput) return;
+    // A dialog is open: swallow shortcuts so keys like Delete/Backspace can't hit
+    // the file list underneath. Escape closes whichever dialog is showing.
+    const modalOpen = propsData || conflict || batchRen || confirmDel || showSettings;
+    if (modalOpen) {
+      if (ev.key === "Escape") { propsData = null; conflict = null; batchRen = null; confirmDel = false; showSettings = false; }
+      return;
+    }
     if (ev.key === "Backspace") { ev.preventDefault(); back(); }
     else if (ev.altKey && ev.key === "ArrowLeft") { ev.preventDefault(); back(); }
     else if (ev.altKey && ev.key === "ArrowRight") { ev.preventDefault(); fwd(); }
