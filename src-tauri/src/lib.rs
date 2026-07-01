@@ -3,14 +3,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 use tauri::Emitter;
-use tauri::Manager;
-
-// Linux prctl(2). Used to set PR_SET_PDEATHSIG on helper processes we spawn so
-// the kernel kills them the moment this process dies — clean exit or crash —
-// instead of orphaning them to systemd (which leaked udevadm monitors).
-extern "C" {
-    fn prctl(option: std::os::raw::c_int, arg2: std::os::raw::c_ulong) -> std::os::raw::c_int;
-}
 
 // Percent-decode a URI path segment string (handles %XX byte escapes).
 fn percent_decode(s: &str) -> String {
@@ -255,10 +247,6 @@ struct PickerConfig {
 struct PickerState {
     config: PickerConfig,
     out_file: String,
-    // Warm-start: launch the picker window HIDDEN and only show it once the file
-    // `<out_file>.show` appears (ZVAN pre-launches this so the picker opens
-    // instantly on click). Normal `--pick` (hidden = false) shows immediately.
-    hidden: bool,
 }
 
 static PICKER_STATE: OnceLock<Option<PickerState>> = OnceLock::new();
@@ -1357,7 +1345,6 @@ fn parse_picker_state() -> Option<PickerState> {
     let mut starting_dir = None;
     let mut filter = None;
     let mut out_file = None;
-    let mut hidden = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--pick" => pick = true,
@@ -1366,7 +1353,6 @@ fn parse_picker_state() -> Option<PickerState> {
             "--out" => out_file = args.next(),
             "--starting-dir" => starting_dir = args.next(),
             "--filter" => filter = args.next(),
-            "--hidden" => hidden = true,
             _ => {}
         }
     }
@@ -1382,7 +1368,6 @@ fn parse_picker_state() -> Option<PickerState> {
             filter,
         },
         out_file,
-        hidden,
     })
 }
 
@@ -1397,48 +1382,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Warm-start picker: keep the window HIDDEN until ZVAN drops the
-            // `<out_file>.show` trigger, then show it instantly (it's already
-            // fully loaded). Normal launches never enter this branch.
-            if let Some(Some(state)) = PICKER_STATE.get() {
-                if state.hidden {
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.hide();
-                        let trigger = format!("{}.show", state.out_file);
-                        std::thread::spawn(move || {
-                            for _ in 0..20000 {
-                                if std::path::Path::new(&trigger).exists() {
-                                    let _ = std::fs::remove_file(&trigger);
-                                    let _ = win.show();
-                                    let _ = win.set_focus();
-                                    return;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(30));
-                            }
-                            // Never triggered (orphaned warm instance) — self-exit.
-                            std::process::exit(1);
-                        });
-                    }
-                }
-            }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                let mut command = std::process::Command::new("udevadm");
-                command
+                let mut child = match std::process::Command::new("udevadm")
                     .args(["monitor", "--udev", "--subsystem-match=block"])
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null());
-                // Tie the monitor's lifetime to ours: if Wayfinder exits or crashes,
-                // the kernel sends SIGKILL to this child instead of orphaning it.
-                unsafe {
-                    use std::os::unix::process::CommandExt;
-                    command.pre_exec(|| {
-                        // PR_SET_PDEATHSIG = 1, SIGKILL = 9
-                        prctl(1, 9 as std::os::raw::c_ulong);
-                        Ok(())
-                    });
-                }
-                let mut child = match command.spawn() {
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
                     Ok(c) => c,
                     Err(_) => return,
                 };
