@@ -1,35 +1,81 @@
-Wayfinder — Proprietary Software License
-Copyright (c) 2026 LegendofZito. All Rights Reserved.
+Wayfinder
 
-PERSONAL USE GRANT
-Permission is hereby granted, free of charge, to any individual obtaining a
-copy of this software and its compiled binaries ("the Software"), to use the
-Software for personal, non-commercial purposes only, subject to the following
-conditions:
+Copyright (c) 2026 Kadaken. All rights reserved.
 
-DISTRIBUTION GRANT
-Distribution of the Software (in compiled binary form only) through the
-Flathub software repository (flathub.org) is explicitly permitted, including
-automatic delivery of updates to end users via their system package manager.
-No other third-party redistribution is authorized.
+This is not open source software. It is provided to you for your own use
+only, and the terms below are the whole of what you are permitted to do
+with it.
 
-RESTRICTIONS — THE FOLLOWING ARE STRICTLY PROHIBITED:
-  1. Modifying, adapting, translating, or creating derivative works of the
-     Software or its source code.
-  2. Redistributing, sublicensing, selling, renting, or otherwise transferring
-     the Software or any portion thereof to any third party, except (a) by
-     linking to the official release page at github.com/LegendofZito/wayfinder,
-     or (b) through the Flathub repository as granted above.
-  3. Using the Software for any commercial purpose or for any public display
-     (commercial or non-commercial) without prior written permission.
-  4. Reverse engineering, decompiling, or disassembling the Software, except
-     to the extent that applicable law expressly permits.
+YOU MAY
 
-DISCLAIMER
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+  1. Install and run this software on machines you own or control, for any
+     purpose, personal or commercial, at no charge.
+
+  2. Make copies for backup purposes.
+
+  3. Tell other people about it and point them at the official download.
+
+YOU MAY NOT, without written permission from Kadaken
+
+  4. Redistribute this software, in whole or in part, in original or
+     modified form, by any means, whether or not you charge for it. That
+     includes mirrors, re-uploads, bundles, app stores, package
+     repositories and forks.
+
+  5. Modify, adapt, translate or create derivative works from it.
+
+  6. Reverse engineer, decompile or disassemble it, except where that right
+     cannot be excluded by the law that applies to you.
+
+  7. Rent, lease, sell, sublicense or otherwise transfer it, or offer it to
+     others as a hosted or managed service.
+
+  8. Remove or alter any copyright, trademark or licence notice in it.
+
+WANT A CHANGE?
+
+Write in. Bug reports, feature requests and changes you need are welcome
+and are the intended way to get them: open an issue, or contact Kadaken
+directly. Changes are made by Kadaken and released to everyone.
+
+SOURCE CODE
+
+Parts of this software ship as readable source because of how it runs.
+Being able to read a file is not permission to copy, modify or
+redistribute it. Sections 4 to 8 apply to every part of this software,
+readable or not.
+
+BETA, AND WHAT COMES AFTER
+
+This software is in beta. It is supplied free of charge while it is, and it
+will change: features, layout and behaviour can move between releases, and a
+build may be withdrawn or replaced at any time.
+
+Every release carries the licence it was published with, and keeps it. Kadaken
+may publish future versions on different terms, including paid or subscription
+terms. Nothing here promises that a later version will be free, and nothing in
+a later version takes away the licence on a version you already hold.
+
+EARLIER VERSIONS
+
+Earlier releases carried a proprietary licence in the name of
+LegendofZito. That name is now Kadaken; the terms are unchanged in
+substance. This licence governs the release it ships with.
+
+THIRD-PARTY COMPONENTS
+
+This software is built with third-party components that carry their own
+licences, which continue to apply to those components. This licence covers
+Kadaken's own work only.
+
+NO WARRANTY
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+NO EVENT SHALL KADAKEN BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THIS SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THIS SOFTWARE.
+
+Contact: https://kadaken.com
