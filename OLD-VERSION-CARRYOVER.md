@@ -128,7 +128,7 @@ Confirmed by reading both codebases, not by guessing.
 
 | # | Feature | Old | Native | Notes |
 |---|---|---|---|---|
-| 1 | **Lasso / rubber-band selection** | `lassoStart` / `lassoMove` / `lassoEnd` | **missing** | Drag a box across files to select them. Explorer has this. |
+| 1 | ~~Lasso / rubber-band selection~~ | `lassoStart` / `lassoMove` / `lassoEnd` | **DONE 2026-08-13** | Enabled on the virtualized ListView via the `enable-rubberband` property. Still missing in Grid/Icons view, which is a GtkFlowBox and has no such property. |
 | 2 | **Open in New Window** | `newWindow` command + menu item | **missing** | Menu entry and backend call both absent. |
 | 3 | **Paste conflict dialog** | `Replace` / `Skip` / `Keep Both` buttons | **missing** | Native silently keeps both, every time. No choice offered. |
 | 4 | **Show/hide individual columns** | `colSize`, `colType`, `colDate` | **missing** | No UI to turn columns off. |

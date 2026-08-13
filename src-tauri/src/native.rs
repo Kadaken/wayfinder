@@ -2129,15 +2129,19 @@ fn details_header() -> (gtk::Box, ColumnSizing) {
 }
 
 fn column_button(text: &str, name: &str, width_chars: i32) -> gtk::Button {
-    // hexpand + Fill are what make xalign mean anything: without them the label
-    // shrinks to its text and sits centred in the button, so the heading drifted
-    // away from the column of values under it. Size is right-aligned to match its
-    // right-aligned values; the rest are left-aligned.
+    // halign Fill makes the label span its button so xalign has something to
+    // align within — without it the text sits centred and drifts off the column.
+    //
+    // hexpand must stay FALSE here. Setting it propagates up and makes every
+    // heading button expand, so Size/Type/Modified each stole a share of the
+    // slack that belongs to Name alone, and the whole header packed ~130px left
+    // of the values beneath it. Only the Name button opts into hexpand, and it
+    // does so in details_header().
     let label = gtk::Label::builder()
         .label(text)
         .xalign(if name == "sort-size" { 1.0 } else { 0.0 })
         .yalign(0.5)
-        .hexpand(true)
+        .hexpand(false)
         .halign(gtk::Align::Fill)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
@@ -3576,6 +3580,7 @@ fn breadcrumb_label(path: &str) -> String {
 /// folder holds ten files or a hundred thousand.
 fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.clone();
+    let ui_for_unbind = ui.clone();
     let ui = ui.clone();
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
@@ -3667,10 +3672,30 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
         item.set_child(Some(&line));
     });
-    factory.connect_unbind(|_, item| {
-        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
-            item.set_child(None::<&gtk::Widget>);
+    factory.connect_unbind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        // A SizeGroup holds a strong reference to every widget added to it. Rows
+        // are rebuilt on each bind and rebound constantly while scrolling, so
+        // without this the three column groups would grow without bound, pinning
+        // every row ever displayed in memory and dragging dead widgets into each
+        // width calculation.
+        if let Some(line) = item.child().and_then(|c| c.downcast::<gtk::Box>().ok()) {
+            let mut children = Vec::new();
+            let mut child = line.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                children.push(widget);
+            }
+            // Order matches the bind above: icon, name, size, kind, modified.
+            if children.len() >= 5 {
+                ui_for_unbind.columns.size.remove_widget(&children[2]);
+                ui_for_unbind.columns.kind.remove_widget(&children[3]);
+                ui_for_unbind.columns.modified.remove_widget(&children[4]);
+            }
         }
+        item.set_child(None::<&gtk::Widget>);
     });
 }
 
