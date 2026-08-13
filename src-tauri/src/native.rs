@@ -301,24 +301,33 @@ row:focus-visible {
     padding: 28px;
 }
 
-/* ONE hairline between panes, but still easy to grab.
-   Previously this was a 5px bar of near-black AND the sidebar/preview each drew
-   their own 1px border against it, so every pane edge showed a ~6px black band
-   with two lines in it. The transparent borders below widen the widget (and so
-   the drag target) to 7px while `background-clip: padding-box` keeps the paint
-   to the 1px line in the middle. */
+/* ONE hairline between panes, no gap, still easy to grab.
+   History, so nobody reintroduces either bug:
+   - It started as a 5px bar of near-black, AND the sidebar/preview each drew
+     their own border against it: a ~6px black band with two lines in it.
+   - Then transparent borders were used to widen the drag target. That failed:
+     transparent shows whatever is BEHIND, which is the paned's own background,
+     so a sliver of the file-list colour appeared past the line and bled over
+     the lighter preview panel. The theme's own separator image also won over
+     the background colour, painting the line light grey instead of near-black.
+   Negative margin + equal padding is the fix: the widget's LAYOUT footprint
+   stays 1px (so the panes sit flush against the line with nothing between
+   them) while its INPUT area is 7px wide. background-clip keeps the paint in
+   the 1px content box, and background-image: none stops the theme drawing its
+   own handle over the top. */
 paned > separator {
-    background: @wf_line;
-    background-clip: padding-box;
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
+    background-color: @wf_line;
+    background-image: none;
+    background-clip: content-box;
     min-width: 1px;
     min-height: 1px;
+    margin: 0 -3px;
+    padding: 0 3px;
 }
 
 paned > separator:hover {
-    background: @wf_accent_hover;
-    background-clip: padding-box;
+    background-color: @wf_accent_hover;
+    background-image: none;
 }
 
 .wf-list {
