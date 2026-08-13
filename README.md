@@ -1,6 +1,6 @@
 # Wayfinder
 
-> Current native app (2026-07-29): Wayfinder runs as a Rust + GTK 4/libadwaita desktop application. The Tauri/Svelte source remains in the repository as a legacy path; new Linux file-manager work belongs in the native code under `src-tauri/src/native.rs` and `native_core.rs`.
+> Current native app (2026-08-13): Wayfinder is a Rust + GTK 4/libadwaita desktop application, and nothing else. The Tauri/Svelte/WebKit shell was **removed** on 2026-08-13 — there is no JavaScript toolchain, no `package.json`, and no library target. All work belongs in `src-tauri/src/native.rs` and `native_core.rs`. What the old shell did is recorded in `OLD-VERSION-CARRYOVER.md`.
 
 **A fast, native file manager for Linux** — built for GTK 4/libadwaita, Wayland, and X11 without Electron or a webview in the primary app.
 
@@ -309,18 +309,20 @@ sudo dnf install gtk4-devel libadwaita-devel gdk-pixbuf2-devel
 git clone https://github.com/LegendofZito/wayfinder.git
 cd wayfinder
 
-# Native test suite
-cargo test --manifest-path src-tauri/Cargo.toml --features native --bin wayfinder-native
+# Test suite
+cargo test --manifest-path src-tauri/Cargo.toml
 
-# Optimized native binary
-cargo build --release --manifest-path src-tauri/Cargo.toml --features native --bin wayfinder-native
+# Optimized binary
+cargo build --release --manifest-path src-tauri/Cargo.toml
 # → src-tauri/target/release/wayfinder-native
 
 # Optional user-local install
 install -Dm755 src-tauri/target/release/wayfinder-native ~/.local/bin/wayfinder
 ```
 
-The Tauri/Svelte code is retained for legacy compatibility. It is not the primary Linux file-manager surface; do not use it for new native behavior.
+The `--features native` flag is gone: GTK is no longer optional, because there
+is no other shell to build. The old `npm run native:build` script is gone too —
+use the `cargo` commands above.
 
 
 ---

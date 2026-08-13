@@ -6,28 +6,20 @@ authors = ["LegendofZito"]
 license = "LicenseRef-Proprietary"
 edition = "2021"
 
-[lib]
-# The `_lib` suffix avoids a name clash with the bin target on Windows.
-name = "wayfinder_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+# The Tauri/WebKit shell was removed on 2026-08-13. This crate is now a single
+# GTK4/libadwaita binary; there is no library target, no build script and no
+# JavaScript toolchain. See OLD-VERSION-CARRYOVER.md for what the old shell did.
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-adw = { version = "0.9.1", package = "libadwaita", optional = true, features = ["gio_v2_80", "gtk_v4_22", "v1_9"] }
-gdk-pixbuf = { version = "0.22", optional = true }
-
-[features]
-default = []
-native = ["dep:adw", "dep:gdk-pixbuf"]
-adw = ["native"]
+adw = { version = "0.9.1", package = "libadwaita", features = [
+    "gio_v2_80",
+    "gtk_v4_22",
+    "v1_9",
+] }
+gdk-pixbuf = "0.22"
 
 [[bin]]
 name = "wayfinder-native"
 path = "src/native.rs"
-required-features = ["native"]
