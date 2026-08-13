@@ -4408,7 +4408,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
 fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.clone();
     let ui_for_action = ui.clone();
-    show_name_dialog(&ui, "New folder", "New Folder", move |name| {
+    show_name_dialog(&ui, "New folder", "New Folder", NameSelection::All, move |name| {
         let state = state.clone();
         let ui = ui_for_action.clone();
         let cwd = cwd.clone();
@@ -4431,7 +4431,7 @@ fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.clone();
     let ui_for_action = ui.clone();
-    show_name_dialog(&ui, "New file", "new.txt", move |name| {
+    show_name_dialog(&ui, "New file", "new.txt", NameSelection::StemOnly, move |name| {
         let state = state.clone();
         let ui = ui_for_action.clone();
         let cwd = cwd.clone();
@@ -4465,7 +4465,13 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let old_path = entry.path.clone();
     let default_name = old_name.clone();
     let ui_for_action = ui.clone();
-    show_name_dialog(&ui, "Rename", &default_name, move |name| {
+    show_name_dialog(
+        &ui,
+        "Rename",
+        &default_name,
+        // A folder has no extension to protect, so select all of it.
+        if entry.is_dir { NameSelection::All } else { NameSelection::StemOnly },
+        move |name| {
         if name == old_name {
             return;
         }
@@ -4939,8 +4945,23 @@ where
 }
 
 #[allow(deprecated)]
-fn show_name_dialog<F>(ui: &Ui, title: &str, default_name: &str, on_ok: F)
-where
+/// How much of the pre-filled name starts out selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameSelection {
+    /// Everything, for a brand-new name the user is expected to replace.
+    All,
+    /// Explorer parity: the base name only, leaving the extension untouched so
+    /// typing a new name cannot silently drop or mangle ".png".
+    StemOnly,
+}
+
+fn show_name_dialog<F>(
+    ui: &Ui,
+    title: &str,
+    default_name: &str,
+    selection: NameSelection,
+    on_ok: F,
+) where
     F: Fn(String) + 'static,
 {
     let dialog = gtk::Dialog::with_buttons(
@@ -4975,7 +4996,20 @@ where
     });
     dialog.present();
     entry.grab_focus();
-    entry.select_region(0, -1);
+    // select_region counts CHARACTERS, not bytes, so a name with any non-ASCII
+    // in it would select the wrong amount if this used byte offsets.
+    let end = match selection {
+        NameSelection::All => -1,
+        NameSelection::StemOnly => {
+            let (stem, ext) = split_stem_ext(default_name);
+            if ext.is_empty() {
+                -1
+            } else {
+                stem.chars().count() as i32
+            }
+        }
+    };
+    entry.select_region(0, end);
 }
 
 #[allow(deprecated)]
@@ -6064,6 +6098,32 @@ mod tests {
         sort_entries(&mut v, SortKey::Name, false);
         assert!(v[0].is_dir, "folder first even descending");
         assert!(!v[1].is_dir && !v[2].is_dir, "files after folders");
+    }
+
+    /// Mirrors the selection maths in `show_name_dialog`. -1 means "select all".
+    fn rename_selection_end(name: &str, is_dir: bool) -> i32 {
+        if is_dir {
+            return -1;
+        }
+        let (stem, ext) = split_stem_ext(name);
+        if ext.is_empty() {
+            -1
+        } else {
+            stem.chars().count() as i32
+        }
+    }
+
+    #[test]
+    fn rename_selects_the_name_but_not_the_extension() {
+        // The whole point: typing a new name must not eat ".png".
+        assert_eq!(rename_selection_end("digital-duck.png", false), 12);
+        assert_eq!(rename_selection_end("archive.tar.gz", false), 11, "only the last suffix is the extension");
+        // Nothing to protect -> select everything.
+        assert_eq!(rename_selection_end("Downloads", true), -1, "folders have no extension");
+        assert_eq!(rename_selection_end("README", false), -1, "no extension");
+        assert_eq!(rename_selection_end(".bashrc", false), -1, "a leading dot is not an extension");
+        // select_region counts characters, not bytes.
+        assert_eq!(rename_selection_end("café.txt", false), 4, "must be chars, not bytes");
     }
 
     #[test]
