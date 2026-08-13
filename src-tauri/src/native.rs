@@ -171,6 +171,7 @@ row:focus-visible {
     background: @wf_raised;
     border-bottom: 1px solid @wf_line;
     min-height: 32px;
+    padding: 0 6px;
 }
 
 .wf-address {
@@ -257,11 +258,28 @@ row:focus-visible {
     color: @wf_text_dim;
     border-bottom: 1px solid @wf_line;
     min-height: 26px;
+    padding: 0 10px;
 }
 
 .wf-column-header label {
     font-weight: 700;
     font-size: 12px;
+}
+
+/* Buttons carry default padding, which pushed each heading off the column of
+   values beneath it. The heading must start exactly where its values start. */
+.wf-column-header button {
+    padding: 0;
+    margin: 0;
+    min-height: 0;
+    min-width: 0;
+    background: none;
+    border: 0;
+    box-shadow: none;
+}
+
+.wf-column-header button:hover {
+    background: @wf_control;
 }
 
 /* The handle needs a 10px grab target but must READ as a hairline divider.
@@ -438,6 +456,7 @@ paned > separator:hover {
     color: @wf_text_dim;
     border-top: 1px solid @wf_line;
     font-size: 12px;
+    padding: 6px 10px;
 }
 
 popover box {
@@ -1205,13 +1224,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     preview_stack.add_named(&preview_picture, Some("image"));
     preview_stack.add_named(&preview_media_box, Some("media"));
     preview_stack.set_visible_child_name("text");
-    let status = gtk::Label::builder()
-        .xalign(0.0)
-        .margin_top(6)
-        .margin_end(10)
-        .margin_bottom(6)
-        .margin_start(10)
-        .build();
+    // Spacing lives in CSS padding so the status bar's background runs the full
+    // width of the window. With margins it stopped short on both sides.
+    let status = gtk::Label::builder().xalign(0.0).build();
     status.add_css_class("wf-status");
 
     let back = icon_button("go-previous-symbolic", "Back");
@@ -1267,10 +1282,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     let path_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     path_bar.add_css_class("wf-pathbar");
-    path_bar.set_margin_top(0);
-    path_bar.set_margin_end(6);
-    path_bar.set_margin_bottom(0);
-    path_bar.set_margin_start(6);
+    // Padding, not margins — see wf-status. Margins left its background floating
+    // 6px short of each edge.
     path_bar.append(&back);
     path_bar.append(&forward);
     path_bar.append(&up);
@@ -2066,8 +2079,9 @@ fn column_resizer(target: &gtk::Button) -> gtk::DrawingArea {
 fn details_header() -> (gtk::Box, ColumnSizing) {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header.add_css_class("wf-column-header");
-    header.set_margin_start(10);
-    header.set_margin_end(10);
+    // Inset via CSS padding, NOT margins. Margins shrink the widget itself, so
+    // the header's background stopped 10px short of each edge and the bar looked
+    // like it was floating above a full-width file list.
 
     // Leading spacer so the "Name" heading lines up with the row names, which
     // begin after the icon slot + gap.
@@ -2103,10 +2117,16 @@ fn details_header() -> (gtk::Box, ColumnSizing) {
 }
 
 fn column_button(text: &str, name: &str, width_chars: i32) -> gtk::Button {
+    // hexpand + Fill are what make xalign mean anything: without them the label
+    // shrinks to its text and sits centred in the button, so the heading drifted
+    // away from the column of values under it. Size is right-aligned to match its
+    // right-aligned values; the rest are left-aligned.
     let label = gtk::Label::builder()
         .label(text)
         .xalign(if name == "sort-size" { 1.0 } else { 0.0 })
         .yalign(0.5)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     if width_chars > 0 {
