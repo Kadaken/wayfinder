@@ -1172,6 +1172,11 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     list_placeholder.add_css_class("wf-empty-placeholder");
     list.set_size_request(-1, 0);
     list.add_css_class("wf-list");
+    // Drag a box across the list to select a run of files, like Explorer.
+    // GtkListView inherits `enable-rubberband` from GtkListBase, but gtk4-rs
+    // generates no typed setter for it, so set the property directly. It needs a
+    // multi-selection model, which this list has.
+    list.set_property("enable-rubberband", true);
     let grid = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::Multiple)
         .activate_on_single_click(false)
