@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Wayfinder
 Comment=Fast, native Linux file manager with a docked preview pane
-Exec=wayfinder
+Exec=wayfinder %U
 Icon=com.kadaken.wayfinder
 Terminal=false
 Type=Application

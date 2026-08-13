@@ -88,7 +88,10 @@ fn serve_media_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
         if trimmed.is_empty() {
             break;
         }
-        if let Some(v) = trimmed.strip_prefix("Range:").or_else(|| trimmed.strip_prefix("range:")) {
+        if let Some(v) = trimmed
+            .strip_prefix("Range:")
+            .or_else(|| trimmed.strip_prefix("range:"))
+        {
             range_header = Some(v.trim().to_string());
         }
     }
@@ -136,7 +139,13 @@ fn serve_media_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             let start = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let end = it
                 .next()
-                .and_then(|s| if s.is_empty() { None } else { s.parse::<u64>().ok() })
+                .and_then(|s| {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        s.parse::<u64>().ok()
+                    }
+                })
                 .unwrap_or(total.saturating_sub(1));
             (start, end.min(total.saturating_sub(1)))
         });
@@ -272,16 +281,15 @@ fn icon_name(p: &Path, is_dir: bool) -> &'static str {
         .unwrap_or("")
         .to_lowercase();
     match ext.as_str() {
-        "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" | "aiff" | "aif"
-        | "alac" => "audio-x-generic",
+        "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" | "aiff"
+        | "aif" | "alac" => "audio-x-generic",
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "wmv" | "m4v" | "mpg" | "mpeg" | "3gp" | "flv"
         | "ts" => "video-x-generic",
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "svg" | "ico" | "avif"
-        | "heic" => "image-x-generic",
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "svg" | "ico"
+        | "avif" | "heic" => "image-x-generic",
         "pdf" => "application-pdf",
-        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "lz" | "lzma" | "cab" => {
-            "application-x-archive"
-        }
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "lz" | "lzma"
+        | "cab" => "application-x-archive",
         "iso" | "img" | "dmg" => "application-x-cd-image",
         "txt" | "log" | "md" | "rst" | "nfo" | "text" => "text-x-generic",
         "doc" | "docx" | "odt" | "rtf" => "x-office-document",
@@ -293,8 +301,7 @@ fn icon_name(p: &Path, is_dir: bool) -> &'static str {
         "xml" => "text-xml",
         "sh" | "bash" | "zsh" | "fish" => "text-x-script",
         "py" => "text-x-python",
-        "js" | "mjs" | "cjs" | "jsx" => "application-javascript",
-        "ts" | "tsx" => "application-javascript",
+        "js" | "mjs" | "cjs" | "jsx" | "tsx" => "application-javascript",
         "rs" => "text-rust",
         "c" | "h" => "text-x-csrc",
         "cpp" | "cc" | "cxx" | "hpp" => "text-x-c++src",
@@ -377,7 +384,9 @@ fn file_contains(p: &Path, q_lower: &str) -> bool {
     if buf.contains(&0) {
         return false; // looks binary
     }
-    String::from_utf8_lossy(&buf).to_lowercase().contains(q_lower)
+    String::from_utf8_lossy(&buf)
+        .to_lowercase()
+        .contains(q_lower)
 }
 
 // Recursively search under `root` for entries whose name (and optionally text
@@ -456,7 +465,14 @@ fn search_dir(
 fn standard_dirs() -> Vec<(String, String)> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let mut v = vec![("Home".to_string(), home.clone())];
-    for d in ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"] {
+    for d in [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Music",
+        "Videos",
+    ] {
         let p = format!("{}/{}", home, d);
         if Path::new(&p).is_dir() {
             v.push((d.to_string(), p));
@@ -495,8 +511,16 @@ fn b64(bytes: &[u8]) -> String {
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         s.push(T[(n >> 18 & 63) as usize] as char);
         s.push(T[(n >> 12 & 63) as usize] as char);
-        s.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        s.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        s.push(if c.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        s.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     s
 }
@@ -574,12 +598,12 @@ fn read_text_preview(path: String) -> Result<String, String> {
 #[derive(Serialize)]
 struct Drive {
     name: String,
-    path: String,        // device path or mountpoint for fuse
-    mountpoint: String,  // "" if not mounted
+    path: String,       // device path or mountpoint for fuse
+    mountpoint: String, // "" if not mounted
     size: u64,
     fstype: String,
-    kind: String,        // "drive" | "gdrive" | "network"
-    removable: bool,     // true for USB / hot-pluggable devices (eligible for Eject)
+    kind: String,    // "drive" | "gdrive" | "network"
+    removable: bool, // true for USB / hot-pluggable devices (eligible for Eject)
 }
 
 #[tauri::command]
@@ -588,7 +612,12 @@ fn list_drives() -> Vec<Drive> {
 
     // Block devices via lsblk JSON
     if let Ok(o) = std::process::Command::new("lsblk")
-        .args(["-J", "-b", "-o", "NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,PATH,TYPE,RM"])
+        .args([
+            "-J",
+            "-b",
+            "-o",
+            "NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,PATH,TYPE,RM",
+        ])
         .output()
     {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
@@ -606,10 +635,12 @@ fn list_drives() -> Vec<Drive> {
                 if (typ == "part" || typ == "disk" || typ == "crypt") && !boring && mp != "/" {
                     let label = dev["label"].as_str().filter(|s| !s.is_empty());
                     let name = dev["name"].as_str().unwrap_or("?");
-                    let removable = dev["rm"].as_bool().unwrap_or(false)
-                        || dev["rm"].as_str() == Some("1");
+                    let removable =
+                        dev["rm"].as_bool().unwrap_or(false) || dev["rm"].as_str() == Some("1");
                     out.push(Drive {
-                        name: label.map(|s| s.to_string()).unwrap_or_else(|| name.to_string()),
+                        name: label
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| name.to_string()),
                         path: dev["path"].as_str().unwrap_or("").to_string(),
                         mountpoint: mp.to_string(),
                         size: dev["size"].as_u64().unwrap_or(0),
@@ -678,7 +709,12 @@ fn mount_drive(device: String) -> Result<String, String> {
     if o.status.success() {
         // output: "Mounted /dev/sdb1 at /run/media/USER/LABEL"
         let s = String::from_utf8_lossy(&o.stdout);
-        Ok(s.rsplit(" at ").next().unwrap_or("").trim().trim_end_matches('.').to_string())
+        Ok(s.rsplit(" at ")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.')
+            .to_string())
     } else {
         Err(String::from_utf8_lossy(&o.stderr).to_string())
     }
@@ -1053,7 +1089,10 @@ fn properties(path: String) -> Result<Props, String> {
             .unwrap_or_else(|| "File".to_string())
     };
     Ok(Props {
-        name: p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.clone()),
+        name: p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone()),
         path: path.clone(),
         kind,
         size: md.len(),
@@ -1095,9 +1134,7 @@ fn start_path() -> Option<String> {
             return Some(dir);
         }
     }
-    let arg = std::env::args()
-        .nth(1)
-        .filter(|a| !a.starts_with('-'))?;
+    let arg = std::env::args().nth(1).filter(|a| !a.starts_with('-'))?;
     let p = Path::new(&arg);
     if p.is_dir() {
         Some(arg)
@@ -1112,9 +1149,7 @@ fn start_path() -> Option<String> {
 // Returns the file to select after navigating (when launched with a file path arg)
 #[tauri::command]
 fn start_select() -> Option<String> {
-    let arg = std::env::args()
-        .nth(1)
-        .filter(|a| !a.starts_with('-'))?;
+    let arg = std::env::args().nth(1).filter(|a| !a.starts_with('-'))?;
     let p = Path::new(&arg);
     if p.is_file() {
         Some(arg)
@@ -1247,17 +1282,50 @@ fn compress_zip(paths: Vec<String>, dest_dir: String) -> Result<String, String> 
 #[tauri::command]
 fn extract_archive(path: String, dest_dir: String) -> Result<(), String> {
     let l = path.to_lowercase();
-    if l.ends_with(".zip") {
-        run_cmd("unzip", &["-o", &path, "-d", &dest_dir])
-    } else if l.ends_with(".tar.gz")
+    let is_archive = l.ends_with(".zip")
+        || l.ends_with(".tar")
+        || l.ends_with(".tar.gz")
         || l.ends_with(".tgz")
         || l.ends_with(".tar.bz2")
         || l.ends_with(".tar.xz")
-        || l.ends_with(".tar")
+        || l.ends_with(".txz")
+        || l.ends_with(".tar.zst")
+        || l.ends_with(".tzst")
+        || l.ends_with(".7z")
+        || l.ends_with(".rar")
+        || l.ends_with(".cbr")
+        || l.ends_with(".cbz")
+        || l.ends_with(".gz")
+        || l.ends_with(".bz2")
+        || l.ends_with(".xz")
+        || l.ends_with(".zst")
+        || l.ends_with(".lz")
+        || l.ends_with(".lzma")
+        || l.ends_with(".cab")
+        || l.ends_with(".iso")
+        || l.ends_with(".arj")
+        || l.ends_with(".lzh");
+    if l.ends_with(".tar")
+        || l.ends_with(".tar.gz")
+        || l.ends_with(".tgz")
+        || l.ends_with(".tar.bz2")
+        || l.ends_with(".tar.xz")
+        || l.ends_with(".txz")
+        || l.ends_with(".tar.zst")
+        || l.ends_with(".tzst")
     {
         run_cmd("tar", &["-xf", &path, "-C", &dest_dir])
-    } else if l.ends_with(".7z") {
-        run_cmd("7z", &["x", &format!("-o{}", dest_dir), &path])
+    } else if l.ends_with(".zip") {
+        run_cmd("unzip", &["-o", &path, "-d", &dest_dir])
+            .or_else(|_| run_cmd("7z", &["x", "-y", &format!("-o{}", dest_dir), &path]))
+    } else if is_archive {
+        run_cmd("7z", &["x", "-y", &format!("-o{}", dest_dir), &path]).or_else(|first| {
+            run_cmd(
+                "unar",
+                &["-force-overwrite", "-output-directory", &dest_dir, &path],
+            )
+            .map_err(|second| format!("{first}; {second}"))
+        })
     } else {
         Err("unsupported archive type".into())
     }
