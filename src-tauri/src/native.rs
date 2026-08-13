@@ -889,7 +889,9 @@ struct Ui {
     path_entry: gtk::Entry,
     search: gtk::SearchEntry,
     sidebar: gtk::ListBox,
-    list: gtk::ListBox,
+    list: gtk::ListView,
+    list_store: gio::ListStore,
+    list_selection: gtk::MultiSelection,
     list_placeholder: gtk::Label,
     list_scroll: gtk::ScrolledWindow,
     grid: gtk::FlowBox,
@@ -1118,20 +1120,30 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         .active(state.borrow().search_in_files)
         .build();
     search_in_files.add_css_class("wf-search-scope");
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::Multiple)
-        .activate_on_single_click(false)
+    // VIRTUALIZED. gtk::ListBox realizes a widget for every row, so a folder of
+    // 21,436 files built 21,436 rows and GTK then re-measured all of them on
+    // every layout pass — 27 seconds of frozen window. gtk::ListView only
+    // realizes the rows actually on screen (~30) and recycles them as you
+    // scroll, which is what Explorer does. Row count no longer affects cost.
+    let list_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let list_selection = gtk::MultiSelection::new(Some(list_store.clone()));
+    let list_factory = gtk::SignalListItemFactory::new();
+    let list = gtk::ListView::builder()
+        .model(&list_selection)
+        .factory(&list_factory)
+        .single_click_activate(false)
         .vexpand(true)
         .build();
     // An empty folder used to render as a blank void, which is indistinguishable
     // from a folder that failed to load. Say which it is, like Explorer does.
+    // ListView has no placeholder slot, so it is an overlay toggled by row count.
     let list_placeholder = gtk::Label::builder()
         .label("This folder is empty")
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
+        .visible(false)
         .build();
     list_placeholder.add_css_class("wf-empty-placeholder");
-    list.set_placeholder(Some(&list_placeholder));
     list.set_size_request(-1, 0);
     list.add_css_class("wf-list");
     let grid = gtk::FlowBox::builder()
@@ -1316,9 +1328,14 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         .propagate_natural_height(false)
         .build();
     grid_scroll.set_size_request(-1, 0);
+    // The empty-folder message rides above the list rather than inside it,
+    // because ListView has no placeholder slot of its own.
+    let list_overlay = gtk::Overlay::new();
+    list_overlay.set_child(Some(&files_scroll));
+    list_overlay.add_overlay(&list_placeholder);
     let files_stack = gtk::Stack::new();
     files_stack.add_css_class("wf-files-stack");
-    files_stack.add_named(&files_scroll, Some("list"));
+    files_stack.add_named(&list_overlay, Some("list"));
     files_stack.add_named(&grid_scroll, Some("grid"));
     files_stack.set_visible_child_name("list");
     let (column_header, columns) = details_header();
@@ -1483,6 +1500,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         search,
         sidebar: sidebar.clone(),
         list,
+        list_store,
+        list_selection,
         list_placeholder,
         list_scroll: files_scroll.clone(),
         grid,
@@ -1537,6 +1556,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         ui.clone(),
         ZoomTarget::Preview,
     );
+    connect_list_factory(&list_factory, &state, &ui);
     connect_background_context(&ui.list, state.clone(), ui.clone());
     connect_actions(
         &state,
@@ -1630,15 +1650,20 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     {
         let state = state.clone();
         let ui = ui.clone();
-        let list = ui.list.clone();
-        list.connect_selected_rows_changed(move |_| update_selection(&state, &ui));
+        let selection = ui.list_selection.clone();
+        selection.connect_selection_changed(move |_, _, _| update_selection(&state, &ui));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
         let list = ui.list.clone();
-        list.connect_row_activated(move |_, row| {
-            if let Some(entry) = entry_for_row(&state, row) {
+        list.connect_activate(move |_, position| {
+            let entry = state
+                .borrow()
+                .visible_entries
+                .get(position as usize)
+                .cloned();
+            if let Some(entry) = entry {
                 open_entry(&state, &ui, entry);
             }
         });
@@ -2850,7 +2875,7 @@ fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
             ui.files_stack.set_visible_child_name("list");
         }
         ViewMode::Grid => {
-            ui.list.unselect_all();
+            ui.list_selection.unselect_all();
             ui.list.remove_css_class("wf-list-compact");
             ui.column_header.set_visible(false);
             ui.files_stack.set_visible_child_name("grid");
@@ -3106,7 +3131,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             if state_for_keys.borrow().view_mode == ViewMode::Grid {
                 ui_for_keys.grid.select_all();
             } else {
-                ui_for_keys.list.select_all();
+                ui_for_keys.list_selection.select_all();
             }
             return glib::Propagation::Stop;
         }
@@ -3389,9 +3414,7 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
 }
 
 fn clear_file_views(ui: &Ui) {
-    while let Some(child) = ui.list.first_child() {
-        ui.list.remove(&child);
-    }
+    ui.list_store.remove_all();
     while let Some(child) = ui.grid.first_child() {
         ui.grid.remove(&child);
     }
@@ -3516,12 +3539,124 @@ fn breadcrumb_label(path: &str) -> String {
     parts.join(" › ")
 }
 
+/// Builds and recycles the Details/Compact rows. `bind` runs only for rows that
+/// are actually on screen, so this is called ~30 times regardless of whether the
+/// folder holds ten files or a hundred thousand.
+fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let state = state.clone();
+    let ui = ui.clone();
+    factory.connect_bind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(boxed) = item.item().and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
+        else {
+            return;
+        };
+        let entry: Entry = boxed.borrow::<Entry>().clone();
+        let icon_zoom = state.borrow().icon_zoom;
+
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        line.add_css_class("wf-file-row");
+        line.set_margin_top(2);
+        line.set_margin_end(10);
+        line.set_margin_bottom(2);
+        line.set_margin_start(10);
+        line.set_tooltip_text(Some(&entry.metadata_error.as_ref().map_or_else(
+            || entry.path.clone(),
+            |error| format!("{}\nMetadata unavailable: {error}", entry.path),
+        )));
+
+        let icon = file_icon(&entry, icon_zoom);
+        // Show full file names: short names stay on one line (compact); long names
+        // wrap to a second line rather than being truncated. Only names too long
+        // for two lines fall back to an ellipsis.
+        let name = gtk::Label::builder()
+            .label(&entry.name)
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        name.add_css_class("wf-file-name");
+        let size_text = if entry.metadata_error.is_some() {
+            "—".to_string()
+        } else if entry.is_dir {
+            String::new()
+        } else {
+            native_core::fmt_size(entry.size)
+        };
+        // max_width_chars is deliberately small on all three: it only sets the
+        // shrink floor. The real width comes from the header's size_request via
+        // the shared SizeGroups, so dragging a column resizes every row with it.
+        let size = gtk::Label::builder()
+            .label(&size_text)
+            .xalign(1.0)
+            .max_width_chars(4)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        size.add_css_class("wf-file-meta");
+        ui.columns.size.add_widget(&size);
+        let kind = gtk::Label::builder()
+            .label(&native_core::kind_label(&entry))
+            .xalign(0.0)
+            .max_width_chars(4)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        kind.add_css_class("wf-file-meta");
+        ui.columns.kind.add_widget(&kind);
+        let modified_text = entry
+            .metadata_error
+            .as_ref()
+            .map(|_| "unavailable".to_string())
+            .unwrap_or_else(|| native_core::fmt_modified(entry.modified));
+        let modified = gtk::Label::builder()
+            .label(&modified_text)
+            .xalign(0.0)
+            .max_width_chars(4)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        modified.add_css_class("wf-file-meta");
+        ui.columns.modified.add_widget(&modified);
+
+        line.append(&icon);
+        line.append(&name);
+        line.append(&size);
+        line.append(&kind);
+        line.append(&modified);
+
+        connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone());
+        if entry.is_dir {
+            connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.path.clone());
+        }
+        connect_row_context(&line, item.position(), state.clone(), ui.clone(), entry.clone());
+
+        item.set_child(Some(&line));
+    });
+    factory.connect_unbind(|_, item| {
+        if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+            item.set_child(None::<&gtk::Widget>);
+        }
+    });
+}
+
+/// Indices of the selected rows, in order.
+fn selected_indices(ui: &Ui) -> Vec<usize> {
+    let bitset = ui.list_selection.selection();
+    let mut out = Vec::new();
+    let size = bitset.size();
+    for i in 0..size {
+        out.push(bitset.nth(i as u32) as usize);
+    }
+    out
+}
+
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     CURRENT_UI.with(|current| *current.borrow_mut() = Some(ui.clone()));
 
-    while let Some(child) = ui.list.first_child() {
-        ui.list.remove(&child);
-    }
+    ui.list_store.remove_all();
     while let Some(child) = ui.grid.first_child() {
         ui.grid.remove(&child);
     }
@@ -3584,94 +3719,34 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         "This folder is empty"
     });
 
+    // The list is virtualized: hand the model the whole set and let ListView
+    // realize only what is on screen. This is O(1) in row count — the 21,436-row
+    // folder costs the same here as a 10-row one.
+    ui.list_placeholder.set_visible(visible_entries.is_empty());
+    if view_mode != ViewMode::Grid {
+        ui.list_store.remove_all();
+        let items: Vec<glib::BoxedAnyObject> = visible_entries
+            .iter()
+            .cloned()
+            .map(glib::BoxedAnyObject::new)
+            .collect();
+        ui.list_store.splice(0, 0, &items);
+    } else {
+        ui.list_store.remove_all();
+    }
+
+    // Only Grid still builds a widget per item; Details/Compact are served by the
+    // virtualized ListView above and must not walk the whole listing here.
+    // NOTE: Grid remains un-virtualized, so a huge folder is still slow in Icons view.
+    if view_mode != ViewMode::Grid {
+        return;
+    }
+
     for (index, entry) in visible_entries.into_iter().enumerate() {
         let tooltip = entry.metadata_error.as_ref().map_or_else(
             || entry.path.clone(),
             |error| format!("{}\nMetadata unavailable: {error}", entry.path),
         );
-        if view_mode != ViewMode::Grid {
-            let row = gtk::ListBoxRow::builder()
-                .activatable(true)
-                .selectable(true)
-                .build();
-            row.set_tooltip_text(Some(&tooltip));
-
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            line.add_css_class("wf-file-row");
-            line.set_margin_top(2);
-            line.set_margin_end(10);
-            line.set_margin_bottom(2);
-            line.set_margin_start(10);
-
-            let icon = file_icon(&entry, icon_zoom);
-            // Show full file names: short names stay on one line (compact); long names
-            // wrap to a second line rather than being truncated. Only names too long
-            // for two lines fall back to an ellipsis.
-            let name = gtk::Label::builder()
-                .label(&entry.name)
-                .xalign(0.0)
-                .hexpand(true)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .lines(2)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
-            name.add_css_class("wf-file-name");
-            let size_text = if entry.metadata_error.is_some() {
-                "—".to_string()
-            } else if entry.is_dir {
-                String::new()
-            } else {
-                native_core::fmt_size(entry.size)
-            };
-            // max_width_chars is deliberately small on all three: it only sets the
-            // shrink floor. The real width comes from the header's size_request via
-            // the shared SizeGroups, so dragging a column resizes every row with it.
-            let size = gtk::Label::builder()
-                .label(&size_text)
-                .xalign(1.0)
-                .max_width_chars(4)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
-            size.add_css_class("wf-file-meta");
-            ui.columns.size.add_widget(&size);
-            let kind = gtk::Label::builder()
-                .label(&native_core::kind_label(&entry))
-                .xalign(0.0)
-                .max_width_chars(4)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
-            kind.add_css_class("wf-file-meta");
-            ui.columns.kind.add_widget(&kind);
-            let modified_text = entry
-                .metadata_error
-                .as_ref()
-                .map(|_| "unavailable".to_string())
-                .unwrap_or_else(|| native_core::fmt_modified(entry.modified));
-            let modified = gtk::Label::builder()
-                .label(&modified_text)
-                .xalign(0.0)
-                .max_width_chars(4)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
-            modified.add_css_class("wf-file-meta");
-            ui.columns.modified.add_widget(&modified);
-
-            line.append(&icon);
-            line.append(&name);
-            line.append(&size);
-            line.append(&kind);
-            line.append(&modified);
-            row.set_child(Some(&line));
-
-            connect_file_drag(&row, state.clone(), ui.clone(), entry.path.clone());
-            if entry.is_dir {
-                connect_file_drop_to_dir(&row, state.clone(), ui.clone(), entry.path.clone());
-            }
-            connect_row_context(&row, state.clone(), ui.clone(), entry.clone());
-
-            ui.list.append(&row);
-        }
 
         if view_mode == ViewMode::Grid {
             let grid_child = gtk::FlowBoxChild::builder().tooltip_text(&tooltip).build();
@@ -4008,16 +4083,9 @@ fn selected_entries(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<Entry> {
                     .and_then(|idx| state.visible_entries.get(idx).cloned())
             })
             .collect(),
-        ViewMode::Details | ViewMode::Compact => ui
-            .list
-            .selected_rows()
+        ViewMode::Details | ViewMode::Compact => selected_indices(ui)
             .into_iter()
-            .filter_map(|row| {
-                let idx = row.index();
-                (idx >= 0)
-                    .then_some(idx as usize)
-                    .and_then(|idx| state.visible_entries.get(idx).cloned())
-            })
+            .filter_map(|idx| state.visible_entries.get(idx).cloned())
             .collect(),
     }
 }
@@ -4052,13 +4120,6 @@ fn picker_selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> 
     paths
 }
 
-fn entry_for_row(state: &Rc<RefCell<AppState>>, row: &gtk::ListBoxRow) -> Option<Entry> {
-    let idx = row.index();
-    if idx < 0 {
-        return None;
-    }
-    state.borrow().visible_entries.get(idx as usize).cloned()
-}
 
 fn entry_for_grid_child(state: &Rc<RefCell<AppState>>, child: &gtk::FlowBoxChild) -> Option<Entry> {
     let idx = child.index();
@@ -4205,11 +4266,9 @@ fn move_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, delta: isize) {
             .first()
             .map(|child| child.index())
             .unwrap_or(-1),
-        ViewMode::Details | ViewMode::Compact => ui
-            .list
-            .selected_rows()
+        ViewMode::Details | ViewMode::Compact => selected_indices(ui)
             .first()
-            .map(|row| row.index())
+            .map(|idx| *idx as i32)
             .unwrap_or(-1),
     };
     let next = if current < 0 {
@@ -4251,11 +4310,11 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
             }
         }
         ViewMode::Details | ViewMode::Compact => {
-            ui.list.unselect_all();
-            if let Some(row) = ui.list.row_at_index(index as i32) {
-                ui.list.select_row(Some(&row));
-                row.grab_focus();
-            }
+            // select_item(.., true) clears the rest, and scroll_to brings the row
+            // into view — with virtualization the row may not be realized yet.
+            ui.list_selection.select_item(index as u32, true);
+            ui.list
+                .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
         }
     }
     update_selection(state, ui);
@@ -5105,14 +5164,22 @@ fn first_hash_run(value: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn connect_row_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui: Ui, entry: Entry) {
+fn connect_row_context(
+    row: &gtk::Box,
+    position: u32,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    entry: Entry,
+) {
     let click = gtk::GestureClick::new();
     click.set_button(3);
     let row_for_click = row.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        if !row_for_click.is_selected() {
-            ui.list.unselect_all();
-            ui.list.select_row(Some(&row_for_click));
+    click.connect_pressed(move |gesture, _, x, y| {
+        // Claim the gesture so the ListView's background handler does not also
+        // fire and clear the selection out from under the menu.
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        if !ui.list_selection.is_selected(position) {
+            ui.list_selection.select_item(position, true);
             update_selection(&state, &ui);
         }
         show_item_context_menu(
@@ -5127,15 +5194,15 @@ fn connect_row_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui: 
     row.add_controller(click);
 }
 
-fn connect_background_context(list: &gtk::ListBox, state: Rc<RefCell<AppState>>, ui: Ui) {
+fn connect_background_context(list: &gtk::ListView, state: Rc<RefCell<AppState>>, ui: Ui) {
     let click = gtk::GestureClick::new();
     click.set_button(3);
     let list_for_click = list.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        if list_for_click.row_at_y(y as i32).is_some() {
-            return;
-        }
-        ui.list.unselect_all();
+    click.connect_pressed(move |gesture, _, x, y| {
+        // A row's own right-click handler claims the gesture first, so reaching
+        // here means the click landed on empty space below the rows.
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        ui.list_selection.unselect_all();
         update_selection(&state, &ui);
         show_background_context_menu(&list_for_click, state.clone(), ui.clone(), x, y);
     });
@@ -5220,7 +5287,7 @@ fn show_drive_context_menu(
 }
 
 fn show_item_context_menu(
-    row: &gtk::ListBoxRow,
+    row: &impl IsA<gtk::Widget>,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
     entry: Entry,
@@ -5372,7 +5439,7 @@ fn show_item_context_menu(
 }
 
 fn show_background_context_menu(
-    list: &gtk::ListBox,
+    list: &impl IsA<gtk::Widget>,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
     x: f64,
