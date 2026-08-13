@@ -207,7 +207,6 @@ row:focus-visible {
 
 .wf-sidebar {
     background: @wf_raised;
-    border-right: 1px solid @wf_line;
     padding: 7px 7px;
 }
 
@@ -302,15 +301,24 @@ row:focus-visible {
     padding: 28px;
 }
 
-/* The pane divider needs real grab area, not a hairline. */
+/* ONE hairline between panes, but still easy to grab.
+   Previously this was a 5px bar of near-black AND the sidebar/preview each drew
+   their own 1px border against it, so every pane edge showed a ~6px black band
+   with two lines in it. The transparent borders below widen the widget (and so
+   the drag target) to 7px while `background-clip: padding-box` keeps the paint
+   to the 1px line in the middle. */
 paned > separator {
     background: @wf_line;
-    min-width: 5px;
-    min-height: 5px;
+    background-clip: padding-box;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    min-width: 1px;
+    min-height: 1px;
 }
 
 paned > separator:hover {
     background: @wf_accent_hover;
+    background-clip: padding-box;
 }
 
 .wf-list {
@@ -400,7 +408,6 @@ paned > separator:hover {
 
 .wf-preview {
     background: @wf_raised;
-    border-left: 1px solid @wf_line;
 }
 
 .wf-picker-actions {
