@@ -1,8 +1,10 @@
 # Wayfinder
 
-**A fast, native file manager for Linux** — built with Tauri 2, Svelte 5, and Rust.
+> Current native app (2026-07-29): Wayfinder runs as a Rust + GTK 4/libadwaita desktop application. The Tauri/Svelte source remains in the repository as a legacy path; new Linux file-manager work belongs in the native code under `src-tauri/src/native.rs` and `native_core.rs`.
 
-Wayfinder replaces Dolphin, Nemo, and Nautilus with a single clean app: dark-themed, keyboard-driven, with a docked preview pane, Windows-style timestamps, image thumbnails, USB hotplug, tabs, and full file operations — all in a 13 MB binary with no Electron overhead.
+**A fast, native file manager for Linux** — built for GTK 4/libadwaita, Wayland, and X11 without Electron or a webview in the primary app.
+
+Wayfinder is a dark, keyboard-driven file manager with a docked preview pane, Windows-style timestamps, image thumbnails, USB hotplug, tabs, and full file operations.
 
 ---
 
@@ -12,9 +14,9 @@ Wayfinder replaces Dolphin, Nemo, and Nautilus with a single clean app: dark-the
 
 ---
 
-## Download
+## Install
 
-Grab the latest binary from the [**Releases**](https://github.com/LegendofZito/wayfinder/releases) page — no install required.
+Grab a packaged build from the [**Releases**](https://github.com/LegendofZito/wayfinder/releases) page when one is available, then make it executable:
 
 ```bash
 chmod +x wayfinder-linux-x86_64
@@ -27,6 +29,8 @@ Or install the RPM on Fedora/RHEL:
 sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 ```
 
+For a local native build, see [Build from Source](#build-from-source).
+
 ---
 
 ## Requirements
@@ -36,6 +40,7 @@ sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 - `gio` / `glib2` — for Trash support
 - `udisks2` — for mounting and ejecting drives
 - A freedesktop icon theme (`breeze-icons`, `papirus-icon-theme`, etc.)
+- GTK 4 and libadwaita runtime libraries — required by the native app
 
 ---
 
@@ -51,6 +56,7 @@ sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 | **Back / Forward** | Full browser-style history per tab. `Backspace` = back, `Alt+←/→` = back/forward |
 | **Up to parent** | `Alt+Up` or the ↑ toolbar button |
 | **Home button** | ⌂ in the toolbar — jumps to your Home folder |
+| **Desktop integration** | Opening a folder from the desktop shows that folder's contents in Wayfinder; opening a file shows and selects it in its parent folder |
 | **Address bar edit** | `Ctrl+L` or double-click the path bar — type any path, press Enter |
 | **Refresh** | `F5` or the ⟳ toolbar button |
 | **Type-ahead** | Start typing a filename — selection jumps to the first match |
@@ -76,12 +82,20 @@ sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 |---------|---------|
 | **Details view** | Table with Name, Size, Type, Modified — click column headers to sort |
 | **Icons / Grid view** | Large icon grid — zoom with `Ctrl+scroll` |
-| **Image thumbnails** | In grid view, actual image previews load automatically (up to 60 per folder). Toggle in ⚙ Options |
+| **Image thumbnails** | In grid view, the first 60 images load in the background (four at a time). A file-type icon remains visible until each thumbnail is ready. |
 | **Sort** | Click any column header to sort ascending; click again for descending |
-| **Folders first** | Directories always appear before files, regardless of sort |
+| **Files before folders** | The current native view keeps regular files above folders, regardless of sort direction. |
 | **Search / Filter** | Type in the search box to live-filter the current folder |
 | **Hidden files** | Toggle with the checkbox at the bottom of the sidebar |
-| **Icon zoom** | `Ctrl+scroll` in the file area to scale icons from 50% to 400% |
+| **Icon zoom** | `Ctrl+scroll` in the file area to scale icons from 60% to 240% |
+
+### Performance and reliability
+
+Wayfinder keeps directory work off the GTK interface thread. Opening a slow directory, including an rclone/FUSE mount, should leave the window usable while the listing loads. If a newer folder is opened before an older load finishes, the older result is ignored.
+
+- A file that cannot provide size or modified-time metadata remains visible and is marked as unavailable instead of disappearing.
+- Local folders refresh automatically after file changes. For cloud and network mounts that do not support Linux change notifications, use **F5** or the refresh button.
+- Only the active Details or Grid presentation is built. Grid thumbnails are cancellable when you change folder or view.
 
 ---
 
@@ -92,11 +106,15 @@ sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 | **Always-on preview** | Right pane shows the selected file — no popups needed |
 | **Image preview** | Renders images up to 60 MB with zoom support |
 | **Preview zoom** | `Ctrl+scroll` inside the preview pane to zoom in/out |
+| **Video preview** | Plays compatible video in the preview pane using GTK media controls |
+| **Audio files** | Show file information in the preview pane; open them in the system's default music player for playback |
 | **Text preview** | Text, code, Markdown, logs, JSON — shows content up to 256 KB |
 | **Binary detection** | Files with binary content show a placeholder instead of garbled text |
 | **File metadata** | Below the preview: name, type, size, modified date |
 | **Toggle preview** | ▭ toolbar button or drag the splitter handle to resize |
-| **Resizable pane** | Drag the splitter between file list and preview — size persists between sessions |
+| **Resizable pane** | Drag the splitter between the file list and preview |
+
+Media opened from Wayfinder uses your desktop's default application. Playback volume is controlled by that player and its PipeWire/Plasma per-application volume, not by Wayfinder's file list.
 
 ---
 
@@ -145,7 +163,7 @@ sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 | **Folders (Tree)** | Collapsible folder tree rooted at Home — click a folder row to expand and navigate |
 | **Recent** | Last 12 folders visited, auto-tracked per session and saved across restarts |
 | **Hidden files toggle** | Checkbox at the bottom of the sidebar |
-| **Resizable sidebar** | Drag the splitter between sidebar and file list |
+| **Sidebar** | Favorites, places, devices, a Home-folder tree, and recents are available in one pane |
 
 ---
 
@@ -158,6 +176,14 @@ sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
 | **Unmount** | Right-click a mounted drive → Unmount |
 | **Eject (safe remove)** | Right-click a USB/removable drive → Eject — safe to remove |
 | **Cloud / network mounts** | rclone mounts (Google Drive etc.) appear alongside local drives |
+
+### Google Drive and other cloud mounts
+
+Wayfinder treats an rclone-mounted Google Drive as a folder. You can browse, open, copy, move, rename, and delete items to the extent rclone and the account permissions allow.
+
+- Sharing, permission changes, and creating Drive links are Google Drive web/app features; use Google Drive in a browser for those tasks.
+- A Google server download-quota or permission error cannot be fixed by changing file managers. Wayfinder will keep the file entry visible where possible; retry after the account/link issue is resolved.
+- Cloud mounts may cache directory data and may not emit change notifications. Refresh with **F5** after an upload, download, or remote change.
 
 ---
 
@@ -180,19 +206,20 @@ All times use a 12-hour clock tied to your system timezone.
 
 ---
 
-### ⚙ Options
+### ⚙ Quick actions
 
-Click **⚙ Options** in the toolbar to configure:
+The toolbar’s **⚙** menu provides the actions used most often while browsing:
 
-| Setting | Default | What it does |
-|---------|---------|--------------|
-| **"Just now" duration** | 2 minutes | How long a newly modified file shows "Just now" before switching to relative time. Set to Off for exact timestamps always |
-| **Show Size column** | On | Toggle the Size column in Details view |
-| **Show Type column** | On | Toggle the Type column in Details view |
-| **Show Modified column** | On | Toggle the Modified date column in Details view |
-| **Image thumbnails** | On | Load real image previews in grid view. Turning off speeds up browsing large image folders |
+| Action | What it does |
+|--------|--------------|
+| **New Folder / New File** | Creates an item in the current folder |
+| **Refresh** | Reloads the current folder, useful for cloud/network mounts |
+| **Show Hidden Files** | Toggles files whose names begin with `.` |
+| **Rename / Copy / Cut / Paste / Move to Trash** | Performs the matching operation on the selection |
+| **Undo** | Reverses the most recent supported operation |
+| **Open Terminal Here** | Opens a terminal in the current folder |
 
-All settings persist across restarts.
+The view mode, sort order, hidden-files preference, favorites, recents, and search-in-files preference persist across restarts.
 
 ---
 
@@ -256,44 +283,45 @@ Wayfinder uses your system's freedesktop icon theme to show per-type icons. Reco
 
 ### Persistence
 
-Everything that matters is saved automatically:
+The native configuration currently saves:
 
 | What | Saved |
 |------|-------|
 | Favorites | Yes — survives restarts |
 | Recent folders | Yes — last 12, survives restarts |
-| Sidebar width | Yes |
-| Preview pane width | Yes |
-| Preview pane visible | Yes |
-| Icon zoom level | Yes |
-| Column visibility | Yes |
-| Thumbnail setting | Yes |
-| "Just now" duration | Yes |
+| Hidden-files preference | Yes |
+| Chosen view and sort order | Yes |
+| Search-in-files preference | Yes |
 
 ---
 
 ## Build from Source
 
-Prerequisites: [Rust](https://rustup.rs), Node.js 20+, [Tauri 2 Linux deps](https://v2.tauri.app/start/prerequisites/).
+The native GTK application is the primary Linux build.
+
+On Fedora, install the development libraries once:
+
+```bash
+sudo dnf install gtk4-devel libadwaita-devel gdk-pixbuf2-devel
+```
 
 ```bash
 git clone https://github.com/LegendofZito/wayfinder.git
 cd wayfinder
-npm install
 
-# Dev mode (hot-reload)
-npm run tauri dev
+# Native test suite
+cargo test --manifest-path src-tauri/Cargo.toml --features native --bin wayfinder-native
 
-# Release binary
-npm run tauri build -- --no-bundle
-# → src-tauri/target/release/wayfinder
+# Optimized native binary
+cargo build --release --manifest-path src-tauri/Cargo.toml --features native --bin wayfinder-native
+# → src-tauri/target/release/wayfinder-native
 
-# RPM package (Fedora/RHEL)
-npm run tauri build -- --bundles rpm
-
-# DEB package (Ubuntu/Debian)
-npm run tauri build -- --bundles deb
+# Optional user-local install
+install -Dm755 src-tauri/target/release/wayfinder-native ~/.local/bin/wayfinder
 ```
+
+The Tauri/Svelte code is retained for legacy compatibility. It is not the primary Linux file-manager surface; do not use it for new native behavior.
+
 
 ---
 
