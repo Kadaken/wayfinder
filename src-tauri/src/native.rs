@@ -3803,10 +3803,7 @@ fn file_icon(entry: &Entry, zoom: f64) -> gtk::Box {
     // with a filename long enough to wrap onto two lines got a taller row and a
     // visibly bigger icon than their single-line neighbours. `set_pixel_size` on
     // an Image is an exact size, so every row's icon matches.
-    let icon = match old_wayfinder_icon_path(&entry.icon) {
-        Some(path) => gtk::Image::from_file(path),
-        None => gtk::Image::from_icon_name(&entry.icon),
-    };
+    let icon = icon_image(&entry.icon);
     icon.set_pixel_size(icon_w.min(icon_h));
     icon.set_halign(gtk::Align::Center);
     icon.set_valign(gtk::Align::Center);
@@ -3855,10 +3852,7 @@ fn grid_file_icon(
 
     // Same fixed-size rule as the list view: an Image at an exact pixel size,
     // not a Picture that grows into whatever space the tile happens to have.
-    let icon = match old_wayfinder_icon_path(&entry.icon) {
-        Some(path) => gtk::Image::from_file(path),
-        None => gtk::Image::from_icon_name(&entry.icon),
-    };
+    let icon = icon_image(&entry.icon);
     icon.set_pixel_size(icon_w.min(icon_h));
     icon.set_halign(gtk::Align::Center);
     icon.set_valign(gtk::Align::Center);
@@ -3933,7 +3927,49 @@ fn finish_thumbnail_job(queue: &Rc<RefCell<ThumbnailQueue>>) {
     start_thumbnail_jobs(queue.clone());
 }
 
+thread_local! {
+    /// Resolved icon-name -> file path. The lookup probes up to 560 paths on a
+    /// miss, and a folder full of one file type asks for the same name on every
+    /// single row.
+    static ICON_PATH_CACHE: RefCell<HashMap<String, Option<PathBuf>>> =
+        RefCell::new(HashMap::new());
+    /// Decoded icon file -> texture. THIS is the one that mattered: building a
+    /// gtk::Image with `from_file` decodes the image on every call, so a folder
+    /// of 21,436 files decoded the same handful of icons 21,436 times. A texture
+    /// is a GObject, so cloning it is a refcount bump and every row shares one
+    /// decode.
+    static ICON_TEXTURE_CACHE: RefCell<HashMap<PathBuf, Option<gdk::Texture>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// A ready-to-display icon widget, decoded at most once per distinct icon.
+fn icon_image(icon_name: &str) -> gtk::Image {
+    let texture = old_wayfinder_icon_path(icon_name).and_then(|path| {
+        ICON_TEXTURE_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .entry(path.clone())
+                .or_insert_with(|| gdk::Texture::from_filename(&path).ok())
+                .clone()
+        })
+    });
+    match texture {
+        Some(texture) => gtk::Image::from_paintable(Some(&texture)),
+        None => gtk::Image::from_icon_name(icon_name),
+    }
+}
+
 fn old_wayfinder_icon_path(name: &str) -> Option<PathBuf> {
+    ICON_PATH_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_insert_with(|| old_wayfinder_icon_path_inner(name))
+            .clone()
+    })
+}
+
+fn old_wayfinder_icon_path_inner(name: &str) -> Option<PathBuf> {
     const THEMES: [&str; 4] = ["breeze-dark", "breeze", "hicolor", "Adwaita"];
     const CATS: [&str; 5] = ["mimetypes", "places", "apps", "devices", "status"];
     const SIZES: [&str; 7] = ["64", "48", "32", "24", "22", "16", "scalable"];
