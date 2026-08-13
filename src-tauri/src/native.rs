@@ -3798,22 +3798,21 @@ fn file_icon(entry: &Entry, zoom: f64) -> gtk::Box {
     slot.set_halign(gtk::Align::Center);
     slot.set_valign(gtk::Align::Center);
 
-    if let Some(path) = old_wayfinder_icon_path(&entry.icon) {
-        let icon = gtk::Picture::for_filename(path);
-        icon.set_can_shrink(true);
-        icon.set_content_fit(gtk::ContentFit::Contain);
-        icon.set_size_request(icon_w, icon_h);
-        icon.set_halign(gtk::Align::Center);
-        icon.set_valign(gtk::Align::Center);
-        slot.append(&icon);
-    } else {
-        let icon = gtk::Image::from_icon_name(&entry.icon);
-        icon.set_pixel_size(icon_w);
-        icon.set_size_request(icon_w, icon_h);
-        icon.set_halign(gtk::Align::Center);
-        icon.set_valign(gtk::Align::Center);
-        slot.append(&icon);
-    }
+    // Use gtk::Image, never gtk::Picture, for the type icon. `set_size_request`
+    // is a MINIMUM: a Picture grows to fill whatever space it is given, so rows
+    // with a filename long enough to wrap onto two lines got a taller row and a
+    // visibly bigger icon than their single-line neighbours. `set_pixel_size` on
+    // an Image is an exact size, so every row's icon matches.
+    let icon = match old_wayfinder_icon_path(&entry.icon) {
+        Some(path) => gtk::Image::from_file(path),
+        None => gtk::Image::from_icon_name(&entry.icon),
+    };
+    icon.set_pixel_size(icon_w.min(icon_h));
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_hexpand(false);
+    icon.set_vexpand(false);
+    slot.append(&icon);
 
     slot
 }
@@ -3854,22 +3853,18 @@ fn grid_file_icon(
         return (slot, Some(thumb));
     }
 
-    if let Some(path) = old_wayfinder_icon_path(&entry.icon) {
-        let icon = gtk::Picture::for_filename(path);
-        icon.set_can_shrink(true);
-        icon.set_content_fit(gtk::ContentFit::Contain);
-        icon.set_size_request(icon_w, icon_h);
-        icon.set_halign(gtk::Align::Center);
-        icon.set_valign(gtk::Align::Center);
-        slot.append(&icon);
-    } else {
-        let icon = gtk::Image::from_icon_name(&entry.icon);
-        icon.set_pixel_size(icon_w);
-        icon.set_size_request(icon_w, icon_h);
-        icon.set_halign(gtk::Align::Center);
-        icon.set_valign(gtk::Align::Center);
-        slot.append(&icon);
-    }
+    // Same fixed-size rule as the list view: an Image at an exact pixel size,
+    // not a Picture that grows into whatever space the tile happens to have.
+    let icon = match old_wayfinder_icon_path(&entry.icon) {
+        Some(path) => gtk::Image::from_file(path),
+        None => gtk::Image::from_icon_name(&entry.icon),
+    };
+    icon.set_pixel_size(icon_w.min(icon_h));
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_hexpand(false);
+    icon.set_vexpand(false);
+    slot.append(&icon);
 
     (slot, None)
 }
