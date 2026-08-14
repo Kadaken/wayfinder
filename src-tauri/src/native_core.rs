@@ -807,10 +807,24 @@ pub fn check_conflicts(srcs: &[String], dest_dir: &str) -> Vec<String> {
         .collect()
 }
 
+/// What to do when the destination already holds a file of the same name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PasteConflict {
+    /// Paste alongside, as "name (2)". Never destroys anything.
+    KeepBoth,
+    /// Overwrite the existing item. DESTRUCTIVE and not undoable — the undo
+    /// stack can move the pasted item back out, but whatever was overwritten is
+    /// already gone.
+    Replace,
+    /// Leave the existing item alone and do not paste that one.
+    Skip,
+}
+
 pub fn resolve_paste(
     srcs: &[String],
     dest_dir: &str,
     is_copy: bool,
+    on_conflict: PasteConflict,
 ) -> Result<Vec<ResolvedItem>, String> {
     if !Path::new(dest_dir).is_dir() {
         return Err(format!("not a folder: {dest_dir}"));
@@ -833,7 +847,24 @@ pub fn resolve_paste(
         }
 
         let dest = if target.exists() {
-            unique_target(dest_dir, name)
+            match on_conflict {
+                PasteConflict::KeepBoth => unique_target(dest_dir, name),
+                PasteConflict::Skip => continue,
+                PasteConflict::Replace => {
+                    // Pasting a folder onto an existing folder cannot merge with
+                    // `cp -T`, and overwriting in place would leave stale
+                    // children behind, so clear the target first.
+                    if same_path {
+                        continue;
+                    }
+                    if target.is_dir() {
+                        fs::remove_dir_all(&target).map_err(|err| err.to_string())?;
+                    } else {
+                        fs::remove_file(&target).map_err(|err| err.to_string())?;
+                    }
+                    target
+                }
+            }
         } else {
             target
         };
@@ -1593,6 +1624,86 @@ mod tests {
             assert!(is_archive_path(path), "{path}");
         }
         assert!(!is_archive_path("/tmp/readme.txt"));
+    }
+
+    /// A scratch dir with src/note.txt = "NEW" and dest/note.txt = "OLD".
+    fn paste_conflict_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wf-paste-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("dest")).unwrap();
+        fs::write(dir.join("src/note.txt"), b"NEW").unwrap();
+        fs::write(dir.join("dest/note.txt"), b"OLD").unwrap();
+        dir
+    }
+
+    #[test]
+    fn paste_keep_both_leaves_the_existing_file_untouched() {
+        let dir = paste_conflict_dir();
+        let src = dir.join("src/note.txt").to_string_lossy().to_string();
+        let dest = dir.join("dest").to_string_lossy().to_string();
+        let out = resolve_paste(&[src], &dest, true, PasteConflict::KeepBoth).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(fs::read(dir.join("dest/note.txt")).unwrap(), b"OLD");
+        assert_ne!(out[0].to, dir.join("dest/note.txt").to_string_lossy());
+        assert_eq!(fs::read(&out[0].to).unwrap(), b"NEW");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paste_replace_overwrites_the_existing_file() {
+        let dir = paste_conflict_dir();
+        let src = dir.join("src/note.txt").to_string_lossy().to_string();
+        let dest = dir.join("dest").to_string_lossy().to_string();
+        let out = resolve_paste(&[src], &dest, true, PasteConflict::Replace).unwrap();
+        assert_eq!(out.len(), 1);
+        // The destination now holds the new bytes, at the ORIGINAL name.
+        assert_eq!(fs::read(dir.join("dest/note.txt")).unwrap(), b"NEW");
+        assert_eq!(out[0].to, dir.join("dest/note.txt").to_string_lossy());
+        // And no "note (2).txt" was left behind.
+        let extras: Vec<_> = fs::read_dir(dir.join("dest"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(extras, vec!["note.txt".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paste_skip_changes_nothing() {
+        let dir = paste_conflict_dir();
+        let src = dir.join("src/note.txt").to_string_lossy().to_string();
+        let dest = dir.join("dest").to_string_lossy().to_string();
+        let out = resolve_paste(&[src], &dest, true, PasteConflict::Skip).unwrap();
+        assert!(out.is_empty(), "skip must paste nothing");
+        assert_eq!(fs::read(dir.join("dest/note.txt")).unwrap(), b"OLD");
+        assert_eq!(fs::read(dir.join("src/note.txt")).unwrap(), b"NEW", "source survives");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paste_replace_swaps_a_whole_folder_without_leaving_stale_children() {
+        let dir = paste_conflict_dir();
+        fs::create_dir_all(dir.join("src/box")).unwrap();
+        fs::write(dir.join("src/box/new.txt"), b"NEW").unwrap();
+        fs::create_dir_all(dir.join("dest/box")).unwrap();
+        fs::write(dir.join("dest/box/stale.txt"), b"STALE").unwrap();
+        let src = dir.join("src/box").to_string_lossy().to_string();
+        let dest = dir.join("dest").to_string_lossy().to_string();
+        resolve_paste(&[src], &dest, true, PasteConflict::Replace).unwrap();
+        assert!(dir.join("dest/box/new.txt").exists());
+        assert!(
+            !dir.join("dest/box/stale.txt").exists(),
+            "replacing a folder must not leave the old contents behind"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

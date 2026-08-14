@@ -1,6 +1,6 @@
 # Findings outside scope
 
-- 2026-08-05: Explorer-parity gaps found in the audit but not yet built: redo (Ctrl+Y needs a redo stack), Shift+Arrow range-extend selection, clickable breadcrumb segments in the address bar, rubber-band (drag-box) selection in Details view, middle-click folder to open in a new tab, a Replace/Skip/Keep-both conflict dialog (paste currently always keeps both), and group-by in Details view.
-- 2026-08-05: Cleaned 96px sidebar icons (shadows stripped) are still sitting in /tmp/sbwork — not yet installed into static/icons/ or regenerated at 18px.
+- STILL OPEN 2026-08-13: redo (Ctrl+Y needs a redo stack); group-by in Details view; Open in New Window (the app keeps its UI in a thread-local `CURRENT_UI`, so a genuine second window needs that unwound first); per-column show/hide and a thumbnails on/off switch in Options; Grid/Icons view is still un-virtualized (GtkFlowBox) so huge folders are slow there and it cannot do rubber-band selection.
+- DONE 2026-08-13: Shift+Arrow range-extend, clickable breadcrumb segments, middle-click folder -> new tab, "Open in New Tab" menu item, and the Replace/Skip/Keep Both paste conflict dialog.
 
-- 2026-08-03: The 18px sidebar icons in `static/icons/sidebar/` (and the installed copies in `~/.local/share/wayfinder/icons/sidebar/`) still carry the same baked-in grey background fringe that the app logo had — `documents.png`, `pictures.png`, `trash.png`, `storage.png`, `home.png`, `downloads.png` are the worst. Same fix applies: rebuild the alpha from a saturation mask and extend interior colour outward.
+- DONE 2026-08-13: sidebar icon shadows stripped at 96px and re-rendered at 18px; static/icons/, static/icons/sidebar/ and the installed copies all updated.

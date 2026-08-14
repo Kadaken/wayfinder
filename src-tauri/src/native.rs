@@ -181,6 +181,32 @@ row:focus-visible {
     padding: 0 8px;
 }
 
+.wf-crumb {
+    background: transparent;
+    color: @wf_text_dim;
+    border: 0;
+    box-shadow: none;
+    min-height: 22px;
+    min-width: 0;
+    padding: 0 6px;
+    border-radius: 5px;
+}
+
+.wf-crumb:hover {
+    background: @wf_control;
+    color: #ffffff;
+}
+
+.wf-crumb-current {
+    color: @wf_text;
+    font-weight: 700;
+}
+
+.wf-crumb-sep {
+    color: @wf_text_muted;
+    padding: 0 1px;
+}
+
 .wf-address-box {
     background: transparent;
     border: 0;
@@ -920,7 +946,7 @@ struct Ui {
     column_header: gtk::Box,
     columns: ColumnSizing,
     path_stack: gtk::Stack,
-    path_label: gtk::Label,
+    path_crumbs: gtk::Box,
     path_entry: gtk::Entry,
     search: gtk::SearchEntry,
     sidebar: gtk::ListBox,
@@ -1204,12 +1230,18 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         thumbnail_queue: None,
     }));
 
-    let path_label = gtk::Label::builder()
-        .ellipsize(gtk::pango::EllipsizeMode::Middle)
-        .xalign(0.0)
+    // Each path segment is its own button, so "Computer > home > zito > Downloads"
+    // lets you jump straight back to any ancestor instead of pressing Up N times.
+    let path_crumbs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    path_crumbs.add_css_class("wf-address");
+    path_crumbs.set_valign(gtk::Align::Center);
+    let path_label = gtk::ScrolledWindow::builder()
+        .child(&path_crumbs)
         .hexpand(true)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .propagate_natural_height(true)
         .build();
-    path_label.add_css_class("wf-address");
     let path_entry = gtk::Entry::builder()
         .hexpand(true)
         .activates_default(true)
@@ -1611,7 +1643,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         column_header,
         columns,
         path_stack,
-        path_label,
+        path_crumbs,
         path_entry,
         search,
         sidebar: sidebar.clone(),
@@ -2319,6 +2351,18 @@ fn switch_tab_action(state: Rc<RefCell<AppState>>, index: usize) {
         state.tabs[index].clone()
     };
     navigate(&state, path);
+}
+
+/// Open `path` in a new tab and switch to it, the way a middle-click or
+/// "Open in New Tab" is expected to behave.
+fn open_path_in_new_tab(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
+    {
+        let mut state = state.borrow_mut();
+        state.tabs.push(path.clone());
+        state.active_tab = state.tabs.len() - 1;
+    }
+    rebuild_tabs(state, ui);
+    navigate(state, path);
 }
 
 fn new_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -3330,11 +3374,14 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             open_selected(&state_for_keys, &ui_for_keys);
             return glib::Propagation::Stop;
         }
-        if !alt && key == gdk::Key::Down {
+        // Only handle plain arrows. With Shift held, let the event through so the
+        // list's own selection model extends the range — intercepting it here
+        // forced a single selection and made Shift+Arrow impossible.
+        if !alt && !shift && key == gdk::Key::Down {
             move_selection(&state_for_keys, &ui_for_keys, 1);
             return glib::Propagation::Stop;
         }
-        if !alt && key == gdk::Key::Up {
+        if !alt && !shift && key == gdk::Key::Up {
             move_selection(&state_for_keys, &ui_for_keys, -1);
             return glib::Propagation::Stop;
         }
@@ -3408,8 +3455,7 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
     };
 
     if let Some(ui) = &ui {
-        ui.path_label.set_label(&breadcrumb_label(&path));
-        ui.path_label.set_tooltip_text(Some(&path));
+        set_breadcrumbs(state, ui, &path);
         ui.path_stack.set_visible_child_name("label");
         ui.search.set_text("");
         if !same_folder {
@@ -3483,8 +3529,7 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
             }
             if let Some(ui) = &ui {
                 rebuild_tabs(&state, ui);
-                ui.path_label.set_label(&breadcrumb_label(&path));
-                ui.path_label.set_tooltip_text(Some(&path));
+                set_breadcrumbs(&state, ui, &path);
                 ui.path_stack.set_visible_child_name("label");
                 ui.search.set_text("");
                 set_preview_text(ui, "Select a file");
@@ -3518,8 +3563,7 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
                 state.borrow_mut().listing_cancel = None;
                 if let Some(ui) = &ui {
                     let current_path = state.borrow().cwd.clone();
-                    ui.path_label.set_label(&breadcrumb_label(&current_path));
-                    ui.path_label.set_tooltip_text(Some(&current_path));
+                    set_breadcrumbs(&state, ui, &current_path);
                     repopulate_rows(&state, ui);
                     update_selection(&state, ui);
                     ui.status.set_label(&format!("Cannot open {path}: {error}"));
@@ -3652,19 +3696,47 @@ fn current_ui_for_state(_state: &Rc<RefCell<AppState>>) -> Option<Ui> {
     CURRENT_UI.with(|ui| ui.borrow().clone())
 }
 
-fn breadcrumb_label(path: &str) -> String {
-    let mut parts = vec!["Computer".to_string()];
-    parts.extend(
-        PathBuf::from(path)
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::RootDir => None,
-                std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
-                _ => None,
-            }),
-    );
-    parts.join(" › ")
+/// Rebuild the address bar as one clickable button per path segment.
+/// Clicking "home" from /home/zito/Downloads jumps straight to /home.
+fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+    while let Some(child) = ui.path_crumbs.first_child() {
+        ui.path_crumbs.remove(&child);
+    }
+    ui.path_crumbs.set_tooltip_text(Some(path));
+
+    // (label, path-to-navigate-to). "Computer" is the filesystem root.
+    let mut crumbs: Vec<(String, String)> = vec![("Computer".to_string(), "/".to_string())];
+    let mut accumulated = PathBuf::from("/");
+    for component in PathBuf::from(path).components() {
+        if let std::path::Component::Normal(value) = component {
+            accumulated.push(value);
+            crumbs.push((
+                value.to_string_lossy().to_string(),
+                accumulated.to_string_lossy().to_string(),
+            ));
+        }
+    }
+
+    let last = crumbs.len().saturating_sub(1);
+    for (index, (label, target)) in crumbs.into_iter().enumerate() {
+        if index > 0 {
+            let sep = gtk::Label::new(Some("›"));
+            sep.add_css_class("wf-crumb-sep");
+            ui.path_crumbs.append(&sep);
+        }
+        let button = gtk::Button::builder().label(&label).build();
+        button.add_css_class("flat");
+        button.add_css_class("wf-crumb");
+        if index == last {
+            // The folder you are already in is not a link.
+            button.add_css_class("wf-crumb-current");
+        }
+        let state = state.clone();
+        button.connect_clicked(move |_| navigate(&state, target.clone()));
+        ui.path_crumbs.append(&button);
+    }
 }
+
 
 /// Builds and recycles the Details/Compact rows. `bind` runs only for rows that
 /// are actually on screen, so this is called ~30 times regardless of whether the
@@ -3760,6 +3832,19 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.path.clone());
         }
         connect_row_context(&line, item.position(), state.clone(), ui.clone(), entry.clone());
+        if entry.is_dir {
+            // Middle-click a folder to open it in a new tab, like a browser.
+            let middle = gtk::GestureClick::new();
+            middle.set_button(2);
+            let state_for_middle = state.clone();
+            let ui_for_middle = ui.clone();
+            let path = entry.path.clone();
+            middle.connect_pressed(move |gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                open_path_in_new_tab(&state_for_middle, &ui_for_middle, path.clone());
+            });
+            line.add_controller(middle);
+        }
 
         item.set_child(Some(&line));
     });
@@ -4610,14 +4695,83 @@ fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
         return;
     };
     let cwd = state.borrow().cwd.clone();
+    let conflicts = native_core::check_conflicts(&clipboard.paths, &cwd);
+    if conflicts.is_empty() {
+        paste_with_conflict_mode(state, ui, native_core::PasteConflict::KeepBoth);
+        return;
+    }
+    // Explorer asks before it overwrites. This used to silently keep both, every
+    // time, which quietly filled folders with "file (2)" copies.
+    let ui_for_choice = ui.clone();
+    show_conflict_dialog(&ui, &conflicts, move |mode| {
+        paste_with_conflict_mode(state.clone(), ui_for_choice.clone(), mode);
+    });
+}
+
+/// Replace / Skip / Keep Both, with Cancel as the escape.
+fn show_conflict_dialog<F>(ui: &Ui, conflicts: &[String], on_choice: F)
+where
+    F: Fn(native_core::PasteConflict) + 'static,
+{
+    let count = conflicts.len();
+    let heading = if count == 1 {
+        format!("\"{}\" already exists here.", conflicts[0])
+    } else {
+        format!("{count} items already exist here.")
+    };
+    let detail = if count == 1 {
+        "Replace it, skip it, or keep both?".to_string()
+    } else {
+        let sample: Vec<&str> = conflicts.iter().take(5).map(String::as_str).collect();
+        let more = count.saturating_sub(sample.len());
+        let listed = sample.join(", ");
+        if more > 0 {
+            format!("{listed}, and {more} more.\n\nReplace them, skip them, or keep both?")
+        } else {
+            format!("{listed}\n\nReplace them, skip them, or keep both?")
+        }
+    };
+
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&detail));
+    dialog.add_responses(&[
+        ("cancel", "Cancel"),
+        ("skip", "Skip"),
+        ("keepboth", "Keep Both"),
+        ("replace", "Replace"),
+    ]);
+    // Replacing destroys the existing file and undo cannot bring it back, so it
+    // is marked destructive and is NOT the default.
+    dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("keepboth"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |dialog, response| {
+        match response {
+            "replace" => on_choice(native_core::PasteConflict::Replace),
+            "skip" => on_choice(native_core::PasteConflict::Skip),
+            "keepboth" => on_choice(native_core::PasteConflict::KeepBoth),
+            _ => {}
+        }
+        dialog.close();
+    });
+    dialog.present(Some(&ui.window));
+}
+
+fn paste_with_conflict_mode(
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    on_conflict: native_core::PasteConflict,
+) {
+    let Some(clipboard) = state.borrow().clipboard.clone() else {
+        return;
+    };
+    let cwd = state.borrow().cwd.clone();
     let is_copy = clipboard.mode == ClipboardMode::Copy;
     let clear_after = clipboard.mode == ClipboardMode::Cut;
     let count = clipboard.paths.len();
-    let conflict_count = native_core::check_conflicts(&clipboard.paths, &cwd).len();
-    let label = if conflict_count > 0 {
-        format!("Pasting {count}; keeping both for {conflict_count} conflict(s)")
-    } else {
-        format!("Pasting {count}")
+    let label = match on_conflict {
+        native_core::PasteConflict::Replace => format!("Pasting {count}, replacing existing"),
+        native_core::PasteConflict::Skip => format!("Pasting {count}, skipping existing"),
+        native_core::PasteConflict::KeepBoth => format!("Pasting {count}"),
     };
 
     run_job(
@@ -4625,7 +4779,7 @@ fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui,
         label,
         move || {
-            let items = native_core::resolve_paste(&clipboard.paths, &cwd, is_copy)?;
+            let items = native_core::resolve_paste(&clipboard.paths, &cwd, is_copy, on_conflict)?;
             Ok(JobOutcome::undo(
                 format!("Pasted {} item{}", items.len(), plural(items.len())),
                 UndoAction::Pasted {
@@ -5495,6 +5649,14 @@ fn show_item_context_menu(
             open_entry(&state, &ui, entry.clone())
         }));
     }
+    if entry.is_dir {
+        let state = state.clone();
+        let ui = ui.clone();
+        let path = entry.path.clone();
+        menu.append(&context_button("Open in New Tab", &popover, move || {
+            open_path_in_new_tab(&state, &ui, path.clone())
+        }));
+    }
     if !entry.is_dir {
         let ui = ui.clone();
         let path = entry.path.clone();
@@ -5900,7 +6062,8 @@ fn connect_file_drop<W: IsA<gtk::Widget>>(widget: &W, state: Rc<RefCell<AppState
             ui_for_drop.clone(),
             format!("Copying {count} dropped item{}", plural(count)),
             move || {
-                let items = native_core::resolve_paste(&srcs, &cwd, true)?;
+                // A drop is not a deliberate paste, so never destroy on conflict.
+                let items = native_core::resolve_paste(&srcs, &cwd, true, native_core::PasteConflict::KeepBoth)?;
                 Ok(JobOutcome::undo(
                     format!("Copied {} item{}", items.len(), plural(items.len())),
                     UndoAction::Pasted {
@@ -5951,7 +6114,8 @@ fn connect_file_drop_to_dir<W: IsA<gtk::Widget>>(
                 tab_label(&dest)
             ),
             move || {
-                let items = native_core::resolve_paste(&srcs, &dest, true)?;
+                // A drop is not a deliberate paste, so never destroy on conflict.
+                let items = native_core::resolve_paste(&srcs, &dest, true, native_core::PasteConflict::KeepBoth)?;
                 Ok(JobOutcome::undo(
                     format!("Copied {} item{}", items.len(), plural(items.len())),
                     UndoAction::Pasted {
