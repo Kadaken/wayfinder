@@ -356,6 +356,39 @@ paned > separator:hover {
     background-image: none;
 }
 
+/* Scrollbars must not draw a second line next to the pane divider.
+   GTK's default trough paints a full-height edge, so every pane boundary showed
+   TWO verticals a few pixels apart: the trough at one x and the divider at
+   another. Only the slider is visible now, and it floats over the content
+   instead of reserving a lane of its own. */
+scrollbar,
+scrollbar trough {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    margin: 0;
+    padding: 0;
+}
+
+/* Inset with margin, NOT a transparent border: a border is subtracted from the
+   slider's minimum size, and GTK warned "slider reported min width -4". */
+scrollbar slider {
+    background: rgba(255, 255, 255, 0.16);
+    border: none;
+    border-radius: 6px;
+    min-width: 8px;
+    min-height: 28px;
+    margin: 2px;
+}
+
+scrollbar slider:hover {
+    background: rgba(255, 255, 255, 0.30);
+}
+
+scrollbar slider:active {
+    background: @wf_accent;
+}
+
 .wf-list {
     background: @wf_base;
 }
@@ -1446,6 +1479,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     sidebar.add_css_class("wf-sidebar");
     let sidebar_scroll = gtk::ScrolledWindow::builder()
         .child(&sidebar)
+        .overlay_scrolling(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .min_content_width(72)
@@ -1458,6 +1492,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     let files_scroll = gtk::ScrolledWindow::builder()
         .child(&list)
+        .overlay_scrolling(true)
         .hexpand(true)
         .vexpand(true)
         .min_content_width(0)
