@@ -939,6 +939,87 @@ struct Ui {
     picker_open: Option<gtk::Button>,
 }
 
+/// The interface Chrome, Brave, Firefox and most GTK/Qt apps call to say
+/// "show me this exact file", rather than just "open this folder". Without a
+/// provider on the bus, browsers silently fall back to opening the parent
+/// directory and the download is never highlighted.
+const FILE_MANAGER1_XML: &str = r#"
+<node>
+  <interface name='org.freedesktop.FileManager1'>
+    <method name='ShowFolders'>
+      <arg type='as' name='URIs' direction='in'/>
+      <arg type='s' name='StartupId' direction='in'/>
+    </method>
+    <method name='ShowItems'>
+      <arg type='as' name='URIs' direction='in'/>
+      <arg type='s' name='StartupId' direction='in'/>
+    </method>
+    <method name='ShowItemProperties'>
+      <arg type='as' name='URIs' direction='in'/>
+      <arg type='s' name='StartupId' direction='in'/>
+    </method>
+  </interface>
+</node>
+"#;
+
+/// Publish org.freedesktop.FileManager1 so "Show in folder" lands on the file.
+///
+/// Every method is routed back through `app.open`, which already navigates to
+/// the parent and selects the item, so there is exactly one code path for
+/// "reveal this file" no matter whether it arrived from the bus, the command
+/// line or a desktop launcher.
+fn export_file_manager1(app: &adw::Application) {
+    let Some(connection) = app.dbus_connection() else {
+        eprintln!("wayfinder: no session bus; 'Show in folder' will not highlight files");
+        return;
+    };
+    let Ok(node) = gio::DBusNodeInfo::for_xml(FILE_MANAGER1_XML) else {
+        return;
+    };
+    let Some(interface) = node.lookup_interface("org.freedesktop.FileManager1") else {
+        return;
+    };
+
+    let app_for_calls = app.clone();
+    let registered = connection
+        .register_object("/org/freedesktop/FileManager1", &interface)
+        .method_call(move |_, _, _, _, method, params, invocation| {
+            // Every method takes (as URIs, s StartupId).
+            let uris: Vec<String> = params
+                .try_child_get::<Vec<String>>(0)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let files: Vec<gio::File> = uris.iter().map(|uri| gio::File::for_uri(uri)).collect();
+            if !files.is_empty() {
+                // All three methods take the same route because `connect_open`
+                // already branches on what the path IS: a directory opens
+                // directly, a file opens its parent with the file selected.
+                // That is exactly ShowFolders vs ShowItems semantics.
+                let _ = method;
+                app_for_calls.open(&files, "");
+            }
+            // The interface returns nothing; reply so the caller is not left
+            // waiting for its 25s D-Bus timeout.
+            invocation.return_value(None);
+        })
+        .build();
+    if let Err(error) = registered {
+        eprintln!("wayfinder: could not export FileManager1: {error}");
+        return;
+    }
+
+    // Claim the well-known name last, so the object is already answering by the
+    // time anything can address us.
+    gio::bus_own_name_on_connection(
+        &connection,
+        "org.freedesktop.FileManager1",
+        gio::BusNameOwnerFlags::NONE,
+        |_, _| {},
+        |_, _| {},
+    );
+}
+
 fn main() {
     if std::env::args().any(|arg| arg == "--pick-capable") {
         std::process::exit(0);
@@ -953,6 +1034,7 @@ fn main() {
         app.style_manager()
             .set_color_scheme(adw::ColorScheme::PreferDark);
         install_app_css();
+        export_file_manager1(app);
     });
     app.connect_activate(|app| {
         let existing_ui = CURRENT_UI.with(|current| current.borrow().clone());
