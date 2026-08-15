@@ -556,8 +556,19 @@ popover contents {
     min-width: 200px;
 }
 
+/* Explorer highlights a menu row with a soft neutral, not a saturated accent.
+   A full-strength blue on every hover made the menu feel noisy. */
 .wf-menu-item:hover {
-    background: @wf_accent;
+    background: @wf_control_hover;
+    color: #ffffff;
+}
+
+.wf-menu-icon {
+    color: @wf_text_dim;
+    -gtk-icon-size: 16px;
+}
+
+.wf-menu-item:hover .wf-menu-icon {
     color: #ffffff;
 }
 
@@ -3211,21 +3222,21 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("New Folder", "Ctrl+Shift+N", &popover, move || {
+        menu.append(&context_item("folder-new-symbolic", "New Folder", "Ctrl+Shift+N", &popover, move || {
             create_folder_action(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("New File", &popover, move || {
+        menu.append(&context_item("document-new-symbolic", "New File", "", &popover, move || {
             create_file_action(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Refresh", "F5", &popover, move || {
+        menu.append(&context_item("view-refresh-symbolic", "Refresh", "F5", &popover, move || {
             let cwd = state.borrow().cwd.clone();
             rebuild_sidebar(&state, &ui);
             navigate_without_history(&state, cwd);
@@ -3248,35 +3259,35 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Rename", "F2", &popover, move || {
+        menu.append(&context_item("document-edit-symbolic", "Rename", "F2", &popover, move || {
             rename_action(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Copy", "Ctrl+C", &popover, move || {
+        menu.append(&context_item("edit-copy-symbolic", "Copy", "Ctrl+C", &popover, move || {
             copy_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Cut", "Ctrl+X", &popover, move || {
+        menu.append(&context_item("edit-cut-symbolic", "Cut", "Ctrl+X", &popover, move || {
             cut_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Paste", "Ctrl+V", &popover, move || {
+        menu.append(&context_item("edit-paste-symbolic", "Paste", "Ctrl+V", &popover, move || {
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Move to Trash", "Delete", &popover, move || {
+        menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
             trash_selection(state.clone(), ui.clone())
         }));
     }
@@ -3292,14 +3303,14 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Open Terminal Here", &popover, move || {
+        menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
             terminal_here(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Empty Trash", &popover, move || {
+        menu.append(&context_item("user-trash-full-symbolic", "Empty Trash", "", &popover, move || {
             empty_trash_action(state.clone(), ui.clone())
         }));
     }
@@ -5689,7 +5700,7 @@ fn show_drive_context_menu(
         let state = state.clone();
         let ui = ui.clone();
         let drive = drive.clone();
-        menu.append(&context_button("Unmount", &popover, move || {
+        menu.append(&context_item("media-eject-symbolic", "Unmount", "", &popover, move || {
             unmount_drive_action(state.clone(), ui.clone(), drive.clone())
         }));
     }
@@ -5698,7 +5709,7 @@ fn show_drive_context_menu(
         let state = state.clone();
         let ui = ui.clone();
         let drive = drive.clone();
-        menu.append(&context_button("Eject", &popover, move || {
+        menu.append(&context_item("media-eject-symbolic", "Eject", "", &popover, move || {
             eject_drive_action(state.clone(), ui.clone(), drive.clone())
         }));
     }
@@ -5730,7 +5741,7 @@ fn show_item_context_menu(
         let state = state.clone();
         let ui = ui.clone();
         let entry = entry.clone();
-        menu.append(&context_button("Open", &popover, move || {
+        menu.append(&context_item("document-open-symbolic", "Open", "", &popover, move || {
             open_entry(&state, &ui, entry.clone())
         }));
     }
@@ -5738,14 +5749,14 @@ fn show_item_context_menu(
         let state = state.clone();
         let ui = ui.clone();
         let path = entry.path.clone();
-        menu.append(&context_button("Open in New Tab", &popover, move || {
+        menu.append(&context_item("tab-new-symbolic", "Open in New Tab", "", &popover, move || {
             open_path_in_new_tab(&state, &ui, path.clone())
         }));
     }
     if !entry.is_dir {
         let ui = ui.clone();
         let path = entry.path.clone();
-        menu.append(&context_button("Open With...", &popover, move || {
+        menu.append(&context_item("application-x-executable-symbolic", "Open With...", "", &popover, move || {
             show_open_with_dialog(ui.clone(), path.clone())
         }));
     }
@@ -5772,28 +5783,28 @@ fn show_item_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Cut", "Ctrl+X", &popover, move || {
+        menu.append(&context_item("edit-cut-symbolic", "Cut", "Ctrl+X", &popover, move || {
             cut_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Copy", "Ctrl+C", &popover, move || {
+        menu.append(&context_item("edit-copy-symbolic", "Copy", "Ctrl+C", &popover, move || {
             copy_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Copy Paths", "Ctrl+Shift+C", &popover, move || {
+        menu.append(&context_item("edit-copy-symbolic", "Copy Paths", "Ctrl+Shift+C", &popover, move || {
             copy_paths_to_system_clipboard(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Paste", "Ctrl+V", &popover, move || {
+        menu.append(&context_item("edit-paste-symbolic", "Paste", "Ctrl+V", &popover, move || {
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
@@ -5812,7 +5823,7 @@ fn show_item_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Compress to ZIP", &popover, move || {
+        menu.append(&context_item("package-symbolic", "Compress to ZIP", "", &popover, move || {
             compress_selection(state.clone(), ui.clone())
         }));
     }
@@ -5831,7 +5842,7 @@ fn show_item_context_menu(
         let state = state.clone();
         let ui = ui.clone();
         let path = entry.path.clone();
-        menu.append(&context_button("Extract Here", &popover, move || {
+        menu.append(&context_item("archive-extract-symbolic", "Extract Here", "", &popover, move || {
             extract_archive_action(state.clone(), ui.clone(), path.clone())
         }));
     }
@@ -5840,14 +5851,14 @@ fn show_item_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Move to Trash", "Delete", &popover, move || {
+        menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
             trash_selection(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Delete Permanently", "Shift+Delete", &popover, move || {
+        menu.append(&context_item("edit-delete-symbolic", "Delete Permanently", "Shift+Delete", &popover, move || {
             permanent_delete_selection(state.clone(), ui.clone())
         }));
     }
@@ -5856,7 +5867,7 @@ fn show_item_context_menu(
     {
         let ui = ui.clone();
         let path = entry.path.clone();
-        menu.append(&context_item("Properties", "Alt+Enter", &popover, move || {
+        menu.append(&context_item("document-properties-symbolic", "Properties", "Alt+Enter", &popover, move || {
             show_properties_for_path(ui.clone(), path.clone())
         }));
     }
@@ -5867,7 +5878,7 @@ fn show_item_context_menu(
         } else {
             native_core::parent_dir(&entry.path)
         };
-        menu.append(&context_button("Open Terminal Here", &popover, move || {
+        menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
             if let Err(err) = native_core::open_terminal(&terminal_path) {
                 ui.status.set_label(&format!("Terminal failed: {err}"));
             }
@@ -5899,28 +5910,28 @@ fn show_background_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("New Folder", "Ctrl+Shift+N", &popover, move || {
+        menu.append(&context_item("folder-new-symbolic", "New Folder", "Ctrl+Shift+N", &popover, move || {
             create_folder_action(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("New File", &popover, move || {
+        menu.append(&context_item("document-new-symbolic", "New File", "", &popover, move || {
             create_file_action(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Paste", "Ctrl+V", &popover, move || {
+        menu.append(&context_item("edit-paste-symbolic", "Paste", "Ctrl+V", &popover, move || {
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
     if state.borrow().cwd.contains("/Trash/files") {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Empty Trash", &popover, move || {
+        menu.append(&context_item("user-trash-full-symbolic", "Empty Trash", "", &popover, move || {
             empty_trash_action(state.clone(), ui.clone())
         }));
     }
@@ -5947,7 +5958,7 @@ fn show_background_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("Properties", "Alt+Enter", &popover, move || {
+        menu.append(&context_item("document-properties-symbolic", "Properties", "Alt+Enter", &popover, move || {
             let cwd = state.borrow().cwd.clone();
             show_properties_for_path(ui.clone(), cwd);
         }));
@@ -5955,7 +5966,7 @@ fn show_background_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Open Terminal Here", &popover, move || {
+        menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
             terminal_here(state.clone(), ui.clone())
         }));
     }
@@ -5968,17 +5979,36 @@ fn context_button<F>(label: &str, popover: &gtk::Popover, action: F) -> gtk::But
 where
     F: Fn() + 'static,
 {
-    context_item(label, "", popover, action)
+    context_item("", label, "", popover, action)
 }
 
-/// One menu row, laid out like Explorer's: label hard left, keyboard shortcut
-/// greyed and hard right. A plain `Button::with_label` centres its text, which
-/// is what made the menu read as a stack of loose buttons rather than a menu.
-fn context_item<F>(label: &str, accel: &str, popover: &gtk::Popover, action: F) -> gtk::Button
+/// One menu row, laid out like Explorer's: icon, then label hard left, then the
+/// keyboard shortcut greyed and hard right.
+///
+/// Two details that make it read as a menu rather than a stack of buttons:
+/// a plain `Button::with_label` CENTRES its text, and the icon slot is reserved
+/// even when a row has no icon, so every label starts on the same left edge.
+fn context_item<F>(
+    icon: &str,
+    label: &str,
+    accel: &str,
+    popover: &gtk::Popover,
+    action: F,
+) -> gtk::Button
 where
     F: Fn() + 'static,
 {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+
+    let image = gtk::Image::new();
+    if !icon.is_empty() {
+        image.set_icon_name(Some(icon));
+    }
+    image.set_pixel_size(16);
+    image.set_size_request(16, 16);
+    image.add_css_class("wf-menu-icon");
+    row.append(&image);
+
     let text = gtk::Label::builder()
         .label(label)
         .xalign(0.0)
@@ -5986,6 +6016,7 @@ where
         .halign(gtk::Align::Fill)
         .build();
     row.append(&text);
+
     if !accel.is_empty() {
         let hint = gtk::Label::builder().label(accel).xalign(1.0).build();
         hint.add_css_class("wf-menu-accel");
