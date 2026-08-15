@@ -977,6 +977,46 @@ pub fn empty_trash() -> Result<(), String> {
     run_cmd_capture("gio", &["trash", "--empty"])
 }
 
+/// The archive's name without its extension, for naming the folder we extract
+/// into. Compound suffixes are handled so "backup.tar.gz" gives "backup", not
+/// "backup.tar".
+pub fn archive_stem(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let lower = name.to_lowercase();
+    for suffix in [
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz", ".tar.lzma",
+    ] {
+        if lower.ends_with(suffix) {
+            return name[..name.len() - suffix.len()].to_string();
+        }
+    }
+    match name.rfind('.') {
+        Some(index) if index > 0 => name[..index].to_string(),
+        _ => name,
+    }
+}
+
+/// Extract into a NEW folder named after the archive, the way Explorer's
+/// "Extract All" does. Without this an archive holding loose files scatters
+/// them across whatever folder you were looking at, which is impossible to undo
+/// by hand. The folder name is uniquified, so extracting twice never overwrites.
+pub fn extract_archive_into_new_dir(path: &str, dest_dir: &str) -> Result<String, String> {
+    let target = unique_target(dest_dir, &archive_stem(path));
+    fs::create_dir_all(&target).map_err(|err| err.to_string())?;
+    let target_str = target.to_string_lossy().to_string();
+    match extract_archive(path, &target_str) {
+        Ok(()) => Ok(target_str),
+        Err(err) => {
+            // Do not leave an empty folder behind after a failed extraction.
+            let _ = fs::remove_dir(&target);
+            Err(err)
+        }
+    }
+}
+
 pub fn is_archive_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".zip")
@@ -1703,6 +1743,58 @@ mod tests {
             !dir.join("dest/box/stale.txt").exists(),
             "replacing a folder must not leave the old contents behind"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_stem_strips_compound_suffixes() {
+        assert_eq!(archive_stem("/tmp/backup.tar.gz"), "backup");
+        assert_eq!(archive_stem("/tmp/backup.tar.zst"), "backup");
+        assert_eq!(archive_stem("/tmp/photos.zip"), "photos");
+        assert_eq!(archive_stem("/tmp/disc.iso"), "disc");
+        // A dot inside the name is not a suffix boundary we should eat twice.
+        assert_eq!(archive_stem("/tmp/v1.2.3.tar.xz"), "v1.2.3");
+        assert_eq!(archive_stem("/tmp/noext"), "noext");
+    }
+
+    #[test]
+    fn extract_into_new_dir_contains_the_files_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!(
+            "wf-extract-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // compress_zip runs `zip` FROM dest_dir with bare file names, so the
+        // sources have to sit in the folder it is told to write into.
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(dir.join("src/a.txt"), b"A").unwrap();
+        fs::write(dir.join("src/b.txt"), b"B").unwrap();
+        let zip = compress_zip(
+            &[
+                dir.join("src/a.txt").to_string_lossy().to_string(),
+                dir.join("src/b.txt").to_string_lossy().to_string(),
+            ],
+            &dir.join("src").to_string_lossy(),
+        )
+        .unwrap();
+
+        let dest = dir.join("out").to_string_lossy().to_string();
+        let first = extract_archive_into_new_dir(&zip, &dest).unwrap();
+        assert!(Path::new(&first).join("a.txt").exists(), "files land inside the new folder");
+        assert!(Path::new(&first).join("b.txt").exists());
+        assert!(
+            !Path::new(&dest).join("a.txt").exists(),
+            "nothing may be scattered into the folder we were looking at"
+        );
+
+        // Extracting the same archive again must not overwrite the first result.
+        let second = extract_archive_into_new_dir(&zip, &dest).unwrap();
+        assert_ne!(first, second, "second extraction gets its own folder");
+        assert!(Path::new(&second).join("a.txt").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
