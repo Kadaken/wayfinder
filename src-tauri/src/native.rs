@@ -1333,7 +1333,6 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     // generates no typed setter for it, so set the property directly. It needs a
     // multi-selection model, which this list has.
     list.set_property("enable-rubberband", true);
-    connect_rubberband_guard(&list);
     let grid = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::Multiple)
         .activate_on_single_click(false)
@@ -3774,41 +3773,6 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
 }
 
 
-/// Box-select must not hijack a drag that starts ON a file.
-///
-/// Rubber-band and per-row drag-out are two gestures competing for the same
-/// press. The list's rubber-band would win, so grabbing a file and pulling it
-/// somewhere started painting a selection box instead of picking the file up.
-///
-/// This runs in the CAPTURE phase — before the list's own drag gesture sees the
-/// press — and turns rubber-band off for that press when the pointer is over a
-/// row. Press empty space and it stays on, so sweeping a box still works.
-fn connect_rubberband_guard(list: &gtk::ListView) {
-    let press = gtk::GestureClick::new();
-    press.set_button(0); // any button
-    press.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let list_for_press = list.clone();
-    press.connect_pressed(move |_, _, x, y| {
-        let on_row = list_for_press
-            .pick(x, y, gtk::PickFlags::DEFAULT)
-            .map(|widget| {
-                // Walk up from whatever was hit to see if it sits inside a file
-                // row. The row Box is tagged "wf-file-row" by the factory.
-                let mut node = Some(widget);
-                while let Some(current) = node {
-                    if current.has_css_class("wf-file-row") {
-                        return true;
-                    }
-                    node = current.parent();
-                }
-                false
-            })
-            .unwrap_or(false);
-        list_for_press.set_property("enable-rubberband", !on_row);
-    });
-    list.add_controller(press);
-}
-
 /// Builds and recycles the Details/Compact rows. `bind` runs only for rows that
 /// are actually on screen, so this is called ~30 times regardless of whether the
 /// folder holds ten files or a hundred thousand.
@@ -6077,6 +6041,17 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
 ) {
     let drag = gtk::DragSource::new();
     drag.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
+    // Win the race against the list's rubber-band without touching any widget
+    // state. Events run capture-phase root->target first, then bubble
+    // target->root; the list's rubber-band gesture is on the bubble leg, so a
+    // capture-phase DragSource on the row sees the press first and a drag that
+    // starts ON a file picks it up instead of painting a selection box.
+    //
+    // The previous attempt flipped `enable-rubberband` from inside a capture
+    // handler. That adds/removes a gesture on the widget WHILE GTK is iterating
+    // that widget's gesture list, which segfaulted in gtk_widget_run_controllers.
+    // Never mutate a widget's controllers during event dispatch.
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
     drag.connect_prepare(move |_, _, _| {
         let selected = selected_paths(&state, &ui);
         let paths = if selected.iter().any(|selected| selected == &path) {
