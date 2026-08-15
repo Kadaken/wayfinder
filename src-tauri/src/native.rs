@@ -5020,6 +5020,28 @@ fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
     );
 }
 
+/// Extract into a new folder named after the archive, then select it.
+fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
+    let cwd = state.borrow().cwd.clone();
+    let stem = native_core::archive_stem(&path);
+    run_job(
+        state,
+        ui,
+        format!("Extracting to {stem}"),
+        move || {
+            let created = native_core::extract_archive_into_new_dir(&path, &cwd)?;
+            Ok(JobOutcome::message(format!(
+                "Extracted to {}",
+                Path::new(&created)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or(created)
+            )))
+        },
+        |_, _, _| {},
+    );
+}
+
 fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
     let cwd = state.borrow().cwd.clone();
     run_job(
@@ -5767,6 +5789,17 @@ fn show_item_context_menu(
         }));
     }
     if native_core::is_archive_path(&entry.path) {
+        {
+            // Default action: a new folder named after the archive, so a badly
+            // packed archive cannot scatter loose files over the current folder.
+            let state = state.clone();
+            let ui = ui.clone();
+            let path = entry.path.clone();
+            let label = format!("Extract to \"{}\"", native_core::archive_stem(&entry.path));
+            menu.append(&context_button(&label, &popover, move || {
+                extract_archive_to_folder_action(state.clone(), ui.clone(), path.clone())
+            }));
+        }
         let state = state.clone();
         let ui = ui.clone();
         let path = entry.path.clone();
