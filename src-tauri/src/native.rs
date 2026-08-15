@@ -538,15 +538,43 @@ popover box {
     background: @wf_raised;
 }
 
-popover button.flat {
-    color: @wf_text;
-    border-radius: 6px;
-    padding: 6px 10px;
+popover contents {
+    background: @wf_raised;
+    border: 1px solid @wf_border;
+    border-radius: 8px;
+    padding: 4px;
 }
 
-popover button.flat:hover {
+/* A menu row: fixed height, text hard left, shortcut hard right. Explorer's
+   menu reads as a menu because every row is the same height and everything
+   lines up on one left edge. */
+.wf-menu-item {
+    color: @wf_text;
+    border-radius: 5px;
+    padding: 0 10px;
+    min-height: 28px;
+    min-width: 200px;
+}
+
+.wf-menu-item:hover {
     background: @wf_accent;
     color: #ffffff;
+}
+
+.wf-menu-accel {
+    color: @wf_text_muted;
+    font-size: 11px;
+}
+
+.wf-menu-item:hover .wf-menu-accel {
+    color: rgba(255, 255, 255, 0.85);
+}
+
+/* Tight rules that group actions, not big gaps that pull the list apart. */
+.wf-menu-sep {
+    background: @wf_border;
+    min-height: 1px;
+    margin: 4px 6px;
 }
 "#;
 
@@ -3183,7 +3211,7 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("New Folder", &popover, move || {
+        menu.append(&context_item("New Folder", "Ctrl+Shift+N", &popover, move || {
             create_folder_action(state.clone(), ui.clone())
         }));
     }
@@ -3197,7 +3225,7 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Refresh", &popover, move || {
+        menu.append(&context_item("Refresh", "F5", &popover, move || {
             let cwd = state.borrow().cwd.clone();
             rebuild_sidebar(&state, &ui);
             navigate_without_history(&state, cwd);
@@ -3220,35 +3248,35 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Rename", &popover, move || {
+        menu.append(&context_item("Rename", "F2", &popover, move || {
             rename_action(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Copy", &popover, move || {
+        menu.append(&context_item("Copy", "Ctrl+C", &popover, move || {
             copy_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Cut", &popover, move || {
+        menu.append(&context_item("Cut", "Ctrl+X", &popover, move || {
             cut_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Paste", &popover, move || {
+        menu.append(&context_item("Paste", "Ctrl+V", &popover, move || {
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Move to Trash", &popover, move || {
+        menu.append(&context_item("Move to Trash", "Delete", &popover, move || {
             trash_selection(state.clone(), ui.clone())
         }));
     }
@@ -5744,28 +5772,28 @@ fn show_item_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Cut", &popover, move || {
+        menu.append(&context_item("Cut", "Ctrl+X", &popover, move || {
             cut_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Copy", &popover, move || {
+        menu.append(&context_item("Copy", "Ctrl+C", &popover, move || {
             copy_selection(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Copy Paths", &popover, move || {
+        menu.append(&context_item("Copy Paths", "Ctrl+Shift+C", &popover, move || {
             copy_paths_to_system_clipboard(&state, &ui)
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Paste", &popover, move || {
+        menu.append(&context_item("Paste", "Ctrl+V", &popover, move || {
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
@@ -5812,14 +5840,14 @@ fn show_item_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Move to Trash", &popover, move || {
+        menu.append(&context_item("Move to Trash", "Delete", &popover, move || {
             trash_selection(state.clone(), ui.clone())
         }));
     }
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Delete Permanently", &popover, move || {
+        menu.append(&context_item("Delete Permanently", "Shift+Delete", &popover, move || {
             permanent_delete_selection(state.clone(), ui.clone())
         }));
     }
@@ -5828,7 +5856,7 @@ fn show_item_context_menu(
     {
         let ui = ui.clone();
         let path = entry.path.clone();
-        menu.append(&context_button("Properties", &popover, move || {
+        menu.append(&context_item("Properties", "Alt+Enter", &popover, move || {
             show_properties_for_path(ui.clone(), path.clone())
         }));
     }
@@ -5871,7 +5899,7 @@ fn show_background_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("New Folder", &popover, move || {
+        menu.append(&context_item("New Folder", "Ctrl+Shift+N", &popover, move || {
             create_folder_action(state.clone(), ui.clone())
         }));
     }
@@ -5885,7 +5913,7 @@ fn show_background_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Paste", &popover, move || {
+        menu.append(&context_item("Paste", "Ctrl+V", &popover, move || {
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
@@ -5919,7 +5947,7 @@ fn show_background_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_button("Properties", &popover, move || {
+        menu.append(&context_item("Properties", "Alt+Enter", &popover, move || {
             let cwd = state.borrow().cwd.clone();
             show_properties_for_path(ui.clone(), cwd);
         }));
@@ -5940,11 +5968,36 @@ fn context_button<F>(label: &str, popover: &gtk::Popover, action: F) -> gtk::But
 where
     F: Fn() + 'static,
 {
-    let button = gtk::Button::builder()
+    context_item(label, "", popover, action)
+}
+
+/// One menu row, laid out like Explorer's: label hard left, keyboard shortcut
+/// greyed and hard right. A plain `Button::with_label` centres its text, which
+/// is what made the menu read as a stack of loose buttons rather than a menu.
+fn context_item<F>(label: &str, accel: &str, popover: &gtk::Popover, action: F) -> gtk::Button
+where
+    F: Fn() + 'static,
+{
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    let text = gtk::Label::builder()
         .label(label)
+        .xalign(0.0)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .build();
+    row.append(&text);
+    if !accel.is_empty() {
+        let hint = gtk::Label::builder().label(accel).xalign(1.0).build();
+        hint.add_css_class("wf-menu-accel");
+        row.append(&hint);
+    }
+
+    let button = gtk::Button::builder()
+        .child(&row)
         .halign(gtk::Align::Fill)
         .build();
     button.add_css_class("flat");
+    button.add_css_class("wf-menu-item");
     let popover = popover.clone();
     button.connect_clicked(move |_| {
         popover.popdown();
@@ -5954,7 +6007,9 @@ where
 }
 
 fn context_separator() -> gtk::Separator {
-    gtk::Separator::new(gtk::Orientation::Horizontal)
+    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+    sep.add_css_class("wf-menu-sep");
+    sep
 }
 
 #[allow(deprecated)]
