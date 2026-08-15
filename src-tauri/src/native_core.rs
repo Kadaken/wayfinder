@@ -1042,6 +1042,21 @@ pub fn is_archive_path(path: &str) -> bool {
         || lower.ends_with(".iso")
         || lower.ends_with(".arj")
         || lower.ends_with(".lzh")
+        // Containers that are not "archives" in the everyday sense but which 7z
+        // opens perfectly, and which people genuinely want to look inside.
+        // .appimage was the one that started this: it is an ELF with a squashfs
+        // stapled on, so `file` calls it an executable, but `7z x` extracts it
+        // without having to RUN it — which is both safer and works even when the
+        // file is not marked executable.
+        || lower.ends_with(".appimage")
+        || lower.ends_with(".deb")
+        || lower.ends_with(".rpm")
+        || lower.ends_with(".jar")
+        || lower.ends_with(".apk")
+        || lower.ends_with(".whl")
+        || lower.ends_with(".msi")
+        || lower.ends_with(".wim")
+        || lower.ends_with(".squashfs")
 }
 
 pub fn is_image_path(path: &str) -> bool {
@@ -1744,6 +1759,33 @@ mod tests {
             "replacing a folder must not leave the old contents behind"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appimage_and_friends_offer_extraction() {
+        // The one that started this: an AppImage is an ELF with a squashfs
+        // stapled on, so it never looked like an archive, and the user was left
+        // with no way to extract it.
+        assert!(is_archive_path("/home/z/Downloads/CodeOp-linux-4.0.0-beta+2 (1).AppImage"));
+        assert!(is_archive_path("/tmp/Thing-x86_64.appimage"), "case-insensitive");
+        for path in [
+            "/tmp/pkg.deb",
+            "/tmp/pkg.rpm",
+            "/tmp/lib.jar",
+            "/tmp/app.apk",
+            "/tmp/mod.whl",
+            "/tmp/setup.msi",
+            "/tmp/boot.wim",
+            "/tmp/root.squashfs",
+        ] {
+            assert!(is_archive_path(path), "{path} should be extractable");
+        }
+        // Still must not offer extraction for ordinary files.
+        for path in ["/tmp/readme.txt", "/tmp/photo.png", "/tmp/clip.mp4", "/tmp/script.sh"] {
+            assert!(!is_archive_path(path), "{path} is not an archive");
+        }
+        // And the extracted folder gets a sensible name.
+        assert_eq!(archive_stem("/tmp/CodeOp-linux-4.0.0-beta+2 (1).AppImage"), "CodeOp-linux-4.0.0-beta+2 (1)");
     }
 
     #[test]
