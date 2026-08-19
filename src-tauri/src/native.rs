@@ -563,6 +563,29 @@ popover contents {
     color: #ffffff;
 }
 
+/* Explorer's top strip: icon-only buttons for the actions you reach for
+   constantly, sitting above the labelled list. */
+.wf-menu-strip {
+    padding: 2px 2px 4px 2px;
+}
+
+.wf-menu-tool {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: @wf_text_dim;
+    border-radius: 5px;
+    min-width: 34px;
+    min-height: 30px;
+    padding: 0;
+    margin: 0;
+}
+
+.wf-menu-tool:hover {
+    background: @wf_control_hover;
+    color: #ffffff;
+}
+
 .wf-menu-icon {
     color: @wf_text_dim;
     -gtk-icon-size: 16px;
@@ -5736,6 +5759,70 @@ fn show_item_context_menu(
     menu.set_margin_end(4);
     menu.set_margin_bottom(4);
     menu.set_margin_start(4);
+
+    // Explorer leads with a strip of icon-only buttons for the actions you reach
+    // for constantly, then the labelled list underneath.
+    {
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        strip.add_css_class("wf-menu-strip");
+        strip.set_homogeneous(true);
+        let tools: [(&str, &str, Box<dyn Fn()>); 5] = [
+            (
+                "edit-cut-symbolic",
+                "Cut",
+                Box::new({
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move || cut_selection(&state, &ui)
+                }),
+            ),
+            (
+                "edit-copy-symbolic",
+                "Copy",
+                Box::new({
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move || copy_selection(&state, &ui)
+                }),
+            ),
+            (
+                "edit-paste-symbolic",
+                "Paste",
+                Box::new({
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move || paste_clipboard(state.clone(), ui.clone())
+                }),
+            ),
+            (
+                "document-edit-symbolic",
+                "Rename",
+                Box::new({
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move || rename_action(state.clone(), ui.clone())
+                }),
+            ),
+            (
+                "user-trash-symbolic",
+                "Move to Trash",
+                Box::new({
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move || trash_selection(state.clone(), ui.clone())
+                }),
+            ),
+        ];
+        for (icon, tooltip, action) in tools {
+            let button = gtk::Button::from_icon_name(icon);
+            button.set_tooltip_text(Some(tooltip));
+            button.add_css_class("flat");
+            button.add_css_class("wf-menu-tool");
+            let popover = popover.clone();
+            button.connect_clicked(move |_| {
+                popover.popdown();
+                action();
+            });
+            strip.append(&button);
+        }
+        menu.append(&strip);
+        menu.append(&context_separator());
+    }
 
     {
         let state = state.clone();
