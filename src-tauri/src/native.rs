@@ -174,6 +174,21 @@ row:focus-visible {
     padding: 0 6px;
 }
 
+/* Explorer's second toolbar row. Groups of buttons split by thin rules, with
+   the view controls pushed to the right. */
+.wf-commandbar {
+    background: @wf_raised;
+    border-bottom: 1px solid @wf_line;
+    min-height: 34px;
+    padding: 3px 6px;
+}
+
+.wf-command-divider {
+    background: @wf_border;
+    min-width: 1px;
+    margin: 5px 5px;
+}
+
 .wf-address {
     background: transparent;
     color: @wf_text;
@@ -1526,11 +1541,35 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     path_bar.append(&copy_path);
     path_bar.append(&search);
     path_bar.append(&search_in_files);
-    path_bar.append(&details_view);
-    path_bar.append(&compact_view);
-    path_bar.append(&icon_view);
-    path_bar.append(&refresh);
-    path_bar.append(&options);
+
+    // Explorer splits its chrome into a NAVIGATION row (back/forward/up/address
+    // /search) and a COMMAND BAR (New, cut/copy/paste/rename/delete, view,
+    // options). Wayfinder had all of it crammed into one row, and nine of the
+    // command buttons below were built and wired up but never put on screen at
+    // all, so New Folder, New File, Cut, Copy, Paste, Rename, Delete, Undo and
+    // Open Terminal were unreachable from the toolbar.
+    let command_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    command_bar.add_css_class("wf-commandbar");
+    command_bar.append(&new_folder);
+    command_bar.append(&new_file);
+    command_bar.append(&command_divider());
+    command_bar.append(&cut);
+    command_bar.append(&copy);
+    command_bar.append(&paste);
+    command_bar.append(&rename);
+    command_bar.append(&trash);
+    command_bar.append(&command_divider());
+    command_bar.append(&undo);
+    command_bar.append(&terminal);
+    let command_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    command_spacer.set_hexpand(true);
+    command_bar.append(&command_spacer);
+    command_bar.append(&details_view);
+    command_bar.append(&compact_view);
+    command_bar.append(&icon_view);
+    command_bar.append(&command_divider());
+    command_bar.append(&refresh);
+    command_bar.append(&options);
 
     let sidebar = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -1655,6 +1694,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         .build();
     path_scroller.set_size_request(0, 0);
     body.append(&path_scroller);
+    body.append(&command_bar);
     body.append(&main);
 
     let picker_open = if picker.is_some() {
@@ -1953,6 +1993,13 @@ fn select_entry_by_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
     if let Some(index) = index {
         select_index(state, ui, index);
     }
+}
+
+/// A thin vertical rule between groups of command-bar buttons.
+fn command_divider() -> gtk::Separator {
+    let sep = gtk::Separator::new(gtk::Orientation::Vertical);
+    sep.add_css_class("wf-command-divider");
+    sep
 }
 
 fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
