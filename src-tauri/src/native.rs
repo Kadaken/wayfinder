@@ -5366,37 +5366,64 @@ fn show_name_dialog<F>(
 ) where
     F: Fn(String) + 'static,
 {
-    let dialog = gtk::Dialog::with_buttons(
-        Some(title),
-        Some(&ui.window),
-        gtk::DialogFlags::MODAL,
-        &[
-            ("Cancel", gtk::ResponseType::Cancel),
-            ("OK", gtk::ResponseType::Ok),
-        ],
-    );
-    dialog.set_default_response(gtk::ResponseType::Ok);
+    // adw::AlertDialog renders INSIDE the parent window rather than as its own
+    // toplevel. The old gtk::Dialog was a separate window, so a KWin rule that
+    // forces Wayfinder windows to a screen position dragged this dialog off
+    // with it — and because it is modal, the app looked frozen while waiting on
+    // a box the user could not see. An in-window dialog cannot be misplaced.
+    let dialog = adw::AlertDialog::new(Some(title), None);
+    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "OK")]);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+
     let entry = gtk::Entry::builder()
         .text(default_name)
-        .activates_default(true)
         .hexpand(true)
-        .margin_top(16)
-        .margin_end(16)
-        .margin_bottom(16)
-        .margin_start(16)
+        .activates_default(true)
         .build();
-    dialog.content_area().append(&entry);
-    let entry_for_response = entry.clone();
-    dialog.connect_response(move |dialog, response| {
-        if response == gtk::ResponseType::Ok {
-            let value = entry_for_response.text().trim().to_string();
+    dialog.set_extra_child(Some(&entry));
+
+    // One shared handler, guarded so confirming with Enter and confirming with
+    // the button can never both fire.
+    let on_ok = Rc::new(on_ok);
+    let done = Rc::new(std::cell::Cell::new(false));
+    let confirm = {
+        let on_ok = on_ok.clone();
+        let done = done.clone();
+        move |value: String| {
+            if done.get() {
+                return;
+            }
+            done.set(true);
+            let value = value.trim().to_string();
             if !value.is_empty() {
                 on_ok(value);
             }
         }
-        dialog.close();
-    });
-    dialog.present();
+    };
+    let confirm = Rc::new(confirm);
+
+    {
+        let entry = entry.clone();
+        let confirm = confirm.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "ok" {
+                confirm(entry.text().to_string());
+            }
+        });
+    }
+    {
+        // Enter in the field confirms, as it did before.
+        let dialog = dialog.clone();
+        let confirm = confirm.clone();
+        entry.connect_activate(move |entry| {
+            confirm(entry.text().to_string());
+            dialog.close();
+        });
+    }
+
+    dialog.present(Some(&ui.window));
     entry.grab_focus();
     // select_region counts CHARACTERS, not bytes, so a name with any non-ASCII
     // in it would select the wrong amount if this used byte offsets.
@@ -5419,33 +5446,22 @@ fn show_confirm_dialog<F>(ui: &Ui, title: &str, body: &str, confirm: &str, on_co
 where
     F: Fn() + 'static,
 {
-    let dialog = gtk::Dialog::with_buttons(
-        Some(title),
-        Some(&ui.window),
-        gtk::DialogFlags::MODAL,
-        &[
-            ("Cancel", gtk::ResponseType::Cancel),
-            (confirm, gtk::ResponseType::Ok),
-        ],
-    );
-    dialog.set_default_response(gtk::ResponseType::Cancel);
-    let label = gtk::Label::builder()
-        .label(body)
-        .wrap(true)
-        .xalign(0.0)
-        .margin_top(16)
-        .margin_end(16)
-        .margin_bottom(16)
-        .margin_start(16)
-        .build();
-    dialog.content_area().append(&label);
-    dialog.connect_response(move |dialog, response| {
-        if response == gtk::ResponseType::Ok {
+    // In-window, for the same reason as show_name_dialog: a separate toplevel
+    // can be moved off-screen by a window rule while still holding a modal
+    // grab, which reads as the app freezing.
+    let dialog = adw::AlertDialog::new(Some(title), Some(body));
+    dialog.add_responses(&[("cancel", "Cancel"), ("confirm", confirm)]);
+    // This guards destructive actions, so Cancel is the default and the
+    // confirming button is marked destructive.
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(None, move |_, response| {
+        if response == "confirm" {
             on_confirm();
         }
-        dialog.close();
     });
-    dialog.present();
+    dialog.present(Some(&ui.window));
 }
 
 #[allow(deprecated)]
