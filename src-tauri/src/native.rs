@@ -410,6 +410,11 @@ scrollbar slider:active {
 
 .wf-list row {
     border-radius: 0;
+    /* Adwaita gives every list row 2px padding. That ring, plus the old margins
+       on the row box, was dead space no file owned: pressing there started a
+       selection box instead of picking the file up. The inset now lives inside
+       the row box (.wf-file-row padding), so the whole line belongs to the file. */
+    padding: 0;
     color: @wf_text;
     border-bottom: 1px solid rgba(255,255,255,0.025);
 }
@@ -425,6 +430,8 @@ scrollbar slider:active {
 
 .wf-file-row {
     min-height: 26px;
+    /* Same geometry as the old 2px row padding + 2px/10px margins. */
+    padding: 4px 12px;
 }
 
 .wf-file-icon {
@@ -2297,6 +2304,9 @@ const ROW_GAP: i32 = 10;
 // The draggable column separators double as the inter-column gap, so their width
 // must equal the rows' box spacing (ROW_GAP) for header and rows to line up.
 const COL_RESIZER_W: i32 = ROW_GAP;
+// Width of the strip at the far right of the Name column, ending at the Size
+// separator, where a press starts a selection box instead of dragging the file.
+const BOX_SELECT_STRIP_W: f64 = 24.0;
 
 /// Shared widths between the details header and every file row. A SizeGroup keeps
 /// each column's header button and its per-row label at one width, so dragging a
@@ -3902,10 +3912,6 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         line.add_css_class("wf-file-row");
-        line.set_margin_top(2);
-        line.set_margin_end(10);
-        line.set_margin_bottom(2);
-        line.set_margin_start(10);
         line.set_tooltip_text(Some(&entry.metadata_error.as_ref().map_or_else(
             || entry.path.clone(),
             |error| format!("{}\nMetadata unavailable: {error}", entry.path),
@@ -3971,7 +3977,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         line.append(&kind);
         line.append(&modified);
 
-        connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone());
+        connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone(), Some(&size));
         if entry.is_dir {
             connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.path.clone());
         }
@@ -4149,7 +4155,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             grid_item.append(&icon);
             grid_item.append(&name);
             grid_child.set_child(Some(&grid_item));
-            connect_file_drag(&grid_child, state.clone(), ui.clone(), entry.path.clone());
+            connect_file_drag(&grid_child, state.clone(), ui.clone(), entry.path.clone(), None);
             if entry.is_dir {
                 connect_file_drop_to_dir(
                     &grid_child,
@@ -6302,12 +6308,29 @@ fn show_properties_for_path(ui: Ui, path: String) {
     dialog.present();
 }
 
+/// `box_select_edge` is the Size label of a Details row. Pressing in the strip
+/// just left of it starts a selection box; pressing anywhere else on the row
+/// drags the file. Grid items pass None: the grid has no selection box.
 fn connect_file_drag<W: IsA<gtk::Widget>>(
     widget: &W,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
     path: String,
+    box_select_edge: Option<&gtk::Label>,
 ) {
+    let row: gtk::Widget = widget.clone().upcast();
+    let edge = box_select_edge.cloned();
+    let in_box_select_strip = Rc::new(move |x: f64| {
+        let Some(edge) = edge.as_ref() else {
+            return false;
+        };
+        let Some(bounds) = edge.compute_bounds(&row) else {
+            return false;
+        };
+        // The box spacing before the Size label is the column separator.
+        let separator = bounds.x() as f64 - ROW_GAP as f64;
+        x >= separator - BOX_SELECT_STRIP_W && x < bounds.x() as f64
+    });
     let drag = gtk::DragSource::new();
     drag.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
     // Win the race against the list's rubber-band without touching any widget
@@ -6321,7 +6344,11 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     // that widget's gesture list, which segfaulted in gtk_widget_run_controllers.
     // Never mutate a widget's controllers during event dispatch.
     drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-    drag.connect_prepare(move |_, _, _| {
+    let strip_for_prepare = in_box_select_strip.clone();
+    drag.connect_prepare(move |_, x, _| {
+        if strip_for_prepare(x) {
+            return None;
+        }
         let selected = selected_paths(&state, &ui);
         let paths = if selected.iter().any(|selected| selected == &path) {
             selected
@@ -6347,7 +6374,38 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
         ];
         Some(gdk::ContentProvider::new_union(&providers))
     });
-    widget.add_controller(drag);
+    widget.add_controller(drag.clone());
+
+    if box_select_edge.is_none() {
+        return;
+    }
+    // Capture phase alone did not win. GtkDragSource refuses to start a drag
+    // until 100 ms after the press (MIN_TIME_TO_DND in gtkdragsource.c), while
+    // the list's rubber-band claims the press the instant the pointer passes the
+    // drag threshold. A quick grab-and-pull crossed the threshold inside those
+    // 100 ms, so the box won and the DragSource was cancelled.
+    //
+    // This gesture claims the press first, at half the threshold, on the capture
+    // leg. Claiming cancels the list's bubble-phase rubber-band. It is grouped
+    // with the DragSource so the claim keeps the DragSource alive, and the drag
+    // starts as soon as its 100 ms are up. No widget state is changed here.
+    let claim = gtk::GestureDrag::new();
+    claim.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let row_for_claim = widget.clone().upcast::<gtk::Widget>();
+    claim.connect_drag_update(move |gesture, offset_x, offset_y| {
+        let Some((start_x, _)) = gesture.start_point() else {
+            return;
+        };
+        if in_box_select_strip(start_x) {
+            return;
+        }
+        let threshold = row_for_claim.settings().gtk_dnd_drag_threshold() as f64 / 2.0;
+        if offset_x.abs() > threshold || offset_y.abs() > threshold {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    widget.add_controller(claim.clone());
+    claim.group_with(&drag);
 }
 
 fn connect_file_drop<W: IsA<gtk::Widget>>(widget: &W, state: Rc<RefCell<AppState>>, ui: Ui) {
