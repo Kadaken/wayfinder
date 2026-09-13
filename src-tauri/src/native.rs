@@ -6308,6 +6308,11 @@ fn show_properties_for_path(ui: Ui, path: String) {
     dialog.present();
 }
 
+/// LOCKED 12 Sep 2026 — Zito confirmed this drag behaviour works. Do not change
+/// it without his say-so. The test `row_drag_beats_selection_box_locked` fails if
+/// any piece below is removed: the grouped capture-phase claim gesture, the
+/// half-threshold claim, the strip check in prepare, and the row padding CSS.
+///
 /// `box_select_edge` is the Size label of a Details row. Pressing in the strip
 /// just left of it starts a selection box; pressing anywhere else on the row
 /// drags the file. Grid items pass None: the grid has no selection box.
@@ -6775,5 +6780,32 @@ mod tests {
             "/tmp/selection".to_string(),
         ];
         assert_eq!(gtk_launch_args(&args), vec!["wayfinder"]);
+    }
+
+    /// LOCKED 12 Sep 2026: dragging a file from anywhere on its row must beat the
+    /// list's selection box. Zito confirmed it works. If this fails, a change
+    /// removed part of that fix — put it back, do not edit this test.
+    #[test]
+    fn row_drag_beats_selection_box_locked() {
+        // Only the app code above the tests, or these strings would match themselves.
+        let full = include_str!("native.rs");
+        let src = &full[..full.find(concat!("#[cfg", "(test)]")).expect("test module marker")];
+        for piece in [
+            "claim.set_propagation_phase(gtk::PropagationPhase::Capture);",
+            "claim.group_with(&drag);",
+            "gtk_dnd_drag_threshold() as f64 / 2.0",
+            "gesture.set_state(gtk::EventSequenceState::Claimed);",
+            "if strip_for_prepare(x) {",
+            "drag.set_propagation_phase(gtk::PropagationPhase::Capture);",
+            "connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone(), Some(&size));",
+            "const BOX_SELECT_STRIP_W: f64 = 24.0;",
+            "padding: 4px 12px;",
+        ] {
+            assert!(src.contains(piece), "locked row-drag fix is missing: {piece}");
+        }
+        assert!(
+            !src.contains(concat!("line.set_", "margin_top(2);")),
+            "row margins are back: they leave dead space that starts a selection box"
+        );
     }
 }
