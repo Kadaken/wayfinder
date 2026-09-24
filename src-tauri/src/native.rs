@@ -6696,48 +6696,120 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     claim.group_with(&drag);
 }
 
-fn connect_file_drop<W: IsA<gtk::Widget>>(widget: &W, state: Rc<RefCell<AppState>>, ui: Ui) {
-    let state_for_drop = state.clone();
-    let ui_for_drop = ui.clone();
+/// Paths offered by a drag, minus the destination folder itself.
+fn dragged_paths(value: &glib::Value, exclude: Option<&str>) -> Vec<String> {
+    let Ok(files) = value.get::<gdk::FileList>() else {
+        return Vec::new();
+    };
+    files
+        .files()
+        .into_iter()
+        .filter_map(|file| file.path())
+        .map(|path| path.to_string_lossy().to_string())
+        .filter(|path| Some(path.as_str()) != exclude)
+        .collect()
+}
+
+/// Whether the drop currently over `target` is a copy (Ctrl, or another drive)
+/// or a move (Shift, or the same drive).
+fn drop_is_copy(target: &gtk::DropTarget, srcs: &[String], dest: &str) -> bool {
+    let mods = target
+        .current_drop()
+        .map(|drop| drop.device())
+        .map(|device| device.modifier_state())
+        .unwrap_or_else(gdk::ModifierType::empty);
+    native_core::drag_is_copy(
+        srcs,
+        dest,
+        mods.contains(gdk::ModifierType::CONTROL_MASK),
+        mods.contains(gdk::ModifierType::SHIFT_MASK),
+    )
+}
+
+fn run_drop_job(
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    srcs: Vec<String>,
+    dest: String,
+    is_copy: bool,
+    to_label: Option<String>,
+) {
+    let count = srcs.len();
+    let (ing, ed) = if is_copy { ("Copying", "Copied") } else { ("Moving", "Moved") };
+    let label = match &to_label {
+        Some(to) => format!("{ing} {count} item{} to {to}", plural(count)),
+        None => format!("{ing} {count} dropped item{}", plural(count)),
+    };
+    run_job(
+        state,
+        ui,
+        label,
+        move || {
+            // A drop is not a deliberate paste, so never destroy on conflict.
+            // A failed MOVE is reported as a failure and never retried as COPY.
+            let items = native_core::resolve_paste(&srcs, &dest, is_copy, native_core::PasteConflict::KeepBoth)?;
+            Ok(JobOutcome::undo(
+                format!("{ed} {} item{}", items.len(), plural(items.len())),
+                UndoAction::Pasted {
+                    items,
+                    was_copy: is_copy,
+                },
+            ))
+        },
+        |_, _, _| {},
+    );
+}
+
+fn build_drop_target(
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    fixed_dest: Option<String>,
+) -> gtk::DropTarget {
     let drop = gtk::DropTarget::new(
         gdk::FileList::static_type(),
         gdk::DragAction::COPY | gdk::DragAction::MOVE,
     );
-    drop.connect_drop(move |_, value, _, _| {
-        let Ok(files) = value.get::<gdk::FileList>() else {
-            return false;
-        };
-        let srcs: Vec<String> = files
-            .files()
-            .into_iter()
-            .filter_map(|file| file.path())
-            .map(|path| path.to_string_lossy().to_string())
-            .collect();
+    // Preload so the offered paths are known while the pointer is still moving.
+    drop.set_preload(true);
+    let to_row = fixed_dest.is_some();
+    let dest_of = {
+        let state = state.clone();
+        move || fixed_dest.clone().unwrap_or_else(|| state.borrow().cwd.clone())
+    };
+    drop.connect_motion({
+        let dest_of = dest_of.clone();
+        move |target, _, _| {
+            let dest = dest_of();
+            let srcs = target
+                .value()
+                .map(|v| dragged_paths(&v, Some(&dest)))
+                .unwrap_or_default();
+            if srcs.is_empty() {
+                return gdk::DragAction::COPY;
+            }
+            if drop_is_copy(target, &srcs, &dest) {
+                gdk::DragAction::COPY
+            } else {
+                gdk::DragAction::MOVE
+            }
+        }
+    });
+    drop.connect_drop(move |target, value, _, _| {
+        let dest = dest_of();
+        let srcs = dragged_paths(value, Some(&dest));
         if srcs.is_empty() {
             return false;
         }
-        let cwd = state_for_drop.borrow().cwd.clone();
-        let count = srcs.len();
-        run_job(
-            state_for_drop.clone(),
-            ui_for_drop.clone(),
-            format!("Copying {count} dropped item{}", plural(count)),
-            move || {
-                // A drop is not a deliberate paste, so never destroy on conflict.
-                let items = native_core::resolve_paste(&srcs, &cwd, true, native_core::PasteConflict::KeepBoth)?;
-                Ok(JobOutcome::undo(
-                    format!("Copied {} item{}", items.len(), plural(items.len())),
-                    UndoAction::Pasted {
-                        items,
-                        was_copy: true,
-                    },
-                ))
-            },
-            |_, _, _| {},
-        );
+        let is_copy = drop_is_copy(target, &srcs, &dest);
+        let to_label = to_row.then(|| tab_label(&dest));
+        run_drop_job(state.clone(), ui.clone(), srcs, dest, is_copy, to_label);
         true
     });
-    widget.add_controller(drop);
+    drop
+}
+
+fn connect_file_drop<W: IsA<gtk::Widget>>(widget: &W, state: Rc<RefCell<AppState>>, ui: Ui) {
+    widget.add_controller(build_drop_target(state, ui, None));
 }
 
 fn connect_file_drop_to_dir<W: IsA<gtk::Widget>>(
@@ -6746,50 +6818,7 @@ fn connect_file_drop_to_dir<W: IsA<gtk::Widget>>(
     ui: Ui,
     dest_dir: String,
 ) {
-    let drop = gtk::DropTarget::new(
-        gdk::FileList::static_type(),
-        gdk::DragAction::COPY | gdk::DragAction::MOVE,
-    );
-    drop.connect_drop(move |_, value, _, _| {
-        let Ok(files) = value.get::<gdk::FileList>() else {
-            return false;
-        };
-        let srcs: Vec<String> = files
-            .files()
-            .into_iter()
-            .filter_map(|file| file.path())
-            .map(|path| path.to_string_lossy().to_string())
-            .filter(|path| path != &dest_dir)
-            .collect();
-        if srcs.is_empty() {
-            return false;
-        }
-        let count = srcs.len();
-        let dest = dest_dir.clone();
-        run_job(
-            state.clone(),
-            ui.clone(),
-            format!(
-                "Copying {count} item{} to {}",
-                plural(count),
-                tab_label(&dest)
-            ),
-            move || {
-                // A drop is not a deliberate paste, so never destroy on conflict.
-                let items = native_core::resolve_paste(&srcs, &dest, true, native_core::PasteConflict::KeepBoth)?;
-                Ok(JobOutcome::undo(
-                    format!("Copied {} item{}", items.len(), plural(items.len())),
-                    UndoAction::Pasted {
-                        items,
-                        was_copy: true,
-                    },
-                ))
-            },
-            |_, _, _| {},
-        );
-        true
-    });
-    widget.add_controller(drop);
+    widget.add_controller(build_drop_target(state, ui, Some(dest_dir)));
 }
 
 fn connect_zoom_controller<W: IsA<gtk::Widget>>(
