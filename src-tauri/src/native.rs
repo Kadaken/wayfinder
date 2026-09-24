@@ -1000,6 +1000,9 @@ fn remove_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
 
 #[derive(Clone)]
 struct AppState {
+    inline_rename: Option<InlineRename>,
+    /// Last plain click on a Name label: path and when, for slow-second-click.
+    last_name_click: Option<(String, std::time::Instant)>,
     cwd: String,
     tabs: Vec<String>,
     active_tab: usize,
@@ -1313,6 +1316,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         })
         .unwrap_or_else(|| "/".to_string());
     let state = Rc::new(RefCell::new(AppState {
+        inline_rename: None,
+        last_name_click: None,
         cwd: initial_cwd.clone(),
         tabs: vec![initial_cwd.clone()],
         active_tab: 0,
@@ -3895,6 +3900,191 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
 /// Builds and recycles the Details/Compact rows. `bind` runs only for rows that
 /// are actually on screen, so this is called ~30 times regardless of whether the
 /// folder holds ten files or a hundred thousand.
+/// Re-binds one row (after an inline edit starts or is cancelled) and keeps it
+/// selected; a ListStore change on a position drops that row's selection.
+fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+    let Some(entry) = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned() else {
+        return;
+    };
+    let pos = state.borrow().visible_entries.iter().position(|e| e.path == path).unwrap_or(0);
+    // A real replace, not items_changed: ListView only rebinds a row when the
+    // model reports a different item there.
+    ui.list_store.splice(pos as u32, 1, &[glib::BoxedAnyObject::new(entry)]);
+    ui.list_selection.select_item(pos as u32, true);
+}
+
+fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
+    state.borrow_mut().inline_rename = Some(InlineRename::new(&entry.path, &entry.name));
+    state.borrow_mut().last_name_click = None;
+    refresh_row(state, ui, &entry.path);
+}
+
+fn cancel_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let Some(edit) = state.borrow_mut().inline_rename.take() else {
+        return;
+    };
+    refresh_row(state, ui, &edit.path);
+}
+
+/// The one commit path for Enter and focus loss. Success renames on disk,
+/// clears the edit and reloads (the existing sort re-places the row); failure
+/// keeps the same field open with the typed text and the reason in the status.
+fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Entry) {
+    let typed = field.text().trim().to_string();
+    let path = {
+        let mut st = state.borrow_mut();
+        let Some(edit) = st.inline_rename.as_mut() else {
+            return;
+        };
+        if !edit.begin_commit(&typed) {
+            return;
+        }
+        edit.path.clone()
+    };
+    let old_name = Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if typed == old_name {
+        cancel_inline_rename(state, ui);
+        return;
+    }
+    match native_core::rename_path(&path, &typed) {
+        Ok(to) => {
+            state.borrow_mut().inline_rename = None;
+            push_undo(state, UndoAction::Renamed { from: path, to: to.clone() });
+            let cwd = state.borrow().cwd.clone();
+            navigate(state, cwd);
+            ui.status.set_label(&format!("Renamed {old_name} to {typed}"));
+        }
+        Err(err) => {
+            if let Some(edit) = state.borrow_mut().inline_rename.as_mut() {
+                edit.fail(err.clone());
+            }
+            ui.status.set_label(&format!("Cannot rename {old_name} to {typed}: {err}"));
+            let field = field.clone();
+            glib::idle_add_local_once(move || {
+                field.grab_focus();
+                field.select_region(0, -1);
+            });
+        }
+    }
+}
+
+fn build_inline_editor(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    entry: &Entry,
+    edit: &InlineRename,
+) -> gtk::Entry {
+    let field = gtk::Entry::builder().text(&edit.text).hexpand(true).build();
+    field.add_css_class("wf-file-name");
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        field.connect_activate(move |f| {
+            debug_assert!(inline_event_commits(InlineEvent::Enter));
+            commit_inline_rename(&state, &ui, f)
+        });
+    }
+    let keys = gtk::EventControllerKey::new();
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                debug_assert!(!inline_event_commits(InlineEvent::Escape));
+                cancel_inline_rename(&state, &ui);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    field.add_controller(keys);
+    let focus = gtk::EventControllerFocus::new();
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        // Clicking away cancels (owner decision); Enter is the only commit.
+        focus.connect_leave(move |_| {
+            debug_assert!(!inline_event_commits(InlineEvent::FocusLoss));
+            cancel_inline_rename(&state, &ui);
+        });
+    }
+    field.add_controller(focus);
+    // Own pointer events: clicks inside the editor place the caret and must not
+    // reach the row's drag/selection handling.
+    let click = gtk::GestureClick::new();
+    click.connect_pressed(|g, _, _, _| { g.set_state(gtk::EventSequenceState::Claimed); });
+    field.add_controller(click);
+
+    // A click on empty list space does not always move keyboard focus, so focus
+    // loss alone would miss it: also watch presses anywhere in the window and
+    // cancel when one lands outside the field. The watcher removes itself.
+    let watcher = gtk::GestureClick::new();
+    watcher.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let (state, ui, field) = (state.clone(), ui.clone(), field.clone());
+        let this = watcher.clone();
+        watcher.connect_pressed(move |_, _, x, y| {
+            if state.borrow().inline_rename.is_none() || !field.is_mapped() {
+                ui.window.remove_controller(&this);
+                return;
+            }
+            let inside = ui
+                .window
+                .pick(x, y, gtk::PickFlags::DEFAULT)
+                .is_some_and(|w| w == field || w.is_ancestor(&field));
+            if !inside {
+                ui.window.remove_controller(&this);
+                cancel_inline_rename(&state, &ui);
+            }
+        });
+    }
+    ui.window.add_controller(watcher);
+
+    let selection = if entry.is_dir { NameSelection::All } else { NameSelection::StemOnly };
+    let end = match selection {
+        NameSelection::All => -1,
+        NameSelection::StemOnly => {
+            let (stem, ext) = split_stem_ext(&edit.text);
+            if ext.is_empty() { -1 } else { stem.chars().count() as i32 }
+        }
+    };
+    let f = field.clone();
+    glib::idle_add_local_once(move || {
+        f.grab_focus();
+        f.select_region(0, end);
+    });
+    field
+}
+
+/// Slow second click on an already-selected Name starts the inline edit.
+fn connect_name_slow_click(
+    label: &gtk::Label,
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    path: &str,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let (state, ui, path) = (state.clone(), ui.clone(), path.to_string());
+    click.connect_released(move |_, n_press, _, _| {
+        let prior = state
+            .borrow()
+            .last_name_click
+            .as_ref()
+            .filter(|(p, _)| *p == path)
+            .map(|(_, at)| at.elapsed());
+        let only_this = selected_paths(&state, &ui) == vec![path.clone()];
+        state.borrow_mut().last_name_click = Some((path.clone(), std::time::Instant::now()));
+        if slow_click_starts_rename(prior, n_press, only_this) {
+            let entry = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned();
+            if let Some(entry) = entry {
+                begin_inline_rename(&state, &ui, &entry);
+            }
+        }
+    });
+    label.add_controller(click);
+}
+
 fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.clone();
     let ui_for_unbind = ui.clone();
@@ -3931,6 +4121,19 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         name.add_css_class("wf-file-name");
+        let editing = state
+            .borrow()
+            .inline_rename
+            .as_ref()
+            .filter(|edit| edit.path == entry.path)
+            .cloned();
+        let name: gtk::Widget = match editing {
+            Some(edit) => build_inline_editor(&state, &ui, &entry, &edit).upcast(),
+            None => {
+                connect_name_slow_click(&name, &state, &ui, &entry.path);
+                name.upcast()
+            }
+        };
         let size_text = if entry.metadata_error.is_some() {
             "—".to_string()
         } else if entry.is_dir {
@@ -4778,6 +4981,10 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Select one item to rename");
         return;
     };
+    if f2_starts_inline_rename(entries.len(), state.borrow().view_mode) {
+        begin_inline_rename(&state, &ui, &entry);
+        return;
+    }
     let old_name = entry.name.clone();
     let old_path = entry.path.clone();
     let default_name = old_name.clone();
@@ -5352,6 +5559,70 @@ where
     });
 }
 
+/// Inline (in-row) rename state. Keyed by the ORIGINAL full path, never a row
+/// index, so virtualised rows rebinding or a re-sort cannot retarget the edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InlineRename {
+    path: String,
+    text: String,
+    error: Option<String>,
+    /// True from the moment a commit starts until it succeeds or fails, so
+    /// Enter followed by the focus loss it causes writes exactly once.
+    pending: bool,
+}
+
+impl InlineRename {
+    fn new(path: &str, text: &str) -> Self {
+        Self { path: path.to_string(), text: text.to_string(), error: None, pending: false }
+    }
+
+    /// Claims the single commit slot; false if a commit is already running.
+    fn begin_commit(&mut self, text: &str) -> bool {
+        if self.pending {
+            return false;
+        }
+        self.pending = true;
+        self.text = text.to_string();
+        true
+    }
+
+    /// A failed commit keeps the field open with the text and the reason.
+    fn fail(&mut self, reason: String) {
+        self.pending = false;
+        self.error = Some(reason);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InlineEvent {
+    Enter,
+    Escape,
+    FocusLoss,
+}
+
+/// Enter is the only gesture that writes; Escape and click-away cancel.
+fn inline_event_commits(event: InlineEvent) -> bool {
+    matches!(event, InlineEvent::Enter)
+}
+
+/// F2 only starts an inline edit for exactly one selected item in a list view.
+fn f2_starts_inline_rename(selected: usize, view: ViewMode) -> bool {
+    selected == 1 && matches!(view, ViewMode::Details | ViewMode::Compact)
+}
+
+/// A slow second click renames only when the name was already selected by an
+/// earlier click, and is neither the first click nor a double-click (open).
+fn slow_click_starts_rename(
+    prior_click_on_same_path: Option<Duration>,
+    n_press: i32,
+    only_this_selected: bool,
+) -> bool {
+    n_press == 1
+        && only_this_selected
+        && prior_click_on_same_path
+            .is_some_and(|d| d >= Duration::from_millis(500) && d <= Duration::from_millis(2000))
+}
+
 #[allow(deprecated)]
 /// How much of the pre-filled name starts out selected.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5363,13 +5634,12 @@ enum NameSelection {
     StemOnly,
 }
 
-fn show_name_dialog<F>(
-    ui: &Ui,
+fn build_name_dialog<F>(
     title: &str,
     default_name: &str,
-    selection: NameSelection,
     on_ok: F,
-) where
+) -> (adw::AlertDialog, gtk::Entry)
+where
     F: Fn(String) + 'static,
 {
     // adw::AlertDialog renders INSIDE the parent window rather than as its own
@@ -5429,6 +5699,19 @@ fn show_name_dialog<F>(
         });
     }
 
+    (dialog, entry)
+}
+
+fn show_name_dialog<F>(
+    ui: &Ui,
+    title: &str,
+    default_name: &str,
+    selection: NameSelection,
+    on_ok: F,
+) where
+    F: Fn(String) + 'static,
+{
+    let (dialog, entry) = build_name_dialog(title, default_name, on_ok);
     dialog.present(Some(&ui.window));
     entry.grab_focus();
     // select_region counts CHARACTERS, not bytes, so a name with any non-ASCII
@@ -6735,6 +7018,76 @@ mod tests {
         } else {
             stem.chars().count() as i32
         }
+    }
+
+    /// Runs only under a virtual display (see the env guard), so it can never
+    /// open a window on the owner's screen.
+    #[test]
+    fn name_dialog_ok_and_enter_invoke_callback_once_cancel_never() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let build = |calls: &Rc<RefCell<Vec<String>>>| {
+            let calls = calls.clone();
+            build_name_dialog("Rename", "a.txt", move |n| calls.borrow_mut().push(n))
+        };
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (dialog, entry) = build(&calls);
+        entry.set_text("b.txt");
+        dialog.emit_by_name::<()>("response", &[&"ok"]);
+        assert_eq!(*calls.borrow(), vec!["b.txt".to_string()], "OK reaches the callback once");
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (dialog, entry) = build(&calls);
+        entry.set_text("c.txt");
+        dialog.emit_by_name::<()>("response", &[&"cancel"]);
+        assert!(calls.borrow().is_empty(), "Cancel never calls back");
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (_dialog, entry) = build(&calls);
+        entry.set_text("d.txt");
+        entry.emit_activate();
+        assert_eq!(*calls.borrow(), vec!["d.txt".to_string()], "Enter reaches the callback once");
+    }
+
+    #[test]
+    fn inline_rename_commit_guard_writes_once_and_failure_keeps_text() {
+        let mut edit = InlineRename::new("/d/a.txt", "a.txt");
+        assert!(edit.begin_commit("b.txt"), "Enter claims the commit");
+        assert!(!edit.begin_commit("b.txt"), "the focus loss after Enter must not write again");
+        edit.fail("\"b.txt\" already exists".into());
+        assert_eq!(edit.text, "b.txt", "text kept for the user to fix");
+        assert!(edit.error.is_some());
+        assert!(edit.begin_commit("c.txt"), "a failed commit can be retried");
+    }
+
+    #[test]
+    fn only_enter_commits_click_away_and_escape_cancel() {
+        assert!(inline_event_commits(InlineEvent::Enter));
+        assert!(!inline_event_commits(InlineEvent::FocusLoss), "click-away must not write");
+        assert!(!inline_event_commits(InlineEvent::Escape));
+    }
+
+    #[test]
+    fn f2_needs_exactly_one_selected_row_in_a_list_view() {
+        assert!(f2_starts_inline_rename(1, ViewMode::Details));
+        assert!(f2_starts_inline_rename(1, ViewMode::Compact));
+        assert!(!f2_starts_inline_rename(0, ViewMode::Details));
+        assert!(!f2_starts_inline_rename(2, ViewMode::Details), "several selected stays batch rename");
+        assert!(!f2_starts_inline_rename(1, ViewMode::Grid), "grid is not in this round");
+    }
+
+    #[test]
+    fn slow_click_needs_an_already_selected_name() {
+        let slow = Some(Duration::from_millis(900));
+        assert!(slow_click_starts_rename(slow, 1, true));
+        assert!(!slow_click_starts_rename(None, 1, true), "first click only selects");
+        assert!(!slow_click_starts_rename(slow, 2, true), "double-click opens");
+        assert!(!slow_click_starts_rename(Some(Duration::from_millis(150)), 1, true), "too fast");
+        assert!(!slow_click_starts_rename(Some(Duration::from_secs(5)), 1, true), "too old");
+        assert!(!slow_click_starts_rename(slow, 1, false), "not the only selection");
     }
 
     #[test]
