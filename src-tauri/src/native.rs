@@ -434,6 +434,14 @@ scrollbar slider:active {
     padding: 4px 12px;
 }
 
+.wf-drag-badge {
+    background: @wf_accent;
+    color: #ffffff;
+    border-radius: 8px;
+    padding: 0 5px;
+    font-size: 10px;
+}
+
 .wf-file-icon {
     min-width: 24px;
     min-height: 22px;
@@ -5242,38 +5250,34 @@ fn clipboard_after_job<T>(clear_cut_after: bool, succeeded: bool, clipboard: Opt
 }
 
 /// Replace / Duplicate / Cancel. Escape or closing the window is Cancel.
+/// Heading and optional detail. One clash: heading only. Several: the names and
+/// the one-choice-applies-to-all statement, and no explanation of the buttons.
+fn conflict_dialog_text(conflicts: &[String]) -> (String, Option<String>) {
+    let count = conflicts.len();
+    if count == 1 {
+        return (format!("\"{}\" already exists here.", conflicts[0]), None);
+    }
+    let sample: Vec<&str> = conflicts.iter().take(5).map(String::as_str).collect();
+    let more = count.saturating_sub(sample.len());
+    let listed = sample.join(", ");
+    let names = if more > 0 { format!("{listed}, and {more} more.") } else { listed };
+    (
+        format!("{count} items already exist here."),
+        Some(format!("{names}\n\nYour choice applies to all of them.")),
+    )
+}
+
 fn show_conflict_dialog<F>(ui: &Ui, conflicts: &[String], on_choice: F)
 where
     F: Fn(native_core::PasteConflict) + 'static,
 {
-    let count = conflicts.len();
-    let heading = if count == 1 {
-        format!("\"{}\" already exists here.", conflicts[0])
-    } else {
-        format!("{count} items already exist here.")
-    };
-    let names = if count == 1 {
-        String::new()
-    } else {
-        let sample: Vec<&str> = conflicts.iter().take(5).map(String::as_str).collect();
-        let more = count.saturating_sub(sample.len());
-        let listed = sample.join(", ");
-        if more > 0 {
-            format!("{listed}, and {more} more.\n\n")
-        } else {
-            format!("{listed}\n\n")
-        }
-    };
-    let scope = if count == 1 { "" } else { " Your choice applies to all of them." };
-    let detail = format!(
-        "{names}Replace overwrites the existing item, and Undo cannot bring the overwritten data back. Duplicate keeps both.{scope}"
-    );
+    let (heading, detail) = conflict_dialog_text(conflicts);
 
-    let dialog = adw::AlertDialog::new(Some(&heading), Some(&detail));
+    let dialog = adw::AlertDialog::new(Some(&heading), detail.as_deref());
     dialog.add_responses(&[
         ("cancel", "Cancel"),
         ("duplicate", "Duplicate"),
-        ("replace", "Replace"),
+        ("replace", "Overwrite"),
     ]);
     dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("duplicate"));
@@ -6870,6 +6874,17 @@ fn show_properties_for_path(ui: Ui, path: String) {
 /// `box_select_edge` is the Size label of a Details row. Pressing in the strip
 /// just left of it starts a selection box; pressing anywhere else on the row
 /// drags the file. Grid items pass None: the grid has no selection box.
+/// The paths a drag carries: the selection captured at the press when the
+/// pressed row belongs to it, else only the pressed row.
+fn drag_payload(snapshot: Option<Vec<String>>, live: Vec<String>, pressed: &str) -> Vec<String> {
+    let selected = snapshot.unwrap_or(live);
+    if selected.iter().any(|p| p == pressed) {
+        selected
+    } else {
+        vec![pressed.to_string()]
+    }
+}
+
 fn connect_file_drag<W: IsA<gtk::Widget>>(
     widget: &W,
     state: Rc<RefCell<AppState>>,
@@ -6903,17 +6918,62 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     // that widget's gesture list, which segfaulted in gtk_widget_run_controllers.
     // Never mutate a widget's controllers during event dispatch.
     drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+    // The selection as it was at the press, before the ordinary press handling
+    // can collapse it to the pressed row. Cleared when the gesture ends.
+    let pressed_selection: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(None));
+    {
+        let snap = gtk::GestureClick::new();
+        snap.set_button(1);
+        snap.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let (state, ui, slot) = (state.clone(), ui.clone(), pressed_selection.clone());
+        snap.connect_pressed(move |_, _, _, _| {
+            *slot.borrow_mut() = Some(selected_paths(&state, &ui));
+        });
+        let slot = pressed_selection.clone();
+        snap.connect_released(move |_, _, _, _| *slot.borrow_mut() = None);
+        let slot = pressed_selection.clone();
+        snap.connect_stopped(move |_| *slot.borrow_mut() = None);
+        widget.add_controller(snap);
+    }
+    {
+        let slot = pressed_selection.clone();
+        drag.connect_drag_end(move |_, _, _| *slot.borrow_mut() = None);
+        let slot = pressed_selection.clone();
+        drag.connect_drag_cancel(move |_, _, _| {
+            *slot.borrow_mut() = None;
+            false
+        });
+    }
+    // A compact fixed-size drag picture (the row's normal icon size plus a small
+    // count badge) instead of GTK's snapshot of the whole row.
+    let drag_count = Rc::new(std::cell::Cell::new(1usize));
+    {
+        let (count, path) = (drag_count.clone(), path.clone());
+        drag.connect_drag_begin(move |_, drag| {
+            let is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+            let image = gtk::Image::from_icon_name(if is_dir { "folder" } else { "text-x-generic" });
+            image.set_pixel_size(32);
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&image));
+            if count.get() > 1 {
+                let badge = gtk::Label::new(Some(&count.get().to_string()));
+                badge.add_css_class("wf-drag-badge");
+                badge.set_halign(gtk::Align::End);
+                badge.set_valign(gtk::Align::End);
+                overlay.add_overlay(&badge);
+            }
+            overlay.set_size_request(32, 32);
+            gtk::DragIcon::for_drag(drag).set_child(Some(&overlay));
+        });
+    }
     let strip_for_prepare = in_box_select_strip.clone();
     drag.connect_prepare(move |_, x, _| {
         if strip_for_prepare(x) {
             return None;
         }
-        let selected = selected_paths(&state, &ui);
-        let paths = if selected.iter().any(|selected| selected == &path) {
-            selected
-        } else {
-            vec![path.clone()]
-        };
+        let snapshot = pressed_selection.borrow().clone();
+        let paths = drag_payload(snapshot, selected_paths(&state, &ui), &path);
+        drag_count.set(paths.len());
         let files: Vec<gio::File> = paths
             .iter()
             .map(|path| gio::File::for_path(PathBuf::from(path)))
@@ -7400,6 +7460,76 @@ mod tests {
     }
 
     #[test]
+    fn drag_payload_keeps_the_press_time_selection_for_every_selected_row() {
+        let root = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(format!("Projects/Scratch/wf-multi-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(root.join("Inbox/Target")).unwrap();
+        let p = |rel: &str| root.join(rel).to_string_lossy().to_string();
+        let (d, e, other) = (p("Inbox/d-two.txt"), p("Inbox/e-two.txt"), p("Inbox/other.txt"));
+        std::fs::write(&d, b"D-BIG-13").unwrap();
+        std::fs::write(&e, b"E-BIG-14!").unwrap();
+        std::fs::write(&other, b"OTHER").unwrap();
+        std::fs::write(p("Inbox/Target/d-two.txt"), b"d1").unwrap();
+        std::fs::write(p("Inbox/Target/e-two.txt"), b"e1").unwrap();
+
+        // the live selection has already collapsed to the pressed row
+        for pressed in [&d, &e] {
+            let paths = drag_payload(Some(vec![d.clone(), e.clone()]), vec![pressed.clone()], pressed);
+            assert_eq!(paths, vec![d.clone(), e.clone()], "both selected rows are carried");
+            let files: Vec<gio::File> = paths.iter().map(gio::File::for_path).collect();
+            assert_eq!(gdk::FileList::from_array(&files).files().len(), 2);
+        }
+        // pressing an unselected row drags only that row
+        assert_eq!(
+            drag_payload(Some(vec![d.clone(), e.clone()]), vec![other.clone()], &other),
+            vec![other.clone()]
+        );
+        // with no snapshot the live selection is used
+        assert_eq!(drag_payload(None, vec![d.clone(), e.clone()], &e), vec![d.clone(), e.clone()]);
+
+        // one aggregate prompt, Duplicate creates both "(2)", MOVE consumes both
+        let srcs = drag_payload(Some(vec![d.clone(), e.clone()]), vec![e.clone()], &e);
+        let t = Transfer {
+            srcs,
+            dest: p("Inbox/Target"),
+            is_copy: false,
+            clear_cut_after: false,
+            style: TransferStyle::DropOnRow,
+        };
+        assert_eq!(
+            plan_transfer(&t),
+            TransferPlan::Ask(vec!["d-two.txt".to_string(), "e-two.txt".to_string()])
+        );
+        perform_transfer(&t.srcs, &t.dest, false, native_core::PasteConflict::KeepBoth).unwrap();
+        assert_eq!(std::fs::read(p("Inbox/Target/d-two (2).txt")).unwrap(), b"D-BIG-13");
+        assert_eq!(std::fs::read(p("Inbox/Target/e-two (2).txt")).unwrap(), b"E-BIG-14!");
+        assert_eq!(std::fs::read(p("Inbox/Target/d-two.txt")).unwrap(), b"d1");
+        assert!(!std::path::Path::new(&d).exists() && !std::path::Path::new(&e).exists());
+        assert_eq!(std::fs::read(&other).unwrap(), b"OTHER");
+    }
+
+    #[test]
+    fn conflict_dialog_wording_is_short() {
+        let (h, d) = conflict_dialog_text(&["a.txt".to_string()]);
+        assert_eq!(h, "\"a.txt\" already exists here.");
+        assert!(d.is_none(), "a single clash shows only the heading");
+        let (h, d) = conflict_dialog_text(&["a".to_string(), "b".to_string()]);
+        assert_eq!(h, "2 items already exist here.");
+        let d = d.unwrap();
+        assert!(d.contains("a, b") && d.contains("applies to all"));
+        for banned in ["Undo", "overwrites", "Replace", "keeps both"] {
+            assert!(!d.contains(banned));
+        }
+    }
+
+    #[test]
     fn transfer_postcondition_rejects_a_bad_result() {
         let before = vec![native_core::SourceSnapshot {
             path: "/nonexistent-wf/a".into(),
@@ -7593,15 +7723,29 @@ mod tests {
 
     /// Runs only under a virtual display (see the env guard), so it can never
     /// open a window on the owner's screen.
+    /// All GTK tests share one thread (GTK initializes once) and run only under
+    /// a virtual display, so they can never open a window on the owner's screen.
     #[test]
-    fn name_dialog_ok_and_enter_invoke_callback_once_cancel_never() {
+    fn gtk_headless_suite() {
         if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
             return;
         }
         gtk::init().expect("gtk init on the virtual display");
+        name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
+        list_activation_gate_on_real_listview_opens_only_when_allowed();
+        inline_editor_click_away_never_writes_and_enter_writes_once();
+    }
+
+    fn name_dialog_ok_and_enter_invoke_callback_once_cancel_never() {
+        let parent = gtk::Window::new();
+        parent.present();
+        pump();
         let build = |calls: &Rc<RefCell<Vec<String>>>| {
             let calls = calls.clone();
-            build_name_dialog("Rename", "a.txt", move |n| calls.borrow_mut().push(n))
+            let built = build_name_dialog("Rename", "a.txt", move |n| calls.borrow_mut().push(n));
+            built.0.present(Some(&parent));
+            pump();
+            built
         };
 
         let calls = Rc::new(RefCell::new(Vec::new()));
@@ -7663,12 +7807,7 @@ mod tests {
         assert!(!g.allows("/d/x", ms(7000)), "stale Enter");
     }
 
-    #[test]
     fn list_activation_gate_on_real_listview_opens_only_when_allowed() {
-        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
-            return;
-        }
-        gtk::init().expect("gtk init on the virtual display");
         let list = gtk::ListView::new(None::<gtk::SelectionModel>, None::<gtk::ListItemFactory>);
         let gate = Rc::new(RefCell::new(ActivationGate::default()));
         let opened = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -7702,12 +7841,7 @@ mod tests {
 
     /// Real GTK widgets and real Scratch paths: focus loss and an outside press
     /// never write; Enter writes exactly once; no watcher is left behind.
-    #[test]
     fn inline_editor_click_away_never_writes_and_enter_writes_once() {
-        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
-            return;
-        }
-        gtk::init().expect("gtk init on the virtual display");
         let root = std::path::Path::new(&std::env::var("HOME").unwrap())
             .join(format!("Projects/Scratch/wf-inline-{}", std::process::id()));
         struct Cleanup(std::path::PathBuf);
