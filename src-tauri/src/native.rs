@@ -6996,6 +6996,18 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     path: String,
     box_select_edge: Option<&gtk::Label>,
 ) {
+    let selected: Rc<dyn Fn() -> Vec<String>> = Rc::new(move || selected_paths(&state, &ui));
+    connect_file_drag_with(widget, selected, path, box_select_edge);
+}
+
+/// The production drag wiring, with the selection source injected so a headless
+/// test can drive the very same controllers over a real ListView.
+fn connect_file_drag_with<W: IsA<gtk::Widget>>(
+    widget: &W,
+    selected: Rc<dyn Fn() -> Vec<String>>,
+    path: String,
+    box_select_edge: Option<&gtk::Label>,
+) -> gtk::DragSource {
     let row: gtk::Widget = widget.clone().upcast();
     let edge = box_select_edge.cloned();
     let in_box_select_strip = Rc::new(move |x: f64| {
@@ -7009,15 +7021,11 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
         let separator = bounds.x() as f64 - ROW_GAP as f64;
         x >= separator - BOX_SELECT_STRIP_W && x < bounds.x() as f64
     });
-    let selected: Rc<dyn Fn() -> Vec<String>> = {
-        let (state, ui) = (state.clone(), ui.clone());
-        Rc::new(move || selected_paths(&state, &ui))
-    };
     let (drag, _snap) =
         build_file_drag_source(widget, path, selected, in_box_select_strip.clone());
 
     if box_select_edge.is_none() {
-        return;
+        return drag;
     }
     // Capture phase alone did not win. GtkDragSource refuses to start a drag
     // until 100 ms after the press (MIN_TIME_TO_DND in gtkdragsource.c), while
@@ -7046,6 +7054,7 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     });
     widget.add_controller(claim.clone());
     claim.group_with(&drag);
+    drag
 }
 
 /// Paths offered by a drag, minus the destination folder itself.
@@ -7762,32 +7771,144 @@ mod tests {
             return;
         }
         gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "GTK tests must run on the virtual X display, got {}",
+            display.name()
+        );
+        // First: earlier tests leave modal dialogs that would swallow real pointer input.
+        real_pointer_drag_carries_the_press_time_selection();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
-        drag_source_prepares_the_press_time_selection_after_the_gesture_is_stopped();
     }
 
-    fn drag_source_prepares_the_press_time_selection_after_the_gesture_is_stopped() {
-        let live = Rc::new(RefCell::new(vec!["/d/a".to_string(), "/d/b".to_string()]));
-        let selected: Rc<dyn Fn() -> Vec<String>> = {
-            let live = live.clone();
-            Rc::new(move || live.borrow().clone())
+    /// Real pointer events (XTEST, on the virtual display only) through the
+    /// production `connect_file_drag_with` controllers on a real ListView row.
+    fn real_pointer_drag_carries_the_press_time_selection() {
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let (drag, snap) = build_file_drag_source(&row, "/d/b".to_string(), selected, Rc::new(|_| false));
-        // press with two rows selected, then ordinary handling collapses the selection
-        snap.emit_by_name::<()>("pressed", &[&1i32, &5.0f64, &5.0f64]);
-        *live.borrow_mut() = vec!["/d/b".to_string()];
-        // the drag claim stops the auxiliary click gesture before prepare runs
-        snap.emit_by_name::<()>("stopped", &[]);
-        let provider = drag
-            .emit_by_name::<Option<gdk::ContentProvider>>("prepare", &[&5.0f64, &5.0f64])
-            .expect("prepare returns a payload");
-        let value = provider.value(gdk::FileList::static_type()).expect("file list value");
-        let files = value.get::<gdk::FileList>().unwrap().files();
-        let got: Vec<String> = files.iter().filter_map(|f| f.path()).map(|p| p.to_string_lossy().into_owned()).collect();
-        assert_eq!(got, vec!["/d/a".to_string(), "/d/b".to_string()], "both rows are dragged");
+        let paths = ["/d/a", "/d/b", "/d/c"];
+        let store = gio::ListStore::new::<gtk::StringObject>();
+        for p in paths {
+            store.append(&gtk::StringObject::new(p));
+        }
+        let selection = gtk::MultiSelection::new(Some(store.clone()));
+        let live_paths = {
+            let (selection, store) = (selection.clone(), store.clone());
+            Rc::new(move || -> Vec<String> {
+                let set = selection.selection();
+                (0..store.n_items())
+                    .filter(|i| set.contains(*i))
+                    .filter_map(|i| store.item(i).and_downcast::<gtk::StringObject>())
+                    .map(|o| o.string().to_string())
+                    .collect()
+            })
+        };
+        let began: Rc<RefCell<Option<(Vec<String>, Vec<String>)>>> = Rc::new(RefCell::new(None));
+        let rows: Rc<RefCell<Vec<gtk::Widget>>> = Rc::new(RefCell::new(Vec::new()));
+        let factory = gtk::SignalListItemFactory::new();
+        {
+            let (live_paths, began, rows, selection) =
+                (live_paths.clone(), began.clone(), rows.clone(), selection.clone());
+            factory.connect_bind(move |_, item| {
+                let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                let path = item.item().and_downcast::<gtk::StringObject>().unwrap().string().to_string();
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+                let name = gtk::Label::new(Some(&path));
+                name.set_hexpand(true);
+                name.set_xalign(0.0);
+                let size = gtk::Label::new(Some("1 KB"));
+                row.append(&name);
+                row.append(&size);
+                row.set_height_request(40);
+                let selected: Rc<dyn Fn() -> Vec<String>> = {
+                    let live_paths = live_paths.clone();
+                    Rc::new(move || live_paths())
+                };
+                let drag = connect_file_drag_with(&row, selected, path, Some(&size));
+                let (live_paths, began) = (live_paths.clone(), began.clone());
+                drag.connect_drag_begin(move |_, gdk_drag| {
+                    let provider = gdk_drag.content();
+                    let carried = match provider.value(gdk::FileList::static_type()) {
+                        Ok(v) => v
+                            .get::<gdk::FileList>()
+                            .map(|l| {
+                                l.files()
+                                    .iter()
+                                    .filter_map(|f| f.path())
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        Err(e) => {
+                            eprintln!("wf-test: content value error {e}");
+                            Vec::new()
+                        }
+                    };
+                    *began.borrow_mut() = Some((carried, live_paths()));
+                });
+                // The ordinary press handling: a plain press selects only its row.
+                let ordinary = gtk::GestureClick::new();
+                let (sel, pos) = (selection.clone(), item.position());
+                ordinary.connect_pressed(move |_, _, _, _| {
+                    sel.select_item(pos, true);
+                });
+                row.add_controller(ordinary);
+                rows.borrow_mut().push(row.clone().upcast());
+                item.set_child(Some(&row));
+            });
+        }
+        let list = gtk::ListView::new(Some(selection.clone()), Some(factory));
+        let win = gtk::Window::new();
+        win.set_title(Some("wf-drag-proof"));
+        win.set_default_size(400, 240);
+        win.set_child(Some(&list));
+        win.present();
+        pump();
+        selection.select_item(0, true);
+        selection.select_item(1, false);
+        assert_eq!(live_paths(), vec!["/d/a".to_string(), "/d/b".to_string()]);
+        let geo = xdo(&["search", "--name", "wf-drag-proof", "getwindowgeometry", "--shell"]);
+        let num = |key: &str| -> i32 {
+            geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
+        };
+        let (wx, wy) = (num("X="), num("Y="));
+        let row_b = rows.borrow().iter().find(|r| {
+            r.first_child().and_downcast::<gtk::Label>().is_some_and(|l| l.text() == "/d/b")
+        }).cloned().expect("row b realized");
+        let b = row_b.compute_bounds(&win).expect("row b bounds");
+        let (px, py) = (wx + 30, wy + b.y() as i32 + 20);
+        let mv = |x: i32, y: i32| {
+            xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            pump();
+        };
+        mv(px, py);
+        xdo(&["mousedown", "1"]);
+        pump();
+        mv(px + 5, py);
+        pump();
+        mv(px + 40, py + 6);
+        pump();
+        mv(px + 60, py + 10);
+        for _ in 0..5 {
+            pump();
+            if began.borrow().is_some() {
+                break;
+            }
+        }
+        let outcome = began.borrow().clone();
+        xdo(&["mouseup", "1"]);
+        pump();
+        let (carried, live_at_begin) = outcome.expect("the real drag began");
+        eprintln!("wf-test: live selection at drag begin = {live_at_begin:?}");
+        assert_eq!(carried, vec!["/d/a".to_string(), "/d/b".to_string()], "prepared list keeps both");
+        win.close();
+        pump();
     }
 
     fn name_dialog_ok_and_enter_invoke_callback_once_cancel_never() {
