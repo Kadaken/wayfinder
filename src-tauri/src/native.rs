@@ -3980,28 +3980,45 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
     }
 }
 
-fn build_inline_editor(
-    state: &Rc<RefCell<AppState>>,
-    ui: &Ui,
-    entry: &Entry,
-    edit: &InlineRename,
-) -> gtk::Entry {
-    let field = gtk::Entry::builder().text(&edit.text).hexpand(true).build();
-    field.add_css_class("wf-file-name");
+/// What the inline editor needs from its surroundings, so the GTK wiring can be
+/// tested against real widgets without a whole window.
+struct InlineHost {
+    /// Enter: the only route that may write.
+    commit: Rc<dyn Fn(&gtk::Entry)>,
+    /// Escape, focus loss, click outside: restore the row, write nothing.
+    cancel: Rc<dyn Fn()>,
+    /// Whether this editor is still the live one.
+    active: Rc<dyn Fn() -> bool>,
+}
+
+fn is_self_or_descendant(widget: &gtk::Widget, field: &gtk::Widget) -> bool {
+    let mut cur = Some(widget.clone());
+    while let Some(w) = cur {
+        if &w == field {
+            return true;
+        }
+        cur = w.parent();
+    }
+    false
+}
+
+fn wire_inline_editor(field: &gtk::Entry, window: &gtk::Window, host: InlineHost) {
     {
-        let (state, ui) = (state.clone(), ui.clone());
+        let commit = host.commit.clone();
         field.connect_activate(move |f| {
             debug_assert!(inline_event_commits(InlineEvent::Enter));
-            commit_inline_rename(&state, &ui, f)
+            eprintln!("wf-event: inline editor Enter");
+            commit(f)
         });
     }
     let keys = gtk::EventControllerKey::new();
     {
-        let (state, ui) = (state.clone(), ui.clone());
+        let cancel = host.cancel.clone();
         keys.connect_key_pressed(move |_, key, _, _| {
             if key == gdk::Key::Escape {
                 debug_assert!(!inline_event_commits(InlineEvent::Escape));
-                cancel_inline_rename(&state, &ui);
+                eprintln!("wf-event: inline editor Escape");
+                cancel();
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -4010,11 +4027,12 @@ fn build_inline_editor(
     field.add_controller(keys);
     let focus = gtk::EventControllerFocus::new();
     {
-        let (state, ui) = (state.clone(), ui.clone());
+        let cancel = host.cancel.clone();
         // Clicking away cancels (owner decision); Enter is the only commit.
         focus.connect_leave(move |_| {
             debug_assert!(!inline_event_commits(InlineEvent::FocusLoss));
-            cancel_inline_rename(&state, &ui);
+            eprintln!("wf-event: inline editor focus loss");
+            cancel();
         });
     }
     field.add_controller(focus);
@@ -4026,28 +4044,71 @@ fn build_inline_editor(
 
     // A click on empty list space does not always move keyboard focus, so focus
     // loss alone would miss it: also watch presses anywhere in the window and
-    // cancel when one lands outside the field. The watcher removes itself.
+    // cancel when one lands outside the field. Controllers are never removed
+    // during event dispatch: removal is deferred, and also happens when the
+    // field unrealizes, so no watcher outlives its row.
     let watcher = gtk::GestureClick::new();
     watcher.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let (state, ui, field) = (state.clone(), ui.clone(), field.clone());
+    let remove_later = {
+        let window = window.clone();
         let this = watcher.clone();
+        Rc::new(move || {
+            let (window, this) = (window.clone(), this.clone());
+            glib::idle_add_local_once(move || window.remove_controller(&this));
+        })
+    };
+    {
+        let (field, host_cancel, active, remove_later) =
+            (field.clone(), host.cancel.clone(), host.active.clone(), remove_later.clone());
+        let window = window.clone();
         watcher.connect_pressed(move |_, _, x, y| {
-            if state.borrow().inline_rename.is_none() || !field.is_mapped() {
-                ui.window.remove_controller(&this);
+            if !active() || !field.is_mapped() {
+                remove_later();
                 return;
             }
-            let inside = ui
-                .window
+            let inside = window
                 .pick(x, y, gtk::PickFlags::DEFAULT)
-                .is_some_and(|w| w == field || w.is_ancestor(&field));
+                .is_some_and(|w| is_self_or_descendant(&w, field.upcast_ref()));
             if !inside {
-                ui.window.remove_controller(&this);
-                cancel_inline_rename(&state, &ui);
+                eprintln!("wf-event: inline editor outside press");
+                remove_later();
+                host_cancel();
             }
         });
     }
-    ui.window.add_controller(watcher);
+    field.connect_unrealize(move |_| remove_later());
+    window.add_controller(watcher);
+}
+
+fn build_inline_editor(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    entry: &Entry,
+    edit: &InlineRename,
+) -> gtk::Entry {
+    let field = gtk::Entry::builder().text(&edit.text).hexpand(true).build();
+    field.add_css_class("wf-file-name");
+    let path = edit.path.clone();
+    wire_inline_editor(
+        &field,
+        ui.window.upcast_ref::<gtk::Window>(),
+        InlineHost {
+            commit: {
+                let (state, ui) = (state.clone(), ui.clone());
+                Rc::new(move |f| commit_inline_rename(&state, &ui, f))
+            },
+            cancel: {
+                let (state, ui) = (state.clone(), ui.clone());
+                Rc::new(move || cancel_inline_rename(&state, &ui))
+            },
+            active: {
+                let state = state.clone();
+                Rc::new(move || {
+                    state.borrow().inline_rename.as_ref().is_some_and(|e| e.path == path)
+                })
+            },
+        },
+    );
 
     let selection = if entry.is_dir { NameSelection::All } else { NameSelection::StemOnly };
     let end = match selection {
@@ -4197,8 +4258,15 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             press.set_propagation_phase(gtk::PropagationPhase::Capture);
             let gate = state.borrow().activation_gate.clone();
             let path = entry.path.clone();
-            press.connect_pressed(move |_, _, _, _| {
-                gate.borrow_mut().press(&path, std::time::Instant::now());
+            press.connect_pressed(move |g, _, _, _| {
+                let plain = !g.current_event_state().intersects(
+                    gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK,
+                );
+                gate.borrow_mut().press(&path, std::time::Instant::now(), plain);
             });
             line.add_controller(press);
         }
@@ -5739,7 +5807,7 @@ fn f2_starts_inline_rename(selected: usize, view: ViewMode) -> bool {
 /// path close together. A plain click or Ctrl+click never opens.
 #[derive(Default)]
 struct ActivationGate {
-    presses: Vec<(String, std::time::Instant)>,
+    presses: Vec<(String, std::time::Instant, bool)>,
     enter_at: Option<std::time::Instant>,
 }
 
@@ -5747,8 +5815,9 @@ impl ActivationGate {
     const DOUBLE: Duration = Duration::from_millis(500);
     const ENTER: Duration = Duration::from_millis(400);
 
-    fn press(&mut self, path: &str, now: std::time::Instant) {
-        self.presses.push((path.to_string(), now));
+    /// `plain` is false when Ctrl, Shift, Alt or Super was held for the press.
+    fn press(&mut self, path: &str, now: std::time::Instant, plain: bool) {
+        self.presses.push((path.to_string(), now, plain));
         if self.presses.len() > 2 {
             self.presses.remove(0);
         }
@@ -5763,8 +5832,10 @@ impl ActivationGate {
             return true;
         }
         let double = match self.presses.as_slice() {
-            [(a, ta), (b, tb)] => {
-                a == path
+            [(a, ta, pa), (b, tb, pb)] => {
+                *pa
+                    && *pb
+                    && a == path
                     && b == path
                     && tb.duration_since(*ta) <= Self::DOUBLE
                     && now.duration_since(*tb) <= Self::DOUBLE
@@ -7345,6 +7416,53 @@ mod tests {
     }
 
     #[test]
+    fn fingerprints_see_every_byte_and_every_tree_entry() {
+        let root = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(format!("Projects/Scratch/wf-fp-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let fp = |p: &std::path::Path| native_core::fingerprint(&p.to_string_lossy()).unwrap();
+
+        // a file over 256 MiB with a change in the middle, away from any edge
+        let big = root.join("big.bin");
+        {
+            let f = std::fs::File::create(&big).unwrap();
+            f.set_len(260 * 1024 * 1024).unwrap();
+        }
+        let first = fp(&big);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
+            f.seek(SeekFrom::Start(77 * 1024 * 1024 + 12345)).unwrap();
+            f.write_all(b"X").unwrap();
+        }
+        assert_ne!(first, fp(&big), "a one-byte change in the middle is seen");
+        std::fs::remove_file(&big).unwrap();
+
+        // nested folder: identical trees match; a rename or equal-size edit differs
+        let mk = |name: &str, inner: &str, body: &[u8]| {
+            let d = root.join(name);
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+            std::fs::write(d.join("sub").join(inner), body).unwrap();
+            std::os::unix::fs::symlink("target-a", d.join("link")).unwrap();
+            d
+        };
+        let a = mk("a", "f.txt", b"12345");
+        let same = mk("same", "f.txt", b"12345");
+        let renamed = mk("renamed", "g.txt", b"12345");
+        let edited = mk("edited", "f.txt", b"12346");
+        assert_eq!(fp(&a), fp(&same));
+        assert_ne!(fp(&a), fp(&renamed), "a renamed nested entry differs");
+        assert_ne!(fp(&a), fp(&edited), "an equal-size nested edit differs");
+    }
+
+    #[test]
     fn transfer_postcondition_compares_bytes_not_lengths() {
         let root = std::path::Path::new(&std::env::var("HOME").unwrap())
             .join(format!("Projects/Scratch/wf-verify-{}", std::process::id()));
@@ -7512,21 +7630,31 @@ mod tests {
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let mut g = ActivationGate::default();
         // one plain click, then a stray position-only activation
-        g.press("/d/a", ms(0));
+        g.press("/d/a", ms(0), true);
         assert!(!g.allows("/d/a", ms(10)));
         // a click on another file, then an activation naming the first: refused
-        g.press("/d/b", ms(100));
-        g.press("/d/a", ms(200));
+        g.press("/d/b", ms(100), true);
+        g.press("/d/a", ms(200), true);
         assert!(!g.allows("/d/a", ms(210)), "the presses were on different files");
         // real double-click on one file opens once
-        g.press("/d/a", ms(1000));
-        g.press("/d/a", ms(1150));
+        g.press("/d/a", ms(1000), true);
+        g.press("/d/a", ms(1150), true);
         assert!(g.allows("/d/a", ms(1155)));
         assert!(!g.allows("/d/a", ms(1160)), "consumed");
         // two slow presses do not open
-        g.press("/d/a", ms(3000));
-        g.press("/d/a", ms(4000));
+        g.press("/d/a", ms(3000), true);
+        g.press("/d/a", ms(4000), true);
         assert!(!g.allows("/d/a", ms(4005)));
+        // Ctrl-click twice, Shift-click twice, or one modified press: never opens
+        g.press("/d/a", ms(8000), false);
+        g.press("/d/a", ms(8100), false);
+        assert!(!g.allows("/d/a", ms(8110)), "double Ctrl-click only selects");
+        g.press("/d/a", ms(8200), false);
+        g.press("/d/a", ms(8300), true);
+        assert!(!g.allows("/d/a", ms(8310)), "one modified press refuses");
+        g.press("/d/a", ms(8400), true);
+        g.press("/d/a", ms(8500), false);
+        assert!(!g.allows("/d/a", ms(8510)), "modified second press refuses");
         // Enter opens, once, only when fresh
         g.enter(ms(5000));
         assert!(g.allows("/d/x", ms(5050)));
@@ -7554,14 +7682,130 @@ mod tests {
         let started = std::time::Instant::now();
         list.emit_by_name::<()>("activate", &[&0u32]);
         assert!(opened.borrow().is_empty(), "a bare activation opens nothing");
-        gate.borrow_mut().press("/d/file1", std::time::Instant::now());
-        gate.borrow_mut().press("/d/file1", std::time::Instant::now());
+        gate.borrow_mut().press("/d/file1", std::time::Instant::now(), true);
+        gate.borrow_mut().press("/d/file1", std::time::Instant::now(), true);
         list.emit_by_name::<()>("activate", &[&1u32]);
         assert_eq!(*opened.borrow(), vec!["/d/file1".to_string()]);
-        gate.borrow_mut().press("/d/file1", std::time::Instant::now());
+        gate.borrow_mut().press("/d/file1", std::time::Instant::now(), true);
         list.emit_by_name::<()>("activate", &[&2u32]);
         assert_eq!(opened.borrow().len(), 1, "a click on one file never opens another");
         assert!(started.elapsed() < Duration::from_millis(500), "activation returns promptly");
+    }
+
+    fn pump() {
+        let ctx = glib::MainContext::default();
+        for _ in 0..40 {
+            while ctx.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Real GTK widgets and real Scratch paths: focus loss and an outside press
+    /// never write; Enter writes exactly once; no watcher is left behind.
+    #[test]
+    fn inline_editor_click_away_never_writes_and_enter_writes_once() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let root = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(format!("Projects/Scratch/wf-inline-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let orig = root.join("rename-me.txt").to_string_lossy().to_string();
+        let proposed = root.join("changed name.txt").to_string_lossy().to_string();
+        std::fs::write(&orig, b"ORIGINAL-BYTES").unwrap();
+
+        let window = gtk::Window::new();
+        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let field = gtk::Entry::builder().text("rename-me.txt").build();
+        let outside = gtk::Button::with_label("outside");
+        holder.append(&field);
+        holder.append(&outside);
+        window.set_child(Some(&holder));
+        window.set_default_size(300, 200);
+
+        let commits = Rc::new(RefCell::new(0));
+        let cancels = Rc::new(RefCell::new(0));
+        let live = Rc::new(RefCell::new(true));
+        let controllers_before = window.observe_controllers().n_items();
+        wire_inline_editor(
+            &field,
+            &window,
+            InlineHost {
+                commit: {
+                    let (commits, orig) = (commits.clone(), orig.clone());
+                    Rc::new(move |f| {
+                        *commits.borrow_mut() += 1;
+                        native_core::rename_path(&orig, f.text().trim()).unwrap();
+                    })
+                },
+                cancel: {
+                    let (cancels, live) = (cancels.clone(), live.clone());
+                    Rc::new(move || {
+                        *cancels.borrow_mut() += 1;
+                        *live.borrow_mut() = false;
+                    })
+                },
+                active: {
+                    let live = live.clone();
+                    Rc::new(move || *live.borrow())
+                },
+            },
+        );
+        window.present();
+        pump();
+        field.grab_focus();
+        pump();
+        field.set_text("changed name.txt");
+
+        // focus loss
+        outside.set_focusable(true);
+        outside.grab_focus();
+        pump();
+        assert_eq!(*commits.borrow(), 0, "focus loss must not commit");
+        assert!(*cancels.borrow() >= 1, "focus loss cancels");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"ORIGINAL-BYTES");
+        assert!(!std::path::Path::new(&proposed).exists());
+
+        // outside press through the window watcher
+        *live.borrow_mut() = true;
+        field.grab_focus();
+        pump();
+        let watcher = window
+            .observe_controllers()
+            .into_iter()
+            .filter_map(|o| o.ok()?.downcast::<gtk::GestureClick>().ok())
+            .find(|g| g.propagation_phase() == gtk::PropagationPhase::Capture)
+            .expect("watcher installed");
+        let p = outside
+            .compute_point(&window, &gtk::graphene::Point::new(3.0, 3.0))
+            .expect("point");
+        let before = *cancels.borrow();
+        watcher.emit_by_name::<()>("pressed", &[&1i32, &(p.x() as f64), &(p.y() as f64)]);
+        pump();
+        assert!(*cancels.borrow() > before || !*live.borrow(), "outside press cancels");
+        assert_eq!(*commits.borrow(), 0, "outside press must not commit");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"ORIGINAL-BYTES");
+        assert!(!std::path::Path::new(&proposed).exists());
+        assert_eq!(
+            window.observe_controllers().n_items(),
+            controllers_before + 0,
+            "the watcher is removed after the outside press"
+        );
+
+        // Enter: exactly one rename
+        field.emit_activate();
+        pump();
+        assert_eq!(*commits.borrow(), 1);
+        assert!(!std::path::Path::new(&orig).exists());
+        assert_eq!(std::fs::read(&proposed).unwrap(), b"ORIGINAL-BYTES");
     }
 
     #[test]
