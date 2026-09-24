@@ -882,6 +882,67 @@ pub fn drag_is_copy(srcs: &[String], dest_dir: &str, ctrl: bool, shift: bool) ->
     })
 }
 
+/// What a source looked like before a transfer: identity and size, so the
+/// result can be checked against the disk afterwards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceSnapshot {
+    pub path: String,
+    pub ino: u64,
+    pub len: u64,
+    pub is_dir: bool,
+}
+
+pub fn snapshot_sources(srcs: &[String]) -> Vec<SourceSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+    srcs.iter()
+        .filter_map(|p| {
+            fs::symlink_metadata(p).ok().map(|m| SourceSnapshot {
+                path: p.clone(),
+                ino: m.ino(),
+                len: m.len(),
+                is_dir: m.is_dir(),
+            })
+        })
+        .collect()
+}
+
+/// Fail-closed postcondition. COPY: every source still present with the same
+/// identity and size, every destination present with matching size. MOVE: every
+/// moved source gone and every destination present with matching size.
+pub fn verify_transfer(
+    before: &[SourceSnapshot],
+    items: &[ResolvedItem],
+    is_copy: bool,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    for item in items {
+        let Some(src) = before.iter().find(|s| s.path == item.from) else {
+            return Err(format!("transfer check: no record of {}", item.from));
+        };
+        let dest = fs::symlink_metadata(&item.to)
+            .map_err(|_| format!("transfer check: {} is missing after the transfer", item.to))?;
+        if !src.is_dir && dest.len() != src.len {
+            return Err(format!(
+                "transfer check: {} is {} bytes, expected {}",
+                item.to,
+                dest.len(),
+                src.len
+            ));
+        }
+        let now = fs::symlink_metadata(&item.from);
+        if is_copy {
+            let now = now
+                .map_err(|_| format!("transfer check: copy removed the source {}", item.from))?;
+            if now.ino() != src.ino || (!src.is_dir && now.len() != src.len) {
+                return Err(format!("transfer check: copy changed the source {}", item.from));
+            }
+        } else if now.is_ok() {
+            return Err(format!("transfer check: move left the source {}", item.from));
+        }
+    }
+    Ok(())
+}
+
 pub fn resolve_paste(
     srcs: &[String],
     dest_dir: &str,

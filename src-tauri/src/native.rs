@@ -4920,8 +4920,16 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
     }
     if entry.is_dir {
         navigate(state, entry.path);
-    } else if let Err(err) = native_core::open_path(&entry.path) {
-        ui.status.set_label(&format!("Open failed: {err}"));
+    } else if std::fs::symlink_metadata(&entry.path).is_err() {
+        // A stale row must never hand a vanished path to an external app: some
+        // of them create the missing file.
+        eprintln!("wf-event: open refused, path is gone: {}", entry.path);
+        ui.status.set_label(&format!("{} no longer exists", entry.name));
+    } else {
+        eprintln!("wf-event: open {}", entry.path);
+        if let Err(err) = native_core::open_path(&entry.path) {
+            ui.status.set_label(&format!("Open failed: {err}"));
+        }
     }
 }
 
@@ -4960,6 +4968,7 @@ fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
             ui,
             format!("Creating file {name}"),
             move || {
+                eprintln!("wf-event: new_file {name} in {cwd}");
                 let path = native_core::new_file(&cwd, &name)?;
                 Ok(JobOutcome::undo(
                     format!("Created {path}"),
@@ -5186,6 +5195,19 @@ where
     dialog.present(Some(&ui.window));
 }
 
+/// The disk work of every transfer, checked against the disk afterwards.
+fn perform_transfer(
+    srcs: &[String],
+    dest: &str,
+    is_copy: bool,
+    on_conflict: native_core::PasteConflict,
+) -> Result<Vec<native_core::ResolvedItem>, String> {
+    let before = native_core::snapshot_sources(srcs);
+    let items = native_core::resolve_paste(srcs, dest, is_copy, on_conflict)?;
+    native_core::verify_transfer(&before, &items, is_copy)?;
+    Ok(items)
+}
+
 fn run_transfer(
     state: Rc<RefCell<AppState>>,
     ui: Ui,
@@ -5215,7 +5237,7 @@ fn run_transfer(
         label,
         move || {
             // A failed MOVE is reported as a failure and never retried as COPY.
-            let items = native_core::resolve_paste(&srcs, &dest, is_copy, on_conflict)?;
+            let items = perform_transfer(&srcs, &dest, is_copy, on_conflict)?;
             Ok(JobOutcome::undo(
                 format!("{ed} {} item{}", items.len(), plural(items.len())),
                 UndoAction::Pasted {
@@ -6789,17 +6811,63 @@ fn dragged_paths(value: &glib::Value, exclude: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Whether the drop currently over `target` is a copy (Ctrl, or another drive)
-/// or a move (Shift, or the same drive).
-fn drop_is_copy(target: &gtk::DropTarget, srcs: &[String], dest: &str) -> bool {
+/// One drop transaction: the target it was negotiated for, the destination, the
+/// full source snapshot and the negotiated action. Motion stores it, drop
+/// consumes it once, leave clears it. The modifiers are read only in motion.
+#[derive(Clone, Debug, PartialEq)]
+struct DropTxn {
+    to_row: bool,
+    dest: String,
+    srcs: Vec<String>,
+    is_copy: bool,
+}
+
+impl DropTxn {
+    fn negotiate(to_row: bool, dest: &str, srcs: &[String], ctrl: bool, shift: bool) -> Self {
+        DropTxn {
+            to_row,
+            dest: dest.to_string(),
+            srcs: srcs.to_vec(),
+            is_copy: native_core::drag_is_copy(srcs, dest, ctrl, shift),
+        }
+    }
+
+    fn action(&self) -> gdk::DragAction {
+        if self.is_copy { gdk::DragAction::COPY } else { gdk::DragAction::MOVE }
+    }
+
+    fn style(&self) -> TransferStyle {
+        if self.to_row { TransferStyle::DropOnRow } else { TransferStyle::Drop }
+    }
+
+    fn into_transfer(self) -> Transfer {
+        let style = self.style();
+        Transfer { srcs: self.srcs, dest: self.dest, is_copy: self.is_copy, clear_cut_after: false, style }
+    }
+}
+
+/// Consume the stored transaction for a drop. It is used only when it was
+/// negotiated for this same target, destination and source set; otherwise the
+/// action falls back to the no-modifier default, never to a second modifier read.
+fn take_drop_txn(
+    slot: &RefCell<Option<DropTxn>>,
+    to_row: bool,
+    dest: &str,
+    srcs: &[String],
+) -> DropTxn {
+    match slot.borrow_mut().take() {
+        Some(txn) if txn.to_row == to_row && txn.dest == dest && txn.srcs == srcs => txn,
+        _ => DropTxn::negotiate(to_row, dest, srcs, false, false),
+    }
+}
+
+fn current_drop_modifiers(target: &gtk::DropTarget) -> (bool, bool) {
     let mods = target
         .current_drop()
         .map(|drop| drop.device())
         .map(|device| device.modifier_state())
         .unwrap_or_else(gdk::ModifierType::empty);
-    native_core::drag_is_copy(
-        srcs,
-        dest,
+    (
         mods.contains(gdk::ModifierType::CONTROL_MASK),
         mods.contains(gdk::ModifierType::SHIFT_MASK),
     )
@@ -6821,8 +6889,9 @@ fn build_drop_target(
         let state = state.clone();
         move || fixed_dest.clone().unwrap_or_else(|| state.borrow().cwd.clone())
     };
+    let slot: Rc<RefCell<Option<DropTxn>>> = Rc::new(RefCell::new(None));
     drop.connect_motion({
-        let dest_of = dest_of.clone();
+        let (dest_of, slot) = (dest_of.clone(), slot.clone());
         move |target, _, _| {
             let dest = dest_of();
             let srcs = target
@@ -6830,28 +6899,33 @@ fn build_drop_target(
                 .map(|v| dragged_paths(&v, Some(&dest)))
                 .unwrap_or_default();
             if srcs.is_empty() {
+                *slot.borrow_mut() = None;
                 return gdk::DragAction::COPY;
             }
-            if drop_is_copy(target, &srcs, &dest) {
-                gdk::DragAction::COPY
-            } else {
-                gdk::DragAction::MOVE
-            }
+            let (ctrl, shift) = current_drop_modifiers(target);
+            let txn = DropTxn::negotiate(to_row, &dest, &srcs, ctrl, shift);
+            let action = txn.action();
+            *slot.borrow_mut() = Some(txn);
+            action
         }
     });
-    drop.connect_drop(move |target, value, _, _| {
+    drop.connect_leave({
+        let slot = slot.clone();
+        move |_| *slot.borrow_mut() = None
+    });
+    drop.connect_drop(move |_, value, _, _| {
         let dest = dest_of();
         let srcs = dragged_paths(value, Some(&dest));
         if srcs.is_empty() {
+            slot.borrow_mut().take();
             return false;
         }
-        let is_copy = drop_is_copy(target, &srcs, &dest);
-        let style = if to_row { TransferStyle::DropOnRow } else { TransferStyle::Drop };
-        transfer_with_preflight(
-            state.clone(),
-            ui.clone(),
-            Transfer { srcs, dest, is_copy, clear_cut_after: false, style },
+        let txn = take_drop_txn(&slot, to_row, &dest, &srcs);
+        eprintln!(
+            "wf-event: drop to_row={} dest={} copy={} srcs={:?}",
+            txn.to_row, txn.dest, txn.is_copy, txn.srcs
         );
+        transfer_with_preflight(state.clone(), ui.clone(), txn.into_transfer());
         true
     });
     drop
@@ -7057,6 +7131,106 @@ mod tests {
         assert_eq!(clipboard_after_job(true, false, Some("cut")), Some("cut"));
         assert_eq!(clipboard_after_job(false, true, Some("copy")), Some("copy"));
         assert_eq!(clipboard_after_job(true, true, Some("cut")), None);
+    }
+
+    #[test]
+    fn drop_transactions_execute_the_negotiated_action_on_disk() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(format!("Projects/Scratch/wf-drop-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(root.join("Inbox/Target")).unwrap();
+        let inbox = root.join("Inbox").to_string_lossy().to_string();
+        let target = root.join("Inbox/Target").to_string_lossy().to_string();
+        let s = |p: &str| root.join("Inbox").join(p).to_string_lossy().to_string();
+        let body = |n: usize| vec![b'x'; n];
+        std::fs::write(s("copy-me.txt"), body(11264)).unwrap();
+        std::fs::write(s("bg-copy.txt"), body(16384)).unwrap();
+        std::fs::write(s("bg-move.txt"), body(15360)).unwrap();
+        std::fs::write(s("m1.txt"), body(100)).unwrap();
+        std::fs::write(s("m2.txt"), body(200)).unwrap();
+
+        // Motion negotiates Ctrl COPY; the release-time modifier read is empty and
+        // is never consulted: drop consumes the stored transaction.
+        let slot = RefCell::new(None);
+        let srcs = vec![s("copy-me.txt")];
+        *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, true, false));
+        let txn = take_drop_txn(&slot, true, &target, &srcs);
+        assert!(txn.is_copy);
+        assert!(slot.borrow().is_none(), "drop consumes the transaction once");
+        let ino = std::fs::metadata(s("copy-me.txt")).unwrap().ino();
+        let t = txn.into_transfer();
+        assert_eq!(plan_transfer(&t), TransferPlan::Run);
+        let items = perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(std::fs::metadata(s("copy-me.txt")).unwrap().ino(), ino);
+        assert_eq!(std::fs::read(s("copy-me.txt")).unwrap(), body(11264));
+        assert_eq!(std::fs::read(format!("{target}/copy-me.txt")).unwrap(), body(11264));
+
+        // Background Ctrl COPY in the same folder is a clash, not a no-op; Duplicate
+        // creates "(2)" and leaves the original inode and bytes alone.
+        let srcs = vec![s("bg-copy.txt")];
+        *slot.borrow_mut() = Some(DropTxn::negotiate(false, &inbox, &srcs, true, false));
+        let t = take_drop_txn(&slot, false, &inbox, &srcs).into_transfer();
+        assert!(t.is_copy);
+        assert_eq!(plan_transfer(&t), TransferPlan::Ask(vec!["bg-copy.txt".to_string()]));
+        let ino = std::fs::metadata(s("bg-copy.txt")).unwrap().ino();
+        perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap();
+        assert_eq!(std::fs::metadata(s("bg-copy.txt")).unwrap().ino(), ino);
+        assert_eq!(std::fs::read(s("bg-copy.txt")).unwrap(), body(16384));
+        assert_eq!(std::fs::read(s("bg-copy (2).txt")).unwrap(), body(16384));
+
+        // Unmodified same-folder background MOVE is a true no-op: same inode and
+        // bytes, nothing else appears.
+        let srcs = vec![s("bg-move.txt")];
+        let before = std::fs::read_dir(&inbox).unwrap().count();
+        *slot.borrow_mut() = Some(DropTxn::negotiate(false, &inbox, &srcs, false, false));
+        let t = take_drop_txn(&slot, false, &inbox, &srcs).into_transfer();
+        assert!(!t.is_copy);
+        let ino = std::fs::metadata(s("bg-move.txt")).unwrap().ino();
+        assert_eq!(plan_transfer(&t), TransferPlan::NoOp);
+        assert_eq!(std::fs::metadata(s("bg-move.txt")).unwrap().ino(), ino);
+        assert_eq!(std::fs::read(s("bg-move.txt")).unwrap(), body(15360));
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), before);
+
+        // Row MOVE of two files: sources gone, one destination each, same bytes.
+        let srcs = vec![s("m1.txt"), s("m2.txt")];
+        *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, false, false));
+        let t = take_drop_txn(&slot, true, &target, &srcs).into_transfer();
+        assert!(!t.is_copy);
+        perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap();
+        assert!(!std::path::Path::new(&s("m1.txt")).exists());
+        assert!(!std::path::Path::new(&s("m2.txt")).exists());
+        assert_eq!(std::fs::read(format!("{target}/m1.txt")).unwrap(), body(100));
+        assert_eq!(std::fs::read(format!("{target}/m2.txt")).unwrap(), body(200));
+
+        // A transaction negotiated for one target never feeds another.
+        let srcs = vec![s("bg-move.txt")];
+        *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, true, false));
+        let other = take_drop_txn(&slot, false, &inbox, &srcs);
+        assert!(!other.is_copy && !other.to_row && other.dest == inbox);
+    }
+
+    #[test]
+    fn transfer_postcondition_rejects_a_bad_result() {
+        let before = vec![native_core::SourceSnapshot {
+            path: "/nonexistent-wf/a".into(),
+            ino: 1,
+            len: 5,
+            is_dir: false,
+        }];
+        let items = vec![native_core::ResolvedItem {
+            from: "/nonexistent-wf/a".into(),
+            to: "/nonexistent-wf/b".into(),
+        }];
+        assert!(native_core::verify_transfer(&before, &items, true).is_err());
+        assert!(native_core::verify_transfer(&before, &items, false).is_err());
     }
 
     #[test]
