@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 /// The drag picture is a ghost of the dragged row at about half opacity.
 const DRAG_GHOST_OPACITY: f64 = 0.55;
+/// The ghost is one item's icon and name, never wider than this many pixels.
+const DRAG_GHOST_MAX_WIDTH: i32 = 240;
+const DRAG_GHOST_ICON: i32 = 20;
 const MAX_GRID_THUMBNAILS: usize = 60;
 const MAX_CONCURRENT_THUMBNAILS: usize = 4;
 
@@ -6891,6 +6894,52 @@ fn drag_payload(snapshot: Option<Vec<String>>, live: Vec<String>, pressed: &str)
     }
 }
 
+/// The compact drag picture: the item's normal icon and its name, translucent,
+/// inside an overlay that also carries the opaque count badge for several items.
+fn build_drag_ghost(path: &str, count: usize) -> (gtk::Overlay, gtk::Box) {
+    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let image = gtk::Image::from_icon_name(if is_dir { "folder" } else { "text-x-generic" });
+    image.set_pixel_size(DRAG_GHOST_ICON);
+    let label = gtk::Label::new(Some(&name));
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(20);
+    label.set_xalign(0.0);
+    let ghost = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    ghost.append(&image);
+    ghost.append(&label);
+    ghost.set_halign(gtk::Align::Start);
+    ghost.set_valign(gtk::Align::Start);
+    ghost.set_opacity(DRAG_GHOST_OPACITY);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&ghost));
+    if count > 1 {
+        let badge = gtk::Label::new(Some(&count.to_string()));
+        badge.add_css_class("wf-drag-badge");
+        badge.set_halign(gtk::Align::End);
+        badge.set_valign(gtk::Align::End);
+        overlay.add_overlay(&badge);
+    }
+    (overlay, ghost)
+}
+
+/// The press point, kept inside the ghost so the ghost never jumps: rounded and
+/// clamped to 0..=size-1 on each axis.
+fn clamp_hotspot(grab: (f64, f64), width: i32, height: i32) -> (i32, i32) {
+    let x = (grab.0.round() as i32).clamp(0, (width - 1).max(0));
+    let y = (grab.1.round() as i32).clamp(0, (height - 1).max(0));
+    (x, y)
+}
+
+fn ghost_hotspot(grab: (f64, f64), ghost: &gtk::Box) -> (i32, i32) {
+    let (_, w, _, _) = ghost.measure(gtk::Orientation::Horizontal, -1);
+    let (_, h, _, _) = ghost.measure(gtk::Orientation::Vertical, -1);
+    clamp_hotspot(grab, w, h)
+}
+
 fn build_file_drag_source<W: IsA<gtk::Widget>>(
     widget: &W,
     path: String,
@@ -6938,31 +6987,17 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
             false
         });
     }
-    // A translucent ghost of the dragged row, held where the press happened
-    // (the point prepare was given), so the names under it stay readable. The
-    // count badge for several items stays opaque.
+    // A compact translucent ghost (icon and name of the dragged item only), held
+    // at the point the press was on, so the row's own name stays readable under
+    // it. The count badge for several items stays opaque.
     let drag_count = Rc::new(std::cell::Cell::new(1usize));
     let grab = Rc::new(std::cell::Cell::new((0.0f64, 0.0f64)));
     {
-        let (count, grab) = (drag_count.clone(), grab.clone());
-        drag.connect_drag_begin(move |src, drag| {
-            let Some(source) = src.widget() else { return };
-            let paintable = gtk::WidgetPaintable::new(Some(&source));
-            let picture = gtk::Picture::for_paintable(&paintable);
-            picture.set_can_shrink(false);
-            picture.set_opacity(DRAG_GHOST_OPACITY);
-            let overlay = gtk::Overlay::new();
-            overlay.set_child(Some(&picture));
-            if count.get() > 1 {
-                let badge = gtk::Label::new(Some(&count.get().to_string()));
-                badge.add_css_class("wf-drag-badge");
-                badge.set_halign(gtk::Align::End);
-                badge.set_valign(gtk::Align::End);
-                overlay.add_overlay(&badge);
-            }
+        let (count, grab, path) = (drag_count.clone(), grab.clone(), path.clone());
+        drag.connect_drag_begin(move |_, drag| {
+            let (overlay, ghost) = build_drag_ghost(&path, count.get());
             gtk::DragIcon::for_drag(drag).set_child(Some(&overlay));
-            let (gx, gy) = grab.get();
-            let (hot_x, hot_y) = (gx.round().max(0.0) as i32, gy.round().max(0.0) as i32);
+            let (hot_x, hot_y) = ghost_hotspot(grab.get(), &ghost);
             drag.set_hotspot(hot_x, hot_y);
         });
     }
@@ -7791,6 +7826,7 @@ mod tests {
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
+        drag_ghost_builds_compact_translucent_item();
     }
 
     /// Real pointer events (XTEST, on the virtual display only) through the
@@ -8209,20 +8245,48 @@ mod tests {
         assert_eq!(gtk_launch_args(&args), vec!["wayfinder"]);
     }
 
-    /// D-17 (23 Sep 2026): the drag picture is a translucent ghost of the dragged
-    /// row, anchored where the press happened. Code cannot prove the name under
-    /// it is readable; only the owner's eyes can.
+    /// D-18 (23 Sep 2026): the drag picture is a compact translucent ghost of the
+    /// dragged item's icon and name, never the whole row. Code cannot prove the
+    /// name beneath is readable; only eyes can.
     #[test]
-    fn drag_ghost_translucent_at_grab_point_d17() {
+    fn drag_ghost_is_compact_icon_and_name_d18() {
         assert!((0.50..=0.60).contains(&DRAG_GHOST_OPACITY));
+        assert!(DRAG_GHOST_MAX_WIDTH <= 240);
         let all = include_str!("native.rs");
         let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
-        assert!(app.contains("gtk::WidgetPaintable::new(Some(&source))"));
-        assert!(app.contains("picture.set_opacity(DRAG_GHOST_OPACITY)"));
-        assert_eq!(app.matches("set_opacity(").count(), 1, "only the picture is translucent");
-        assert!(app.contains("grab.set((x, y))"));
+        assert!(!app.contains("WidgetPaintable") && !app.contains("DRAG_HAND"));
+        assert_eq!(app.matches("set_opacity(").count(), 1, "only the ghost is translucent");
+        assert!(app.contains("ghost.set_opacity(DRAG_GHOST_OPACITY)"));
         assert!(app.contains("drag.set_hotspot(hot_x, hot_y)"));
-        assert!(!app.contains("DRAG_HAND") && !app.contains("set_hotspot(-"));
+        assert!(app.contains("ghost_hotspot(grab.get(), &ghost)"));
+        // hotspot clamped into the ghost, never negative
+        assert_eq!(clamp_hotspot((500.0, 300.0), 200, 30), (199, 29));
+        assert_eq!(clamp_hotspot((-5.0, -1.0), 200, 30), (0, 0));
+        assert_eq!(clamp_hotspot((40.4, 12.6), 200, 30), (40, 13));
+    }
+
+    fn drag_ghost_builds_compact_translucent_item() {
+        let long = "a-very-long-file-name-that-would-never-fit-in-a-compact-ghost-at-all.txt";
+        let (overlay, ghost) = build_drag_ghost(&format!("/tmp/{long}"), 3);
+        let (min_w, nat_w, _, _) = ghost.measure(gtk::Orientation::Horizontal, -1);
+        assert!(nat_w <= DRAG_GHOST_MAX_WIDTH && min_w <= DRAG_GHOST_MAX_WIDTH, "ghost {nat_w}px wide");
+        let (_, nat_h, _, _) = ghost.measure(gtk::Orientation::Vertical, -1);
+        assert!(nat_h <= 48, "ghost {nat_h}px high");
+        assert!((ghost.opacity() - DRAG_GHOST_OPACITY).abs() < 1e-3);
+        // the count badge sits beside the ghost in the overlay, opaque
+        let mut badge = None;
+        let mut child = overlay.first_child();
+        while let Some(c) = child {
+            if c.has_css_class("wf-drag-badge") {
+                badge = Some(c.clone());
+            }
+            child = c.next_sibling();
+        }
+        let badge = badge.expect("count badge present for 3 items");
+        assert!((badge.opacity() - 1.0).abs() < 1e-3);
+        assert!(badge.parent().as_ref() == Some(overlay.upcast_ref::<gtk::Widget>()));
+        let (o1, g1) = build_drag_ghost("/tmp/x.txt", 1);
+        assert!(o1.first_child().is_some() && g1.opacity() < 1.0);
     }
 
     /// LOCKED 12 Sep 2026: dragging a file from anywhere on its row must beat the
