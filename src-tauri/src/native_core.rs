@@ -827,6 +827,27 @@ pub enum PasteConflict {
     Skip,
 }
 
+/// Explorer drag action: Ctrl copies, Shift moves, otherwise MOVE only when
+/// every source and the destination folder are on the same device. If any
+/// metadata cannot be read the choice is an explicit conservative COPY.
+pub fn drag_is_copy(srcs: &[String], dest_dir: &str, ctrl: bool, shift: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if ctrl {
+        return true;
+    }
+    if shift {
+        return false;
+    }
+    let Ok(dest) = fs::metadata(dest_dir) else {
+        return true;
+    };
+    !srcs.iter().all(|src| {
+        fs::symlink_metadata(src)
+            .map(|m| m.dev() == dest.dev())
+            .unwrap_or(false)
+    })
+}
+
 pub fn resolve_paste(
     srcs: &[String],
     dest_dir: &str,
@@ -1742,6 +1763,34 @@ mod tests {
         fs::write(dir.join("src/note.txt"), b"NEW").unwrap();
         fs::write(dir.join("dest/note.txt"), b"OLD").unwrap();
         dir
+    }
+
+    #[test]
+    fn drag_action_modifiers_and_device_default() {
+        let d = std::env::temp_dir().join(format!("wf-drag-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("dest")).unwrap();
+        fs::write(d.join("a.txt"), "a").unwrap();
+        fs::write(d.join("b.txt"), "b").unwrap();
+        let dest = d.join("dest").to_string_lossy().to_string();
+        let a = d.join("a.txt").to_string_lossy().to_string();
+        let b = d.join("b.txt").to_string_lossy().to_string();
+        let srcs = vec![a.clone(), b.clone()];
+        assert!(!drag_is_copy(&srcs, &dest, false, false), "same device defaults to MOVE");
+        assert!(drag_is_copy(&srcs, &dest, true, false), "Ctrl copies");
+        assert!(!drag_is_copy(&srcs, &dest, false, true), "Shift moves");
+        assert!(drag_is_copy(&srcs, &dest, true, true), "Ctrl wins over Shift");
+        // unreadable source or destination: explicit conservative COPY
+        assert!(drag_is_copy(&[d.join("missing").to_string_lossy().to_string()], &dest, false, false));
+        assert!(drag_is_copy(&srcs, &d.join("nodir").to_string_lossy(), false, false));
+        // /proc is a different device from a scratch dir
+        assert!(drag_is_copy(&["/proc/self".to_string()], &dest, false, false), "different device copies");
+        // a real move of both files, then undo path via resolve_paste move back
+        let items = resolve_paste(&srcs, &dest, false, PasteConflict::KeepBoth).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(!Path::new(&a).exists() && !Path::new(&b).exists());
+        assert!(d.join("dest/a.txt").exists() && d.join("dest/b.txt").exists());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
