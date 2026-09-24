@@ -7116,7 +7116,13 @@ fn current_drop_modifiers(target: &gtk::DropTarget) -> (bool, bool) {
         .map(|drop| drop.device())
         .map(|device| device.modifier_state())
         .unwrap_or_else(gdk::ModifierType::empty)
-        | target.current_event_state();
+        | target.current_event_state()
+        | target
+            .widget()
+            .and_then(|w| w.display().default_seat())
+            .and_then(|seat| seat.keyboard())
+            .map(|kb| kb.modifier_state())
+            .unwrap_or_else(gdk::ModifierType::empty);
     (
         mods.contains(gdk::ModifierType::CONTROL_MASK),
         mods.contains(gdk::ModifierType::SHIFT_MASK),
