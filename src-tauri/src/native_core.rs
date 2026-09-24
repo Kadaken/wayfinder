@@ -882,33 +882,104 @@ pub fn drag_is_copy(srcs: &[String], dest_dir: &str, ctrl: bool, shift: bool) ->
     })
 }
 
-/// What a source looked like before a transfer: identity and size, so the
-/// result can be checked against the disk afterwards.
+/// What a source looked like before a transfer: identity plus a content
+/// fingerprint, so the result can be checked against the disk afterwards.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceSnapshot {
     pub path: String,
     pub ino: u64,
-    pub len: u64,
-    pub is_dir: bool,
+    pub fp: Fingerprint,
 }
 
-pub fn snapshot_sources(srcs: &[String]) -> Vec<SourceSnapshot> {
+/// Regular files: length and a streaming digest of every byte up to
+/// `FULL_DIGEST_LIMIT`; larger files digest the length plus the first, middle
+/// and last MiB. Folders: recursive file count and total bytes (the names and
+/// contents inside are not compared). Symlinks: the link target.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fingerprint {
+    File { len: u64, digest: u64 },
+    Dir { files: u64, bytes: u64 },
+    Link(String),
+}
+
+const FULL_DIGEST_LIMIT: u64 = 256 * 1024 * 1024;
+const SAMPLE: u64 = 1024 * 1024;
+
+fn digest_file(path: &Path, len: u64) -> Result<u64, String> {
+    use std::hash::Hasher;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut feed = |file: &mut fs::File, mut n: u64| -> Result<(), String> {
+        while n > 0 {
+            let want = n.min(buf.len() as u64) as usize;
+            let got = file.read(&mut buf[..want]).map_err(|e| e.to_string())?;
+            if got == 0 {
+                break;
+            }
+            hasher.write(&buf[..got]);
+            n -= got as u64;
+        }
+        Ok(())
+    };
+    if len <= FULL_DIGEST_LIMIT {
+        feed(&mut file, len)?;
+    } else {
+        for at in [0, len / 2, len - SAMPLE] {
+            file.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+            feed(&mut file, SAMPLE)?;
+        }
+    }
+    hasher.write_u64(len);
+    Ok(hasher.finish())
+}
+
+fn dir_totals(path: &Path) -> Result<(u64, u64), String> {
+    let (mut files, mut bytes) = (0, 0);
+    for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            let (f, b) = dir_totals(&entry.path())?;
+            files += f;
+            bytes += b;
+        } else {
+            files += 1;
+            bytes += meta.len();
+        }
+    }
+    Ok((files, bytes))
+}
+
+pub fn fingerprint(path: &str) -> Result<Fingerprint, String> {
+    let p = Path::new(path);
+    let meta = fs::symlink_metadata(p).map_err(|e| format!("{path}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(p).map_err(|e| e.to_string())?;
+        Ok(Fingerprint::Link(target.to_string_lossy().to_string()))
+    } else if meta.is_dir() {
+        let (files, bytes) = dir_totals(p)?;
+        Ok(Fingerprint::Dir { files, bytes })
+    } else {
+        Ok(Fingerprint::File { len: meta.len(), digest: digest_file(p, meta.len())? })
+    }
+}
+
+/// Fails if any requested source cannot be recorded.
+pub fn snapshot_sources(srcs: &[String]) -> Result<Vec<SourceSnapshot>, String> {
     use std::os::unix::fs::MetadataExt;
     srcs.iter()
-        .filter_map(|p| {
-            fs::symlink_metadata(p).ok().map(|m| SourceSnapshot {
-                path: p.clone(),
-                ino: m.ino(),
-                len: m.len(),
-                is_dir: m.is_dir(),
-            })
+        .map(|p| {
+            let meta = fs::symlink_metadata(p).map_err(|e| format!("cannot read {p}: {e}"))?;
+            Ok(SourceSnapshot { path: p.clone(), ino: meta.ino(), fp: fingerprint(p)? })
         })
         .collect()
 }
 
 /// Fail-closed postcondition. COPY: every source still present with the same
-/// identity and size, every destination present with matching size. MOVE: every
-/// moved source gone and every destination present with matching size.
+/// identity and content, every destination present with matching content. MOVE:
+/// every moved source gone and every destination present with matching content.
 pub fn verify_transfer(
     before: &[SourceSnapshot],
     items: &[ResolvedItem],
@@ -919,21 +990,17 @@ pub fn verify_transfer(
         let Some(src) = before.iter().find(|s| s.path == item.from) else {
             return Err(format!("transfer check: no record of {}", item.from));
         };
-        let dest = fs::symlink_metadata(&item.to)
-            .map_err(|_| format!("transfer check: {} is missing after the transfer", item.to))?;
-        if !src.is_dir && dest.len() != src.len {
-            return Err(format!(
-                "transfer check: {} is {} bytes, expected {}",
-                item.to,
-                dest.len(),
-                src.len
-            ));
+        let dest = fingerprint(&item.to).map_err(|_| {
+            format!("transfer check: {} is missing after the transfer", item.to)
+        })?;
+        if dest != src.fp {
+            return Err(format!("transfer check: {} does not match its source", item.to));
         }
         let now = fs::symlink_metadata(&item.from);
         if is_copy {
             let now = now
                 .map_err(|_| format!("transfer check: copy removed the source {}", item.from))?;
-            if now.ino() != src.ino || (!src.is_dir && now.len() != src.len) {
+            if now.ino() != src.ino || fingerprint(&item.from)? != src.fp {
                 return Err(format!("transfer check: copy changed the source {}", item.from));
             }
         } else if now.is_ok() {
