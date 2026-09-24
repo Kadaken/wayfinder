@@ -4060,7 +4060,11 @@ fn wire_inline_editor(field: &gtk::Entry, window: &gtk::Window, host: InlineHost
     let remove_later = {
         let window = window.clone();
         let this = watcher.clone();
+        let removed = Rc::new(std::cell::Cell::new(false));
         Rc::new(move || {
+            if removed.replace(true) {
+                return;
+            }
             let (window, this) = (window.clone(), this.clone());
             glib::idle_add_local_once(move || window.remove_controller(&this));
         })
@@ -6885,26 +6889,12 @@ fn drag_payload(snapshot: Option<Vec<String>>, live: Vec<String>, pressed: &str)
     }
 }
 
-fn connect_file_drag<W: IsA<gtk::Widget>>(
+fn build_file_drag_source<W: IsA<gtk::Widget>>(
     widget: &W,
-    state: Rc<RefCell<AppState>>,
-    ui: Ui,
     path: String,
-    box_select_edge: Option<&gtk::Label>,
-) {
-    let row: gtk::Widget = widget.clone().upcast();
-    let edge = box_select_edge.cloned();
-    let in_box_select_strip = Rc::new(move |x: f64| {
-        let Some(edge) = edge.as_ref() else {
-            return false;
-        };
-        let Some(bounds) = edge.compute_bounds(&row) else {
-            return false;
-        };
-        // The box spacing before the Size label is the column separator.
-        let separator = bounds.x() as f64 - ROW_GAP as f64;
-        x >= separator - BOX_SELECT_STRIP_W && x < bounds.x() as f64
-    });
+    selected: Rc<dyn Fn() -> Vec<String>>,
+    in_box_select_strip: Rc<dyn Fn(f64) -> bool>,
+) -> (gtk::DragSource, gtk::GestureClick) {
     let drag = gtk::DragSource::new();
     drag.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
     // Win the race against the list's rubber-band without touching any widget
@@ -6921,19 +6911,21 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     // The selection as it was at the press, before the ordinary press handling
     // can collapse it to the pressed row. Cleared when the gesture ends.
     let pressed_selection: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(None));
+    let snap_out;
     {
         let snap = gtk::GestureClick::new();
         snap.set_button(1);
         snap.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let (state, ui, slot) = (state.clone(), ui.clone(), pressed_selection.clone());
+        let (selected, slot) = (selected.clone(), pressed_selection.clone());
         snap.connect_pressed(move |_, _, _, _| {
-            *slot.borrow_mut() = Some(selected_paths(&state, &ui));
+            *slot.borrow_mut() = Some(selected());
         });
         let slot = pressed_selection.clone();
         snap.connect_released(move |_, _, _, _| *slot.borrow_mut() = None);
-        let slot = pressed_selection.clone();
-        snap.connect_stopped(move |_| *slot.borrow_mut() = None);
-        widget.add_controller(snap);
+        // No connect_stopped clear: the drag claim stops this gesture before the
+        // DragSource's delayed prepare, which must still see the press snapshot.
+        widget.add_controller(snap.clone());
+        snap_out = Some(snap);
     }
     {
         let slot = pressed_selection.clone();
@@ -6971,8 +6963,8 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
         if strip_for_prepare(x) {
             return None;
         }
-        let snapshot = pressed_selection.borrow().clone();
-        let paths = drag_payload(snapshot, selected_paths(&state, &ui), &path);
+        let snapshot = pressed_selection.borrow_mut().take();
+        let paths = drag_payload(snapshot, selected(), &path);
         drag_count.set(paths.len());
         let files: Vec<gio::File> = paths
             .iter()
@@ -6994,6 +6986,35 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
         Some(gdk::ContentProvider::new_union(&providers))
     });
     widget.add_controller(drag.clone());
+    (drag, snap_out.expect("snapshot gesture"))
+}
+
+fn connect_file_drag<W: IsA<gtk::Widget>>(
+    widget: &W,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    path: String,
+    box_select_edge: Option<&gtk::Label>,
+) {
+    let row: gtk::Widget = widget.clone().upcast();
+    let edge = box_select_edge.cloned();
+    let in_box_select_strip = Rc::new(move |x: f64| {
+        let Some(edge) = edge.as_ref() else {
+            return false;
+        };
+        let Some(bounds) = edge.compute_bounds(&row) else {
+            return false;
+        };
+        // The box spacing before the Size label is the column separator.
+        let separator = bounds.x() as f64 - ROW_GAP as f64;
+        x >= separator - BOX_SELECT_STRIP_W && x < bounds.x() as f64
+    });
+    let selected: Rc<dyn Fn() -> Vec<String>> = {
+        let (state, ui) = (state.clone(), ui.clone());
+        Rc::new(move || selected_paths(&state, &ui))
+    };
+    let (drag, _snap) =
+        build_file_drag_source(widget, path, selected, in_box_select_strip.clone());
 
     if box_select_edge.is_none() {
         return;
@@ -7094,7 +7115,8 @@ fn current_drop_modifiers(target: &gtk::DropTarget) -> (bool, bool) {
         .current_drop()
         .map(|drop| drop.device())
         .map(|device| device.modifier_state())
-        .unwrap_or_else(gdk::ModifierType::empty);
+        .unwrap_or_else(gdk::ModifierType::empty)
+        | target.current_event_state();
     (
         mods.contains(gdk::ModifierType::CONTROL_MASK),
         mods.contains(gdk::ModifierType::SHIFT_MASK),
@@ -7133,6 +7155,9 @@ fn build_drop_target(
             let (ctrl, shift) = current_drop_modifiers(target);
             let txn = DropTxn::negotiate(to_row, &dest, &srcs, ctrl, shift);
             let action = txn.action();
+            if slot.borrow().as_ref().map(|t| t.is_copy) != Some(txn.is_copy) {
+                eprintln!("wf-event: motion to_row={to_row} ctrl={ctrl} shift={shift} copy={}", txn.is_copy);
+            }
             *slot.borrow_mut() = Some(txn);
             action
         }
@@ -7734,6 +7759,29 @@ mod tests {
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
+        drag_source_prepares_the_press_time_selection_after_the_gesture_is_stopped();
+    }
+
+    fn drag_source_prepares_the_press_time_selection_after_the_gesture_is_stopped() {
+        let live = Rc::new(RefCell::new(vec!["/d/a".to_string(), "/d/b".to_string()]));
+        let selected: Rc<dyn Fn() -> Vec<String>> = {
+            let live = live.clone();
+            Rc::new(move || live.borrow().clone())
+        };
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let (drag, snap) = build_file_drag_source(&row, "/d/b".to_string(), selected, Rc::new(|_| false));
+        // press with two rows selected, then ordinary handling collapses the selection
+        snap.emit_by_name::<()>("pressed", &[&1i32, &5.0f64, &5.0f64]);
+        *live.borrow_mut() = vec!["/d/b".to_string()];
+        // the drag claim stops the auxiliary click gesture before prepare runs
+        snap.emit_by_name::<()>("stopped", &[]);
+        let provider = drag
+            .emit_by_name::<Option<gdk::ContentProvider>>("prepare", &[&5.0f64, &5.0f64])
+            .expect("prepare returns a payload");
+        let value = provider.value(gdk::FileList::static_type()).expect("file list value");
+        let files = value.get::<gdk::FileList>().unwrap().files();
+        let got: Vec<String> = files.iter().filter_map(|f| f.path()).map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(got, vec!["/d/a".to_string(), "/d/b".to_string()], "both rows are dragged");
     }
 
     fn name_dialog_ok_and_enter_invoke_callback_once_cancel_never() {
