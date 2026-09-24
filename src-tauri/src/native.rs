@@ -1003,6 +1003,7 @@ struct AppState {
     inline_rename: Option<InlineRename>,
     /// Last plain click on a Name label: path and when, for slow-second-click.
     last_name_click: Option<(String, std::time::Instant)>,
+    activation_gate: Rc<RefCell<ActivationGate>>,
     cwd: String,
     tabs: Vec<String>,
     active_tab: usize,
@@ -1318,6 +1319,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     let state = Rc::new(RefCell::new(AppState {
         inline_rename: None,
         last_name_click: None,
+        activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: initial_cwd.clone(),
         tabs: vec![initial_cwd.clone()],
         active_tab: 0,
@@ -1954,16 +1956,23 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         let state = state.clone();
         let ui = ui.clone();
         let list = ui.list.clone();
-        list.connect_activate(move |_, position| {
-            let entry = state
-                .borrow()
-                .visible_entries
-                .get(position as usize)
-                .cloned();
-            if let Some(entry) = entry {
-                open_entry(&state, &ui, entry);
-            }
-        });
+        let gate = state.borrow().activation_gate.clone();
+        let paths = {
+            let state = state.clone();
+            Rc::new(move |position: u32| {
+                state.borrow().visible_entries.get(position as usize).map(|e| e.path.clone())
+            }) as Rc<dyn Fn(u32) -> Option<String>>
+        };
+        let open = {
+            let (state, ui) = (state.clone(), ui.clone());
+            Rc::new(move |path: String| {
+                let entry = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned();
+                if let Some(entry) = entry {
+                    open_entry(&state, &ui, entry);
+                }
+            }) as Rc<dyn Fn(String)>
+        };
+        connect_gated_activate(&list, gate, paths, open);
     }
     {
         let state = state.clone();
@@ -4180,6 +4189,19 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         line.append(&kind);
         line.append(&modified);
 
+        {
+            // Records which file each press hit, for the double-click gate. It
+            // never claims the sequence.
+            let press = gtk::GestureClick::new();
+            press.set_button(1);
+            press.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let gate = state.borrow().activation_gate.clone();
+            let path = entry.path.clone();
+            press.connect_pressed(move |_, _, _, _| {
+                gate.borrow_mut().press(&path, std::time::Instant::now());
+            });
+            line.add_controller(press);
+        }
         connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone(), Some(&size));
         if entry.is_dir {
             connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.path.clone());
@@ -5709,6 +5731,83 @@ fn inline_event_commits(event: InlineEvent) -> bool {
 /// F2 only starts an inline edit for exactly one selected item in a list view.
 fn f2_starts_inline_rename(selected: usize, view: ViewMode) -> bool {
     selected == 1 && matches!(view, ViewMode::Details | ViewMode::Compact)
+}
+
+/// Opening is explicit: GTK reports an activation by list position only, which
+/// can name a different file after a drag or a row rebind. An activation opens
+/// only when Enter was just pressed, or the last two presses were on that same
+/// path close together. A plain click or Ctrl+click never opens.
+#[derive(Default)]
+struct ActivationGate {
+    presses: Vec<(String, std::time::Instant)>,
+    enter_at: Option<std::time::Instant>,
+}
+
+impl ActivationGate {
+    const DOUBLE: Duration = Duration::from_millis(500);
+    const ENTER: Duration = Duration::from_millis(400);
+
+    fn press(&mut self, path: &str, now: std::time::Instant) {
+        self.presses.push((path.to_string(), now));
+        if self.presses.len() > 2 {
+            self.presses.remove(0);
+        }
+    }
+
+    fn enter(&mut self, now: std::time::Instant) {
+        self.enter_at = Some(now);
+    }
+
+    fn allows(&mut self, path: &str, now: std::time::Instant) -> bool {
+        if self.enter_at.take().is_some_and(|at| now.duration_since(at) <= Self::ENTER) {
+            return true;
+        }
+        let double = match self.presses.as_slice() {
+            [(a, ta), (b, tb)] => {
+                a == path
+                    && b == path
+                    && tb.duration_since(*ta) <= Self::DOUBLE
+                    && now.duration_since(*tb) <= Self::DOUBLE
+            }
+            _ => false,
+        };
+        if double {
+            self.presses.clear();
+        }
+        double
+    }
+}
+
+fn connect_gated_activate(
+    list: &gtk::ListView,
+    gate: Rc<RefCell<ActivationGate>>,
+    path_at: Rc<dyn Fn(u32) -> Option<String>>,
+    open: Rc<dyn Fn(String)>,
+) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let gate = gate.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter) {
+                gate.borrow_mut().enter(std::time::Instant::now());
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    list.add_controller(keys);
+    list.connect_activate(move |_, position| {
+        let started = std::time::Instant::now();
+        let Some(path) = path_at(position) else { return };
+        let allowed = gate.borrow_mut().allows(&path, started);
+        if allowed {
+            open(path.clone());
+        }
+        eprintln!(
+            "wf-event: activate {path} allowed={allowed} took={}ms",
+            started.elapsed().as_millis()
+        );
+    });
 }
 
 /// A slow second click renames only when the name was already selected by an
@@ -7365,6 +7464,65 @@ mod tests {
         entry.set_text("d.txt");
         entry.emit_activate();
         assert_eq!(*calls.borrow(), vec!["d.txt".to_string()], "Enter reaches the callback once");
+    }
+
+    #[test]
+    fn activation_gate_single_and_ctrl_click_never_open() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut g = ActivationGate::default();
+        // one plain click, then a stray position-only activation
+        g.press("/d/a", ms(0));
+        assert!(!g.allows("/d/a", ms(10)));
+        // a click on another file, then an activation naming the first: refused
+        g.press("/d/b", ms(100));
+        g.press("/d/a", ms(200));
+        assert!(!g.allows("/d/a", ms(210)), "the presses were on different files");
+        // real double-click on one file opens once
+        g.press("/d/a", ms(1000));
+        g.press("/d/a", ms(1150));
+        assert!(g.allows("/d/a", ms(1155)));
+        assert!(!g.allows("/d/a", ms(1160)), "consumed");
+        // two slow presses do not open
+        g.press("/d/a", ms(3000));
+        g.press("/d/a", ms(4000));
+        assert!(!g.allows("/d/a", ms(4005)));
+        // Enter opens, once, only when fresh
+        g.enter(ms(5000));
+        assert!(g.allows("/d/x", ms(5050)));
+        assert!(!g.allows("/d/x", ms(5060)));
+        g.enter(ms(6000));
+        assert!(!g.allows("/d/x", ms(7000)), "stale Enter");
+    }
+
+    #[test]
+    fn list_activation_gate_on_real_listview_opens_only_when_allowed() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let list = gtk::ListView::new(None::<gtk::SelectionModel>, None::<gtk::ListItemFactory>);
+        let gate = Rc::new(RefCell::new(ActivationGate::default()));
+        let opened = Rc::new(RefCell::new(Vec::<String>::new()));
+        let path_at: Rc<dyn Fn(u32) -> Option<String>> =
+            Rc::new(|p| Some(format!("/d/file{p}")));
+        let open: Rc<dyn Fn(String)> = {
+            let opened = opened.clone();
+            Rc::new(move |p| opened.borrow_mut().push(p))
+        };
+        connect_gated_activate(&list, gate.clone(), path_at, open);
+        let started = std::time::Instant::now();
+        list.emit_by_name::<()>("activate", &[&0u32]);
+        assert!(opened.borrow().is_empty(), "a bare activation opens nothing");
+        gate.borrow_mut().press("/d/file1", std::time::Instant::now());
+        gate.borrow_mut().press("/d/file1", std::time::Instant::now());
+        list.emit_by_name::<()>("activate", &[&1u32]);
+        assert_eq!(*opened.borrow(), vec!["/d/file1".to_string()]);
+        gate.borrow_mut().press("/d/file1", std::time::Instant::now());
+        list.emit_by_name::<()>("activate", &[&2u32]);
+        assert_eq!(opened.borrow().len(), 1, "a click on one file never opens another");
+        assert!(started.elapsed() < Duration::from_millis(500), "activation returns promptly");
     }
 
     #[test]
