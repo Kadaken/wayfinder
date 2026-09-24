@@ -5052,20 +5052,55 @@ fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
         return;
     };
     let cwd = state.borrow().cwd.clone();
-    let conflicts = native_core::check_conflicts(&clipboard.paths, &cwd);
+    let is_copy = clipboard.mode == ClipboardMode::Copy;
+    let clear_after = clipboard.mode == ClipboardMode::Cut;
+    transfer_with_preflight(
+        state,
+        ui,
+        Transfer {
+            srcs: clipboard.paths,
+            dest: cwd,
+            is_copy,
+            clear_cut_after: clear_after,
+            style: TransferStyle::Paste,
+        },
+    );
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TransferStyle {
+    Paste,
+    /// Drop on the folder background.
+    Drop,
+    /// Drop on a folder row; names the destination.
+    DropOnRow,
+}
+
+#[derive(Clone)]
+struct Transfer {
+    srcs: Vec<String>,
+    dest: String,
+    is_copy: bool,
+    clear_cut_after: bool,
+    style: TransferStyle,
+}
+
+/// The one gate for clipboard copy/cut and both drop targets. No clash runs
+/// straight away; a clash asks Replace / Duplicate / Cancel once for the whole
+/// operation, and Cancel starts nothing.
+fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
+    let conflicts = native_core::check_conflicts(&transfer.srcs, &transfer.dest, transfer.is_copy);
     if conflicts.is_empty() {
-        paste_with_conflict_mode(state, ui, native_core::PasteConflict::KeepBoth);
+        run_transfer(state, ui, transfer, native_core::PasteConflict::KeepBoth);
         return;
     }
-    // Explorer asks before it overwrites. This used to silently keep both, every
-    // time, which quietly filled folders with "file (2)" copies.
     let ui_for_choice = ui.clone();
     show_conflict_dialog(&ui, &conflicts, move |mode| {
-        paste_with_conflict_mode(state.clone(), ui_for_choice.clone(), mode);
+        run_transfer(state.clone(), ui_for_choice.clone(), transfer.clone(), mode);
     });
 }
 
-/// Replace / Skip / Keep Both, with Cancel as the escape.
+/// Replace / Duplicate / Cancel. Escape or closing the window is Cancel.
 fn show_conflict_dialog<F>(ui: &Ui, conflicts: &[String], on_choice: F)
 where
     F: Fn(native_core::PasteConflict) + 'static,
@@ -5076,69 +5111,73 @@ where
     } else {
         format!("{count} items already exist here.")
     };
-    let detail = if count == 1 {
-        "Replace it, skip it, or keep both?".to_string()
+    let names = if count == 1 {
+        String::new()
     } else {
         let sample: Vec<&str> = conflicts.iter().take(5).map(String::as_str).collect();
         let more = count.saturating_sub(sample.len());
         let listed = sample.join(", ");
         if more > 0 {
-            format!("{listed}, and {more} more.\n\nReplace them, skip them, or keep both?")
+            format!("{listed}, and {more} more.\n\n")
         } else {
-            format!("{listed}\n\nReplace them, skip them, or keep both?")
+            format!("{listed}\n\n")
         }
     };
+    let scope = if count == 1 { "" } else { " Your choice applies to all of them." };
+    let detail = format!(
+        "{names}Replace overwrites the existing item, and Undo cannot bring the overwritten data back. Duplicate keeps both.{scope}"
+    );
 
     let dialog = adw::AlertDialog::new(Some(&heading), Some(&detail));
     dialog.add_responses(&[
         ("cancel", "Cancel"),
-        ("skip", "Skip"),
-        ("keepboth", "Keep Both"),
+        ("duplicate", "Duplicate"),
         ("replace", "Replace"),
     ]);
-    // Replacing destroys the existing file and undo cannot bring it back, so it
-    // is marked destructive and is NOT the default.
     dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("keepboth"));
+    dialog.set_default_response(Some("duplicate"));
     dialog.set_close_response("cancel");
     dialog.connect_response(None, move |dialog, response| {
-        match response {
-            "replace" => on_choice(native_core::PasteConflict::Replace),
-            "skip" => on_choice(native_core::PasteConflict::Skip),
-            "keepboth" => on_choice(native_core::PasteConflict::KeepBoth),
-            _ => {}
+        if let Some(mode) = native_core::conflict_response(response) {
+            on_choice(mode);
         }
         dialog.close();
     });
     dialog.present(Some(&ui.window));
 }
 
-fn paste_with_conflict_mode(
+fn run_transfer(
     state: Rc<RefCell<AppState>>,
     ui: Ui,
+    transfer: Transfer,
     on_conflict: native_core::PasteConflict,
 ) {
-    let Some(clipboard) = state.borrow().clipboard.clone() else {
-        return;
+    let Transfer { srcs, dest, is_copy, clear_cut_after, style } = transfer;
+    let count = srcs.len();
+    let (ing, ed) = match (style, is_copy) {
+        (TransferStyle::Paste, _) => ("Pasting", "Pasted"),
+        (_, true) => ("Copying", "Copied"),
+        (_, false) => ("Moving", "Moved"),
     };
-    let cwd = state.borrow().cwd.clone();
-    let is_copy = clipboard.mode == ClipboardMode::Copy;
-    let clear_after = clipboard.mode == ClipboardMode::Cut;
-    let count = clipboard.paths.len();
-    let label = match on_conflict {
-        native_core::PasteConflict::Replace => format!("Pasting {count}, replacing existing"),
-        native_core::PasteConflict::Skip => format!("Pasting {count}, skipping existing"),
-        native_core::PasteConflict::KeepBoth => format!("Pasting {count}"),
+    let mut label = match style {
+        TransferStyle::Paste => format!("{ing} {count}"),
+        TransferStyle::Drop => format!("{ing} {count} dropped item{}", plural(count)),
+        TransferStyle::DropOnRow => {
+            format!("{ing} {count} item{} to {}", plural(count), tab_label(&dest))
+        }
     };
-
+    if on_conflict == native_core::PasteConflict::Replace {
+        label.push_str(", replacing existing");
+    }
     run_job(
         state,
         ui,
         label,
         move || {
-            let items = native_core::resolve_paste(&clipboard.paths, &cwd, is_copy, on_conflict)?;
+            // A failed MOVE is reported as a failure and never retried as COPY.
+            let items = native_core::resolve_paste(&srcs, &dest, is_copy, on_conflict)?;
             Ok(JobOutcome::undo(
-                format!("Pasted {} item{}", items.len(), plural(items.len())),
+                format!("{ed} {} item{}", items.len(), plural(items.len())),
                 UndoAction::Pasted {
                     items,
                     was_copy: is_copy,
@@ -5146,7 +5185,7 @@ fn paste_with_conflict_mode(
             ))
         },
         move |state, _, _| {
-            if clear_after {
+            if clear_cut_after {
                 state.borrow_mut().clipboard = None;
             }
         },
@@ -6726,40 +6765,6 @@ fn drop_is_copy(target: &gtk::DropTarget, srcs: &[String], dest: &str) -> bool {
     )
 }
 
-fn run_drop_job(
-    state: Rc<RefCell<AppState>>,
-    ui: Ui,
-    srcs: Vec<String>,
-    dest: String,
-    is_copy: bool,
-    to_label: Option<String>,
-) {
-    let count = srcs.len();
-    let (ing, ed) = if is_copy { ("Copying", "Copied") } else { ("Moving", "Moved") };
-    let label = match &to_label {
-        Some(to) => format!("{ing} {count} item{} to {to}", plural(count)),
-        None => format!("{ing} {count} dropped item{}", plural(count)),
-    };
-    run_job(
-        state,
-        ui,
-        label,
-        move || {
-            // A drop is not a deliberate paste, so never destroy on conflict.
-            // A failed MOVE is reported as a failure and never retried as COPY.
-            let items = native_core::resolve_paste(&srcs, &dest, is_copy, native_core::PasteConflict::KeepBoth)?;
-            Ok(JobOutcome::undo(
-                format!("{ed} {} item{}", items.len(), plural(items.len())),
-                UndoAction::Pasted {
-                    items,
-                    was_copy: is_copy,
-                },
-            ))
-        },
-        |_, _, _| {},
-    );
-}
-
 fn build_drop_target(
     state: Rc<RefCell<AppState>>,
     ui: Ui,
@@ -6801,8 +6806,12 @@ fn build_drop_target(
             return false;
         }
         let is_copy = drop_is_copy(target, &srcs, &dest);
-        let to_label = to_row.then(|| tab_label(&dest));
-        run_drop_job(state.clone(), ui.clone(), srcs, dest, is_copy, to_label);
+        let style = if to_row { TransferStyle::DropOnRow } else { TransferStyle::Drop };
+        transfer_with_preflight(
+            state.clone(),
+            ui.clone(),
+            Transfer { srcs, dest, is_copy, clear_cut_after: false, style },
+        );
         true
     });
     drop
