@@ -632,6 +632,13 @@ pub fn rename_path(path: &str, new_name: &str) -> Result<String, String> {
     validate_name(new_name)?;
     let parent = Path::new(path).parent().ok_or("no parent")?;
     let dest = parent.join(new_name);
+    if dest.as_path() == Path::new(path) {
+        return Ok(dest.to_string_lossy().to_string());
+    }
+    // fs::rename silently replaces an existing file on Linux; never do that.
+    if dest.symlink_metadata().is_ok() {
+        return Err(format!("\"{new_name}\" already exists"));
+    }
     fs::rename(path, &dest).map_err(|err| err.to_string())?;
     Ok(dest.to_string_lossy().to_string())
 }
@@ -1209,7 +1216,7 @@ pub fn fmt_modified(seconds: i64) -> String {
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
-    if name.trim().is_empty() || name.contains('/') {
+    if name.trim().is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err("invalid name".into());
     }
     Ok(())
@@ -1393,6 +1400,45 @@ mod tests {
 
     fn now_unix() -> i64 {
         glib::DateTime::now_local().unwrap().to_unix()
+    }
+
+    #[test]
+    fn rename_path_refuses_illegal_names() {
+        let dir = test_dir("rename-illegal");
+        let file = dir.join("a.txt");
+        fs::write(&file, "a").unwrap();
+        for bad in ["", "   ", ".", "..", "x/y"] {
+            assert!(rename_path(file.to_str().unwrap(), bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(file.exists(), "the source is untouched");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_path_never_overwrites_an_existing_sibling() {
+        let dir = test_dir("rename-collision");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "AAA").unwrap();
+        fs::write(&b, "BBB").unwrap();
+        let err = rename_path(a.to_str().unwrap(), "b.txt").unwrap_err();
+        assert!(err.contains("already exists"), "reason names the collision: {err}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "AAA");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "BBB");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_path_same_name_is_a_no_op_and_real_rename_moves_the_file() {
+        let dir = test_dir("rename-real");
+        let a = dir.join("a.txt");
+        fs::write(&a, "AAA").unwrap();
+        assert_eq!(rename_path(a.to_str().unwrap(), "a.txt").unwrap(), a.to_string_lossy());
+        assert!(a.exists());
+        let to = rename_path(a.to_str().unwrap(), "café.txt").unwrap();
+        assert!(!a.exists(), "old path gone");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "AAA");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
