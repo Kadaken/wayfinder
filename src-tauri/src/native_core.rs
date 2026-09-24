@@ -805,13 +805,33 @@ pub fn delete_permanent(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn check_conflicts(srcs: &[String], dest_dir: &str) -> Vec<String> {
+/// Names that would clash at the destination. A MOVE onto its own path is a
+/// no-op, not a clash; a COPY onto its own path clashes (Duplicate is offered).
+pub fn check_conflicts(srcs: &[String], dest_dir: &str, is_copy: bool) -> Vec<String> {
     srcs.iter()
         .filter_map(|src| {
             let name = Path::new(src).file_name()?.to_str()?.to_string();
-            Path::new(dest_dir).join(&name).exists().then_some(name)
+            let target = Path::new(dest_dir).join(&name);
+            if !target.exists() {
+                return None;
+            }
+            let same_path = matches!(
+                (fs::canonicalize(src), fs::canonicalize(&target)),
+                (Ok(a), Ok(b)) if a == b
+            );
+            (is_copy || !same_path).then_some(name)
         })
         .collect()
+}
+
+/// Maps a clash-dialog response to what to do. Cancel (and Escape / close)
+/// is None: no transfer may start.
+pub fn conflict_response(response: &str) -> Option<PasteConflict> {
+    match response {
+        "replace" => Some(PasteConflict::Replace),
+        "duplicate" => Some(PasteConflict::KeepBoth),
+        _ => None,
+    }
 }
 
 /// What to do when the destination already holds a file of the same name.
@@ -1277,7 +1297,7 @@ fn unique_target(dest_dir: &str, name: &str) -> PathBuf {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
-    let mut n = 1;
+    let mut n = 2;
     loop {
         let cand = base.join(format!("{} ({}){}", stem, n, ext));
         if !cand.exists() {
@@ -1749,8 +1769,15 @@ mod tests {
     }
 
     /// A scratch dir with src/note.txt = "NEW" and dest/note.txt = "OLD".
+    /// Throwaway test data lives under ~/Projects/Scratch, never /tmp.
+    fn scratch_root() -> std::path::PathBuf {
+        let root = Path::new(&std::env::var("HOME").unwrap()).join("Projects/Scratch/wf-unit-tests");
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     fn paste_conflict_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = scratch_root().join(format!(
             "wf-paste-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1767,7 +1794,7 @@ mod tests {
 
     #[test]
     fn drag_action_modifiers_and_device_default() {
-        let d = std::env::temp_dir().join(format!("wf-drag-{}", std::process::id()));
+        let d = scratch_root().join(format!("wf-drag-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("dest")).unwrap();
         fs::write(d.join("a.txt"), "a").unwrap();
@@ -1785,11 +1812,57 @@ mod tests {
         assert!(drag_is_copy(&srcs, &d.join("nodir").to_string_lossy(), false, false));
         // /proc is a different device from a scratch dir
         assert!(drag_is_copy(&["/proc/self".to_string()], &dest, false, false), "different device copies");
-        // a real move of both files, then undo path via resolve_paste move back
+        // a real move of both files, then the real undo
         let items = resolve_paste(&srcs, &dest, false, PasteConflict::KeepBoth).unwrap();
         assert_eq!(items.len(), 2);
         assert!(!Path::new(&a).exists() && !Path::new(&b).exists());
         assert!(d.join("dest/a.txt").exists() && d.join("dest/b.txt").exists());
+        restore_moved_items(&items).unwrap();
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert_eq!(fs::read(&b).unwrap(), b"b");
+        assert!(!d.join("dest/a.txt").exists() && !d.join("dest/b.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clash_preflight_and_three_choices() {
+        let d = paste_conflict_dir();
+        let src = d.join("src/note.txt").to_string_lossy().to_string();
+        let dest = d.join("dest").to_string_lossy().to_string();
+        fs::write(d.join("src/free.txt"), b"F").unwrap();
+        let free = d.join("src/free.txt").to_string_lossy().to_string();
+        // one clash plus one clean item, for copy and for move
+        for is_copy in [true, false] {
+            assert_eq!(check_conflicts(&[src.clone(), free.clone()], &dest, is_copy), vec!["note.txt"]);
+        }
+        // moving onto its own folder is a no-op, not a clash; copying is a clash
+        let own = d.join("dest/note.txt").to_string_lossy().to_string();
+        assert!(check_conflicts(&[own.clone()], &dest, false).is_empty());
+        assert_eq!(check_conflicts(&[own], &dest, true), vec!["note.txt"]);
+        // Cancel and Escape start nothing; the other two map to their modes
+        assert_eq!(conflict_response("cancel"), None);
+        assert_eq!(conflict_response("close"), None);
+        assert_eq!(conflict_response("duplicate"), Some(PasteConflict::KeepBoth));
+        assert_eq!(conflict_response("replace"), Some(PasteConflict::Replace));
+        // Duplicate numbers from (2), then (3), keeping the extension; folders too
+        let one = resolve_paste(&[src.clone()], &dest, true, PasteConflict::KeepBoth).unwrap();
+        assert!(one[0].to.ends_with("note (2).txt"));
+        let two = resolve_paste(&[src.clone()], &dest, true, PasteConflict::KeepBoth).unwrap();
+        assert!(two[0].to.ends_with("note (3).txt"));
+        assert_eq!(fs::read(d.join("dest/note.txt")).unwrap(), b"OLD");
+        fs::create_dir_all(d.join("src/box")).unwrap();
+        fs::create_dir_all(d.join("dest/box")).unwrap();
+        let bx = d.join("src/box").to_string_lossy().to_string();
+        let dup = resolve_paste(&[bx], &dest, true, PasteConflict::KeepBoth).unwrap();
+        assert!(dup[0].to.ends_with("box (2)"));
+        // Replace on a move: only the named destination item changes, source is consumed
+        let out = resolve_paste(&[src.clone()], &dest, false, PasteConflict::Replace).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(fs::read(d.join("dest/note.txt")).unwrap(), b"NEW");
+        assert!(!Path::new(&src).exists());
+        assert!(d.join("dest/note (2).txt").exists(), "other items untouched");
+        // Cancel: nothing called, so every byte is as it was
+        assert_eq!(fs::read(&free).unwrap(), b"F");
         let _ = fs::remove_dir_all(&d);
     }
 
