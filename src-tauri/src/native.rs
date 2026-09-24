@@ -5224,7 +5224,7 @@ fn perform_transfer(
     is_copy: bool,
     on_conflict: native_core::PasteConflict,
 ) -> Result<Vec<native_core::ResolvedItem>, String> {
-    let before = native_core::snapshot_sources(srcs);
+    let before = native_core::snapshot_sources(srcs)?;
     let items = native_core::resolve_paste(srcs, dest, is_copy, on_conflict)?;
     native_core::verify_transfer(&before, &items, is_copy)?;
     Ok(items)
@@ -6945,19 +6945,17 @@ impl DropTxn {
     }
 }
 
-/// Consume the stored transaction for a drop. It is used only when it was
-/// negotiated for this same target, destination and source set; otherwise the
-/// action falls back to the no-modifier default, never to a second modifier read.
+/// Consume the stored transaction for a drop. Only the exact tuple negotiated
+/// for this target, destination and source set is returned; anything else is a
+/// refusal (None), never a guessed default action.
 fn take_drop_txn(
     slot: &RefCell<Option<DropTxn>>,
     to_row: bool,
     dest: &str,
     srcs: &[String],
-) -> DropTxn {
-    match slot.borrow_mut().take() {
-        Some(txn) if txn.to_row == to_row && txn.dest == dest && txn.srcs == srcs => txn,
-        _ => DropTxn::negotiate(to_row, dest, srcs, false, false),
-    }
+) -> Option<DropTxn> {
+    let txn = slot.borrow_mut().take()?;
+    (txn.to_row == to_row && txn.dest == dest && txn.srcs == srcs).then_some(txn)
 }
 
 fn current_drop_modifiers(target: &gtk::DropTarget) -> (bool, bool) {
@@ -7008,9 +7006,15 @@ fn build_drop_target(
             action
         }
     });
+    // Leave clears the stored tuple only after the current event is handled, so
+    // a leave delivered just before the drop cannot erase it (and a missing
+    // tuple refuses the drop rather than guessing an action).
     drop.connect_leave({
         let slot = slot.clone();
-        move |_| *slot.borrow_mut() = None
+        move |_| {
+            let slot = slot.clone();
+            glib::idle_add_local_once(move || *slot.borrow_mut() = None);
+        }
     });
     drop.connect_drop(move |_, value, _, _| {
         let dest = dest_of();
@@ -7019,7 +7023,11 @@ fn build_drop_target(
             slot.borrow_mut().take();
             return false;
         }
-        let txn = take_drop_txn(&slot, to_row, &dest, &srcs);
+        let Some(txn) = take_drop_txn(&slot, to_row, &dest, &srcs) else {
+            eprintln!("wf-event: drop REFUSED, no matching negotiated tuple for {dest}");
+            ui.status.set_label("Drop refused: the drag action was not settled");
+            return false;
+        };
         eprintln!(
             "wf-event: drop to_row={} dest={} copy={} srcs={:?}",
             txn.to_row, txn.dest, txn.is_copy, txn.srcs
@@ -7260,7 +7268,7 @@ mod tests {
         let slot = RefCell::new(None);
         let srcs = vec![s("copy-me.txt")];
         *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, true, false));
-        let txn = take_drop_txn(&slot, true, &target, &srcs);
+        let txn = take_drop_txn(&slot, true, &target, &srcs).expect("exact tuple");
         assert!(txn.is_copy);
         assert!(slot.borrow().is_none(), "drop consumes the transaction once");
         let ino = std::fs::metadata(s("copy-me.txt")).unwrap().ino();
@@ -7276,7 +7284,7 @@ mod tests {
         // creates "(2)" and leaves the original inode and bytes alone.
         let srcs = vec![s("bg-copy.txt")];
         *slot.borrow_mut() = Some(DropTxn::negotiate(false, &inbox, &srcs, true, false));
-        let t = take_drop_txn(&slot, false, &inbox, &srcs).into_transfer();
+        let t = take_drop_txn(&slot, false, &inbox, &srcs).expect("exact tuple").into_transfer();
         assert!(t.is_copy);
         assert_eq!(plan_transfer(&t), TransferPlan::Ask(vec!["bg-copy.txt".to_string()]));
         let ino = std::fs::metadata(s("bg-copy.txt")).unwrap().ino();
@@ -7290,7 +7298,7 @@ mod tests {
         let srcs = vec![s("bg-move.txt")];
         let before = std::fs::read_dir(&inbox).unwrap().count();
         *slot.borrow_mut() = Some(DropTxn::negotiate(false, &inbox, &srcs, false, false));
-        let t = take_drop_txn(&slot, false, &inbox, &srcs).into_transfer();
+        let t = take_drop_txn(&slot, false, &inbox, &srcs).expect("exact tuple").into_transfer();
         assert!(!t.is_copy);
         let ino = std::fs::metadata(s("bg-move.txt")).unwrap().ino();
         assert_eq!(plan_transfer(&t), TransferPlan::NoOp);
@@ -7301,7 +7309,7 @@ mod tests {
         // Row MOVE of two files: sources gone, one destination each, same bytes.
         let srcs = vec![s("m1.txt"), s("m2.txt")];
         *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, false, false));
-        let t = take_drop_txn(&slot, true, &target, &srcs).into_transfer();
+        let t = take_drop_txn(&slot, true, &target, &srcs).expect("exact tuple").into_transfer();
         assert!(!t.is_copy);
         perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap();
         assert!(!std::path::Path::new(&s("m1.txt")).exists());
@@ -7312,8 +7320,12 @@ mod tests {
         // A transaction negotiated for one target never feeds another.
         let srcs = vec![s("bg-move.txt")];
         *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, true, false));
-        let other = take_drop_txn(&slot, false, &inbox, &srcs);
-        assert!(!other.is_copy && !other.to_row && other.dest == inbox);
+        assert!(take_drop_txn(&slot, false, &inbox, &srcs).is_none(), "wrong target refuses");
+        assert!(slot.borrow().is_none(), "a refused drop clears the state");
+        assert!(take_drop_txn(&slot, true, &target, &srcs).is_none(), "missing tuple refuses");
+        // refusal starts nothing: both sides stay byte-identical
+        assert_eq!(std::fs::read(s("bg-move.txt")).unwrap(), body(15360));
+        assert!(!std::path::Path::new(&format!("{target}/bg-move.txt")).exists());
     }
 
     #[test]
@@ -7321,8 +7333,7 @@ mod tests {
         let before = vec![native_core::SourceSnapshot {
             path: "/nonexistent-wf/a".into(),
             ino: 1,
-            len: 5,
-            is_dir: false,
+            fp: native_core::Fingerprint::File { len: 5, digest: 1 },
         }];
         let items = vec![native_core::ResolvedItem {
             from: "/nonexistent-wf/a".into(),
@@ -7330,6 +7341,34 @@ mod tests {
         }];
         assert!(native_core::verify_transfer(&before, &items, true).is_err());
         assert!(native_core::verify_transfer(&before, &items, false).is_err());
+        assert!(native_core::snapshot_sources(&["/nonexistent-wf/a".to_string()]).is_err());
+    }
+
+    #[test]
+    fn transfer_postcondition_compares_bytes_not_lengths() {
+        let root = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(format!("Projects/Scratch/wf-verify-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt").to_string_lossy().to_string();
+        let b = root.join("b.txt").to_string_lossy().to_string();
+        std::fs::write(&a, b"AAAAAAAA").unwrap();
+        let before = native_core::snapshot_sources(&[a.clone()]).unwrap();
+        // an equal-length copy with different bytes must fail
+        std::fs::write(&b, b"AAAAAAAB").unwrap();
+        let items = vec![native_core::ResolvedItem { from: a.clone(), to: b.clone() }];
+        assert!(native_core::verify_transfer(&before, &items, true).is_err());
+        std::fs::write(&b, b"AAAAAAAA").unwrap();
+        assert!(native_core::verify_transfer(&before, &items, true).is_ok());
+        // a source changed by an equal-length overwrite fails a COPY check
+        std::fs::write(&a, b"BBBBBBBB").unwrap();
+        assert!(native_core::verify_transfer(&before, &items, true).is_err());
     }
 
     #[test]
