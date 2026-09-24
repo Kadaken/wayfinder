@@ -17,9 +17,8 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Drag hand: picture size, and how far down and right of the pointer it sits.
-const DRAG_HAND_SIZE: i32 = 20;
-const DRAG_HAND_GAP: i32 = 8;
+/// The drag picture is a ghost of the dragged row at about half opacity.
+const DRAG_GHOST_OPACITY: f64 = 0.55;
 const MAX_GRID_THUMBNAILS: usize = 60;
 const MAX_CONCURRENT_THUMBNAILS: usize = 4;
 
@@ -440,10 +439,9 @@ scrollbar slider:active {
 .wf-drag-badge {
     background: @wf_accent;
     color: #ffffff;
-    border-radius: 6px;
-    padding: 0 3px;
-    font-size: 8px;
-    min-height: 0;
+    border-radius: 8px;
+    padding: 0 5px;
+    font-size: 10px;
 }
 
 .wf-file-icon {
@@ -6940,17 +6938,21 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
             false
         });
     }
-    // A compact fixed-size drag picture (the row's normal icon size plus a small
-    // count badge) instead of GTK's snapshot of the whole row.
+    // A translucent ghost of the dragged row, held where the press happened
+    // (the point prepare was given), so the names under it stay readable. The
+    // count badge for several items stays opaque.
     let drag_count = Rc::new(std::cell::Cell::new(1usize));
+    let grab = Rc::new(std::cell::Cell::new((0.0f64, 0.0f64)));
     {
-        let (count, path) = (drag_count.clone(), path.clone());
-        drag.connect_drag_begin(move |_, drag| {
-            let is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
-            let image = gtk::Image::from_icon_name(if is_dir { "folder" } else { "text-x-generic" });
-            image.set_pixel_size(DRAG_HAND_SIZE);
+        let (count, grab) = (drag_count.clone(), grab.clone());
+        drag.connect_drag_begin(move |src, drag| {
+            let Some(source) = src.widget() else { return };
+            let paintable = gtk::WidgetPaintable::new(Some(&source));
+            let picture = gtk::Picture::for_paintable(&paintable);
+            picture.set_can_shrink(false);
+            picture.set_opacity(DRAG_GHOST_OPACITY);
             let overlay = gtk::Overlay::new();
-            overlay.set_child(Some(&image));
+            overlay.set_child(Some(&picture));
             if count.get() > 1 {
                 let badge = gtk::Label::new(Some(&count.get().to_string()));
                 badge.add_css_class("wf-drag-badge");
@@ -6958,17 +6960,18 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
                 badge.set_valign(gtk::Align::End);
                 overlay.add_overlay(&badge);
             }
-            overlay.set_size_request(DRAG_HAND_SIZE, DRAG_HAND_SIZE);
             gtk::DragIcon::for_drag(drag).set_child(Some(&overlay));
-            // Negative hotspot puts the picture down and right of the pointer.
-            drag.set_hotspot(-DRAG_HAND_GAP, -DRAG_HAND_GAP);
+            let (gx, gy) = grab.get();
+            let (hot_x, hot_y) = (gx.round().max(0.0) as i32, gy.round().max(0.0) as i32);
+            drag.set_hotspot(hot_x, hot_y);
         });
     }
     let strip_for_prepare = in_box_select_strip.clone();
-    drag.connect_prepare(move |_, x, _| {
+    drag.connect_prepare(move |_, x, y| {
         if strip_for_prepare(x) {
             return None;
         }
+        grab.set((x, y));
         let snapshot = pressed_selection.borrow_mut().take();
         let paths = drag_payload(snapshot, selected(), &path);
         drag_count.set(paths.len());
@@ -8206,16 +8209,20 @@ mod tests {
         assert_eq!(gtk_launch_args(&args), vec!["wayfinder"]);
     }
 
-    /// D-16 (23 Sep 2026): the drag hand is 20px and sits 8px down and right of
-    /// the pointer so the file under it stays visible.
+    /// D-17 (23 Sep 2026): the drag picture is a translucent ghost of the dragged
+    /// row, anchored where the press happened. Code cannot prove the name under
+    /// it is readable; only the owner's eyes can.
     #[test]
-    fn drag_hand_small_and_lower_right_d16() {
-        assert_eq!(DRAG_HAND_SIZE, 20);
-        assert_eq!(DRAG_HAND_GAP, 8);
-        let app = &include_str!("native.rs")[..include_str!("native.rs").find("#[cfg(test)]\nmod tests").unwrap_or(0)];
-        assert!(app.contains("drag.set_hotspot(-DRAG_HAND_GAP, -DRAG_HAND_GAP)"));
-        assert!(app.contains("image.set_pixel_size(DRAG_HAND_SIZE)"));
-        assert!(app.contains("overlay.set_size_request(DRAG_HAND_SIZE, DRAG_HAND_SIZE)"));
+    fn drag_ghost_translucent_at_grab_point_d17() {
+        assert!((0.50..=0.60).contains(&DRAG_GHOST_OPACITY));
+        let all = include_str!("native.rs");
+        let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(app.contains("gtk::WidgetPaintable::new(Some(&source))"));
+        assert!(app.contains("picture.set_opacity(DRAG_GHOST_OPACITY)"));
+        assert_eq!(app.matches("set_opacity(").count(), 1, "only the picture is translucent");
+        assert!(app.contains("grab.set((x, y))"));
+        assert!(app.contains("drag.set_hotspot(hot_x, hot_y)"));
+        assert!(!app.contains("DRAG_HAND") && !app.contains("set_hotspot(-"));
     }
 
     /// LOCKED 12 Sep 2026: dragging a file from anywhere on its row must beat the
