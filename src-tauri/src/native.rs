@@ -17,6 +17,9 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Drag hand: picture size, and how far down and right of the pointer it sits.
+const DRAG_HAND_SIZE: i32 = 20;
+const DRAG_HAND_GAP: i32 = 8;
 const MAX_GRID_THUMBNAILS: usize = 60;
 const MAX_CONCURRENT_THUMBNAILS: usize = 4;
 
@@ -437,9 +440,10 @@ scrollbar slider:active {
 .wf-drag-badge {
     background: @wf_accent;
     color: #ffffff;
-    border-radius: 8px;
-    padding: 0 5px;
-    font-size: 10px;
+    border-radius: 6px;
+    padding: 0 3px;
+    font-size: 8px;
+    min-height: 0;
 }
 
 .wf-file-icon {
@@ -6944,7 +6948,7 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
         drag.connect_drag_begin(move |_, drag| {
             let is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
             let image = gtk::Image::from_icon_name(if is_dir { "folder" } else { "text-x-generic" });
-            image.set_pixel_size(32);
+            image.set_pixel_size(DRAG_HAND_SIZE);
             let overlay = gtk::Overlay::new();
             overlay.set_child(Some(&image));
             if count.get() > 1 {
@@ -6954,8 +6958,10 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
                 badge.set_valign(gtk::Align::End);
                 overlay.add_overlay(&badge);
             }
-            overlay.set_size_request(32, 32);
+            overlay.set_size_request(DRAG_HAND_SIZE, DRAG_HAND_SIZE);
             gtk::DragIcon::for_drag(drag).set_child(Some(&overlay));
+            // Negative hotspot puts the picture down and right of the pointer.
+            drag.set_hotspot(-DRAG_HAND_GAP, -DRAG_HAND_GAP);
         });
     }
     let strip_for_prepare = in_box_select_strip.clone();
@@ -8198,6 +8204,18 @@ mod tests {
             "/tmp/selection".to_string(),
         ];
         assert_eq!(gtk_launch_args(&args), vec!["wayfinder"]);
+    }
+
+    /// D-16 (23 Sep 2026): the drag hand is 20px and sits 8px down and right of
+    /// the pointer so the file under it stays visible.
+    #[test]
+    fn drag_hand_small_and_lower_right_d16() {
+        assert_eq!(DRAG_HAND_SIZE, 20);
+        assert_eq!(DRAG_HAND_GAP, 8);
+        let app = &include_str!("native.rs")[..include_str!("native.rs").find("#[cfg(test)]\nmod tests").unwrap_or(0)];
+        assert!(app.contains("drag.set_hotspot(-DRAG_HAND_GAP, -DRAG_HAND_GAP)"));
+        assert!(app.contains("image.set_pixel_size(DRAG_HAND_SIZE)"));
+        assert!(app.contains("overlay.set_size_request(DRAG_HAND_SIZE, DRAG_HAND_SIZE)"));
     }
 
     /// LOCKED 12 Sep 2026: dragging a file from anywhere on its row must beat the
