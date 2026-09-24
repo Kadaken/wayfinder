@@ -891,78 +891,91 @@ pub struct SourceSnapshot {
     pub fp: Fingerprint,
 }
 
-/// Regular files: length and a streaming digest of every byte up to
-/// `FULL_DIGEST_LIMIT`; larger files digest the length plus the first, middle
-/// and last MiB. Folders: recursive file count and total bytes (the names and
-/// contents inside are not compared). Symlinks: the link target.
+/// Exact content fingerprints (64-bit SipHash over every byte, streamed with
+/// bounded memory at any size). Files: length and digest of all bytes. Folders:
+/// a digest over the sorted relative names, entry types, symlink targets and
+/// every regular-file byte, so renamed or edited entries differ. Symlinks: the
+/// link target. Unreadable entries or a read that ends early are errors.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fingerprint {
     File { len: u64, digest: u64 },
-    Dir { files: u64, bytes: u64 },
+    Tree { entries: u64, digest: u64 },
     Link(String),
 }
 
-const FULL_DIGEST_LIMIT: u64 = 256 * 1024 * 1024;
-const SAMPLE: u64 = 1024 * 1024;
-
-fn digest_file(path: &Path, len: u64) -> Result<u64, String> {
+fn hash_file_bytes(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    path: &Path,
+    len: u64,
+) -> Result<(), String> {
     use std::hash::Hasher;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
     let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut feed = |file: &mut fs::File, mut n: u64| -> Result<(), String> {
-        while n > 0 {
-            let want = n.min(buf.len() as u64) as usize;
-            let got = file.read(&mut buf[..want]).map_err(|e| e.to_string())?;
-            if got == 0 {
-                break;
-            }
-            hasher.write(&buf[..got]);
-            n -= got as u64;
+    let mut seen = 0u64;
+    loop {
+        let got = file.read(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
+        if got == 0 {
+            break;
         }
-        Ok(())
-    };
-    if len <= FULL_DIGEST_LIMIT {
-        feed(&mut file, len)?;
-    } else {
-        for at in [0, len / 2, len - SAMPLE] {
-            file.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
-            feed(&mut file, SAMPLE)?;
-        }
+        hasher.write(&buf[..got]);
+        seen += got as u64;
     }
-    hasher.write_u64(len);
-    Ok(hasher.finish())
+    if seen != len {
+        return Err(format!("{}: read {seen} of {len} bytes", path.display()));
+    }
+    Ok(())
 }
 
-fn dir_totals(path: &Path) -> Result<(u64, u64), String> {
-    let (mut files, mut bytes) = (0, 0);
-    for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let meta = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-        if meta.is_dir() {
-            let (f, b) = dir_totals(&entry.path())?;
-            files += f;
-            bytes += b;
+fn hash_tree(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    dir: &Path,
+    entries: &mut u64,
+) -> Result<(), String> {
+    use std::hash::Hasher;
+    let mut names = fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .map(|e| e.map(|e| e.file_name()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        *entries += 1;
+        hasher.write(name.to_string_lossy().as_bytes());
+        hasher.write_u8(0);
+        if meta.file_type().is_symlink() {
+            hasher.write_u8(b'L');
+            let target = fs::read_link(&path).map_err(|e| e.to_string())?;
+            hasher.write(target.to_string_lossy().as_bytes());
+        } else if meta.is_dir() {
+            hasher.write_u8(b'D');
+            hash_tree(hasher, &path, entries)?;
+            hasher.write_u8(b'/');
         } else {
-            files += 1;
-            bytes += meta.len();
+            hasher.write_u8(b'F');
+            hasher.write_u64(meta.len());
+            hash_file_bytes(hasher, &path, meta.len())?;
         }
     }
-    Ok((files, bytes))
+    Ok(())
 }
 
 pub fn fingerprint(path: &str) -> Result<Fingerprint, String> {
+    use std::hash::Hasher;
     let p = Path::new(path);
     let meta = fs::symlink_metadata(p).map_err(|e| format!("{path}: {e}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     if meta.file_type().is_symlink() {
         let target = fs::read_link(p).map_err(|e| e.to_string())?;
         Ok(Fingerprint::Link(target.to_string_lossy().to_string()))
     } else if meta.is_dir() {
-        let (files, bytes) = dir_totals(p)?;
-        Ok(Fingerprint::Dir { files, bytes })
+        let mut entries = 0;
+        hash_tree(&mut hasher, p, &mut entries)?;
+        Ok(Fingerprint::Tree { entries, digest: hasher.finish() })
     } else {
-        Ok(Fingerprint::File { len: meta.len(), digest: digest_file(p, meta.len())? })
+        hash_file_bytes(&mut hasher, p, meta.len())?;
+        Ok(Fingerprint::File { len: meta.len(), digest: hasher.finish() })
     }
 }
 
