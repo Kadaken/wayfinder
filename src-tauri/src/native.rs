@@ -5089,15 +5089,57 @@ struct Transfer {
 /// straight away; a clash asks Replace / Duplicate / Cancel once for the whole
 /// operation, and Cancel starts nothing.
 fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
+    match plan_transfer(&transfer) {
+        TransferPlan::NoOp => ui.status.set_label("Already in this folder"),
+        TransferPlan::Run => {
+            run_transfer(state, ui, transfer, native_core::PasteConflict::KeepBoth);
+        }
+        TransferPlan::Ask(conflicts) => {
+            let ui_for_choice = ui.clone();
+            show_conflict_dialog(&ui, &conflicts, move |mode| {
+                run_transfer(state.clone(), ui_for_choice.clone(), transfer.clone(), mode);
+            });
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TransferPlan {
+    /// Every item is already at its destination and this is a MOVE.
+    NoOp,
+    /// No clash: run straight away.
+    Run,
+    /// Clashing names: ask once for the whole operation.
+    Ask(Vec<String>),
+}
+
+fn plan_transfer(transfer: &Transfer) -> TransferPlan {
+    if native_core::is_noop_move(&transfer.srcs, &transfer.dest, transfer.is_copy) {
+        return TransferPlan::NoOp;
+    }
     let conflicts = native_core::check_conflicts(&transfer.srcs, &transfer.dest, transfer.is_copy);
     if conflicts.is_empty() {
-        run_transfer(state, ui, transfer, native_core::PasteConflict::KeepBoth);
-        return;
+        TransferPlan::Run
+    } else {
+        TransferPlan::Ask(conflicts)
     }
-    let ui_for_choice = ui.clone();
-    show_conflict_dialog(&ui, &conflicts, move |mode| {
-        run_transfer(state.clone(), ui_for_choice.clone(), transfer.clone(), mode);
-    });
+}
+
+/// The dialog seam: returns the mode to run with, or None when nothing may
+/// start (Cancel, Escape, close). `start` is only called for Some.
+fn apply_conflict_response(response: &str, start: impl FnOnce(native_core::PasteConflict)) {
+    if let Some(mode) = native_core::conflict_response(response) {
+        start(mode);
+    }
+}
+
+/// A cut clipboard is emptied only when the job succeeded.
+fn clipboard_after_job<T>(clear_cut_after: bool, succeeded: bool, clipboard: Option<T>) -> Option<T> {
+    if clear_cut_after && succeeded {
+        None
+    } else {
+        clipboard
+    }
 }
 
 /// Replace / Duplicate / Cancel. Escape or closing the window is Cancel.
@@ -5138,9 +5180,7 @@ where
     dialog.set_default_response(Some("duplicate"));
     dialog.set_close_response("cancel");
     dialog.connect_response(None, move |dialog, response| {
-        if let Some(mode) = native_core::conflict_response(response) {
-            on_choice(mode);
-        }
+        apply_conflict_response(response, &on_choice);
         dialog.close();
     });
     dialog.present(Some(&ui.window));
@@ -5185,9 +5225,9 @@ fn run_transfer(
             ))
         },
         move |state, _, _| {
-            if clear_cut_after {
-                state.borrow_mut().clipboard = None;
-            }
+            // after_success only runs when the job succeeded.
+            let mut st = state.borrow_mut();
+            st.clipboard = clipboard_after_job(clear_cut_after, true, st.clipboard.take());
         },
     );
 }
@@ -6997,6 +7037,69 @@ fn plural(count: usize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transfer_seam_cancel_starts_nothing_and_cut_clears_only_on_success() {
+        let started = std::cell::Cell::new(0);
+        for response in ["cancel", "close", ""] {
+            apply_conflict_response(response, |_| started.set(started.get() + 1));
+        }
+        assert_eq!(started.get(), 0, "Cancel / close / Escape must not start a transfer");
+        apply_conflict_response("replace", |m| {
+            assert_eq!(m, native_core::PasteConflict::Replace);
+            started.set(started.get() + 1);
+        });
+        apply_conflict_response("duplicate", |m| {
+            assert_eq!(m, native_core::PasteConflict::KeepBoth);
+            started.set(started.get() + 1);
+        });
+        assert_eq!(started.get(), 2);
+        // cut clipboard: kept on failure or when not a cut, cleared only on success
+        assert_eq!(clipboard_after_job(true, false, Some("cut")), Some("cut"));
+        assert_eq!(clipboard_after_job(false, true, Some("copy")), Some("copy"));
+        assert_eq!(clipboard_after_job(true, true, Some("cut")), None);
+    }
+
+    #[test]
+    fn plan_transfer_noop_run_ask_and_cancel_leaves_bytes() {
+        let root = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(format!("Projects/Scratch/wf-plan-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("dest")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"SRC").unwrap();
+        std::fs::write(root.join("dest/a.txt"), b"DST").unwrap();
+        std::fs::write(root.join("src/free.txt"), b"FREE").unwrap();
+        let s = |p: &str| root.join(p).to_string_lossy().to_string();
+        let mk = |srcs: Vec<String>, dest: &str, is_copy| Transfer {
+            srcs,
+            dest: dest.to_string(),
+            is_copy,
+            clear_cut_after: !is_copy,
+            style: TransferStyle::Paste,
+        };
+        assert_eq!(plan_transfer(&mk(vec![s("src/free.txt")], &s("dest"), false)), TransferPlan::Run);
+        assert_eq!(
+            plan_transfer(&mk(vec![s("src/a.txt"), s("src/free.txt")], &s("dest"), true)),
+            TransferPlan::Ask(vec!["a.txt".to_string()])
+        );
+        // a MOVE onto its own folder is a true no-op; a COPY offers Duplicate
+        assert_eq!(plan_transfer(&mk(vec![s("dest/a.txt")], &s("dest"), false)), TransferPlan::NoOp);
+        assert_eq!(
+            plan_transfer(&mk(vec![s("dest/a.txt")], &s("dest"), true)),
+            TransferPlan::Ask(vec!["a.txt".to_string()])
+        );
+        // planning and Cancel touch nothing
+        assert_eq!(std::fs::read(root.join("src/a.txt")).unwrap(), b"SRC");
+        assert_eq!(std::fs::read(root.join("dest/a.txt")).unwrap(), b"DST");
+        assert_eq!(std::fs::read(root.join("src/free.txt")).unwrap(), b"FREE");
+    }
+
     use super::*;
 
     fn entry(name: &str, is_dir: bool, modified: i64) -> Entry {
