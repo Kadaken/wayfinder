@@ -824,6 +824,22 @@ pub fn check_conflicts(srcs: &[String], dest_dir: &str, is_copy: bool) -> Vec<St
         .collect()
 }
 
+/// True when this is a MOVE and every item is already at its destination path:
+/// nothing to do, so no job, undo record or clipboard change should follow.
+pub fn is_noop_move(srcs: &[String], dest_dir: &str, is_copy: bool) -> bool {
+    !is_copy
+        && !srcs.is_empty()
+        && srcs.iter().all(|src| {
+            let Some(name) = Path::new(src).file_name() else {
+                return false;
+            };
+            matches!(
+                (fs::canonicalize(src), fs::canonicalize(Path::new(dest_dir).join(name))),
+                (Ok(a), Ok(b)) if a == b
+            )
+        })
+}
+
 /// Maps a clash-dialog response to what to do. Cancel (and Escape / close)
 /// is None: no transfer may start.
 pub fn conflict_response(response: &str) -> Option<PasteConflict> {
@@ -843,8 +859,6 @@ pub enum PasteConflict {
     /// stack can move the pasted item back out, but whatever was overwritten is
     /// already gone.
     Replace,
-    /// Leave the existing item alone and do not paste that one.
-    Skip,
 }
 
 /// Explorer drag action: Ctrl copies, Shift moves, otherwise MOVE only when
@@ -897,7 +911,6 @@ pub fn resolve_paste(
         let dest = if target.exists() {
             match on_conflict {
                 PasteConflict::KeepBoth => unique_target(dest_dir, name),
-                PasteConflict::Skip => continue,
                 PasteConflict::Replace => {
                     // Pasting a folder onto an existing folder cannot merge with
                     // `cp -T`, and overwriting in place would leave stale
@@ -1769,22 +1782,43 @@ mod tests {
     }
 
     /// A scratch dir with src/note.txt = "NEW" and dest/note.txt = "OLD".
-    /// Throwaway test data lives under ~/Projects/Scratch, never /tmp.
-    fn scratch_root() -> std::path::PathBuf {
-        let root = Path::new(&std::env::var("HOME").unwrap()).join("Projects/Scratch/wf-unit-tests");
-        fs::create_dir_all(&root).unwrap();
-        root
+    /// Throwaway test data lives under ~/Projects/Scratch, never /tmp. Each case
+    /// removes its own directory on drop (also when an assertion panics), then
+    /// removes the shared root only if it is empty, so siblings are never touched.
+    struct ScratchCase(std::path::PathBuf);
+
+    impl std::ops::Deref for ScratchCase {
+        type Target = std::path::PathBuf;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
     }
 
-    fn paste_conflict_dir() -> std::path::PathBuf {
-        let dir = scratch_root().join(format!(
-            "wf-paste-{}-{:?}",
+    impl Drop for ScratchCase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+            if let Some(root) = self.0.parent() {
+                let _ = fs::remove_dir(root); // fails unless empty
+            }
+        }
+    }
+
+    fn scratch_case(tag: &str) -> ScratchCase {
+        let root = Path::new(&std::env::var("HOME").unwrap()).join("Projects/Scratch/wf-unit-tests");
+        let dir = root.join(format!(
+            "{tag}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        fs::create_dir_all(&dir).unwrap();
+        ScratchCase(dir)
+    }
+
+    fn paste_conflict_dir() -> ScratchCase {
+        let dir = scratch_case("wf-paste");
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::create_dir_all(dir.join("dest")).unwrap();
         fs::write(dir.join("src/note.txt"), b"NEW").unwrap();
@@ -1794,8 +1828,7 @@ mod tests {
 
     #[test]
     fn drag_action_modifiers_and_device_default() {
-        let d = scratch_root().join(format!("wf-drag-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let d = scratch_case("wf-drag");
         fs::create_dir_all(d.join("dest")).unwrap();
         fs::write(d.join("a.txt"), "a").unwrap();
         fs::write(d.join("b.txt"), "b").unwrap();
@@ -1821,7 +1854,6 @@ mod tests {
         assert_eq!(fs::read(&a).unwrap(), b"a");
         assert_eq!(fs::read(&b).unwrap(), b"b");
         assert!(!d.join("dest/a.txt").exists() && !d.join("dest/b.txt").exists());
-        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1863,7 +1895,6 @@ mod tests {
         assert!(d.join("dest/note (2).txt").exists(), "other items untouched");
         // Cancel: nothing called, so every byte is as it was
         assert_eq!(fs::read(&free).unwrap(), b"F");
-        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1876,7 +1907,6 @@ mod tests {
         assert_eq!(fs::read(dir.join("dest/note.txt")).unwrap(), b"OLD");
         assert_ne!(out[0].to, dir.join("dest/note.txt").to_string_lossy());
         assert_eq!(fs::read(&out[0].to).unwrap(), b"NEW");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1896,19 +1926,6 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(extras, vec!["note.txt".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn paste_skip_changes_nothing() {
-        let dir = paste_conflict_dir();
-        let src = dir.join("src/note.txt").to_string_lossy().to_string();
-        let dest = dir.join("dest").to_string_lossy().to_string();
-        let out = resolve_paste(&[src], &dest, true, PasteConflict::Skip).unwrap();
-        assert!(out.is_empty(), "skip must paste nothing");
-        assert_eq!(fs::read(dir.join("dest/note.txt")).unwrap(), b"OLD");
-        assert_eq!(fs::read(dir.join("src/note.txt")).unwrap(), b"NEW", "source survives");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1926,7 +1943,6 @@ mod tests {
             !dir.join("dest/box/stale.txt").exists(),
             "replacing a folder must not leave the old contents behind"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
