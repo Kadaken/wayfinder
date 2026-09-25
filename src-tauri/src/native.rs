@@ -2159,7 +2159,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
             Rc::new(move |path: String| {
                 let entry = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned();
                 if let Some(entry) = entry {
-                    open_entry(&state, &ui, entry);
+                    let (state, ui) = (state.clone(), ui.clone());
+                    defer_after_signal(move || open_entry(&state, &ui, entry));
                 }
             }) as Rc<dyn Fn(String)>
         };
@@ -2177,7 +2178,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         let grid = ui.grid.clone();
         grid.connect_child_activated(move |_, child| {
             if let Some(entry) = entry_for_grid_child(&state, child) {
-                open_entry(&state, &ui, entry);
+                let (state, ui) = (state.clone(), ui.clone());
+                defer_after_signal(move || open_entry(&state, &ui, entry));
             }
         });
     }
@@ -6467,6 +6469,14 @@ impl ActivationGate {
     }
 }
 
+/// Opening a folder rebuilds the file views and destroys the very row or child
+/// whose activation signal is still unwinding. Run the open on the next main
+/// context turn, after GTK has finished that signal. The caller captures the
+/// entry BEFORE deferring, so a later rebind or selection cannot retarget it.
+fn defer_after_signal(open: impl FnOnce() + 'static) {
+    glib::idle_add_local_once(open);
+}
+
 fn connect_gated_activate(
     list: &gtk::ListView,
     gate: Rc<RefCell<ActivationGate>>,
@@ -8530,6 +8540,7 @@ mod tests {
         invert_selection_is_the_exact_complement_d29();
         preview_pane_toggle_is_one_safe_route_d30();
         job_result_survives_its_own_refresh_d32();
+        folder_activation_waits_for_gtk_to_finish_d33();
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
@@ -8752,6 +8763,92 @@ mod tests {
         pump();
         assert_eq!(state.borrow().cwd, dir_str);
         assert_eq!(ui.status.label(), "1 item shown", "the stale message never appears");
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn folder_activation_waits_for_gtk_to_finish_d33() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d33-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "I").unwrap();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        std::fs::write(dir.join("b.txt"), "B").unwrap();
+        std::env::set_var("HOME", &home);
+        let dir_str = dir.to_string_lossy().to_string();
+        let sub_str = sub.to_string_lossy().to_string();
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d33test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        let back_to_dir = |mode: ViewMode| {
+            navigate(&state, dir_str.clone());
+            wait_for("listing", || state.borrow().cwd == dir_str && state.borrow().visible_entries.len() == 3);
+            set_view_mode(&state, &ui, mode);
+            pump();
+        };
+        let position_of = |name: &str| {
+            state.borrow().visible_entries.iter().position(|e| e.name == name).expect(name)
+        };
+
+        // Details, then Compact: the real list activation action, armed by the real gate.
+        for mode in [ViewMode::Details, ViewMode::Compact] {
+            back_to_dir(mode);
+            let pos = position_of("sub");
+            // a bare activation opens nothing, even after the deferred turn
+            ui.list.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
+            pump();
+            assert_eq!(state.borrow().cwd, dir_str, "a bare activation opens nothing");
+            {
+                let gate = state.borrow().activation_gate.clone();
+                gate.borrow_mut().press(&sub_str, std::time::Instant::now(), true);
+                gate.borrow_mut().press(&sub_str, std::time::Instant::now(), true);
+            }
+            let generation = state.borrow().listing_generation;
+            let rows = ui.list_store.n_items();
+            ui.list.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
+            assert_eq!(state.borrow().listing_generation, generation, "no navigation began inside the signal");
+            assert_eq!(ui.list_store.n_items(), rows, "the activated row is still alive when the signal returns");
+            wait_for("deferred open", || state.borrow().cwd == sub_str);
+            wait_for("sub listing", || state.borrow().visible_entries.len() == 1);
+        }
+
+        // Grid: the real child activation.
+        back_to_dir(ViewMode::Grid);
+        let pos = position_of("sub");
+        let child = ui.grid.child_at_index(pos as i32).expect("grid child");
+        let generation = state.borrow().listing_generation;
+        child.emit_by_name::<()>("activate", &[]);
+        assert_eq!(state.borrow().listing_generation, generation, "no navigation began inside the grid signal");
+        assert!(child.parent().is_some(), "the activated grid child is still alive when the signal returns");
+        wait_for("deferred grid open", || state.borrow().cwd == sub_str);
+        wait_for("sub listing", || state.borrow().visible_entries.len() == 1);
+
+        // Identity survives deferral: both files vanish so nothing can launch, then the
+        // entries are reversed; only the captured entry (b.txt) may be refused.
+        back_to_dir(ViewMode::Grid);
+        let pos = position_of("b.txt");
+        let child = ui.grid.child_at_index(pos as i32).expect("grid child");
+        child.emit_by_name::<()>("activate", &[]);
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        state.borrow_mut().visible_entries.reverse();
+        wait_for("captured entry refused", || ui.status.label() == "b.txt no longer exists");
 
         ui.window.destroy();
         match old_home {
