@@ -1052,6 +1052,110 @@ fn remove_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
     ui.status.set_label("Removed from Favorites");
 }
 
+/// One tab: its current folder plus its own back/forward history. `id` is stable
+/// for the tab's lifetime, so an async listing can never land in another tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabState {
+    id: u64,
+    path: String,
+    history: Vec<String>,
+    index: usize,
+}
+
+impl TabState {
+    fn new(id: u64, path: String) -> Self {
+        Self { id, history: vec![path.clone()], path, index: 0 }
+    }
+
+    /// Ordinary navigation: drop only this tab's forward branch, then append if
+    /// the target differs from the current entry.
+    fn record(&mut self, path: &str) {
+        self.path = path.to_string();
+        if self.history.get(self.index).map(|c| c != path).unwrap_or(true) {
+            self.history.truncate(self.index + 1);
+            self.history.push(path.to_string());
+            self.index = self.history.len() - 1;
+        }
+    }
+
+    fn can_back(&self) -> bool {
+        self.index > 0
+    }
+
+    fn can_forward(&self) -> bool {
+        self.index + 1 < self.history.len()
+    }
+}
+
+/// The window's tabs. All history reads and writes go through the active tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabSet {
+    tabs: Vec<TabState>,
+    active: usize,
+    next_id: u64,
+}
+
+impl TabSet {
+    fn new(path: String) -> Self {
+        Self { tabs: vec![TabState::new(0, path)], active: 0, next_id: 1 }
+    }
+
+    fn active(&self) -> &TabState {
+        &self.tabs[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active]
+    }
+
+    /// Adds a tab with one history entry and makes it active.
+    fn open(&mut self, path: String) {
+        self.tabs.push(TabState::new(self.next_id, path));
+        self.next_id += 1;
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn switch(&mut self, index: usize) -> Option<String> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+        self.active = index;
+        Some(self.active().path.clone())
+    }
+
+    /// Closes the active tab; returns the surviving active tab's path.
+    fn close_active(&mut self) -> Option<String> {
+        if self.tabs.len() <= 1 {
+            return None;
+        }
+        self.tabs.remove(self.active);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        Some(self.active().path.clone())
+    }
+
+    /// Target index and path one step back / forward in the active tab. The
+    /// cursor only moves when that listing succeeds.
+    fn back_target(&self) -> Option<(usize, String)> {
+        let tab = self.active();
+        tab.can_back().then(|| (tab.index - 1, tab.history[tab.index - 1].clone()))
+    }
+
+    fn forward_target(&self) -> Option<(usize, String)> {
+        let tab = self.active();
+        tab.can_forward().then(|| (tab.index + 1, tab.history[tab.index + 1].clone()))
+    }
+}
+
+/// How a finished listing updates the active tab's history.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavMode {
+    Record,
+    Keep,
+    Cursor(usize),
+}
+
 #[derive(Clone)]
 struct AppState {
     inline_rename: Option<InlineRename>,
@@ -1061,10 +1165,7 @@ struct AppState {
     last_name_click: Option<(String, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
     cwd: String,
-    tabs: Vec<String>,
-    active_tab: usize,
-    history: Vec<String>,
-    history_index: usize,
+    tabs: TabSet,
     entries: Vec<Entry>,
     visible_entries: Vec<Entry>,
     /// A path forced to the very top of the listing regardless of sort — set when
@@ -1388,10 +1489,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: initial_cwd.clone(),
-        tabs: vec![initial_cwd.clone()],
-        active_tab: 0,
-        history: vec![initial_cwd],
-        history_index: 0,
+        tabs: TabSet::new(initial_cwd),
         entries: Vec::new(),
         visible_entries: Vec::new(),
         pinned_top: select_path.clone(),
@@ -2520,7 +2618,10 @@ fn rebuild_tabs(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 
     let (tabs, active_tab) = {
         let state = state.borrow();
-        (state.tabs.clone(), state.active_tab)
+        (
+            state.tabs.tabs.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+            state.tabs.active,
+        )
     };
 
     for (index, path) in tabs.iter().enumerate() {
@@ -2578,56 +2679,45 @@ fn tab_label(path: &str) -> String {
 }
 
 fn switch_tab_action(state: Rc<RefCell<AppState>>, index: usize) {
-    let path = {
-        let mut state = state.borrow_mut();
-        if index >= state.tabs.len() {
-            return;
-        }
-        state.active_tab = index;
-        state.tabs[index].clone()
+    let path = match state.borrow_mut().tabs.switch(index) {
+        Some(path) => path,
+        None => return,
     };
-    navigate(&state, path);
+    // Sensitivity follows the newly active tab now, not when its listing ends.
+    if let Some(ui) = ui_for_state(&state) {
+        update_nav_buttons(&state, &ui);
+    }
+    navigate_without_history(&state, path);
 }
 
 /// Open `path` in a new tab and switch to it, the way a middle-click or
 /// "Open in New Tab" is expected to behave.
 fn open_path_in_new_tab(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
-    {
-        let mut state = state.borrow_mut();
-        state.tabs.push(path.clone());
-        state.active_tab = state.tabs.len() - 1;
-    }
+    state.borrow_mut().tabs.open(path.clone());
     rebuild_tabs(state, ui);
-    navigate(state, path);
+    update_nav_buttons(state, ui);
+    navigate_without_history(state, path);
 }
 
 fn new_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let path = state.borrow().cwd.clone();
-    {
-        let mut state = state.borrow_mut();
-        state.tabs.push(path.clone());
-        state.active_tab = state.tabs.len() - 1;
-    }
+    state.borrow_mut().tabs.open(path.clone());
     rebuild_tabs(&state, &ui);
-    navigate(&state, path);
+    update_nav_buttons(&state, &ui);
+    navigate_without_history(&state, path);
 }
 
 fn close_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let path = {
-        let mut state = state.borrow_mut();
-        if state.tabs.len() <= 1 {
+    let path = match state.borrow_mut().tabs.close_active() {
+        Some(path) => path,
+        None => {
             ui.status.set_label("Keep at least one tab open");
             return;
         }
-        let active = state.active_tab;
-        state.tabs.remove(active);
-        if state.active_tab >= state.tabs.len() {
-            state.active_tab = state.tabs.len() - 1;
-        }
-        state.tabs[state.active_tab].clone()
     };
     rebuild_tabs(&state, &ui);
-    navigate(&state, path);
+    update_nav_buttons(&state, &ui);
+    navigate_without_history(&state, path);
 }
 
 fn edit_path_action(state: &Rc<RefCell<AppState>>, ui: &Ui) {
@@ -3105,29 +3195,13 @@ fn connect_actions(
     {
         let state = state.clone();
         back.connect_clicked(move |_| {
-            let path = {
-                let mut state = state.borrow_mut();
-                if state.history_index == 0 {
-                    return;
-                }
-                state.history_index -= 1;
-                state.history[state.history_index].clone()
-            };
-            navigate_without_history(&state, path);
+            history_step(&state, false);
         });
     }
     {
         let state = state.clone();
         forward.connect_clicked(move |_| {
-            let path = {
-                let mut state = state.borrow_mut();
-                if state.history_index + 1 >= state.history.len() {
-                    return;
-                }
-                state.history_index += 1;
-                state.history[state.history_index].clone()
-            };
-            navigate_without_history(&state, path);
+            history_step(&state, true);
         });
     }
     {
@@ -3594,27 +3668,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Left {
-            let path = {
-                let mut state = state_for_keys.borrow_mut();
-                if state.history_index == 0 {
-                    return glib::Propagation::Stop;
-                }
-                state.history_index -= 1;
-                state.history[state.history_index].clone()
-            };
-            navigate_without_history(&state_for_keys, path);
+            history_step(&state_for_keys, false);
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Right {
-            let path = {
-                let mut state = state_for_keys.borrow_mut();
-                if state.history_index + 1 >= state.history.len() {
-                    return glib::Propagation::Stop;
-                }
-                state.history_index += 1;
-                state.history[state.history_index].clone()
-            };
-            navigate_without_history(&state_for_keys, path);
+            history_step(&state_for_keys, true);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F2 {
@@ -3645,15 +3703,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::BackSpace {
-            let path = {
-                let mut state = state_for_keys.borrow_mut();
-                if state.history_index == 0 {
-                    return glib::Propagation::Stop;
-                }
-                state.history_index -= 1;
-                state.history[state.history_index].clone()
-            };
-            navigate_without_history(&state_for_keys, path);
+            history_step(&state_for_keys, false);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F5 {
@@ -3674,15 +3724,29 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn navigate(state: &Rc<RefCell<AppState>>, path: String) {
-    navigate_to(state, path, true);
+    navigate_to(state, path, NavMode::Record);
 }
 
 fn navigate_without_history(state: &Rc<RefCell<AppState>>, path: String) {
-    navigate_to(state, path, false);
+    navigate_to(state, path, NavMode::Keep);
 }
 
-fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool) {
+/// Back or forward in the ACTIVE tab; its cursor moves only when the listing
+/// succeeds.
+fn history_step(state: &Rc<RefCell<AppState>>, forward: bool) {
+    let target = {
+        let state = state.borrow();
+        if forward { state.tabs.forward_target() } else { state.tabs.back_target() }
+    };
+    if let Some((index, path)) = target {
+        navigate_to(state, path, NavMode::Cursor(index));
+    }
+}
+
+fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, mode: NavMode) {
     let show_hidden = state.borrow().show_hidden;
+    // The tab this request belongs to; a completion for any other tab is dropped.
+    let tab_id = state.borrow().tabs.active().id;
     let ui = ui_for_state(state);
     // Refreshing the SAME folder (e.g. after a delete) should keep the scroll
     // position; only real navigation to a different folder resets to the top.
@@ -3738,7 +3802,9 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
     glib::timeout_add_local(Duration::from_millis(40), move || match rx.try_recv() {
         Ok(Ok(listing)) => {
             // The result is only valid for the newest navigation request.
-            if state.borrow().listing_generation != generation {
+            if state.borrow().listing_generation != generation
+                || state.borrow().tabs.active().id != tab_id
+            {
                 return glib::ControlFlow::Break;
             }
             let item_count = listing.entries.len();
@@ -3755,21 +3821,15 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
                     state.sort_ascending = false;
                 }
                 state.cwd = path.clone();
-                let active = state.active_tab;
-                if let Some(tab) = state.tabs.get_mut(active) {
-                    *tab = path.clone();
-                }
-                if record_history {
-                    let history_index = state.history_index;
-                    let should_push = state
-                        .history
-                        .get(history_index)
-                        .map(|current| current != &path)
-                        .unwrap_or(true);
-                    if should_push {
-                        state.history.truncate(history_index + 1);
-                        state.history.push(path.clone());
-                        state.history_index = state.history.len() - 1;
+                let tab = state.tabs.active_mut();
+                match mode {
+                    NavMode::Record => tab.record(&path),
+                    NavMode::Keep => tab.path = path.clone(),
+                    NavMode::Cursor(index) => {
+                        if tab.history.get(index) == Some(&path) {
+                            tab.index = index;
+                        }
+                        tab.path = path.clone();
                     }
                 }
                 if state
@@ -4122,9 +4182,8 @@ fn listing_status(
 
 fn update_nav_buttons(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.borrow();
-    ui.back.set_sensitive(state.history_index > 0);
-    ui.forward
-        .set_sensitive(state.history_index + 1 < state.history.len());
+    ui.back.set_sensitive(state.tabs.active().can_back());
+    ui.forward.set_sensitive(state.tabs.active().can_forward());
 }
 
 thread_local! {
@@ -8302,6 +8361,148 @@ mod tests {
         new_folder_menu_and_shared_inline_editor_d21();
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
         sustained_stream_keeps_objects_pointer_and_timing_d22();
+        tabs_keep_independent_history_d27();
+    }
+
+    fn tabs_keep_independent_history_d27() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d27-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mk = |n: &str| {
+            let d = root.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            d.to_string_lossy().to_string()
+        };
+        let (a0, a1, a2, b0, b1) = (mk("a0"), mk("a1"), mk("a2"), mk("b0"), mk("b1"));
+        let missing = root.join("missing").to_string_lossy().to_string();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d27test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(a0.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        let at = |p: &str| {
+            let (state, p) = (state.clone(), p.to_string());
+            move || state.borrow().cwd == p
+        };
+        let hist = |i: usize| {
+            let s = state.borrow();
+            (s.tabs.tabs[i].history.clone(), s.tabs.tabs[i].index)
+        };
+        let v = |x: &[&String]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        wait_for("a0", at(&a0));
+        for p in [&a1, &a2] {
+            navigate(&state, p.clone());
+            wait_for("nav", at(p));
+        }
+        assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2));
+
+        // a new tab and Open in New Tab each start with exactly one entry
+        assert!(ui.back.is_sensitive(), "A at its end has Back");
+        open_path_in_new_tab(&state, &ui, b0.clone());
+        assert!(!ui.back.is_sensitive() && !ui.forward.is_sensitive(), "one-entry tab, before the listing");
+        wait_for("b0", at(&b0));
+        assert_eq!(hist(1), (v(&[&b0]), 0));
+        navigate(&state, b1.clone());
+        wait_for("b1", at(&b1));
+        assert_eq!(hist(1), (v(&[&b0, &b1]), 1));
+        assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2), "A untouched by B");
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive());
+
+        // Back/Forward in B stay inside B
+        history_step(&state, false);
+        wait_for("b back", at(&b0));
+        assert_eq!(hist(1), (v(&[&b0, &b1]), 0));
+        assert!(!ui.back.is_sensitive() && ui.forward.is_sensitive());
+        history_step(&state, true);
+        wait_for("b fwd", at(&b1));
+
+        // repeated switching grows nothing and restores each tab
+        for _ in 0..3 {
+            switch_tab_action(state.clone(), 0);
+            assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's state before its listing");
+            wait_for("to A", at(&a2));
+            assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive());
+            switch_tab_action(state.clone(), 1);
+            assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "B's state before its listing");
+            wait_for("to B", at(&b1));
+        }
+        history_step(&state, false);
+        wait_for("b0 for sensitivity", at(&b0));
+        switch_tab_action(state.clone(), 0);
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A after B was at its start");
+        wait_for("A", at(&a2));
+        switch_tab_action(state.clone(), 1);
+        assert!(!ui.back.is_sensitive() && ui.forward.is_sensitive(), "B at its start, before the listing");
+        wait_for("B", at(&b0));
+        history_step(&state, true);
+        wait_for("b1 restored", at(&b1));
+        assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2));
+        assert_eq!(hist(1), (v(&[&b0, &b1]), 1));
+
+        // A: Back to a1/a0, then a new navigation truncates only A's forward branch
+        switch_tab_action(state.clone(), 0);
+        wait_for("A", at(&a2));
+        history_step(&state, false);
+        wait_for("a1", at(&a1));
+        history_step(&state, false);
+        wait_for("a0", at(&a0));
+        assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 0));
+        history_step(&state, true);
+        wait_for("a1 again", at(&a1));
+        navigate(&state, b0.clone());
+        wait_for("branch", at(&b0));
+        assert_eq!(hist(0), (v(&[&a0, &a1, &b0]), 2));
+        assert_eq!(hist(1), (v(&[&b0, &b1]), 1), "B unchanged by A's branch");
+
+        // a failed listing and a superseded one write to no tab
+        let before = (hist(0), hist(1));
+        navigate(&state, missing.clone());
+        wait_for("failure reported", || ui.status.label().contains("Cannot open"));
+        assert_eq!((hist(0), hist(1)), before);
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's own state after a failed listing");
+        navigate(&state, a2.clone());
+        navigate(&state, a1.clone());
+        wait_for("superseding load", at(&a1));
+        pump();
+        assert_eq!(hist(0), (v(&[&a0, &a1, &b0, &a1]), 3), "only the newest load recorded");
+        // a load pending while the tab changes lands nowhere
+        let before = (hist(0), hist(1));
+        navigate(&state, a2.clone());
+        switch_tab_action(state.clone(), 1);
+        wait_for("B shown", at(&b1));
+        pump();
+        assert_eq!((hist(0), hist(1)), before);
+        assert_eq!(state.borrow().cwd, b1);
+
+        // a failed listing leaves the ACTIVE tab's sensitivity, not the prior tab's
+        history_step(&state, false);
+        wait_for("B at start", at(&b0));
+        switch_tab_action(state.clone(), 0);
+        wait_for("A shown", at(&a1));
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive());
+        navigate(&state, missing.clone());
+        wait_for("second failure", || ui.status.label().contains("Cannot open"));
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's state, not B's");
+        switch_tab_action(state.clone(), 1);
+        wait_for("B again", at(&b0));
+        history_step(&state, true);
+        wait_for("B restored", at(&b1));
+        assert_eq!((hist(0), hist(1)), before);
+
+        // closing B keeps A's exact history and cursor
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive());
+        close_tab_action(state.clone(), ui.clone());
+        assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's Back restored before the listing");
+        wait_for("A after close", at(&a1));
+        assert_eq!(state.borrow().tabs.tabs.len(), 1);
+        assert_eq!(hist(0), before.0);
     }
 
     fn metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22() {
@@ -8582,6 +8783,28 @@ mod tests {
         assert!(outcome.message.contains("warning"));
         assert!(matches!(outcome.undo, Some(UndoAction::Pasted { was_copy: true, ref items }) if items.len() == 1));
         assert!(transfer_outcome("Pasted", true, Err("rolled back".into())).is_err());
+    }
+
+    #[test]
+    fn tab_history_model_is_per_tab_d27() {
+        let mut set = TabSet::new("/a0".into());
+        set.active_mut().record("/a1");
+        set.active_mut().record("/a1");
+        assert_eq!(set.active().history, ["/a0", "/a1"], "same path is not appended twice");
+        set.open("/b0".into());
+        assert_eq!(set.active().history, ["/b0"]);
+        assert_eq!(set.active().id, 1);
+        assert!(set.back_target().is_none() && set.forward_target().is_none());
+        assert_eq!(set.switch(0).as_deref(), Some("/a1"));
+        assert_eq!(set.back_target(), Some((0, "/a0".into())));
+        assert_eq!(set.switch(9), None);
+        set.open("/c0".into());
+        assert_eq!(set.active().id, 2);
+        set.switch(0);
+        assert_eq!(set.close_active().as_deref(), Some("/b0"), "closing keeps the next tab's history");
+        assert_eq!(set.active().history, ["/b0"]);
+        assert_eq!(set.close_active().as_deref(), Some("/c0"));
+        assert_eq!(set.close_active(), None, "the last tab stays");
     }
 
     #[test]
