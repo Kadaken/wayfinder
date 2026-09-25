@@ -1238,6 +1238,11 @@ struct Ui {
     list_scroll: gtk::ScrolledWindow,
     grid: gtk::FlowBox,
     preview_stack: gtk::Stack,
+    preview_scroll: gtk::ScrolledWindow,
+    file_preview: gtk::Paned,
+    preview_toggle: gtk::ToggleButton,
+    /// Divider position remembered while the preview pane is hidden.
+    preview_saved_position: Rc<std::cell::Cell<i32>>,
     preview_picture: gtk::Picture,
     preview_media_picture: gtk::Picture,
     preview_media_controls: gtk::MediaControls,
@@ -1693,6 +1698,18 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         "Icons",
         state.borrow().view_mode == ViewMode::Grid,
     );
+    let preview_toggle = gtk::ToggleButton::builder()
+        .tooltip_text("Preview pane")
+        .active(true)
+        .build();
+    // Icon themes differ (Adwaita has the first, Breeze the others); with none of
+    // them installed the button falls back to the ▭ glyph the README names.
+    match preview_toggle_icon() {
+        Some(name) => preview_toggle.set_icon_name(name),
+        None => preview_toggle.set_label("\u{25AD}"),
+    }
+    preview_toggle.add_css_class("wf-icon-button");
+    size_toolbar_button(&preview_toggle);
     // No width_request: 58px was narrower than the label's natural size, so the
     // text sat clipped against the toolbar edge.
     let options = gtk::Button::builder()
@@ -1747,6 +1764,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     command_bar.append(&details_view);
     command_bar.append(&compact_view);
     command_bar.append(&icon_view);
+    command_bar.append(&preview_toggle);
     command_bar.append(&command_divider());
     command_bar.append(&hidden);
     command_bar.append(&refresh);
@@ -1973,6 +1991,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         list_scroll: files_scroll.clone(),
         grid,
         preview_stack,
+        preview_scroll: preview_scroll.clone(),
+        file_preview: file_preview.clone(),
+        preview_toggle: preview_toggle.clone(),
+        preview_saved_position: Rc::new(std::cell::Cell::new(0)),
         preview_picture,
         preview_media_picture,
         preview_media_controls,
@@ -3238,6 +3260,13 @@ fn connect_actions(
     {
         let state = state.clone();
         let ui = ui.clone();
+        ui.preview_toggle
+            .clone()
+            .connect_toggled(move |button| set_preview_visible(&state, &ui, button.is_active()));
+    }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
         new_folder.connect_clicked(move |_| create_folder_action(state.clone(), ui.clone()));
     }
     {
@@ -3328,6 +3357,53 @@ fn connect_actions(
         options.connect_clicked(move |_| {
             show_options_popover(&options_for_popover, state.clone(), ui.clone());
         });
+    }
+}
+
+/// The first right-pane icon the current theme actually has (Adwaita and Breeze
+/// name it differently), or None so the button falls back to the glyph.
+fn preview_toggle_icon() -> Option<&'static str> {
+    let display = gdk::Display::default()?;
+    let theme = gtk::IconTheme::for_display(&display);
+    [
+        "sidebar-show-right-symbolic",
+        "sidebar-expand-right-symbolic",
+        "view-preview-symbolic",
+        "fileview-preview-symbolic",
+    ]
+    .into_iter()
+    .find(|name| theme.has_icon(name))
+}
+
+/// The one route that shows or hides the whole preview pane. Hiding releases
+/// every live preview resource and remembers the divider; showing restores the
+/// divider and renders the current selection through the normal path. Setting
+/// the current value is a no-op.
+fn set_preview_visible(state: &Rc<RefCell<AppState>>, ui: &Ui, visible: bool) {
+    if ui.preview_scroll.is_visible() == visible {
+        if ui.preview_toggle.is_active() != visible {
+            ui.preview_toggle.set_active(visible);
+        }
+        return;
+    }
+    if visible {
+        ui.preview_scroll.set_visible(true);
+        let saved = ui.preview_saved_position.get();
+        if saved > 0 {
+            ui.file_preview.set_position(saved);
+        }
+    } else {
+        ui.preview_saved_position.set(ui.file_preview.position());
+        // Clears media stream and paintable while the guards still pass.
+        set_preview_text(ui, "Select a file");
+        ui.preview_picture.set_file(None::<&gio::File>);
+        ui.preview_scroll.set_visible(false);
+    }
+    if ui.preview_toggle.is_active() != visible {
+        ui.preview_toggle.set_active(visible);
+    }
+    if visible {
+        update_selection(state, ui);
     }
 }
 
@@ -7905,6 +7981,9 @@ fn connect_zoom_controller<W: IsA<gtk::Widget>>(
 }
 
 fn update_preview(ui: &Ui, entry: &Entry) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
     if entry.is_dir {
         set_preview_text(ui, &native_core::entry_summary(entry));
         return;
@@ -7942,6 +8021,9 @@ fn preview_zoom_for(ui: &Ui) -> f64 {
 }
 
 fn set_preview_text(ui: &Ui, text: &str) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
     ui.preview_media_controls
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
@@ -7974,6 +8056,9 @@ fn set_preview_text(ui: &Ui, text: &str) {
 }
 
 fn set_preview_image(ui: &Ui, path: &str) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
     ui.preview_media_controls
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
@@ -7991,6 +8076,9 @@ fn set_preview_image(ui: &Ui, path: &str) {
 }
 
 fn set_preview_media(ui: &Ui, path: &str) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
     let file = gio::File::for_path(PathBuf::from(path));
     let media = gtk::MediaFile::for_file(&file);
     let zoom = preview_zoom_for(ui);
@@ -8417,6 +8505,148 @@ mod tests {
         tabs_keep_independent_history_d27();
         show_hidden_toolbar_and_options_stay_in_sync_d28();
         invert_selection_is_the_exact_complement_d29();
+        preview_pane_toggle_is_one_safe_route_d30();
+    }
+
+    fn preview_pane_toggle_is_one_safe_route_d30() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d30-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "AAA-preview-text").unwrap();
+        std::fs::write(dir.join("b.txt"), "BBB-preview-text").unwrap();
+        std::env::set_var("HOME", &home);
+        let dir_str = dir.to_string_lossy().to_string();
+        let open = |id: &str| {
+            let app = adw::Application::builder()
+                .application_id(id)
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).expect("register test application");
+            build_ui(&app, Some(dir_str.clone()), None);
+            let found = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            (app, found.0, found.1)
+        };
+        let (_app, state, ui) = open("io.github.legendofzito.wayfinder.d30test");
+        wait_for("listing", || state.borrow().visible_entries.len() == 2);
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let invariants = || {
+            let s = state.borrow();
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            (
+                names,
+                s.clipboard.is_none(),
+                s.undo_stack.len(),
+                (s.tabs.tabs[0].history.clone(), s.tabs.tabs[0].index),
+                (ui.back.is_sensitive(), ui.forward.is_sensitive()),
+                (view_mode_id(s.view_mode), s.sort_key, s.sort_ascending, s.filter_text.clone()),
+                format!("{:?}", load_config()),
+            )
+        };
+        let before = invariants();
+
+        // reachable, active by default, pane visible
+        assert_eq!(ui.preview_toggle.tooltip_text().as_deref(), Some("Preview pane"));
+        match ui.preview_toggle.icon_name() {
+            Some(name) => assert!(
+                gtk::IconTheme::for_display(&gdk::Display::default().unwrap()).has_icon(name.as_str()),
+                "installed icon {name}"
+            ),
+            None => assert_eq!(ui.preview_toggle.label().as_deref(), Some("\u{25AD}")),
+        }
+        assert!(ui.preview_toggle.is_active() && ui.preview_toggle.is_mapped());
+        let mut in_bar = false;
+        let mut w = ui.preview_toggle.parent();
+        while let Some(p) = w {
+            in_bar |= p.has_css_class("wf-commandbar");
+            w = p.parent();
+        }
+        assert!(in_bar, "the toggle sits in the command bar");
+        assert!(ui.preview_scroll.is_visible() && ui.preview_scroll.is_mapped());
+        assert!(ui.preview_scroll.parent().as_ref() == Some(ui.file_preview.upcast_ref()));
+
+        select_entry_by_path(&state, &ui, &path("a.txt"));
+        wait_for("a preview", || ui.preview.label().contains("AAA-preview-text"));
+
+        // a valid non-default divider position
+        ui.window.set_size_request(1400, 600);
+        wait_for("paned width", || ui.file_preview.width() > 900);
+        let width = ui.file_preview.width();
+        let default_pos = ui.file_preview.position();
+        let custom = default_pos + (width - 190 - default_pos) / 2;
+        assert!(custom > default_pos + 10, "room to move the divider: {default_pos} {width}");
+        ui.file_preview.set_position(custom);
+        pump();
+        assert_eq!(ui.file_preview.position(), custom);
+
+        // off: pane hidden, resources released, files side reclaims the width
+        ui.preview_toggle.set_active(false);
+        wait_for("pane hidden", || !ui.preview_scroll.is_mapped());
+        assert!(!ui.preview_scroll.is_visible() && !ui.preview_toggle.is_active());
+        assert!(ui.preview_media_picture.paintable().is_none());
+        assert!(ui.preview_media_controls.media_stream().is_none());
+        assert!(ui.preview_picture.file().is_none());
+        assert_eq!(ui.preview.label(), "Select a file");
+        let files = ui.file_preview.start_child().unwrap();
+        wait_for("files side reclaims", || files.width() >= ui.file_preview.width() - 2);
+        assert_eq!(ui.preview_saved_position.get(), custom);
+
+        // select another row while off: selection/status change, no preview work
+        select_entry_by_path(&state, &ui, &path("b.txt"));
+        assert_eq!(selected_paths(&state, &ui), vec![path("b.txt")]);
+        assert!(ui.status.label().contains("1 selected"), "{}", ui.status.label());
+        pump();
+        assert_eq!(ui.preview.label(), "Select a file", "no preview rendered while off");
+        assert!(ui.preview_media_picture.paintable().is_none());
+        ui.preview_toggle.set_active(false);
+        assert!(!ui.preview_scroll.is_visible(), "re-selecting off is a no-op");
+
+        // on: pane returns, current selection renders, divider restored
+        ui.preview_toggle.set_active(true);
+        wait_for("pane shown", || ui.preview_scroll.is_mapped());
+        wait_for("b preview", || ui.preview.label().contains("BBB-preview-text"));
+        assert!(ui.preview_toggle.is_active());
+        wait_for("divider restored", || ui.file_preview.position() == custom);
+
+        // repeated cycles do not drift
+        for _ in 0..2 {
+            ui.preview_toggle.set_active(false);
+            wait_for("hidden again", || !ui.preview_scroll.is_mapped());
+            assert_eq!(ui.preview_saved_position.get(), custom);
+            ui.preview_toggle.set_active(true);
+            wait_for("shown again", || ui.preview_scroll.is_mapped());
+            wait_for("no drift", || ui.file_preview.position() == custom);
+            assert!(ui.preview.label().contains("BBB-preview-text"));
+        }
+        assert_eq!(
+            all_widgets(ui.file_preview.upcast_ref())
+                .iter()
+                .filter(|w| w.has_css_class("wf-preview"))
+                .count(),
+            1,
+            "one preview pane"
+        );
+        assert_eq!(invariants(), before);
+
+        // a new window defaults to visible and active
+        let (_app2, _state2, ui2) = open("io.github.legendofzito.wayfinder.d30test2");
+        assert!(ui2.preview_toggle.is_active() && ui2.preview_scroll.is_visible());
+        ui2.window.destroy();
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn invert_selection_is_the_exact_complement_d29() {
