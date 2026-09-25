@@ -654,6 +654,20 @@ pub fn rename_path(path: &str, new_name: &str) -> Result<String, String> {
 }
 
 pub fn batch_rename(items: &[(String, String)]) -> Result<Vec<ResolvedItem>, String> {
+    batch_rename_with(items, &|_| Ok(()))
+}
+
+/// All-or-nothing batch rename: the request is planned and checked without
+/// mutation, every source is staged to an owned same-parent temporary, then every
+/// temporary is placed at its destination. Any error reverses the placements and
+/// restores every staged source to its exact original path; an `Err` therefore
+/// leaves no visible rename and no owned temporary, or names each failed
+/// restoration. Not crash-atomic. `step` is a test seam called before each
+/// "stage" and each "place".
+pub fn batch_rename_with(
+    items: &[(String, String)],
+    step: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<Vec<ResolvedItem>, String> {
     let mut operations = Vec::new();
     let mut destinations = HashSet::new();
     let mut moving_from = HashSet::new();
@@ -666,11 +680,13 @@ pub fn batch_rename(items: &[(String, String)]) -> Result<Vec<ResolvedItem>, Str
         if from == dest {
             continue;
         }
+        if !moving_from.insert(from.to_string_lossy().to_string()) {
+            return Err(format!("duplicate source: {path}"));
+        }
         let dest_key = dest.to_string_lossy().to_string();
-        if !destinations.insert(dest_key.clone()) {
+        if !destinations.insert(dest_key) {
             return Err(format!("duplicate target name: {new_name}"));
         }
-        moving_from.insert(from.to_string_lossy().to_string());
         operations.push((from, dest));
     }
 
@@ -679,40 +695,81 @@ pub fn batch_rename(items: &[(String, String)]) -> Result<Vec<ResolvedItem>, Str
     }
 
     for (from, dest) in &operations {
-        if !from.exists() {
+        if !entry_exists(from)? {
             return Err(format!("missing source: {}", from.to_string_lossy()));
         }
-        if dest.exists() && !moving_from.contains(&dest.to_string_lossy().to_string()) {
+        if entry_exists(dest)? && !moving_from.contains(&dest.to_string_lossy().to_string()) {
             return Err(format!("target already exists: {}", dest.to_string_lossy()));
         }
     }
 
     let pid = std::process::id();
-    let mut staged = Vec::new();
-    for (index, (from, _)) in operations.iter().enumerate() {
-        let parent = from.parent().ok_or("no parent")?;
-        let mut temp = parent.join(format!(".wayfinder-rename-{pid}-{index}.tmp"));
-        let mut suffix = 0;
-        while temp.exists() {
-            suffix += 1;
-            temp = parent.join(format!(".wayfinder-rename-{pid}-{index}-{suffix}.tmp"));
+    let mut staged: Vec<PathBuf> = Vec::new();
+    let mut placed = 0usize;
+    let result = (|| -> Result<(), String> {
+        for (index, (from, _)) in operations.iter().enumerate() {
+            step("stage")?;
+            let parent = from.parent().ok_or("no parent")?;
+            let mut temp = parent.join(format!(".wayfinder-rename-{pid}-{index}.tmp"));
+            let mut suffix = 0;
+            while entry_exists(&temp)? {
+                suffix += 1;
+                temp = parent.join(format!(".wayfinder-rename-{pid}-{index}-{suffix}.tmp"));
+            }
+            fs::rename(from, &temp).map_err(|err| err.to_string())?;
+            staged.push(temp);
         }
-        fs::rename(from, &temp).map_err(|err| err.to_string())?;
-        staged.push(temp);
-    }
+        for (index, (_, dest)) in operations.iter().enumerate() {
+            step("place")?;
+            fs::rename(&staged[index], dest).map_err(|err| err.to_string())?;
+            placed = index + 1;
+        }
+        Ok(())
+    })();
 
-    let mut done = Vec::new();
-    for ((from, dest), temp) in operations.into_iter().zip(staged.into_iter()) {
-        if let Err(err) = fs::rename(&temp, &dest) {
-            let _ = fs::rename(&temp, &from);
-            return Err(err.to_string());
+    if let Err(err) = result {
+        let mut failures = Vec::new();
+        // Barrier 1: vacate every completed destination, newest first, restoring no original.
+        let mut still_placed = HashSet::new();
+        for index in (0..placed).rev() {
+            if let Err(e) = fs::rename(&operations[index].1, &staged[index]) {
+                failures.push(format!("{}: {e}", operations[index].1.display()));
+                still_placed.insert(index);
+            }
         }
-        done.push(ResolvedItem {
-            from: from.to_string_lossy().to_string(),
-            to: dest.to_string_lossy().to_string(),
+        // Barrier 2: only now return each temporary to its original path, never
+        // onto an original that a placed item may still occupy.
+        for index in (0..staged.len()).rev() {
+            if still_placed.contains(&index) {
+                continue;
+            }
+            let original = &operations[index].0;
+            if still_placed.iter().any(|&i| operations[i].1 == *original) {
+                failures.push(format!(
+                    "{}: not restored, {} still occupied",
+                    staged[index].display(),
+                    original.display()
+                ));
+                continue;
+            }
+            if let Err(e) = fs::rename(&staged[index], original) {
+                failures.push(format!("{}: {e}", staged[index].display()));
+            }
+        }
+        return Err(if failures.is_empty() {
+            err
+        } else {
+            format!("{err}; rollback incomplete: {}", failures.join("; "))
         });
     }
-    Ok(done)
+
+    Ok(operations
+        .into_iter()
+        .map(|(from, dest)| ResolvedItem {
+            from: from.to_string_lossy().to_string(),
+            to: dest.to_string_lossy().to_string(),
+        })
+        .collect())
 }
 
 /// Build an RFC 2483 `text/uri-list` payload (CRLF-separated `file://` URIs) for
@@ -2621,6 +2678,160 @@ mod tests {
         assert_eq!(fs::read_to_string(&b).unwrap(), "bravo");
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn no_rename_residue(dir: &Path) -> bool {
+        fn walk(dir: &Path) -> bool {
+            fs::read_dir(dir).unwrap().all(|e| {
+                let e = e.unwrap();
+                !e.file_name().to_string_lossy().starts_with(".wayfinder-rename-")
+                    && (!e.file_type().unwrap().is_dir() || walk(&e.path()))
+            })
+        }
+        walk(dir)
+    }
+
+    fn rename_fixture(root: &Path) -> Vec<(String, String)> {
+        fs::create_dir_all(root.join("tree/inner")).unwrap();
+        fs::write(root.join("tree/inner/deep.txt"), "deep").unwrap();
+        fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::os::unix::fs::symlink("missing-target", root.join("link")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("other/o.txt"), "oo").unwrap();
+        let p = |n: &str| root.join(n).to_string_lossy().to_string();
+        vec![
+            (p("a.txt"), "a2.txt".into()),
+            (p("tree"), "tree2".into()),
+            (p("link"), "link2".into()),
+            (p("other/o.txt"), "o2.txt".into()),
+        ]
+    }
+
+    #[test]
+    fn batch_rename_failures_restore_everything_exactly_d25() {
+        for (phase, nth) in [("stage", 2), ("place", 2), ("place", 3), ("stage", 4), ("place", 4)] {
+            let root = scratch_case("wf-d25-fail");
+            let items = rename_fixture(&root);
+            let before = fingerprint(root.to_str().unwrap()).unwrap();
+            let seen = std::cell::Cell::new(0);
+            let step = |name: &str| {
+                if name == phase {
+                    seen.set(seen.get() + 1);
+                    if seen.get() == nth {
+                        return Err(format!("injected failure at {phase} #{nth}"));
+                    }
+                }
+                Ok(())
+            };
+            let result = batch_rename_with(&items, &step);
+            assert!(result.is_err(), "{phase}#{nth}: {result:?}");
+            assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "exact: {phase}#{nth}");
+            assert!(no_rename_residue(&root), "residue: {phase}#{nth}");
+            assert!(fs::symlink_metadata(root.join("link")).is_ok());
+        }
+    }
+
+    #[test]
+    fn batch_rename_swap_and_cycle_place_failures_roll_back_d25() {
+        for cycle in [false, true] {
+            for nth in [2, 3] {
+                if !cycle && nth == 3 {
+                    continue;
+                }
+                let root = scratch_case("wf-d25-cyc-fail");
+                fs::write(root.join("a"), "A file").unwrap();
+                fs::create_dir(root.join("b")).unwrap();
+                fs::write(root.join("b/x"), "B tree").unwrap();
+                std::os::unix::fs::symlink("c-target", root.join("c")).unwrap();
+                let before = fingerprint(root.to_str().unwrap()).unwrap();
+                let p = |n: &str| root.join(n).to_string_lossy().to_string();
+                let items = if cycle {
+                    vec![(p("a"), "b".into()), (p("b"), "c".into()), (p("c"), "a".into())]
+                } else {
+                    vec![(p("a"), "b".into()), (p("b"), "a".into())]
+                };
+                let seen = std::cell::Cell::new(0);
+                let step = |name: &str| {
+                    if name == "place" {
+                        seen.set(seen.get() + 1);
+                        if seen.get() == nth {
+                            return Err("injected".to_string());
+                        }
+                    }
+                    Ok(())
+                };
+                assert!(batch_rename_with(&items, &step).is_err());
+                assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "cycle={cycle} place#{nth}");
+                assert_eq!(fs::read_to_string(root.join("a")).unwrap(), "A file");
+                assert_eq!(fs::read_to_string(root.join("b/x")).unwrap(), "B tree");
+                assert_eq!(fs::read_link(root.join("c")).unwrap().to_string_lossy(), "c-target");
+                assert!(no_rename_residue(&root));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_rename_cycle_succeeds_and_undoes_d25() {
+        let root = scratch_case("wf-d25-cycle");
+        fs::write(root.join("a"), "A").unwrap();
+        fs::write(root.join("b"), "B").unwrap();
+        fs::create_dir(root.join("c")).unwrap();
+        fs::write(root.join("c/x"), "X").unwrap();
+        let before = fingerprint(root.to_str().unwrap()).unwrap();
+        let p = |n: &str| root.join(n).to_string_lossy().to_string();
+        let done = batch_rename(&[(p("a"), "b".into()), (p("b"), "c".into()), (p("c"), "a".into())]).unwrap();
+        assert_eq!(fs::read_to_string(root.join("b")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(root.join("c")).unwrap(), "B");
+        assert_eq!(fs::read_to_string(root.join("a/x")).unwrap(), "X");
+        assert!(no_rename_residue(&root));
+        restore_renamed_items(&done).unwrap();
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+        assert!(no_rename_residue(&root));
+    }
+
+    #[test]
+    fn batch_rename_broken_links_d25() {
+        let root = scratch_case("wf-d25-link");
+        let p = |n: &str| root.join(n).to_string_lossy().to_string();
+        std::os::unix::fs::symlink("gone", root.join("l")).unwrap();
+        let before = fingerprint(root.to_str().unwrap()).unwrap();
+        let done = batch_rename(&[(p("l"), "l2".into())]).unwrap();
+        assert_eq!(fs::read_link(root.join("l2")).unwrap().to_string_lossy(), "gone");
+        assert!(fs::symlink_metadata(root.join("l")).is_err());
+        restore_renamed_items(&done).unwrap();
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+
+        // unrelated broken-link destination is occupied
+        fs::write(root.join("f"), "F").unwrap();
+        std::os::unix::fs::symlink("gone2", root.join("busy")).unwrap();
+        let before = fingerprint(root.to_str().unwrap()).unwrap();
+        assert!(batch_rename(&[(p("f"), "busy".into())]).is_err());
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+        assert!(no_rename_residue(&root));
+
+        // cycle containing a broken link
+        let before = fingerprint(root.to_str().unwrap()).unwrap();
+        let done = batch_rename(&[(p("f"), "busy".into()), (p("busy"), "f".into())]).unwrap();
+        assert_eq!(fs::read_to_string(root.join("busy")).unwrap(), "F");
+        assert_eq!(fs::read_link(root.join("f")).unwrap().to_string_lossy(), "gone2");
+        restore_renamed_items(&done).unwrap();
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+        assert!(no_rename_residue(&root));
+    }
+
+    #[test]
+    fn batch_rename_rejects_duplicates_and_noops_d25() {
+        let root = scratch_case("wf-d25-dup");
+        let p = |n: &str| root.join(n).to_string_lossy().to_string();
+        fs::write(root.join("a"), "A").unwrap();
+        fs::write(root.join("b"), "B").unwrap();
+        let before = fingerprint(root.to_str().unwrap()).unwrap();
+        assert!(batch_rename(&[(p("a"), "z".into()), (p("b"), "z".into())]).is_err());
+        assert!(batch_rename(&[(p("a"), "y".into()), (p("a"), "z".into())]).is_err());
+        assert!(batch_rename(&[(p("missing"), "q".into())]).is_err());
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+        assert!(batch_rename(&[(p("a"), "a".into())]).unwrap().is_empty());
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
     }
 
     #[test]
