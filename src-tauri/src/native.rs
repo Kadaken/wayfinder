@@ -942,22 +942,23 @@ fn update_config(change: impl FnOnce(&mut AppConfig)) -> Option<AppConfig> {
     config_path().map(|path| update_config_at(&path, change))
 }
 
-/// This window's own view settings only; favorites and recents are untouched.
-fn save_view_settings(state: &AppState) {
-    let (show_hidden, view_mode, search_in_files, sort_key, sort_ascending) = (
-        state.show_hidden,
-        view_mode_id(state.view_mode).to_string(),
-        state.search_in_files,
-        state.sort_key,
-        state.sort_ascending,
-    );
-    update_config(|config| {
-        config.show_hidden = show_hidden;
-        config.view_mode = view_mode;
-        config.search_in_files = search_in_files;
-        config.sort_key = sort_key;
-        config.sort_ascending = sort_ascending;
-    });
+// Each view control persists only the field the user changed, so a window
+// holding stale values never writes them over another window's change.
+fn config_show_hidden(config: &mut AppConfig, value: bool) {
+    config.show_hidden = value;
+}
+
+fn config_search_in_files(config: &mut AppConfig, value: bool) {
+    config.search_in_files = value;
+}
+
+fn config_view_mode(config: &mut AppConfig, mode: ViewMode) {
+    config.view_mode = view_mode_id(mode).to_string();
+}
+
+fn config_sort(config: &mut AppConfig, key: SortKey, ascending: bool) {
+    config.sort_key = key;
+    config.sort_ascending = ascending;
 }
 
 fn default_favorites() -> Vec<Bookmark> {
@@ -1957,7 +1958,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         search_in_files.connect_toggled(move |button| {
             let mut state_ref = state.borrow_mut();
             state_ref.search_in_files = button.is_active();
-            save_view_settings(&state_ref);
+            let value = state_ref.search_in_files;
+            update_config(|config| config_search_in_files(config, value));
         });
     }
     {
@@ -3152,7 +3154,8 @@ fn connect_actions(
             {
                 let mut state = state.borrow_mut();
                 state.show_hidden = button.is_active();
-                save_view_settings(&state);
+                let value = state.show_hidden;
+                update_config(|config| config_show_hidden(config, value));
             }
             let cwd = state.borrow().cwd.clone();
             navigate(&state, cwd);
@@ -3258,7 +3261,7 @@ fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
     {
         let mut state_ref = state.borrow_mut();
         state_ref.view_mode = mode;
-        save_view_settings(&state_ref);
+        update_config(|config| config_view_mode(config, mode));
     }
     match mode {
         ViewMode::Details => {
@@ -3313,7 +3316,8 @@ fn connect_sort_headers(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                             // item at the top; a second click reverses it.
                             state_ref.sort_ascending = key != SortKey::Modified;
                         }
-                        save_view_settings(&state_ref);
+                        let (key, ascending) = (state_ref.sort_key, state_ref.sort_ascending);
+                        update_config(|config| config_sort(config, key, ascending));
                     }
                     update_sort_header_labels(&state, &ui);
                     repopulate_rows(&state, &ui);
@@ -3402,7 +3406,8 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             {
                 let mut state = state.borrow_mut();
                 state.show_hidden = !state.show_hidden;
-                save_view_settings(&state);
+                let value = state.show_hidden;
+                update_config(|config| config_show_hidden(config, value));
             }
             let cwd = state.borrow().cwd.clone();
             navigate(&state, cwd);
@@ -8355,6 +8360,50 @@ mod tests {
         assert!(c.show_hidden && !c.sort_ascending);
         update_config_at(&path, |c| remove_favorite(&mut c.favorites, &p1));
         assert_eq!(read_config_at(&path).favorites.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D-19 correction: each view control persists only its own field. A stale
+    /// window changing one setting must not write back another window's change.
+    #[test]
+    fn view_settings_persist_only_the_changed_field_d19() {
+        let dir = std::env::temp_dir().join(format!("wf-view-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("native-config.json");
+        update_config_at(&path, |c| *c = AppConfig::default());
+        // A changes every field; stale B (which still thinks the defaults hold)
+        // then changes one field at a time.
+        update_config_at(&path, |c| config_show_hidden(c, true));
+        update_config_at(&path, |c| config_view_mode(c, ViewMode::Grid));
+        update_config_at(&path, |c| config_search_in_files(c, true));
+        update_config_at(&path, |c| config_sort(c, SortKey::Size, false));
+        let want = read_config_at(&path);
+        assert!(want.show_hidden && want.search_in_files && !want.sort_ascending);
+        // stale B: sort only
+        update_config_at(&path, |c| config_sort(c, SortKey::Modified, true));
+        let c = read_config_at(&path);
+        assert!(c.show_hidden && c.search_in_files, "sort must not touch hidden/search");
+        assert_eq!(c.view_mode, want.view_mode, "sort must not touch view mode");
+        assert_eq!((c.sort_key, c.sort_ascending), (SortKey::Modified, true));
+        // stale B: hidden only
+        update_config_at(&path, |c| config_show_hidden(c, false));
+        let c = read_config_at(&path);
+        assert!(!c.show_hidden && c.search_in_files);
+        assert_eq!((c.sort_key, c.sort_ascending), (SortKey::Modified, true));
+        assert_eq!(c.view_mode, want.view_mode);
+        // stale B: search only
+        update_config_at(&path, |c| config_search_in_files(c, false));
+        let c = read_config_at(&path);
+        assert!(!c.search_in_files && !c.show_hidden);
+        assert_eq!(c.view_mode, want.view_mode);
+        // stale B: view mode only
+        update_config_at(&path, |c| config_show_hidden(c, true));
+        update_config_at(&path, |c| config_view_mode(c, ViewMode::Compact));
+        let c = read_config_at(&path);
+        assert!(c.show_hidden && !c.search_in_files);
+        assert_eq!((c.sort_key, c.sort_ascending), (SortKey::Modified, true));
+        assert_ne!(c.view_mode, want.view_mode);
+        assert!(!include_str!("native.rs").contains(concat!("save_view", "_settings(")), "no whole-snapshot view write");
         let _ = fs::remove_dir_all(&dir);
     }
 
