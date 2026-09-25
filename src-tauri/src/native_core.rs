@@ -558,10 +558,58 @@ pub fn eject_drive(device: &str) -> Result<(), String> {
     run_cmd_capture("udisksctl", &["power-off", "-b", &disk])
 }
 
+/// Starts an external program without waiting for it to finish and reaps it
+/// on its own thread, so an exited child never lingers as a zombie while
+/// Wayfinder keeps running. Returns the child's PID as soon as it has started.
+/// Launch errors are returned unchanged; if the reaper thread cannot be
+/// started the child is killed and reaped here and that failure is returned.
+fn spawn_reaped(mut command: Command) -> std::io::Result<u32> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let child = command.spawn()?;
+    let pid = child.id();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let for_thread = std::sync::Arc::clone(&slot);
+    let thread_program = program.clone();
+    let started = std::thread::Builder::new()
+        .name(format!("wf-reap-{pid}"))
+        .spawn(move || {
+            let child = for_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(mut child) = child {
+                if let Err(err) = child.wait() {
+                    eprintln!("wayfinder: waiting for {thread_program} (pid {pid}) failed: {err}");
+                }
+            }
+        });
+    match started {
+        Ok(_) => Ok(pid),
+        Err(err) => {
+            let child = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let mut cleanup = String::new();
+            if let Some(mut child) = child {
+                if let Err(kill_err) = child.kill() {
+                    cleanup.push_str(&format!("; kill failed: {kill_err}"));
+                }
+                if let Err(wait_err) = child.wait() {
+                    cleanup.push_str(&format!("; child {pid} was not confirmed reaped: {wait_err}"));
+                }
+            }
+            Err(std::io::Error::other(format!(
+                "could not start a reaper for {program}: {err}{cleanup}"
+            )))
+        }
+    }
+}
+
 pub fn open_path(path: &str) -> Result<(), String> {
-    Command::new("xdg-open")
-        .arg(path)
-        .spawn()
+    let mut command = Command::new("xdg-open");
+    command.arg(path);
+    spawn_reaped(command)
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -623,9 +671,9 @@ pub fn open_with(app_id: &str, path: &str) -> Result<(), String> {
     for dir in app_dirs() {
         let desktop_file = format!("{dir}/{app_id}");
         if Path::new(&desktop_file).exists() {
-            return Command::new("gio")
-                .args(["launch", &desktop_file, path])
-                .spawn()
+            let mut command = Command::new("gio");
+            command.args(["launch", &desktop_file, path]);
+            return spawn_reaped(command)
                 .map(|_| ())
                 .map_err(|err| err.to_string());
         }
@@ -649,7 +697,7 @@ pub fn open_terminal(path: &str) -> Result<(), String> {
         } else {
             command.args(*args).arg(path);
         }
-        match command.spawn() {
+        match spawn_reaped(command) {
             Ok(_) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err.to_string()),
@@ -2129,6 +2177,55 @@ pub fn scratch_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit(')').next()?.trim().chars().next()
+    }
+
+    struct KillOnDrop(u32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").arg(self.0.to_string()).status();
+        }
+    }
+
+    #[test]
+    fn spawn_reaped_reaps_short_children_and_returns_promptly_from_long_ones() {
+        // A short-lived child must disappear from /proc, not stay defunct,
+        // while this process keeps running.
+        let mut short = Command::new("sh");
+        short.args(["-c", "exit 0"]);
+        let short_pid = spawn_reaped(short).expect("short child starts");
+        let mut gone = false;
+        for _ in 0..100 {
+            if proc_state(short_pid).is_none() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "short child {short_pid} must be fully reaped, state {:?}", proc_state(short_pid));
+
+        // A long-lived child must not be waited for at launch.
+        let mut long = Command::new("sleep");
+        long.arg("30");
+        let started = std::time::Instant::now();
+        let long_pid = spawn_reaped(long).expect("long child starts");
+        let _cleanup = KillOnDrop(long_pid);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "launch waited {elapsed:?}");
+        assert!(
+            matches!(proc_state(long_pid), Some(state) if state != 'Z'),
+            "long child must still be running, state {:?}",
+            proc_state(long_pid)
+        );
+
+        // A missing program keeps its launch error.
+        let missing = Command::new("wf-no-such-program-d41");
+        let err = spawn_reaped(missing).expect_err("missing program fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{SystemTime, UNIX_EPOCH};
