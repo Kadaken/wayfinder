@@ -3510,6 +3510,13 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         }
         menu.append(&row);
     }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        menu.append(&context_item("", "Invert Selection", "", &popover, move || {
+            invert_selection(&state, &ui)
+        }));
+    }
 
     menu.append(&context_separator());
     {
@@ -5423,6 +5430,35 @@ fn typeahead_select(state: &Rc<RefCell<AppState>>, ui: &Ui, ch: char) {
     if let Some(index) = index {
         select_index(state, ui, index);
     }
+}
+
+/// Selects exactly the visible rows that are not selected now, in the active
+/// presentation, without rebuilding the listing.
+fn invert_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let (view_mode, count) = {
+        let state = state.borrow();
+        (state.view_mode, state.visible_entries.len())
+    };
+    match view_mode {
+        ViewMode::Grid => {
+            for index in 0..count {
+                if let Some(child) = ui.grid.child_at_index(index as i32) {
+                    if child.is_selected() {
+                        ui.grid.unselect_child(&child);
+                    } else {
+                        ui.grid.select_child(&child);
+                    }
+                }
+            }
+        }
+        ViewMode::Details | ViewMode::Compact => {
+            let count = (count as u32).min(ui.list_selection.n_items());
+            let complement = gtk::Bitset::new_range(0, count);
+            complement.subtract(&ui.list_selection.selection());
+            ui.list_selection.set_selection(&complement, &gtk::Bitset::new_range(0, count));
+        }
+    }
+    update_selection(state, ui);
 }
 
 fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
@@ -8380,6 +8416,178 @@ mod tests {
         sustained_stream_keeps_objects_pointer_and_timing_d22();
         tabs_keep_independent_history_d27();
         show_hidden_toolbar_and_options_stay_in_sync_d28();
+        invert_selection_is_the_exact_complement_d29();
+    }
+
+    fn invert_selection_is_the_exact_complement_d29() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d29-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in ["alpha.txt", "beta.txt", "gamma.txt", "delta.txt", "apple.png"] {
+            std::fs::write(dir.join(name), "data").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d29test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 6);
+
+        let names = || {
+            let mut v: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let invariants = || {
+            let s = state.borrow();
+            (
+                names(),
+                s.clipboard.is_none(),
+                s.undo_stack.len(),
+                (s.tabs.tabs[0].history.clone(), s.tabs.tabs[0].index),
+                (ui.back.is_sensitive(), ui.forward.is_sensitive()),
+                (s.sort_key, s.sort_ascending),
+                // the test itself switches views, which the config records; invert must not
+                format!("{:?}", AppConfig { view_mode: String::new(), ..load_config() }),
+            )
+        };
+        let before = invariants();
+        let options_button = all_widgets(ui.window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.tooltip_text().as_deref() == Some("View and folder options"))
+            .expect("Options button");
+        let invert = || {
+            options_button.emit_clicked();
+            let popover = popovers_of(options_button.upcast_ref()).pop().expect("options popover");
+            button_labelled(popover.upcast_ref(), "Invert Selection")
+                .expect("Invert Selection row")
+                .emit_clicked();
+            popover.popdown();
+            popover.unparent();
+        };
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let sel = || {
+            let mut v = selected_paths(&state, &ui);
+            v.sort();
+            v
+        };
+        let sorted = |names: &[&str]| {
+            let mut v: Vec<String> = names.iter().map(|n| path(n)).collect();
+            v.sort();
+            v
+        };
+        let all_names = ["alpha.txt", "beta.txt", "gamma.txt", "delta.txt", "apple.png", "sub"];
+        let rest_of = |chosen: &[&str]| -> Vec<&str> {
+            all_names.iter().copied().filter(|n| !chosen.contains(n)).collect()
+        };
+        let index_of = |n: &str| state.borrow().visible_entries.iter().position(|e| e.path == path(n)).unwrap();
+        let grid = |ui: &Ui| ui.grid.clone();
+        let pick = |mode: ViewMode, n: &str, extend: bool| {
+            let i = index_of(n);
+            if mode == ViewMode::Grid {
+                let child = grid(&ui).child_at_index(i as i32).unwrap();
+                if !extend {
+                    ui.grid.unselect_all();
+                }
+                ui.grid.select_child(&child);
+            } else {
+                ui.list_selection.select_item(i as u32, !extend);
+            }
+        };
+        let clear = |mode: ViewMode| {
+            if mode == ViewMode::Grid {
+                ui.grid.unselect_all()
+            } else {
+                ui.list_selection.unselect_all();
+            }
+        };
+
+        for mode in [ViewMode::Details, ViewMode::Compact, ViewMode::Grid] {
+            let mode_name = view_mode_id(mode);
+            set_view_mode(&state, &ui, mode);
+            wait_for("view rows", || {
+                if mode == ViewMode::Grid {
+                    ui.grid.child_at_index(5).is_some()
+                } else {
+                    ui.list_selection.n_items() == 6
+                }
+            });
+            let (one, two) = (["beta.txt"], ["alpha.txt", "sub"]);
+            pick(mode, "beta.txt", false);
+            assert_eq!(sel(), sorted(&one));
+            invert();
+            assert_eq!(sel(), sorted(&rest_of(&one)), "{mode_name}: complement of one");
+            assert!(ui.status.label().contains("5 selected"), "{mode_name}: {}", ui.status.label());
+            assert_ne!(ui.preview.label(), "Select a file", "{mode_name}");
+            invert();
+            assert_eq!(sel(), sorted(&one), "{mode_name}: twice restores");
+            assert!(ui.status.label().contains("1 selected"), "{mode_name}: {}", ui.status.label());
+
+            pick(mode, "alpha.txt", false);
+            pick(mode, "sub", true);
+            assert_eq!(sel(), sorted(&two));
+            invert();
+            assert_eq!(sel(), sorted(&rest_of(&two)), "{mode_name}: partial");
+            invert();
+            assert_eq!(sel(), sorted(&two), "{mode_name}: partial twice");
+
+            clear(mode);
+            assert!(sel().is_empty());
+            invert();
+            assert_eq!(sel(), sorted(&all_names), "{mode_name}: none to all");
+            assert!(ui.status.label().contains("6 selected"), "{mode_name}: {}", ui.status.label());
+            invert();
+            assert!(sel().is_empty(), "{mode_name}: all to none");
+            assert_eq!(ui.preview.label(), "Select a file", "{mode_name}");
+            assert_eq!(view_mode_id(state.borrow().view_mode), mode_name);
+            assert_eq!(invariants(), before, "{mode_name}: invariants");
+        }
+        set_view_mode(&state, &ui, ViewMode::Details);
+        wait_for("details rows", || ui.list_selection.n_items() == 6);
+
+        // a filter limits invert to visible rows; no filtered-out path is selected
+        ui.search.set_text("a.txt");
+        wait_for("filtered", || state.borrow().visible_entries.len() == 4);
+        let visible: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(visible.len(), 4, "{visible:?}");
+        assert!(visible.iter().all(|p| p.ends_with("a.txt")), "{visible:?}");
+        pick(ViewMode::Details, "alpha.txt", false);
+        pick(ViewMode::Details, "beta.txt", true);
+        invert();
+        assert_eq!(sel(), sorted(&["gamma.txt", "delta.txt"]), "filtered complement");
+        invert();
+        assert_eq!(sel(), sorted(&["alpha.txt", "beta.txt"]), "filtered twice");
+        assert!(sel().iter().all(|p| visible.contains(p)));
+
+        // zero visible rows: safe, nothing selected
+        ui.search.set_text("zzz-no-match");
+        wait_for("no rows", || state.borrow().visible_entries.is_empty());
+        invert();
+        assert!(sel().is_empty());
+        assert!(ui.list_selection.selection().is_empty());
+        ui.search.set_text("");
+        wait_for("unfiltered", || state.borrow().visible_entries.len() == 6);
+        assert!(sel().is_empty());
+        assert_eq!(invariants(), before, "final invariants");
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn show_hidden_toolbar_and_options_stay_in_sync_d28() {
