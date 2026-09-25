@@ -1235,6 +1235,17 @@ fn main() {
             .set_color_scheme(adw::ColorScheme::PreferDark);
         install_app_css();
         export_file_manager1(app);
+        // `app.open-window <folder>`: the same independent window Ctrl+N makes,
+        // reachable from outside (gdbus / desktop actions) without a keystroke.
+        let open_window = gio::SimpleAction::new("open-window", Some(glib::VariantTy::STRING));
+        let app_for_action = app.clone();
+        open_window.connect_activate(move |_, parameter| {
+            let path = parameter
+                .and_then(|value| value.get::<String>())
+                .filter(|path| Path::new(path).is_dir());
+            build_ui(&app_for_action, path, None);
+        });
+        app.add_action(&open_window);
     });
     app.connect_activate(|app| {
         if let Some((_, ui)) = active_window() {
