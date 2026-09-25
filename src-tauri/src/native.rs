@@ -913,25 +913,51 @@ fn load_config() -> AppConfig {
         .unwrap_or_default()
 }
 
-fn save_config(state: &AppState) {
-    let Some(path) = config_path() else {
-        return;
-    };
+fn read_config_at(path: &Path) -> AppConfig {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Reads the config as it is on disk NOW, applies one change, writes it back.
+/// Every window shares the file, so a window may only change the fields it
+/// owns; rewriting a stale full snapshot would undo another window's changes.
+fn update_config_at(path: &Path, change: impl FnOnce(&mut AppConfig)) -> AppConfig {
+    let mut config = read_config_at(path);
+    change(&mut config);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let config = AppConfig {
-        favorites: state.favorites.clone(),
-        recents: state.recents.clone(),
-        show_hidden: state.show_hidden,
-        view_mode: view_mode_id(state.view_mode).to_string(),
-        search_in_files: state.search_in_files,
-        sort_key: state.sort_key,
-        sort_ascending: state.sort_ascending,
-    };
     if let Ok(raw) = serde_json::to_string_pretty(&config) {
-        let _ = fs::write(path, raw);
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, raw).is_ok() {
+            let _ = fs::rename(&tmp, path);
+        }
     }
+    config
+}
+
+fn update_config(change: impl FnOnce(&mut AppConfig)) -> Option<AppConfig> {
+    config_path().map(|path| update_config_at(&path, change))
+}
+
+/// This window's own view settings only; favorites and recents are untouched.
+fn save_view_settings(state: &AppState) {
+    let (show_hidden, view_mode, search_in_files, sort_key, sort_ascending) = (
+        state.show_hidden,
+        view_mode_id(state.view_mode).to_string(),
+        state.search_in_files,
+        state.sort_key,
+        state.sort_ascending,
+    );
+    update_config(|config| {
+        config.show_hidden = show_hidden;
+        config.view_mode = view_mode;
+        config.search_in_files = search_in_files;
+        config.sort_key = sort_key;
+        config.sort_ascending = sort_ascending;
+    });
 }
 
 fn default_favorites() -> Vec<Bookmark> {
@@ -971,13 +997,23 @@ fn bookmark_for_path(path: &str) -> Bookmark {
     }
 }
 
-fn push_recent_dir(state: &mut AppState, path: &str) {
+fn push_recent(recents: &mut Vec<Bookmark>, path: &str) {
     if !Path::new(path).is_dir() {
         return;
     }
-    state.recents.retain(|bookmark| bookmark.path != path);
-    state.recents.insert(0, bookmark_for_path(path));
-    state.recents.truncate(12);
+    recents.retain(|bookmark| bookmark.path != path);
+    recents.insert(0, bookmark_for_path(path));
+    recents.truncate(12);
+}
+
+fn add_favorite(favorites: &mut Vec<Bookmark>, path: &str) {
+    if !favorites.iter().any(|favorite| favorite.path == path) {
+        favorites.push(bookmark_for_path(path));
+    }
+}
+
+fn remove_favorite(favorites: &mut Vec<Bookmark>, path: &str) {
+    favorites.retain(|favorite| favorite.path != path);
 }
 
 fn is_favorite(state: &AppState, path: &str) -> bool {
@@ -993,8 +1029,10 @@ fn add_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
     {
         let mut state_ref = state.borrow_mut();
         if !is_favorite(&state_ref, &path) {
-            state_ref.favorites.push(bookmark_for_path(&path));
-            save_config(&state_ref);
+            match update_config(|config| add_favorite(&mut config.favorites, &path)) {
+                Some(config) => state_ref.favorites = config.favorites,
+                None => add_favorite(&mut state_ref.favorites, &path),
+            }
         }
     }
     rebuild_sidebar(state, ui);
@@ -1004,8 +1042,10 @@ fn add_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
 fn remove_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
     {
         let mut state_ref = state.borrow_mut();
-        state_ref.favorites.retain(|favorite| favorite.path != path);
-        save_config(&state_ref);
+        match update_config(|config| remove_favorite(&mut config.favorites, &path)) {
+            Some(config) => state_ref.favorites = config.favorites,
+            None => remove_favorite(&mut state_ref.favorites, &path),
+        }
     }
     rebuild_sidebar(state, ui);
     ui.status.set_label("Removed from Favorites");
@@ -1906,7 +1946,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         search_in_files.connect_toggled(move |button| {
             let mut state_ref = state.borrow_mut();
             state_ref.search_in_files = button.is_active();
-            save_config(&state_ref);
+            save_view_settings(&state_ref);
         });
     }
     {
@@ -3101,7 +3141,7 @@ fn connect_actions(
             {
                 let mut state = state.borrow_mut();
                 state.show_hidden = button.is_active();
-                save_config(&state);
+                save_view_settings(&state);
             }
             let cwd = state.borrow().cwd.clone();
             navigate(&state, cwd);
@@ -3207,7 +3247,7 @@ fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
     {
         let mut state_ref = state.borrow_mut();
         state_ref.view_mode = mode;
-        save_config(&state_ref);
+        save_view_settings(&state_ref);
     }
     match mode {
         ViewMode::Details => {
@@ -3262,7 +3302,7 @@ fn connect_sort_headers(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                             // item at the top; a second click reverses it.
                             state_ref.sort_ascending = key != SortKey::Modified;
                         }
-                        save_config(&state_ref);
+                        save_view_settings(&state_ref);
                     }
                     update_sort_header_labels(&state, &ui);
                     repopulate_rows(&state, &ui);
@@ -3351,7 +3391,7 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             {
                 let mut state = state.borrow_mut();
                 state.show_hidden = !state.show_hidden;
-                save_config(&state);
+                save_view_settings(&state);
             }
             let cwd = state.borrow().cwd.clone();
             navigate(&state, cwd);
@@ -3701,8 +3741,10 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool
                 state.entries = listing.entries;
                 state.visible_entries.clear();
                 state.filter_text.clear();
-                push_recent_dir(&mut state, &path);
-                save_config(&state);
+                match update_config(|config| push_recent(&mut config.recents, &path)) {
+                    Some(config) => state.recents = config.recents,
+                    None => push_recent(&mut state.recents, &path),
+                }
             }
             if let Some(ui) = &ui {
                 rebuild_tabs(&state, ui);
@@ -8242,6 +8284,40 @@ mod tests {
             "/tmp/selection".to_string(),
         ];
         assert_eq!(gtk_launch_args(&args), vec!["wayfinder"]);
+    }
+
+    /// D-19: two windows share one config file. A window changing its view
+    /// settings must not undo another window's favorites or recents, and
+    /// concurrent favorite/recent updates must both survive.
+    #[test]
+    fn config_updates_preserve_fields_changed_by_another_window_d19() {
+        let dir = std::env::temp_dir().join(format!("wf-cfg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("native-config.json");
+        let (d1, d2) = (dir.join("one"), dir.join("two"));
+        fs::create_dir_all(&d1).unwrap();
+        fs::create_dir_all(&d2).unwrap();
+        let (p1, p2) = (d1.to_string_lossy().to_string(), d2.to_string_lossy().to_string());
+        update_config_at(&path, |c| c.favorites.clear());
+        // window A and window B both start from the same (empty) view of the file
+        update_config_at(&path, |c| add_favorite(&mut c.favorites, &p1)); // A
+        update_config_at(&path, |c| add_favorite(&mut c.favorites, &p2)); // B, stale
+        update_config_at(&path, |c| push_recent(&mut c.recents, &p1));
+        update_config_at(&path, |c| push_recent(&mut c.recents, &p2));
+        // B then changes only a view setting
+        update_config_at(&path, |c| {
+            c.show_hidden = true;
+            c.sort_ascending = false;
+        });
+        let c = read_config_at(&path);
+        let fav: Vec<_> = c.favorites.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(fav, vec![p1.clone(), p2.clone()], "both favorites survive");
+        let rec: Vec<_> = c.recents.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(rec, vec![p2.clone(), p1.clone()], "both recents survive");
+        assert!(c.show_hidden && !c.sort_ascending);
+        update_config_at(&path, |c| remove_favorite(&mut c.favorites, &p1));
+        assert_eq!(read_config_at(&path).favorites.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// D-18 (23 Sep 2026): the drag picture is a compact translucent ghost of the
