@@ -4438,6 +4438,7 @@ fn selected_indices(ui: &Ui) -> Vec<usize> {
 }
 
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let focus_was_in_files = focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid);
     ui.list_store.remove_all();
     while let Some(child) = ui.grid.first_child() {
         ui.grid.remove(&child);
@@ -4515,6 +4516,11 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.list_store.splice(0, 0, &items);
     } else {
         ui.list_store.remove_all();
+    }
+    if view_mode == ViewMode::Grid {
+        keep_focus_on_empty_view(&ui.grid, focus_was_in_files, visible_entries.is_empty());
+    } else {
+        keep_focus_on_empty_view(&ui.list, focus_was_in_files, visible_entries.is_empty());
     }
 
     // Only Grid still builds a widget per item; Details/Compact are served by the
@@ -5380,9 +5386,8 @@ where
     dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("duplicate"));
     dialog.set_close_response("cancel");
-    dialog.connect_response(None, move |dialog, response| {
+    dialog.connect_response(None, move |_, response| {
         apply_conflict_response(response, &on_choice);
-        dialog.close();
     });
     dialog.present(Some(&ui.window));
 }
@@ -5398,6 +5403,24 @@ fn perform_transfer(
     let items = native_core::resolve_paste(srcs, dest, is_copy, on_conflict)?;
     native_core::verify_transfer(&before, &items, is_copy)?;
     Ok(items)
+}
+
+/// True when keyboard focus is `root` or somewhere inside it.
+fn focus_within(window: &impl IsA<gtk::Window>, root: &impl IsA<gtk::Widget>) -> bool {
+    let root = root.upcast_ref::<gtk::Widget>();
+    window.focus().is_some_and(|focus| &focus == root || focus.is_ancestor(root))
+}
+
+/// When a folder's last row is removed while focus sat on a file row, GTK's
+/// next-frame focus search skips the empty view and lands on the selectable
+/// preview label, which raises a critical. An empty view holds no rows, so
+/// focusing its root keeps focus in the file pane and on a widget that survives.
+fn keep_focus_on_empty_view(root: &impl IsA<gtk::Widget>, focus_was_in_view: bool, is_empty: bool) {
+    if focus_was_in_view && is_empty {
+        // An empty FlowBox is not focusable by default and would pass focus on.
+        root.set_focusable(true);
+        root.grab_focus();
+    }
 }
 
 fn run_transfer(
@@ -7911,6 +7934,87 @@ mod tests {
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
         drag_ghost_builds_compact_translucent_item();
+        emptied_folder_keeps_focus_on_the_view_root_d20();
+    }
+
+    /// D-20: removing the last row of a folder while focus sat on a file row
+    /// made GTK's next-frame focus search hit the selectable preview label and
+    /// raise a critical (fatal under test). Focus must move to the surviving
+    /// view root, and only when it was in the file pane.
+    fn emptied_folder_keeps_focus_on_the_view_root_d20() {
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_bind(|_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let text = item.item().and_downcast::<gtk::StringObject>().unwrap().string();
+            item.set_child(Some(&gtk::Label::new(Some(&text))));
+        });
+        let store = gio::ListStore::new::<gtk::StringObject>();
+        store.append(&gtk::StringObject::new("only-row"));
+        let list = gtk::ListView::new(Some(gtk::MultiSelection::new(Some(store.clone()))), Some(factory));
+        let grid = gtk::FlowBox::new();
+        let grid_label = gtk::Label::new(Some("grid-item"));
+        grid.append(&grid_label);
+        let entry = gtk::Entry::new();
+        let preview = gtk::Label::new(Some("preview"));
+        preview.set_selectable(true);
+        let pane = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        for w in [entry.upcast_ref::<gtk::Widget>(), list.upcast_ref(), grid.upcast_ref(), preview.upcast_ref()] {
+            pane.append(w);
+        }
+        list.set_hexpand(true);
+        let win = gtk::Window::new();
+        win.set_default_size(500, 200);
+        win.set_child(Some(&pane));
+        win.present();
+        pump();
+        let focus = || gtk::prelude::GtkWindowExt::focus(&win);
+
+        // Focus outside the file pane is never taken.
+        entry.grab_focus();
+        pump();
+        let outside = focus();
+        assert!(outside.is_some() && !focus_within(&win, &list));
+        let was_in = focus_within(&win, &list);
+        store.remove_all();
+        keep_focus_on_empty_view(&list, was_in, true);
+        pump();
+        assert_eq!(focus(), outside, "focus outside the file view is not stolen");
+
+        // Details/Compact: focus on a row, last row removed.
+        store.append(&gtk::StringObject::new("only-row"));
+        pump();
+        list.grab_focus();
+        pump();
+        assert!(focus_within(&win, &list) && focus().as_ref() != Some(list.upcast_ref()), "focus is on a row");
+        let was_in = focus_within(&win, &list);
+        store.remove_all();
+        keep_focus_on_empty_view(&list, was_in, true);
+        pump();
+        assert_eq!(focus(), Some(list.clone().upcast()), "empty list root owns focus, no critical");
+
+        // A non-empty result leaves focus alone.
+        store.append(&gtk::StringObject::new("kept"));
+        pump();
+        list.grab_focus();
+        pump();
+        let before = focus();
+        keep_focus_on_empty_view(&list, true, false);
+        assert_eq!(focus(), before);
+
+        // Grid: the FlowBox is the root.
+        let child = grid_label.parent().expect("flow box child");
+        child.grab_focus();
+        pump();
+        assert!(focus_within(&win, &grid) && focus().as_ref() != Some(grid.upcast_ref()));
+        let was_in = focus_within(&win, &grid);
+        while let Some(c) = grid.first_child() {
+            grid.remove(&c);
+        }
+        keep_focus_on_empty_view(&grid, was_in, true);
+        pump();
+        assert_eq!(focus(), Some(grid.clone().upcast()), "empty grid root owns focus, no critical");
+        win.close();
+        pump();
     }
 
     /// Real pointer events (XTEST, on the virtual display only) through the
@@ -8405,6 +8509,18 @@ mod tests {
         assert_ne!(c.view_mode, want.view_mode);
         assert!(!include_str!("native.rs").contains(concat!("save_view", "_settings(")), "no whole-snapshot view write");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D-20: AdwAlertDialog closes itself after `response`; closing it again in
+    /// the handler raises a GTK critical.
+    #[test]
+    fn conflict_dialog_response_does_not_close_again_d20() {
+        let all = include_str!("native.rs");
+        let start = all.find("fn show_conflict_dialog<F>").unwrap();
+        let body = &all[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("connect_response"));
+        assert!(!body.contains(".close()"), "response handler must not close the dialog again");
     }
 
     #[test]
