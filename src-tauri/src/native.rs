@@ -1222,6 +1222,7 @@ struct Ui {
     tabbar: gtk::Box,
     back: gtk::Button,
     forward: gtk::Button,
+    hidden: gtk::ToggleButton,
     files_stack: gtk::Stack,
     column_header: gtk::Box,
     columns: ColumnSizing,
@@ -1747,6 +1748,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     command_bar.append(&compact_view);
     command_bar.append(&icon_view);
     command_bar.append(&command_divider());
+    command_bar.append(&hidden);
     command_bar.append(&refresh);
     command_bar.append(&options);
 
@@ -1955,6 +1957,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         tabbar,
         back: back.clone(),
         forward: forward.clone(),
+        hidden: hidden.clone(),
         files_stack,
         column_header,
         columns,
@@ -3230,16 +3233,7 @@ fn connect_actions(
     }
     {
         let state = state.clone();
-        hidden.connect_toggled(move |button| {
-            {
-                let mut state = state.borrow_mut();
-                state.show_hidden = button.is_active();
-                let value = state.show_hidden;
-                update_config(|config| config_show_hidden(config, value));
-            }
-            let cwd = state.borrow().cwd.clone();
-            navigate(&state, cwd);
-        });
+        hidden.connect_toggled(move |button| set_show_hidden(&state, button.is_active()));
     }
     {
         let state = state.clone();
@@ -3335,6 +3329,24 @@ fn connect_actions(
             show_options_popover(&options_for_popover, state.clone(), ui.clone());
         });
     }
+}
+
+/// The one Show Hidden path: only the flag and its config field change, then the
+/// current folder reloads without a history visit. Setting the current value is
+/// a no-op.
+fn set_show_hidden(state: &Rc<RefCell<AppState>>, value: bool) {
+    if state.borrow().show_hidden == value {
+        return;
+    }
+    state.borrow_mut().show_hidden = value;
+    update_config(|config| config_show_hidden(config, value));
+    if let Some(ui) = ui_for_state(state) {
+        if ui.hidden.is_active() != value {
+            ui.hidden.set_active(value);
+        }
+    }
+    let cwd = state.borrow().cwd.clone();
+    navigate_without_history(state, cwd);
 }
 
 fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
@@ -3481,17 +3493,22 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         }));
     }
     {
-        let state = state.clone();
-        menu.append(&context_button("Show Hidden Files", &popover, move || {
-            {
-                let mut state = state.borrow_mut();
-                state.show_hidden = !state.show_hidden;
-                let value = state.show_hidden;
-                update_config(|config| config_show_hidden(config, value));
-            }
-            let cwd = state.borrow().cwd.clone();
-            navigate(&state, cwd);
-        }));
+        // Checked mirror of the toolbar toggle; clicking flips that toggle, whose
+        // handler is the only show-hidden path.
+        let checked = state.borrow().show_hidden;
+        let ui = ui.clone();
+        let row = context_item(
+            if checked { "object-select-symbolic" } else { "" },
+            "Show Hidden Files",
+            "",
+            &popover,
+            move || ui.hidden.set_active(!ui.hidden.is_active()),
+        );
+        row.set_widget_name("wf-show-hidden-option");
+        if checked {
+            row.add_css_class("wf-checked");
+        }
+        menu.append(&row);
     }
 
     menu.append(&context_separator());
@@ -8362,6 +8379,132 @@ mod tests {
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
         sustained_stream_keeps_objects_pointer_and_timing_d22();
         tabs_keep_independent_history_d27();
+        show_hidden_toolbar_and_options_stay_in_sync_d28();
+    }
+
+    fn show_hidden_toolbar_and_options_stay_in_sync_d28() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d28-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join(".hiddir")).unwrap();
+        std::fs::write(dir.join("vis.txt"), "v").unwrap();
+        std::fs::write(dir.join(".hid.txt"), "h").unwrap();
+        std::env::set_var("HOME", &home);
+        let dir_str = dir.to_string_lossy().to_string();
+        let open = |id: &str| {
+            let app = adw::Application::builder()
+                .application_id(id)
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).expect("register test application");
+            build_ui(&app, Some(dir_str.clone()), None);
+            let found = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            (app, found.0, found.1)
+        };
+        let saved = || load_config().show_hidden;
+        let option_row = |ui: &Ui| {
+            let options = all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.tooltip_text().as_deref() == Some("View and folder options"))
+                .expect("Options button");
+            options.emit_clicked();
+            let popover = popovers_of(options.upcast_ref()).pop().expect("options popover");
+            let row = all_widgets(popover.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == "wf-show-hidden-option")
+                .and_then(|w| w.downcast::<gtk::Button>().ok())
+                .expect("Show Hidden Files row");
+            (popover, row)
+        };
+        // The row is checked exactly when its icon is the check mark and it has the class.
+        let row_checked = |row: &gtk::Button| {
+            let icon = all_widgets(row.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Image>().ok())
+                .any(|i| i.icon_name().as_deref() == Some("object-select-symbolic"));
+            assert_eq!(icon, row.has_css_class("wf-checked"));
+            icon
+        };
+        let close = |popover: gtk::Popover| {
+            popover.popdown();
+            popover.unparent();
+        };
+
+        let (_app, state, ui) = open("io.github.legendofzito.wayfinder.d28test");
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        let tab = || {
+            let s = state.borrow();
+            (s.tabs.tabs[0].history.clone(), s.tabs.tabs[0].index)
+        };
+        let nav = || (ui.back.is_sensitive(), ui.forward.is_sensitive());
+        let (tab0, nav0) = (tab(), nav());
+
+        // reachable: a descendant of the visible window and of the command bar
+        assert!(ui.hidden.is_ancestor(&ui.window) && ui.hidden.is_mapped());
+        let mut in_bar = false;
+        let mut w = ui.hidden.parent();
+        while let Some(p) = w {
+            in_bar |= p.has_css_class("wf-commandbar");
+            w = p.parent();
+        }
+        assert!(in_bar, "the toggle sits in the command bar");
+
+        // saved false: both surfaces off, hidden rows absent
+        assert!(!saved() && !state.borrow().show_hidden && !ui.hidden.is_active());
+        let (pop, row) = option_row(&ui);
+        assert!(!row_checked(&row));
+        close(pop);
+        assert!(state.borrow().visible_entries.iter().all(|e| !e.name.starts_with('.')));
+
+        // real toolbar signal: on
+        ui.hidden.set_active(true);
+        wait_for("hidden rows shown", || state.borrow().visible_entries.len() == 3);
+        assert!(saved() && state.borrow().show_hidden);
+        let (pop, row) = option_row(&ui);
+        assert!(row_checked(&row), "Options follows the toolbar");
+        assert_eq!((tab(), nav()), (tab0.clone(), nav0));
+
+        // real Options control: off
+        row.emit_clicked();
+        wait_for("hidden rows removed", || state.borrow().visible_entries.len() == 1);
+        assert!(!ui.hidden.is_active() && !saved() && !state.borrow().show_hidden);
+        close(pop);
+        let (pop, row) = option_row(&ui);
+        assert!(!row_checked(&row));
+        close(pop);
+        assert_eq!((tab(), nav()), (tab0.clone(), nav0));
+
+        // Options control: on, then re-selecting the current value is a no-op
+        let (pop, row) = option_row(&ui);
+        row.emit_clicked();
+        wait_for("shown again", || state.borrow().visible_entries.len() == 3);
+        assert!(ui.hidden.is_active() && saved());
+        close(pop);
+        let generation = state.borrow().listing_generation;
+        set_show_hidden(&state, true);
+        assert_eq!(state.borrow().listing_generation, generation, "no second refresh");
+        assert_eq!((tab(), nav()), (tab0, nav0));
+
+        // a new window starts with both controls on and the rows visible
+        ui.window.destroy();
+        let (_app2, state2, ui2) = open("io.github.legendofzito.wayfinder.d28test2");
+        wait_for("new window listing", || state2.borrow().visible_entries.len() == 3);
+        assert!(ui2.hidden.is_active() && state2.borrow().show_hidden);
+        let (pop, row) = option_row(&ui2);
+        assert!(row_checked(&row));
+        close(pop);
+        ui2.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn tabs_keep_independent_history_d27() {
