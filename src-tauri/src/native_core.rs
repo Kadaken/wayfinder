@@ -1587,6 +1587,70 @@ fn type_label(name: &str) -> String {
     }
 }
 
+/// The live windows of one process. Each entry owns its state, its widgets and
+/// its application hold, and nothing is shared between entries, so closing or
+/// driving one window can never touch another (D-19).
+pub struct WindowRegistry<S, U, H> {
+    entries: Vec<(std::rc::Rc<std::cell::RefCell<S>>, U, H)>,
+}
+
+impl<S, U, H> Default for WindowRegistry<S, U, H> {
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<S, U: Clone, H> WindowRegistry<S, U, H> {
+    pub fn register(&mut self, state: &std::rc::Rc<std::cell::RefCell<S>>, ui: U, hold: H) {
+        self.entries.push((state.clone(), ui, hold));
+    }
+
+    /// Removes only this window. The caller drops the returned hold after it
+    /// has released any borrow of the registry.
+    pub fn unregister(&mut self, state: &std::rc::Rc<std::cell::RefCell<S>>) -> Option<(U, H)> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(entry, _, _)| std::rc::Rc::ptr_eq(entry, state))?;
+        let (_, ui, hold) = self.entries.remove(index);
+        Some((ui, hold))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn ui_for_state(&self, state: &std::rc::Rc<std::cell::RefCell<S>>) -> Option<U> {
+        self.entries
+            .iter()
+            .find(|(entry, _, _)| std::rc::Rc::ptr_eq(entry, state))
+            .map(|(_, ui, _)| ui.clone())
+    }
+
+    pub fn state_for_ui(
+        &self,
+        matches: impl Fn(&U) -> bool,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<S>>> {
+        self.entries
+            .iter()
+            .find(|(_, ui, _)| matches(ui))
+            .map(|(state, _, _)| state.clone())
+    }
+
+    /// The window a desktop request should reuse: the one `is_active` picks,
+    /// else the most recently opened.
+    pub fn active(
+        &self,
+        is_active: impl Fn(&U) -> bool,
+    ) -> Option<(std::rc::Rc<std::cell::RefCell<S>>, U)> {
+        self.entries
+            .iter()
+            .find(|(_, ui, _)| is_active(ui))
+            .or_else(|| self.entries.last())
+            .map(|(state, ui, _)| (state.clone(), ui.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2185,5 +2249,42 @@ mod tests {
         assert_eq!(fs::read_to_string(extracted).unwrap(), "archive payload");
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn window_registry_keeps_windows_apart_d19() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        struct S(&'static str);
+        let dropped = Rc::new(Cell::new(0));
+        struct Hold(Rc<Cell<i32>>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let (a, b) = (Rc::new(RefCell::new(S("a"))), Rc::new(RefCell::new(S("b"))));
+        let mut reg: WindowRegistry<S, &'static str, Hold> = WindowRegistry::default();
+        reg.register(&a, "ui-a", Hold(dropped.clone()));
+        reg.register(&b, "ui-b", Hold(dropped.clone()));
+        // no aliasing: each state finds only its own ui and back
+        assert_eq!(reg.ui_for_state(&a), Some("ui-a"));
+        assert_eq!(reg.ui_for_state(&b), Some("ui-b"));
+        assert!(Rc::ptr_eq(&reg.state_for_ui(|u| *u == "ui-a").unwrap(), &a));
+        assert_eq!(reg.state_for_ui(|u| *u == "ui-b").unwrap().borrow().0, "b");
+        // active: the active one, else the newest
+        assert_eq!(reg.active(|u| *u == "ui-a").unwrap().1, "ui-a");
+        assert_eq!(reg.active(|_| false).unwrap().1, "ui-b");
+        // closing a releases only a's hold; b stays registered and alive
+        drop(reg.unregister(&a));
+        assert_eq!((reg.len(), dropped.get()), (1, 1));
+        assert_eq!(reg.ui_for_state(&a), None);
+        assert_eq!(reg.ui_for_state(&b), Some("ui-b"));
+        assert!(reg.unregister(&a).is_none(), "closing twice releases nothing more");
+        assert_eq!(dropped.get(), 1);
+        // last close empties it
+        drop(reg.unregister(&b));
+        assert_eq!((reg.len(), dropped.get()), (0, 2));
+        assert!(reg.active(|_| true).is_none());
     }
 }
