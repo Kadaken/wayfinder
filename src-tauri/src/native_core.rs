@@ -1039,6 +1039,121 @@ pub fn resolve_paste(
     is_copy: bool,
     on_conflict: PasteConflict,
 ) -> Result<Vec<ResolvedItem>, String> {
+    resolve_paste_with(srcs, dest_dir, is_copy, on_conflict, &|_| Ok(()))
+}
+
+/// A unique, not-yet-existing sibling name in `dir` for internal staging or backup.
+fn internal_sibling(dir: &Path, kind: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = dir.join(format!(".wf-replace-{kind}-{}-{n}", std::process::id()));
+        if fs::symlink_metadata(&path).is_err() {
+            return path;
+        }
+    }
+}
+
+fn remove_any(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path).map_err(|e| e.to_string()),
+        Ok(_) => fs::remove_file(path).map_err(|e| e.to_string()),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Replaces `target` with `src` without ever leaving the target missing on
+/// failure. The incoming object is prepared beside the target and checked
+/// against the source fingerprint; the old target is then moved to a unique
+/// backup, the replacement is placed, and the backup is deleted only at the end.
+/// Any error after the backup exists restores the old target. `step` is a test
+/// seam that is called at "prepare", "backup", "place" and "remove_source".
+/// Not crash-atomic: two renames are involved. A cross-device MOVE that fails
+/// while deleting its source can leave that source partly deleted.
+fn replace_target(
+    src: &str,
+    target: &Path,
+    is_copy: bool,
+    step: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = target.parent().ok_or("bad target")?;
+    let src_fp = fingerprint(src)?;
+    let rename_move = !is_copy
+        && fs::symlink_metadata(src).map_err(|e| e.to_string())?.dev()
+            == fs::metadata(dir).map_err(|e| e.to_string())?.dev();
+
+    let stage = internal_sibling(dir, "new");
+    let backup = internal_sibling(dir, "old");
+    let stage_str = stage.to_string_lossy().to_string();
+    let cleanup_stage = || {
+        let _ = remove_any(&stage);
+    };
+
+    // Prepare: nothing live is touched.
+    if !rename_move {
+        let prepared = run_cmd_capture("cp", &["-a", "-T", "--", src, &stage_str]).map(|_| ());
+        let prepared = prepared.and_then(|_| {
+            if fingerprint(&stage_str)? == src_fp {
+                Ok(())
+            } else {
+                Err("the prepared copy does not match its source".to_string())
+            }
+        });
+        if let Err(err) = prepared {
+            cleanup_stage();
+            return Err(err);
+        }
+    }
+    if let Err(err) = step("prepare") {
+        cleanup_stage();
+        return Err(err);
+    }
+
+    // Commit: old target aside, replacement in, backup gone.
+    if let Err(err) = step("backup").and_then(|_| fs::rename(target, &backup).map_err(|e| e.to_string())) {
+        cleanup_stage();
+        return Err(err);
+    }
+    let mut placed = false;
+    let committed = (|| -> Result<(), String> {
+        step("place")?;
+        if rename_move {
+            fs::rename(src, target).map_err(|e| e.to_string())?;
+        } else {
+            fs::rename(&stage, target).map_err(|e| e.to_string())?;
+        }
+        placed = true;
+        if !is_copy && !rename_move {
+            step("remove_source")?;
+            remove_any(Path::new(src))?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = committed {
+        if placed && rename_move {
+            // The source moved into place; put it back before restoring the target.
+            let _ = fs::rename(target, src);
+        } else if placed {
+            let _ = remove_any(target);
+        }
+        cleanup_stage();
+        return match fs::rename(&backup, target) {
+            Ok(()) => Err(err),
+            Err(restore) => Err(format!("{err}; could not restore the old item ({restore}): {}", backup.display())),
+        };
+    }
+    cleanup_stage();
+    remove_any(&backup).map_err(|e| format!("replaced, but could not remove the old item: {e}"))
+}
+
+pub fn resolve_paste_with(
+    srcs: &[String],
+    dest_dir: &str,
+    is_copy: bool,
+    on_conflict: PasteConflict,
+    step: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<Vec<ResolvedItem>, String> {
     if !Path::new(dest_dir).is_dir() {
         return Err(format!("not a folder: {dest_dir}"));
     }
@@ -1063,18 +1178,17 @@ pub fn resolve_paste(
             match on_conflict {
                 PasteConflict::KeepBoth => unique_target(dest_dir, name),
                 PasteConflict::Replace => {
-                    // Pasting a folder onto an existing folder cannot merge with
-                    // `cp -T`, and overwriting in place would leave stale
-                    // children behind, so clear the target first.
+                    // A folder cannot merge with `cp -T`, and overwriting in place
+                    // would leave stale children, so the target is swapped whole.
                     if same_path {
                         continue;
                     }
-                    if target.is_dir() {
-                        fs::remove_dir_all(&target).map_err(|err| err.to_string())?;
-                    } else {
-                        fs::remove_file(&target).map_err(|err| err.to_string())?;
-                    }
-                    target
+                    replace_target(src, &target, is_copy, step)?;
+                    out.push(ResolvedItem {
+                        from: src.clone(),
+                        to: target.to_string_lossy().to_string(),
+                    });
+                    continue;
                 }
             }
         } else {
@@ -1788,6 +1902,94 @@ mod tests {
             is_image: false,
             icon: "file".into(),
             metadata_error: None,
+        }
+    }
+
+    /// Fixture: `dest/item` (old) and `src/item` (incoming), as a file or a tree.
+    fn replace_fixture(root: &Path, tree: bool) -> (String, String, String) {
+        let (src_dir, dest_dir) = (root.join("src"), root.join("dest"));
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let (src, old) = (src_dir.join("item"), dest_dir.join("item"));
+        if tree {
+            for (base, tag) in [(&src, "new"), (&old, "old")] {
+                fs::create_dir_all(base.join("sub")).unwrap();
+                fs::write(base.join("sub/file.txt"), format!("{tag} deep")).unwrap();
+                fs::write(base.join(format!("{tag}-only.txt")), tag).unwrap();
+            }
+        } else {
+            fs::write(&src, b"new bytes").unwrap();
+            fs::write(&old, b"old bytes").unwrap();
+        }
+        (
+            src.to_string_lossy().to_string(),
+            dest_dir.to_string_lossy().to_string(),
+            old.to_string_lossy().to_string(),
+        )
+    }
+
+    fn names_in(dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn replace_failures_keep_old_destination_and_source_and_leave_no_residue_d23() {
+        for tree in [false, true] {
+            for is_copy in [true, false] {
+                for fail_at in ["prepare", "backup", "place"] {
+                    let root = scratch_case("wf-d23-fail");
+                    let (src, dest_dir, old) = replace_fixture(&root, tree);
+                    let src_before = fingerprint(&src).unwrap();
+                    let old_before = fingerprint(&old).unwrap();
+                    let step = |name: &str| {
+                        if name == fail_at { Err(format!("injected failure at {name}")) } else { Ok(()) }
+                    };
+                    let result = resolve_paste_with(&[src.clone()], &dest_dir, is_copy, PasteConflict::Replace, &step);
+                    // Cross-device MOVE source removal ("remove_source") is not
+                    // reachable on one filesystem: untested here, carried to D-24.
+                    assert!(result.is_err(), "tree={tree} copy={is_copy} at {fail_at}: {result:?}");
+                    assert_eq!(fingerprint(&old).unwrap(), old_before, "old destination intact: tree={tree} copy={is_copy} {fail_at}");
+                    assert_eq!(fingerprint(&src).unwrap(), src_before, "source intact: tree={tree} copy={is_copy} {fail_at}");
+                    assert_eq!(names_in(&dest_dir), vec!["item".to_string()], "no residue: {fail_at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replace_preparation_failure_leaves_old_destination_untouched_d23() {
+        for tree in [false, true] {
+            let root = scratch_case("wf-d23-prep");
+            let (src, dest_dir, old) = replace_fixture(&root, tree);
+            let old_before = fingerprint(&old).unwrap();
+            let missing = format!("{src}-missing");
+            assert!(resolve_paste(&[missing], &dest_dir, true, PasteConflict::Replace).is_err());
+            assert_eq!(fingerprint(&old).unwrap(), old_before);
+            assert_eq!(names_in(&dest_dir), vec!["item".to_string()]);
+        }
+    }
+
+    #[test]
+    fn replace_success_gives_exact_new_object_and_right_source_presence_d23() {
+        for tree in [false, true] {
+            for is_copy in [true, false] {
+                let root = scratch_case("wf-d23-ok");
+                let (src, dest_dir, old) = replace_fixture(&root, tree);
+                let snapshot = snapshot_sources(&[src.clone()]).unwrap();
+                let items = resolve_paste(&[src.clone()], &dest_dir, is_copy, PasteConflict::Replace).unwrap();
+                verify_transfer(&snapshot, &items, is_copy).unwrap();
+                assert_eq!(fingerprint(&old).unwrap(), snapshot[0].fp);
+                assert_eq!(Path::new(&src).exists(), is_copy);
+                if tree {
+                    assert!(!Path::new(&old).join("old-only.txt").exists(), "no stale children");
+                }
+                assert_eq!(names_in(&dest_dir), vec!["item".to_string()], "no stage or backup left");
+            }
         }
     }
 
