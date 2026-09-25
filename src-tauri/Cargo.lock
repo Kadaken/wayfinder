@@ -690,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "gdk-pixbuf",
  "libadwaita",
+ "libc",
  "serde",
  "serde_json",
 ]

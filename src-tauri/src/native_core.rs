@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const IMG_EXT: [&str; 12] = [
@@ -176,19 +176,6 @@ fn percent_decode(value: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-fn percent_encode_segment(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                (byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
 }
 
 pub fn list_dir_cancellable(
@@ -923,64 +910,176 @@ pub fn trash_paths(paths: &[String]) -> Result<(), String> {
 
 pub fn restore_from_trash(paths: &[String]) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
-    let info_dir = format!("{}/.local/share/Trash/info", home);
-
+    let trash = Path::new(&home).join(".local/share/Trash");
     for original in paths {
-        if let Some(idx) = original.find("/Trash/files/") {
-            let name = &original[idx + "/Trash/files/".len()..];
-            if !name.is_empty() && !name.contains('/') {
-                let uri = format!("trash:///{}", percent_encode_segment(name));
-                run_cmd("gio", &["trash", "--restore", &uri])?;
-                continue;
-            }
+        restore_from_trash_in(&trash, original)?;
+    }
+    Ok(())
+}
+
+struct TrashEntry {
+    info: PathBuf,
+    payload: PathBuf,
+    destination: PathBuf,
+}
+
+fn parse_trashinfo(content: &str) -> Option<(String, String)> {
+    let mut original = None;
+    let mut date = String::new();
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("Path=") {
+            original = Some(percent_decode(value.trim()));
+        } else if let Some(value) = line.strip_prefix("DeletionDate=") {
+            date = value.trim().to_string();
         }
+    }
+    original.map(|path| (path, date))
+}
 
-        let mut best: Option<(String, String)> = None;
-        if let Ok(entries) = fs::read_dir(&info_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("trashinfo") {
-                    continue;
-                }
-                let content = match fs::read_to_string(&path) {
-                    Ok(content) => content,
-                    Err(_) => continue,
-                };
-
-                let mut original_path = None;
-                let mut deletion_date = String::new();
-                for line in content.lines() {
-                    if let Some(value) = line.strip_prefix("Path=") {
-                        original_path = Some(percent_decode(value.trim()));
-                    } else if let Some(value) = line.strip_prefix("DeletionDate=") {
-                        deletion_date = value.trim().to_string();
+/// Resolves the selector (an original path, or a direct child of this Trash's
+/// `files/` directory) to the on-disk payload, its `.trashinfo` and the exact
+/// decoded destination. Everything resolved stays inside `trash`.
+fn resolve_trash_entry(trash: &Path, selector: &str) -> Result<TrashEntry, String> {
+    let info_dir = trash.join("info");
+    let files_dir = trash.join("files");
+    let selected = Path::new(selector);
+    let explicit = match (selected.parent(), selected.file_name()) {
+        (Some(parent), Some(name)) if parent == files_dir => name.to_str().map(str::to_string),
+        _ => None,
+    };
+    let stem = match explicit {
+        Some(stem) => stem,
+        None => {
+            let mut best: Option<(String, String)> = None;
+            if let Ok(entries) = fs::read_dir(&info_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("trashinfo") {
+                        continue;
                     }
-                }
-
-                if original_path.as_deref() == Some(original.as_str()) {
-                    let name = path
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if best
-                        .as_ref()
-                        .map(|(_, date)| deletion_date > *date)
-                        .unwrap_or(true)
+                    let Some((original, date)) = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|content| parse_trashinfo(&content))
+                    else {
+                        continue;
+                    };
+                    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                        continue;
+                    };
+                    if original == selector
+                        && best.as_ref().map(|(_, d)| date > *d).unwrap_or(true)
                     {
-                        best = Some((name, deletion_date));
+                        best = Some((stem.to_string(), date));
                     }
                 }
             }
-        }
-
-        match best {
-            Some((name, _)) => {
-                let uri = format!("trash:///{}", percent_encode_segment(&name));
-                run_cmd("gio", &["trash", "--restore", &uri])?;
+            match best {
+                Some((stem, _)) => stem,
+                None => return Err(format!("not found in trash: {selector}")),
             }
-            None => return Err(format!("not found in trash: {original}")),
         }
+    };
+    let info = info_dir.join(format!("{stem}.trashinfo"));
+    match fs::symlink_metadata(&info) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "trash metadata is not a regular file: {}",
+                info.display()
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("not found in trash: {selector}"))
+        }
+        Err(err) => return Err(format!("cannot read trash metadata {}: {err}", info.display())),
+    }
+    let content = fs::read_to_string(&info)
+        .map_err(|err| format!("cannot read trash metadata {}: {err}", info.display()))?;
+    let Some((original, _)) = parse_trashinfo(&content) else {
+        return Err(format!("malformed trash metadata: {}", info.display()));
+    };
+    if !original.starts_with('/') {
+        return Err(format!(
+            "malformed trash metadata (Path is not absolute): {}",
+            info.display()
+        ));
+    }
+    let payload = files_dir.join(&stem);
+    if fs::symlink_metadata(&payload).is_err() {
+        return Err(format!("trash payload missing: {}", payload.display()));
+    }
+    Ok(TrashEntry {
+        info,
+        payload,
+        destination: PathBuf::from(original),
+    })
+}
+
+/// Moves `from` to `to` without ever replacing an existing file, directory or
+/// dangling symlink at `to` (one atomic kernel call, no exists-then-rename race).
+fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("path contains a NUL byte: {}", path.display()))
+    };
+    let (from_c, to_c) = (c(from)?, c(to)?);
+    // SAFETY: both C strings are NUL-terminated and stay alive for the whole call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Err(format!("already exists: {}", to.display()))
+    } else {
+        Err(format!("{}: {err}", to.display()))
+    }
+}
+
+fn restore_from_trash_in(trash: &Path, selector: &str) -> Result<(), String> {
+    restore_with(trash, selector, &|info| fs::remove_file(info))
+}
+
+/// The one restore implementation; `remove_info` is injectable only so tests can
+/// force the metadata-removal failure that triggers the rollback.
+fn restore_with(
+    trash: &Path,
+    selector: &str,
+    remove_info: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let entry = resolve_trash_entry(trash, selector)?;
+    let parent = entry
+        .destination
+        .parent()
+        .ok_or_else(|| format!("no destination folder: {}", entry.destination.display()))?;
+    if !parent.is_dir() {
+        return Err(format!("destination folder is missing: {}", parent.display()));
+    }
+    rename_no_replace(&entry.payload, &entry.destination)
+        .map_err(|err| format!("cannot restore from trash: {err}"))?;
+    if let Err(err) = remove_info(&entry.info) {
+        return match rename_no_replace(&entry.destination, &entry.payload) {
+            Ok(()) => Err(format!(
+                "could not remove {}: {err}; item left in trash at {}",
+                entry.info.display(),
+                entry.payload.display()
+            )),
+            Err(back) => Err(format!(
+                "could not remove {}: {err}; could not move back ({back}); the item is at {} and the trash path {} is occupied",
+                entry.info.display(),
+                entry.destination.display(),
+                entry.payload.display()
+            )),
+        };
     }
     Ok(())
 }
@@ -1907,22 +2006,6 @@ fn whole_disk_of(device: &str) -> String {
     device.to_string()
 }
 
-fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
-    Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| err.to_string())
-        .and_then(|status| {
-            status
-                .success()
-                .then_some(())
-                .ok_or_else(|| format!("{cmd} failed"))
-        })
-}
-
 fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<(), String> {
     let output = Command::new(cmd)
         .args(args)
@@ -2828,6 +2911,190 @@ mod tests {
 
     fn test_dir(name: &str) -> ScratchCase {
         scratch_case(&format!("wayfinder-native-{name}"))
+    }
+
+    /// Builds a real on-disk trash entry (files/ + info/) and returns its trash dir.
+    fn trash_entry(root: &Path, stem: &str, original: &Path, date: &str, body: &[u8]) {
+        let trash = root.join("Trash");
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::write(trash.join("files").join(stem), body).unwrap();
+        let encoded: String = original
+            .to_string_lossy()
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        fs::write(
+            trash.join("info").join(format!("{stem}.trashinfo")),
+            format!("[Trash Info]\nPath={encoded}\nDeletionDate={date}\n"),
+        )
+        .unwrap();
+    }
+
+    fn trash_left(root: &Path) -> usize {
+        let count = |sub: &str| fs::read_dir(root.join("Trash").join(sub)).unwrap().count();
+        count("files") + count("info")
+    }
+
+    #[test]
+    fn restore_from_trash_repeats_for_spaced_percent_name_without_daemon() {
+        let root = test_dir("restore-repeat");
+        let dest = root.join("F");
+        fs::create_dir_all(&dest).unwrap();
+        let original = dest.join("wf 50% fixture.txt");
+        for round in 0..3 {
+            let body = format!("body {round}");
+            trash_entry(&root, "wf 50% fixture.txt", &original, "2026-01-01T00:00:00", body.as_bytes());
+            restore_from_trash_in(&root.join("Trash"), original.to_str().unwrap()).unwrap();
+            assert_eq!(fs::read_to_string(&original).unwrap(), body);
+            assert_eq!(trash_left(&root), 0);
+            fs::remove_file(&original).unwrap();
+        }
+        // newest exact match is chosen; the older entry stays untouched
+        trash_entry(&root, "a", &original, "2026-01-01T00:00:00", b"old");
+        trash_entry(&root, "a_2", &original, "2026-02-01T00:00:00", b"new");
+        restore_from_trash_in(&root.join("Trash"), original.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"new");
+        assert!(root.join("Trash/files/a").exists() && root.join("Trash/info/a.trashinfo").exists());
+        assert_eq!(trash_left(&root), 2);
+        // explicit Trash/files/<name> form uses the same resolver
+        fs::remove_file(&original).unwrap();
+        let explicit = format!("{}/Trash/files/a", root.display());
+        restore_from_trash_in(&root.join("Trash"), &explicit).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"old");
+        assert_eq!(trash_left(&root), 0);
+    }
+
+    #[test]
+    fn restore_from_trash_restores_directory_with_nested_file() {
+        let root = test_dir("restore-dir");
+        let dest = root.join("F");
+        fs::create_dir_all(&dest).unwrap();
+        let original = dest.join("folder");
+        trash_entry(&root, "folder", &original, "2026-01-01T00:00:00", b"");
+        let payload = root.join("Trash/files/folder");
+        fs::remove_file(&payload).unwrap();
+        fs::create_dir_all(payload.join("sub")).unwrap();
+        fs::write(payload.join("sub/n.txt"), b"nested").unwrap();
+        restore_from_trash_in(&root.join("Trash"), original.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(original.join("sub/n.txt")).unwrap(), b"nested");
+        assert_eq!(trash_left(&root), 0);
+    }
+
+    #[test]
+    fn restore_from_trash_never_overwrites_and_reports_bad_metadata() {
+        let root = test_dir("restore-refuse");
+        let dest = root.join("F");
+        fs::create_dir_all(&dest).unwrap();
+        let trash = root.join("Trash");
+        let original = dest.join("x.txt");
+
+        trash_entry(&root, "x.txt", &original, "2026-01-01T00:00:00", b"trashed");
+        fs::write(&original, b"existing").unwrap();
+        let err = restore_from_trash_in(&trash, original.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(fs::read(&original).unwrap(), b"existing");
+        assert_eq!(trash_left(&root), 2);
+        fs::remove_file(&original).unwrap();
+
+        std::os::unix::fs::symlink(dest.join("nowhere"), &original).unwrap();
+        let err = restore_from_trash_in(&trash, original.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(fs::symlink_metadata(&original).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(trash.join("files/x.txt")).unwrap(), b"trashed");
+        fs::remove_file(&original).unwrap();
+
+        let err = restore_from_trash_in(&trash, dest.join("absent").to_str().unwrap()).unwrap_err();
+        assert_eq!(err, format!("not found in trash: {}/absent", dest.display()));
+
+        fs::write(trash.join("info/bad.trashinfo"), "[Trash Info]\nDeletionDate=x\n").unwrap();
+        fs::write(trash.join("files/bad"), b"b").unwrap();
+        let sel = format!("{}/files/bad", trash.display());
+        let err = restore_from_trash_in(&trash, &sel).unwrap_err();
+        assert!(err.starts_with("malformed trash metadata"), "{err}");
+
+        fs::remove_file(trash.join("files/x.txt")).unwrap();
+        let err = restore_from_trash_in(&trash, original.to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("trash payload missing"), "{err}");
+
+        let gone = dest.join("gone-dir/y.txt");
+        trash_entry(&root, "y.txt", &gone, "2026-01-01T00:00:00", b"y");
+        let err = restore_from_trash_in(&trash, gone.to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("destination folder is missing"), "{err}");
+        assert!(trash.join("files/y.txt").exists() && trash.join("info/y.txt.trashinfo").exists());
+        assert!(trash.join("files/bad").exists());
+    }
+
+    #[test]
+    fn restore_from_trash_selector_is_confined_to_this_trash() {
+        let root = test_dir("restore-confine");
+        let dest = root.join("F");
+        fs::create_dir_all(&dest).unwrap();
+        let trash = root.join("Trash");
+        let original = dest.join("c.txt");
+        trash_entry(&root, "c.txt", &original, "2026-01-01T00:00:00", b"c");
+        // a lookalike Trash elsewhere, a nested path and dot names are not selectors
+        let lookalike = root.join("Other/Trash/files/c.txt");
+        for sel in [
+            lookalike.to_str().unwrap().to_string(),
+            format!("{}/files/sub/c.txt", trash.display()),
+            format!("{}/files/..", trash.display()),
+            format!("{}/files/.", trash.display()),
+            format!("{}/files/../info/c.txt", trash.display()),
+        ] {
+            let err = restore_from_trash_in(&trash, &sel).unwrap_err();
+            assert!(err.starts_with("not found in trash"), "{sel}: {err}");
+        }
+        assert_eq!(trash_left(&root), 2);
+        // a symlinked .trashinfo is refused
+        fs::rename(trash.join("info/c.txt.trashinfo"), root.join("real.info")).unwrap();
+        std::os::unix::fs::symlink(root.join("real.info"), trash.join("info/c.txt.trashinfo")).unwrap();
+        let sel = format!("{}/files/c.txt", trash.display());
+        let err = restore_from_trash_in(&trash, &sel).unwrap_err();
+        assert!(err.starts_with("trash metadata is not a regular file"), "{err}");
+        assert!(!original.exists() && trash.join("files/c.txt").exists());
+    }
+
+    #[test]
+    fn restore_from_trash_rolls_back_when_metadata_removal_fails() {
+        let root = test_dir("restore-rollback");
+        let dest = root.join("F");
+        fs::create_dir_all(&dest).unwrap();
+        let trash = root.join("Trash");
+        let original = dest.join("r.txt");
+        trash_entry(&root, "r.txt", &original, "2026-01-01T00:00:00", b"payload");
+        let info = trash.join("info/r.txt.trashinfo");
+        let payload = trash.join("files/r.txt");
+
+        let fail = |_: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "injected"))
+        };
+        let err = restore_with(&trash, original.to_str().unwrap(), &fail).unwrap_err();
+        assert!(err.contains("injected") && err.contains("item left in trash at"), "{err}");
+        assert!(err.contains(payload.to_str().unwrap()), "{err}");
+        assert!(!original.exists());
+        assert_eq!(fs::read(&payload).unwrap(), b"payload");
+        assert!(info.exists());
+
+        // rollback itself collides: the payload path is re-occupied during removal
+        let occupied = payload.clone();
+        let fail_and_occupy = move |_: &Path| -> std::io::Result<()> {
+            fs::write(&occupied, b"intruder")?;
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "injected"))
+        };
+        let err = restore_with(&trash, original.to_str().unwrap(), &fail_and_occupy).unwrap_err();
+        assert!(err.contains("could not move back"), "{err}");
+        assert!(err.contains(original.to_str().unwrap()), "{err}");
+        assert!(err.contains(payload.to_str().unwrap()), "{err}");
+        assert_eq!(fs::read(&original).unwrap(), b"payload");
+        assert_eq!(fs::read(&payload).unwrap(), b"intruder");
+        assert!(info.exists());
     }
 
     #[test]
