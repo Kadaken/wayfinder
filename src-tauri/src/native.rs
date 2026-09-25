@@ -1055,6 +1055,8 @@ fn remove_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
 #[derive(Clone)]
 struct AppState {
     inline_rename: Option<InlineRename>,
+    /// A path to select and scroll to once the next listing is on screen.
+    reveal_path: Option<String>,
     /// Last plain click on a Name label: path and when, for slow-second-click.
     last_name_click: Option<(String, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
@@ -1380,6 +1382,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         .unwrap_or_else(|| "/".to_string());
     let state = Rc::new(RefCell::new(AppState {
         inline_rename: None,
+        reveal_path: None,
         last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: initial_cwd.clone(),
@@ -1918,6 +1921,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     );
     connect_list_factory(&list_factory, &state, &ui);
     connect_background_context(&ui.list, state.clone(), ui.clone());
+    connect_grid_background_context(&grid_scroll, state.clone(), ui.clone());
     connect_actions(
         &state,
         &ui,
@@ -4016,6 +4020,12 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
 /// Re-binds one row (after an inline edit starts or is cancelled) and keeps it
 /// selected; a ListStore change on a position drops that row's selection.
 fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+    if state.borrow().view_mode == ViewMode::Grid {
+        // Grid has no row model: rebuild its children and re-select the item.
+        repopulate_rows(state, ui);
+        select_entry_by_path(state, ui, path);
+        return;
+    }
     let Some(entry) = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned() else {
         return;
     };
@@ -4527,6 +4537,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // virtualized ListView above and must not walk the whole listing here.
     // NOTE: Grid remains un-virtualized, so a huge folder is still slow in Icons view.
     if view_mode != ViewMode::Grid {
+        apply_pending_reveal(state, ui);
         return;
     }
 
@@ -4558,7 +4569,22 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 .build();
             name.add_css_class("wf-grid-name");
             grid_item.append(&icon);
-            grid_item.append(&name);
+            let editing = state
+                .borrow()
+                .inline_rename
+                .as_ref()
+                .filter(|edit| edit.path == entry.path)
+                .cloned();
+            match editing {
+                Some(edit) => {
+                    let field = build_inline_editor(state, ui, &entry, &edit);
+                    field.set_width_chars(12);
+                    field.set_max_width_chars(12);
+                    field.set_hexpand(false);
+                    grid_item.append(&field);
+                }
+                None => grid_item.append(&name),
+            }
             grid_child.set_child(Some(&grid_item));
             connect_file_drag(&grid_child, state.clone(), ui.clone(), entry.path.clone(), None);
             if entry.is_dir {
@@ -4583,6 +4609,33 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     if let Some(queue) = thumbnail_queue {
         start_thumbnail_jobs(queue);
     }
+    apply_pending_reveal(state, ui);
+}
+
+/// Selects and scrolls to a just-created path once its row exists. Focus is left
+/// to the inline editor, which claims it itself.
+fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let Some(path) = state.borrow_mut().reveal_path.take() else {
+        return;
+    };
+    let index = state.borrow().visible_entries.iter().position(|e| e.path == path);
+    let Some(index) = index else {
+        return;
+    };
+    let view_mode = state.borrow().view_mode;
+    match view_mode {
+        ViewMode::Grid => {
+            ui.grid.unselect_all();
+            if let Some(child) = ui.grid.child_at_index(index as i32) {
+                ui.grid.select_child(&child);
+            }
+        }
+        ViewMode::Details | ViewMode::Compact => {
+            ui.list_selection.select_item(index as u32, true);
+            ui.list.scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
+        }
+    }
+    update_selection(state, ui);
 }
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, ascending: bool) {
@@ -5089,7 +5142,10 @@ fn typeahead_select(state: &Rc<RefCell<AppState>>, ui: &Ui, ch: char) {
 }
 
 fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
-    match state.borrow().view_mode {
+    // Copy the mode out: grabbing focus below can run editor handlers that
+    // borrow the state again.
+    let view_mode = state.borrow().view_mode;
+    match view_mode {
         ViewMode::Grid => {
             ui.grid.unselect_all();
             if let Some(child) = ui.grid.child_at_index(index as i32) {
@@ -5135,27 +5191,36 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
     }
 }
 
+/// The one New Folder path (background menu, toolbar, options menu, Ctrl+Shift+N):
+/// create a real numbered folder, then open the shared inline editor on it with
+/// the whole name selected. Nothing is shown or recorded unless the folder exists.
 fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.clone();
-    let ui_for_action = ui.clone();
-    show_name_dialog(&ui, "New folder", "New Folder", NameSelection::All, move |name| {
-        let state = state.clone();
-        let ui = ui_for_action.clone();
-        let cwd = cwd.clone();
-        run_job(
-            state,
-            ui,
-            format!("Creating folder {name}"),
-            move || {
-                let path = native_core::make_dir(&cwd, &name)?;
-                Ok(JobOutcome::undo(
-                    format!("Created {path}"),
-                    UndoAction::Created { paths: vec![path] },
-                ))
-            },
-            |_, _, _| {},
-        );
-    });
+    run_job(
+        state,
+        ui,
+        "Creating folder".to_string(),
+        move || {
+            let path = native_core::make_numbered_dir(&cwd, "New Folder")?;
+            Ok(JobOutcome::undo(
+                format!("Created {path}"),
+                UndoAction::Created { paths: vec![path] },
+            ))
+        },
+        |state, _, outcome| {
+            if let Some(UndoAction::Created { paths }) = &outcome.undo {
+                if let Some(path) = paths.first() {
+                    let name = Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let mut st = state.borrow_mut();
+                    st.inline_rename = Some(InlineRename::new(path, &name));
+                    st.reveal_path = Some(path.clone());
+                }
+            }
+        },
+    );
 }
 
 fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -6412,6 +6477,31 @@ fn connect_background_context(list: &gtk::ListView, state: Rc<RefCell<AppState>>
     list.add_controller(click);
 }
 
+/// Grid has no per-item menu yet; a right-click on empty file-pane space (the
+/// scroller, or the grid between its items) opens the same background menu.
+fn connect_grid_background_context(
+    scroll: &gtk::ScrolledWindow,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let scroll_for_click = scroll.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        let on_item = scroll_for_click
+            .pick(x, y, gtk::PickFlags::DEFAULT)
+            .is_some_and(|w| w.ancestor(gtk::FlowBoxChild::static_type()).is_some());
+        if on_item {
+            return;
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        ui.grid.unselect_all();
+        update_selection(&state, &ui);
+        show_background_context_menu(&scroll_for_click, state.clone(), ui.clone(), x, y);
+    });
+    scroll.add_controller(click);
+}
+
 fn connect_drive_context(
     row: &gtk::ListBoxRow,
     state: Rc<RefCell<AppState>>,
@@ -6750,18 +6840,27 @@ fn show_background_context_menu(
     menu.set_margin_start(4);
 
     {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("folder-new-symbolic", "New Folder", "Ctrl+Shift+N", &popover, move || {
-            create_folder_action(state.clone(), ui.clone())
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("document-new-symbolic", "New File", "", &popover, move || {
-            create_file_action(state.clone(), ui.clone())
-        }));
+        let (folder_state, folder_ui) = (state.clone(), ui.clone());
+        let (file_state, file_ui) = (state.clone(), ui.clone());
+        menu.append(&context_submenu(
+            "document-new-symbolic",
+            "New",
+            &popover,
+            vec![
+                (
+                    "folder-new-symbolic",
+                    "Folder",
+                    "Ctrl+Shift+N",
+                    Rc::new(move || create_folder_action(folder_state.clone(), folder_ui.clone())),
+                ),
+                (
+                    "document-new-symbolic",
+                    "File",
+                    "",
+                    Rc::new(move || create_file_action(file_state.clone(), file_ui.clone())),
+                ),
+            ],
+        ));
     }
     {
         let state = state.clone();
@@ -6830,16 +6929,7 @@ where
 /// Two details that make it read as a menu rather than a stack of buttons:
 /// a plain `Button::with_label` CENTRES its text, and the icon slot is reserved
 /// even when a row has no icon, so every label starts on the same left edge.
-fn context_item<F>(
-    icon: &str,
-    label: &str,
-    accel: &str,
-    popover: &gtk::Popover,
-    action: F,
-) -> gtk::Button
-where
-    F: Fn() + 'static,
-{
+fn menu_row(icon: &str, label: &str, accel: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
 
     let image = gtk::Image::new();
@@ -6864,7 +6954,20 @@ where
         hint.add_css_class("wf-menu-accel");
         row.append(&hint);
     }
+    row
+}
 
+fn context_item<F>(
+    icon: &str,
+    label: &str,
+    accel: &str,
+    popover: &gtk::Popover,
+    action: F,
+) -> gtk::Button
+where
+    F: Fn() + 'static,
+{
+    let row = menu_row(icon, label, accel);
     let button = gtk::Button::builder()
         .child(&row)
         .halign(gtk::Align::Fill)
@@ -6875,6 +6978,50 @@ where
     button.connect_clicked(move |_| {
         popover.popdown();
         action();
+    });
+    button
+}
+
+/// A menu row that opens a second popover to its right (Explorer's `New >`).
+/// Choosing an entry closes both popovers, then runs the action.
+fn context_submenu(
+    icon: &str,
+    label: &str,
+    popover: &gtk::Popover,
+    items: Vec<(&'static str, &'static str, &'static str, Rc<dyn Fn()>)>,
+) -> gtk::Button {
+    let row = menu_row(icon, label, "");
+    let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+    arrow.set_pixel_size(12);
+    row.append(&arrow);
+    let button = gtk::Button::builder().child(&row).halign(gtk::Align::Fill).build();
+    button.add_css_class("flat");
+    button.add_css_class("wf-menu-item");
+    let parent = popover.clone();
+    button.connect_clicked(move |button| {
+        let side = gtk::Popover::new();
+        side.set_has_arrow(false);
+        side.set_position(gtk::PositionType::Right);
+        side.set_parent(button);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.set_margin_top(4);
+        menu.set_margin_end(4);
+        menu.set_margin_bottom(4);
+        menu.set_margin_start(4);
+        for (icon, label, accel, action) in &items {
+            let parent = parent.clone();
+            let action = action.clone();
+            menu.append(&context_item(icon, label, accel, &side, move || {
+                parent.popdown();
+                action();
+            }));
+        }
+        side.set_child(Some(&menu));
+        side.connect_closed(|side| {
+            let side = side.clone();
+            glib::idle_add_local_once(move || side.unparent());
+        });
+        side.popup();
     });
     button
 }
@@ -7935,6 +8082,242 @@ mod tests {
         inline_editor_click_away_never_writes_and_enter_writes_once();
         drag_ghost_builds_compact_translucent_item();
         emptied_folder_keeps_focus_on_the_view_root_d20();
+        new_folder_menu_and_shared_inline_editor_d21();
+    }
+
+    fn descendants(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        let mut child = root.first_child();
+        while let Some(c) = child {
+            out.push(c.clone());
+            descendants(&c, out);
+            child = c.next_sibling();
+        }
+    }
+
+    fn all_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = vec![root.clone()];
+        descendants(root, &mut out);
+        out
+    }
+
+    /// The button in `root`'s tree whose visible label is exactly `label`.
+    fn button_labelled(root: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+        all_widgets(root).into_iter().find_map(|w| {
+            let button = w.downcast_ref::<gtk::Button>()?;
+            let has = all_widgets(button.upcast_ref())
+                .iter()
+                .any(|c| c.downcast_ref::<gtk::Label>().is_some_and(|l| l.label() == label));
+            has.then(|| button.clone())
+        })
+    }
+
+    fn popovers_of(widget: &gtk::Widget) -> Vec<gtk::Popover> {
+        all_widgets(widget).into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).collect()
+    }
+
+    fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..80 {
+            if cond() {
+                return;
+            }
+            pump();
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn inline_field(root: &gtk::Widget) -> Option<gtk::Entry> {
+        all_widgets(root)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+            .find(|e| e.has_css_class("wf-file-name"))
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// D-21: New > Folder from the file-pane background (Details and Grid), the
+    /// toolbar, the options menu and Ctrl+Shift+N all reach one action, which
+    /// creates a real numbered folder and opens the shared inline editor on it.
+    fn new_folder_menu_and_shared_inline_editor_d21() {
+        let root = std::env::temp_dir().join(format!("wf-d21-{}", std::process::id()));
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("New Folder")).unwrap();
+        std::fs::write(dir.join("aaa.txt"), "a").unwrap();
+        std::fs::write(dir.join("taken"), "t").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d21test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        let win: gtk::Widget = ui.window.clone().upcast();
+        let created = |name: &str| dir.join(name);
+
+        // ---- Details: background menu, real traversal New -> Folder.
+        let undo_len = |s: &Rc<RefCell<AppState>>| s.borrow().undo_stack.len();
+        let undo_before = undo_len(&state);
+        show_background_context_menu(&ui.list, state.clone(), ui.clone(), 10.0, 10.0);
+        let menu_popover = popovers_of(ui.list.upcast_ref()).pop().expect("background popover");
+        assert!(button_labelled(menu_popover.upcast_ref(), "New Folder").is_none(), "no top-level New Folder row");
+        assert!(button_labelled(menu_popover.upcast_ref(), "Folder").is_none(), "Folder is inside New, not top level");
+        let new_row = button_labelled(menu_popover.upcast_ref(), "New").expect("a New row");
+        new_row.emit_clicked();
+        let side = popovers_of(new_row.upcast_ref()).pop().expect("New opens a submenu");
+        assert!(button_labelled(side.upcast_ref(), "File").is_some(), "New File lives under New");
+        button_labelled(side.upcast_ref(), "Folder").expect("Folder under New").emit_clicked();
+        wait_for("the folder on disk", || created("New Folder (2)").is_dir());
+        wait_for("the inline editor", || inline_field(ui.list.upcast_ref()).is_some());
+        let field = inline_field(ui.list.upcast_ref()).unwrap();
+        assert_eq!(field.text(), "New Folder (2)");
+        let full = created("New Folder (2)").to_string_lossy().to_string();
+        assert_eq!(state.borrow().inline_rename.as_ref().map(|e| e.path.clone()), Some(full.clone()));
+        assert_eq!(selected_paths(&state, &ui), vec![full.clone()], "the new folder is selected");
+        wait_for("full selection and focus", || {
+            field.selection_bounds() == Some((0, 14)) && focus_within(&ui.window, &field)
+        });
+        assert_eq!(undo_len(&state), undo_before + 1);
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Created { paths }) if paths == &vec![full.clone()]));
+
+        // Enter renames exactly once; a second Enter writes nothing more.
+        field.set_text("Renamed");
+        field.emit_activate();
+        field.emit_activate();
+        wait_for("rename", || created("Renamed").is_dir() && !created("New Folder (2)").exists());
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Renamed { .. })));
+        assert_eq!(undo_len(&state), undo_before + 2, "one Created and one Renamed, no double write");
+        wait_for("editor gone", || inline_field(ui.list.upcast_ref()).is_none());
+
+        // ---- Toolbar: same action; Escape keeps the generated folder.
+        let toolbar_button = |tip: &str| {
+            all_widgets(&win)
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.tooltip_text().as_deref() == Some(tip))
+                .unwrap_or_else(|| panic!("toolbar button {tip}"))
+        };
+        toolbar_button("New folder").emit_clicked();
+        wait_for("toolbar folder", || created("New Folder (2)").is_dir());
+        wait_for("toolbar editor", || inline_field(ui.list.upcast_ref()).is_some());
+        cancel_inline_rename(&state, &ui);
+        wait_for("editor closed", || inline_field(ui.list.upcast_ref()).is_none());
+        assert!(created("New Folder (2)").is_dir(), "cancelling leaves the created folder");
+        assert!(state.borrow().inline_rename.is_none());
+
+        // ---- Options menu: same action.
+        let options = toolbar_button("View and folder options");
+        options.emit_clicked();
+        let options_popover = popovers_of(options.upcast_ref()).pop().expect("options popover");
+        button_labelled(options_popover.upcast_ref(), "New Folder").expect("options New Folder").emit_clicked();
+        wait_for("options folder", || created("New Folder (3)").is_dir());
+        wait_for("options editor", || inline_field(ui.list.upcast_ref()).is_some());
+        cancel_inline_rename(&state, &ui);
+
+        // ---- Ctrl+Shift+N through the window's real key controller.
+        let handled = ui
+            .window
+            .observe_controllers()
+            .into_iter()
+            .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+            .any(|key| {
+                key.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[&gdk::Key::N, &0u32, &(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)],
+                )
+            });
+        assert!(handled, "Ctrl+Shift+N is handled");
+        wait_for("shortcut folder", || created("New Folder (4)").is_dir());
+        wait_for("shortcut editor", || inline_field(ui.list.upcast_ref()).is_some());
+
+        // A colliding rename stays open with its exact reason and changes nothing.
+        let field = inline_field(ui.list.upcast_ref()).unwrap();
+        field.set_text("taken");
+        field.emit_activate();
+        wait_for("collision error", || state.borrow().inline_rename.as_ref().is_some_and(|e| e.error.is_some()));
+        assert!(created("New Folder (4)").is_dir() && created("taken").is_file());
+        assert!(inline_field(ui.list.upcast_ref()).is_some(), "the editor stays open");
+        cancel_inline_rename(&state, &ui);
+
+        // ---- Grid: background menu on the grid surface, same editor and commit.
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        wait_for("grid children", || ui.grid.child_at_index(0).is_some());
+        let grid_scroll = ui.files_stack.child_by_name("grid").expect("grid scroller");
+        let secondary = all_widgets(&grid_scroll)[..1]
+            .iter()
+            .flat_map(|w| {
+                w.observe_controllers()
+                    .into_iter()
+                    .filter_map(|c| c.ok()?.downcast::<gtk::GestureClick>().ok())
+                    .filter(|g| g.button() == 3)
+                    .collect::<Vec<_>>()
+            })
+            .count();
+        assert_eq!(secondary, 1, "the grid surface has a right-click handler");
+        show_background_context_menu(&grid_scroll, state.clone(), ui.clone(), 10.0, 10.0);
+        let grid_menu = popovers_of(&grid_scroll).pop().expect("grid background popover");
+        let new_row = button_labelled(grid_menu.upcast_ref(), "New").expect("grid New row");
+        new_row.emit_clicked();
+        let side = popovers_of(new_row.upcast_ref()).pop().expect("grid submenu");
+        button_labelled(side.upcast_ref(), "Folder").expect("grid Folder").emit_clicked();
+        wait_for("grid folder", || created("New Folder (4)").is_dir() && dir_names(&dir).iter().any(|n| n == "New Folder (5)"));
+        wait_for("grid editor", || inline_field(ui.grid.upcast_ref()).is_some());
+        let field = inline_field(ui.grid.upcast_ref()).unwrap();
+        assert_eq!(field.text(), "New Folder (5)");
+        wait_for("grid selection", || {
+            field.selection_bounds() == Some((0, 14)) && focus_within(&ui.window, &field)
+        });
+        assert_eq!(selected_paths(&state, &ui), vec![created("New Folder (5)").to_string_lossy().to_string()]);
+        field.set_text("GridNamed");
+        field.emit_activate();
+        field.emit_activate();
+        wait_for("grid rename", || created("GridNamed").is_dir() && !created("New Folder (5)").exists());
+        wait_for("grid editor gone", || inline_field(ui.grid.upcast_ref()).is_none());
+        // Cancel in Grid keeps the folder too.
+        create_folder_action(state.clone(), ui.clone());
+        wait_for("grid folder 2", || created("New Folder (5)").is_dir());
+        wait_for("grid editor 2", || inline_field(ui.grid.upcast_ref()).is_some());
+        cancel_inline_rename(&state, &ui);
+        wait_for("grid editor closed", || inline_field(ui.grid.upcast_ref()).is_none());
+        assert!(created("New Folder (5)").is_dir());
+        set_view_mode(&state, &ui, ViewMode::Details);
+
+        // ---- Failure leaves no folder, editor or undo entry.
+        use std::os::unix::fs::PermissionsExt;
+        let before_names = dir_names(&dir);
+        let undo_before = undo_len(&state);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        create_folder_action(state.clone(), ui.clone());
+        wait_for("failure status", || ui.status.label().starts_with("Operation failed"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pump();
+        assert_eq!(dir_names(&dir), before_names, "disk unchanged");
+        assert!(state.borrow().inline_rename.is_none() && state.borrow().reveal_path.is_none());
+        assert_eq!(undo_len(&state), undo_before, "no undo entry for a failed creation");
+        assert!(inline_field(ui.list.upcast_ref()).is_none());
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        drop(win);
     }
 
     /// D-20: removing the last row of a folder while focus sat on a file row

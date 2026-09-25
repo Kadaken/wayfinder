@@ -611,11 +611,21 @@ pub fn read_text_preview(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
-pub fn make_dir(parent: &str, name: &str) -> Result<String, String> {
-    validate_name(name)?;
-    let path = Path::new(parent).join(name);
-    fs::create_dir(&path).map_err(|err| err.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+/// Explorer numbering: "New Folder", then "New Folder (2)", "New Folder (3)"...
+/// `create_dir` is the existence check, so a sibling that appears between two
+/// attempts is skipped rather than overwritten or raced.
+pub fn make_numbered_dir(parent: &str, base: &str) -> Result<String, String> {
+    validate_name(base)?;
+    for n in 1..=100_000u32 {
+        let name = if n == 1 { base.to_string() } else { format!("{base} ({n})") };
+        let path = Path::new(parent).join(&name);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path.to_string_lossy().to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Err("no free folder name".into())
 }
 
 pub fn new_file(parent: &str, name: &str) -> Result<String, String> {
@@ -1659,6 +1669,28 @@ mod tests {
 
     fn now_unix() -> i64 {
         glib::DateTime::now_local().unwrap().to_unix()
+    }
+
+    #[test]
+    fn numbered_folder_is_explorer_numbered_and_never_overwrites_d21() {
+        let dir = test_dir("numbered-folder");
+        let parent = dir.to_str().unwrap();
+        let first = make_numbered_dir(parent, "New Folder").unwrap();
+        assert_eq!(first, dir.join("New Folder").to_string_lossy());
+        // A file and a folder already own the next names; a marker proves no overwrite.
+        fs::write(dir.join("New Folder (2)"), "keep").unwrap();
+        fs::create_dir(dir.join("New Folder (3)")).unwrap();
+        fs::write(dir.join("New Folder (3)").join("marker"), "keep").unwrap();
+        let next = make_numbered_dir(parent, "New Folder").unwrap();
+        assert_eq!(next, dir.join("New Folder (4)").to_string_lossy());
+        assert!(dir.join("New Folder (4)").is_dir());
+        assert_eq!(fs::read_to_string(dir.join("New Folder (2)")).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(dir.join("New Folder (3)").join("marker")).unwrap(), "keep");
+        let fifth = make_numbered_dir(parent, "New Folder").unwrap();
+        assert_eq!(fifth, dir.join("New Folder (5)").to_string_lossy());
+        assert!(make_numbered_dir(parent, "a/b").is_err());
+        assert!(make_numbered_dir(dir.join("missing").to_str().unwrap(), "New Folder").is_err());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
