@@ -19,6 +19,7 @@ adw = { version = "0.9.1", package = "libadwaita", features = [
     "v1_9",
 ] }
 gdk-pixbuf = "0.22"
+libc = "0.2"
 
 [[bin]]
 name = "wayfinder-native"
