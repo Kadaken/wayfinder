@@ -438,22 +438,99 @@ pub fn list_drives() -> Vec<Drive> {
     out
 }
 
+/// Result of running the mount command: `Ok(())` on a zero exit, `Err(stderr)` on
+/// a nonzero one. The outer `Result` is a failure to run it at all.
+pub type MountRun = Result<Result<(), String>, String>;
+
 pub fn mount_drive(device: &str) -> Result<String, String> {
-    let output = Command::new("udisksctl")
-        .args(["mount", "-b", device])
-        .output()
-        .map_err(|err| err.to_string())?;
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout
-            .rsplit(" at ")
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches('.')
-            .to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    mount_drive_with(
+        device,
+        &|device| {
+            let output = Command::new("udisksctl")
+                .args(["mount", "-b", device])
+                .output()
+                .map_err(|err| err.to_string())?;
+            Ok(if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            })
+        },
+        &|device| {
+            let output = Command::new("lsblk")
+                .args(["-J", "-o", "PATH,MOUNTPOINTS", device])
+                .output()
+                .map_err(|err| err.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        },
+    )
+}
+
+/// A zero exit only means the command finished. The location comes from system
+/// state (`lookup` returns structured `lsblk -J` output), never from stdout.
+pub fn mount_drive_with(
+    device: &str,
+    run: &dyn Fn(&str) -> MountRun,
+    lookup: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    run(device)??;
+    let none = "Mount command completed but no usable mountpoint was found";
+    let json = lookup(device).map_err(|err| format!("{none}: {err}"))?;
+    verified_mountpoint(device, &json).map_err(|err| format!("{none}: {err}"))
+}
+
+/// The one directory `device` is mounted at, or an error. Fail-closed on parse
+/// errors, no mountpoint, several distinct mountpoints, and any path that is not
+/// absolute or not an existing directory.
+pub fn verified_mountpoint(device: &str, lsblk_json: &str) -> Result<String, String> {
+    fn find<'a>(node: &'a serde_json::Value, device: &str, out: &mut Vec<&'a serde_json::Value>) {
+        if node["path"].as_str() == Some(device) {
+            out.push(node);
+        }
+        if let Some(children) = node["children"].as_array() {
+            for child in children {
+                find(child, device, out);
+            }
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(lsblk_json).map_err(|err| format!("unreadable lsblk output: {err}"))?;
+    let mut nodes = Vec::new();
+    for node in value["blockdevices"].as_array().ok_or("unreadable lsblk output")? {
+        find(node, device, &mut nodes);
+    }
+    if nodes.len() != 1 {
+        return Err(format!("{device} not found exactly once in lsblk output"));
+    }
+    let node = nodes[0];
+    let mut candidates: Vec<String> = Vec::new();
+    let mut add = |v: &serde_json::Value| {
+        if let Some(text) = v.as_str().filter(|t| !t.is_empty()) {
+            if !candidates.iter().any(|c| c == text) {
+                candidates.push(text.to_string());
+            }
+        }
+    };
+    add(&node["mountpoint"]);
+    if let Some(list) = node["mountpoints"].as_array() {
+        list.iter().for_each(&mut add);
+    }
+    match candidates.len() {
+        0 => Err(format!("{device} has no mountpoint")),
+        1 => {
+            let path = candidates.remove(0);
+            if !Path::new(&path).is_absolute() {
+                return Err(format!("mountpoint is not absolute: {path}"));
+            }
+            if !fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
+                return Err(format!("mountpoint is not a directory: {path}"));
+            }
+            Ok(path)
+        }
+        _ => Err(format!("{device} has several mountpoints: {}", candidates.join(", "))),
     }
 }
 
@@ -2832,6 +2909,63 @@ mod tests {
         assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
         assert!(batch_rename(&[(p("a"), "a".into())]).unwrap().is_empty());
         assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+    }
+
+    fn lsblk_json(entries: &[(&str, serde_json::Value)]) -> String {
+        let nodes: Vec<_> = entries
+            .iter()
+            .map(|(path, mounts)| serde_json::json!({"path": path, "mountpoints": mounts}))
+            .collect();
+        serde_json::json!({ "blockdevices": nodes }).to_string()
+    }
+
+    #[test]
+    fn mount_result_needs_a_verified_mountpoint_d26() {
+        let root = scratch_case("wf-d26 mount");
+        let spaced = root.join("USB DRIVE");
+        fs::create_dir(&spaced).unwrap();
+        let file = root.join("plain.txt");
+        fs::write(&file, "x").unwrap();
+        let s = |p: &Path| p.to_string_lossy().to_string();
+        let ok: &dyn Fn(&str) -> MountRun = &|_| Ok(Ok(()));
+        let dev = "/dev/sdx1";
+        let with = |json: String| mount_drive_with(dev, ok, &move |_| Ok(json.clone()));
+
+        // nonzero exit keeps its stderr; lookup never consulted
+        let failed = mount_drive_with(dev, &|_| Ok(Err("Error mounting: busy".into())), &|_| panic!("no lookup"));
+        assert_eq!(failed.unwrap_err(), "Error mounting: busy");
+        assert!(mount_drive_with(dev, &|_| Err("no udisksctl".into()), &|_| panic!()).is_err());
+
+        // zero exit, no mountpoint in system state: rejected
+        let err = with(lsblk_json(&[(dev, serde_json::json!([null]))])).unwrap_err();
+        assert!(err.contains("no usable mountpoint"), "{err}");
+        assert!(with("not json".into()).is_err());
+        assert!(mount_drive_with(dev, ok, &|_| Err("lsblk gone".into())).is_err());
+
+        // stdout wording is never consulted: valid device mountpoint accepted
+        assert_eq!(with(lsblk_json(&[(dev, serde_json::json!([s(&spaced)]))])).unwrap(), s(&spaced));
+
+        // bad candidates
+        for bad in ["", "relative/dir", &s(&root.join("missing")), &s(&file)] {
+            assert!(with(lsblk_json(&[(dev, serde_json::json!([bad]))])).is_err(), "{bad}");
+        }
+
+        // a mountpoint belonging to another device only
+        let other = lsblk_json(&[("/dev/sdy1", serde_json::json!([s(&spaced)])), (dev, serde_json::json!([null]))]);
+        assert!(with(other).is_err());
+        assert!(with(lsblk_json(&[("/dev/sdy1", serde_json::json!([s(&spaced)]))])).is_err());
+
+        // ambiguous: several distinct mountpoints
+        let two = lsblk_json(&[(dev, serde_json::json!([s(&spaced), s(&root)]))]);
+        assert!(with(two).unwrap_err().contains("several"));
+        // same path repeated is one candidate
+        assert!(with(lsblk_json(&[(dev, serde_json::json!([s(&spaced), s(&spaced)]))])).is_ok());
+
+        // nested child device
+        let nested = serde_json::json!({"blockdevices": [{"path": "/dev/sdx", "mountpoints": [null],
+            "children": [{"path": dev, "mountpoints": [s(&spaced)]}]}]})
+        .to_string();
+        assert_eq!(with(nested).unwrap(), s(&spaced));
     }
 
     #[test]
