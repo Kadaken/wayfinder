@@ -1661,6 +1661,113 @@ impl<S, U: Clone, H> WindowRegistry<S, U, H> {
     }
 }
 
+/// Minimum gap between two folder-refresh scan starts, and the settle time that
+/// lets a writer finish before a scan reads its size.
+pub const REFRESH_MIN_GAP_MS: u64 = 500;
+pub const REFRESH_SETTLE_MS: u64 = 500;
+
+/// Coalesces directory-monitor events into scans. Pure: the caller passes the
+/// clock in milliseconds, so the rules are testable without a main loop.
+/// One instance belongs to one monitor generation; a new folder gets a new one.
+#[derive(Debug, Default)]
+pub struct RefreshCoalescer {
+    last_start: Option<u64>,
+    timer_pending: bool,
+    in_flight: bool,
+    dirty: bool,
+}
+
+impl RefreshCoalescer {
+    fn schedule(&mut self, now: u64) -> u64 {
+        self.timer_pending = true;
+        let gap = self
+            .last_start
+            .map_or(0, |start| (start + REFRESH_MIN_GAP_MS).saturating_sub(now));
+        gap.max(REFRESH_SETTLE_MS)
+    }
+
+    /// A monitor event. `Some(delay)` = arm one timer for that many ms; `None` =
+    /// a timer or scan already covers it (an in-flight scan is marked dirty).
+    pub fn on_event(&mut self, now: u64) -> Option<u64> {
+        if self.in_flight {
+            self.dirty = true;
+            return None;
+        }
+        if self.timer_pending {
+            return None;
+        }
+        Some(self.schedule(now))
+    }
+
+    /// The armed timer fired: the scan starts now.
+    pub fn on_timer(&mut self, now: u64) {
+        self.timer_pending = false;
+        self.in_flight = true;
+        self.dirty = false;
+        self.last_start = Some(now);
+    }
+
+    /// The scan finished (applied or discarded). `Some(delay)` = one follow-up
+    /// scan is owed because events arrived while it ran.
+    pub fn on_scan_done(&mut self, now: u64) -> Option<u64> {
+        self.in_flight = false;
+        if self.dirty {
+            self.dirty = false;
+            return Some(self.schedule(now));
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshKind {
+    /// Same paths and same everything except size/modified: update in place.
+    MetadataOnly,
+    /// Membership or identity changed: rebuild the rows.
+    Structural,
+}
+
+/// Compares the current listing with a fresh scan by path identity. Only size
+/// and modified time may differ for a metadata-only refresh.
+pub fn classify_refresh(current: &[Entry], scanned: &[Entry]) -> RefreshKind {
+    if current.len() != scanned.len() {
+        return RefreshKind::Structural;
+    }
+    let by_path: std::collections::HashMap<&str, &Entry> =
+        current.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+    if by_path.len() != current.len() {
+        return RefreshKind::Structural;
+    }
+    for new in scanned {
+        let Some(old) = by_path.get(new.path.as_str()) else {
+            return RefreshKind::Structural;
+        };
+        if old.name != new.name
+            || old.is_dir != new.is_dir
+            || old.is_image != new.is_image
+            || old.icon != new.icon
+            || old.metadata_error != new.metadata_error
+        {
+            return RefreshKind::Structural;
+        }
+    }
+    RefreshKind::MetadataOnly
+}
+
+/// Root for throwaway test data: ~/Projects/Scratch/wf-unit-tests, never /tmp.
+/// Derived from the build's manifest path, not $HOME, because tests replace HOME.
+#[cfg(test)]
+pub fn scratch_root() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let projects = manifest
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "Projects"))
+        .expect("the repository lives under ~/Projects");
+    let root = projects.join("Scratch").join("wf-unit-tests");
+    fs::create_dir_all(&root).expect("create the scratch test root");
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1669,6 +1776,111 @@ mod tests {
 
     fn now_unix() -> i64 {
         glib::DateTime::now_local().unwrap().to_unix()
+    }
+
+    fn refresh_entry(path: &str, size: u64, modified: i64) -> Entry {
+        Entry {
+            name: path.rsplit('/').next().unwrap().to_string(),
+            path: path.to_string(),
+            is_dir: false,
+            size,
+            modified,
+            is_image: false,
+            icon: "file".into(),
+            metadata_error: None,
+        }
+    }
+
+    #[test]
+    fn scratch_case_disappears_when_a_test_panics() {
+        let path = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let seen = path.clone();
+        let result = std::panic::catch_unwind(move || {
+            let dir = scratch_case("wf-unwind");
+            fs::write(dir.join("marker"), b"x").unwrap();
+            *seen.lock().unwrap() = Some(dir.to_path_buf());
+            panic!("deliberate assertion failure");
+        });
+        assert!(result.is_err());
+        let dir = path.lock().unwrap().clone().expect("fixture was created");
+        assert!(!dir.exists(), "the fixture is removed while unwinding");
+    }
+
+    #[test]
+    fn refresh_coalescer_limits_scans_and_never_overlaps_d22() {
+        let mut c = RefreshCoalescer::default();
+        // A burst of events yields one timer, exactly 500 ms after the first.
+        assert_eq!(c.on_event(1000), Some(500));
+        assert_eq!(c.on_event(1010), None);
+        assert_eq!(c.on_event(1200), None);
+        c.on_timer(1500);
+        // Events during the scan mark it dirty and start nothing.
+        assert_eq!(c.on_event(1510), None);
+        assert_eq!(c.on_event(1520), None);
+        // The follow-up is one scan, never sooner than 500 ms after the last start.
+        let owed = c.on_scan_done(1550).expect("one follow-up is owed");
+        assert!(1550 + owed >= 1500 + REFRESH_MIN_GAP_MS);
+        assert_eq!(c.on_event(1600), None);
+        c.on_timer(1550 + owed);
+        // No events while it ran: nothing owed.
+        assert_eq!(c.on_scan_done(2100), None);
+        // A later event still waits at least 500 ms from the last start (2050).
+        let later = c.on_event(2150).expect("a new timer");
+        assert!(2150 + later >= 2050 + REFRESH_MIN_GAP_MS && later >= 500);
+        c.on_timer(2150 + later);
+        assert_eq!(c.on_scan_done(2700), None);
+        // Far in the future: the 500 ms first-event delay only.
+        assert_eq!(c.on_event(9000), Some(500));
+    }
+
+    #[test]
+    fn refresh_scans_start_at_least_500ms_apart_under_a_write_storm_d22() {
+        let mut c = RefreshCoalescer::default();
+        let mut starts: Vec<u64> = Vec::new();
+        let mut timer: Option<u64> = None;
+        let mut scan_end: Option<u64> = None;
+        for now in 0..6000u64 {
+            if timer == Some(now) {
+                timer = None;
+                c.on_timer(now);
+                starts.push(now);
+                scan_end = Some(now + 20);
+            }
+            if scan_end == Some(now) {
+                scan_end = None;
+                if let Some(delay) = c.on_scan_done(now) {
+                    timer = Some(now + delay);
+                }
+            }
+            if now % 7 == 0 {
+                if let Some(delay) = c.on_event(now) {
+                    timer = Some(now + delay);
+                }
+            }
+        }
+        assert!(starts.len() >= 5, "scans keep happening: {starts:?}");
+        for pair in starts.windows(2) {
+            assert!(pair[1] - pair[0] >= REFRESH_MIN_GAP_MS, "{starts:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_classification_keeps_identity_and_flags_structure_d22() {
+        let current = vec![refresh_entry("/d/a", 1, 10), refresh_entry("/d/b", 2, 20)];
+        let grown = vec![refresh_entry("/d/b", 999, 99), refresh_entry("/d/a", 5, 50)];
+        assert_eq!(classify_refresh(&current, &grown), RefreshKind::MetadataOnly);
+        assert_eq!(classify_refresh(&current, &current), RefreshKind::MetadataOnly);
+        let created = vec![current[0].clone(), current[1].clone(), refresh_entry("/d/c", 1, 1)];
+        assert_eq!(classify_refresh(&current, &created), RefreshKind::Structural);
+        assert_eq!(classify_refresh(&created, &current), RefreshKind::Structural);
+        let renamed = vec![refresh_entry("/d/a", 1, 10), refresh_entry("/d/z", 2, 20)];
+        assert_eq!(classify_refresh(&current, &renamed), RefreshKind::Structural);
+        let mut retyped = current.clone();
+        retyped[0].is_dir = true;
+        assert_eq!(classify_refresh(&current, &retyped), RefreshKind::Structural);
+        let mut broken = current.clone();
+        broken[1].metadata_error = Some("gone".into());
+        assert_eq!(classify_refresh(&current, &broken), RefreshKind::Structural);
     }
 
     #[test]
@@ -1906,17 +2118,8 @@ mod tests {
         assert_eq!(fmt_modified(-5), "unknown");
     }
 
-    fn test_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "wayfinder-native-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(name: &str) -> ScratchCase {
+        scratch_case(&format!("wayfinder-native-{name}"))
     }
 
     #[test]
@@ -2031,6 +2234,12 @@ mod tests {
         }
     }
 
+    impl AsRef<Path> for ScratchCase {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
     impl Drop for ScratchCase {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
@@ -2041,8 +2250,7 @@ mod tests {
     }
 
     fn scratch_case(tag: &str) -> ScratchCase {
-        let root = Path::new(&std::env::var("HOME").unwrap()).join("Projects/Scratch/wf-unit-tests");
-        let dir = root.join(format!(
+        let dir = scratch_root().join(format!(
             "{tag}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2222,14 +2430,7 @@ mod tests {
 
     #[test]
     fn extract_into_new_dir_contains_the_files_and_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!(
-            "wf-extract-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = scratch_case("wf-extract");
         // compress_zip runs `zip` FROM dest_dir with bare file names, so the
         // sources have to sit in the folder it is told to write into.
         fs::create_dir_all(dir.join("src")).unwrap();
