@@ -1033,6 +1033,36 @@ pub fn verify_transfer(
     Ok(())
 }
 
+/// Result of a committed transfer. `warnings` are cleanup problems after a valid,
+/// verified commit: the visible end state is exact and Undo applies.
+#[derive(Debug)]
+pub struct TransferResult {
+    pub items: Vec<ResolvedItem>,
+    pub warnings: Vec<String>,
+}
+
+/// One live change that can be reversed, in commit order.
+enum JournalOp {
+    Backup { target: PathBuf, backup: PathBuf },
+    Placed { dest: PathBuf },
+    Moved { src: PathBuf, dest: PathBuf },
+    Hold { src: PathBuf, hold: PathBuf },
+}
+
+enum PlanKind {
+    Fresh,
+    Replace,
+}
+
+struct PlanItem {
+    src: String,
+    dest: PathBuf,
+    kind: PlanKind,
+    /// A staged copy is used (COPY, or a cross-device MOVE).
+    stage: Option<PathBuf>,
+}
+
+#[cfg(test)]
 pub fn resolve_paste(
     srcs: &[String],
     dest_dir: &str,
@@ -1040,6 +1070,17 @@ pub fn resolve_paste(
     on_conflict: PasteConflict,
 ) -> Result<Vec<ResolvedItem>, String> {
     resolve_paste_with(srcs, dest_dir, is_copy, on_conflict, &|_| Ok(()))
+}
+
+#[cfg(test)]
+pub fn resolve_paste_with(
+    srcs: &[String],
+    dest_dir: &str,
+    is_copy: bool,
+    on_conflict: PasteConflict,
+    step: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<Vec<ResolvedItem>, String> {
+    transfer_batch(srcs, dest_dir, is_copy, on_conflict, step, false).map(|r| r.items)
 }
 
 /// A unique, not-yet-existing sibling name in `dir` for internal staging or backup.
@@ -1054,118 +1095,88 @@ fn internal_sibling(dir: &Path, kind: &str) -> PathBuf {
     }
 }
 
+/// True when a directory entry exists at `path`, without following symlinks (a
+/// broken link is an entry). Only `NotFound` means absent; any other error is real.
+fn entry_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot inspect {}: {e}", path.display())),
+    }
+}
+
 fn remove_any(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path).map_err(|e| e.to_string()),
         Ok(_) => fs::remove_file(path).map_err(|e| e.to_string()),
-        Err(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot inspect {}: {e}", path.display())),
     }
 }
 
-/// Replaces `target` with `src` without ever leaving the target missing on
-/// failure. The incoming object is prepared beside the target and checked
-/// against the source fingerprint; the old target is then moved to a unique
-/// backup, the replacement is placed, and the backup is deleted only at the end.
-/// Any error after the backup exists restores the old target. `step` is a test
-/// seam that is called at "prepare", "backup", "place" and "remove_source".
-/// Not crash-atomic: two renames are involved. A cross-device MOVE that fails
-/// while deleting its source can leave that source partly deleted.
-fn replace_target(
-    src: &str,
-    target: &Path,
-    is_copy: bool,
-    step: &dyn Fn(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let dir = target.parent().ok_or("bad target")?;
-    let src_fp = fingerprint(src)?;
-    let rename_move = !is_copy
-        && fs::symlink_metadata(src).map_err(|e| e.to_string())?.dev()
-            == fs::metadata(dir).map_err(|e| e.to_string())?.dev();
-
-    let stage = internal_sibling(dir, "new");
-    let backup = internal_sibling(dir, "old");
-    let stage_str = stage.to_string_lossy().to_string();
-    let cleanup_stage = || {
-        let _ = remove_any(&stage);
-    };
-
-    // Prepare: nothing live is touched.
-    if !rename_move {
-        let prepared = run_cmd_capture("cp", &["-a", "-T", "--", src, &stage_str]).map(|_| ());
-        let prepared = prepared.and_then(|_| {
-            if fingerprint(&stage_str)? == src_fp {
-                Ok(())
-            } else {
-                Err("the prepared copy does not match its source".to_string())
+/// Reverses the journal newest-first and removes owned stages. Every reversal is
+/// attempted; failures are returned so the caller reports them explicitly.
+fn roll_back(journal: &[JournalOp], stages: &[PathBuf]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for op in journal.iter().rev() {
+        let result = match op {
+            JournalOp::Placed { dest } => remove_any(dest),
+            JournalOp::Moved { src, dest } => {
+                fs::rename(dest, src).map_err(|e| format!("{}: {e}", dest.display()))
             }
-        });
-        if let Err(err) = prepared {
-            cleanup_stage();
-            return Err(err);
-        }
-    }
-    if let Err(err) = step("prepare") {
-        cleanup_stage();
-        return Err(err);
-    }
-
-    // Commit: old target aside, replacement in, backup gone.
-    if let Err(err) = step("backup").and_then(|_| fs::rename(target, &backup).map_err(|e| e.to_string())) {
-        cleanup_stage();
-        return Err(err);
-    }
-    let mut placed = false;
-    let committed = (|| -> Result<(), String> {
-        step("place")?;
-        if rename_move {
-            fs::rename(src, target).map_err(|e| e.to_string())?;
-        } else {
-            fs::rename(&stage, target).map_err(|e| e.to_string())?;
-        }
-        placed = true;
-        if !is_copy && !rename_move {
-            step("remove_source")?;
-            remove_any(Path::new(src))?;
-        }
-        Ok(())
-    })();
-    if let Err(err) = committed {
-        if placed && rename_move {
-            // The source moved into place; put it back before restoring the target.
-            let _ = fs::rename(target, src);
-        } else if placed {
-            let _ = remove_any(target);
-        }
-        cleanup_stage();
-        return match fs::rename(&backup, target) {
-            Ok(()) => Err(err),
-            Err(restore) => Err(format!("{err}; could not restore the old item ({restore}): {}", backup.display())),
+            JournalOp::Hold { src, hold } => {
+                fs::rename(hold, src).map_err(|e| format!("{}: {e}", hold.display()))
+            }
+            JournalOp::Backup { target, backup } => {
+                fs::rename(backup, target).map_err(|e| format!("{}: {e}", backup.display()))
+            }
         };
+        if let Err(err) = result {
+            failures.push(err);
+        }
     }
-    cleanup_stage();
-    remove_any(&backup).map_err(|e| format!("replaced, but could not remove the old item: {e}"))
+    for stage in stages {
+        if let Err(err) = remove_any(stage) {
+            failures.push(format!("{}: {err}", stage.display()));
+        }
+    }
+    failures
 }
 
-pub fn resolve_paste_with(
+/// Transfers a whole batch as one transaction. The batch is planned and every
+/// incoming object is prepared and fingerprint-checked before any live path
+/// changes. Old destinations and moved sources are then kept in reversible
+/// same-filesystem places (backup beside the target, hold beside the source)
+/// until the postcondition passes. An `Err` means every source and destination
+/// is exactly as before and nothing owned remains (or the error names what could
+/// not be rolled back). An `Ok` is committed; cleanup problems become warnings.
+/// Not crash-atomic and not safe against concurrent outside changes.
+/// `step` is a test seam called at "prepare", "backup", "hold", "place",
+/// "verify" and "cleanup"; `force_cross_device` makes MOVE use the cross-device
+/// strategy (staged copy plus source hold) even on one filesystem.
+pub fn transfer_batch(
     srcs: &[String],
     dest_dir: &str,
     is_copy: bool,
     on_conflict: PasteConflict,
     step: &dyn Fn(&str) -> Result<(), String>,
-) -> Result<Vec<ResolvedItem>, String> {
+    force_cross_device: bool,
+) -> Result<TransferResult, String> {
+    use std::os::unix::fs::MetadataExt;
     if !Path::new(dest_dir).is_dir() {
         return Err(format!("not a folder: {dest_dir}"));
     }
+    let dest_dev = fs::metadata(dest_dir).map_err(|e| e.to_string())?.dev();
+    let before = snapshot_sources(srcs)?;
 
-    let mut out = Vec::new();
+    // Plan: no live mutation.
+    let mut plan: Vec<PlanItem> = Vec::new();
     for src in srcs {
         let name = Path::new(src)
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("bad source name")?;
         let target = Path::new(dest_dir).join(name);
-
         let same_path = matches!(
             (fs::canonicalize(src), fs::canonicalize(&target)),
             (Ok(a), Ok(b)) if a == b
@@ -1173,41 +1184,141 @@ pub fn resolve_paste_with(
         if same_path && !is_copy {
             continue;
         }
-
-        let dest = if target.exists() {
+        let planned = |p: &Path| plan.iter().any(|item| item.dest == p);
+        let (dest, kind) = if entry_exists(&target)? || planned(&target) {
             match on_conflict {
-                PasteConflict::KeepBoth => unique_target(dest_dir, name),
+                PasteConflict::KeepBoth => {
+                    let (stem, ext) = match name.rfind('.') {
+                        Some(i) if i > 0 => (&name[..i], &name[i..]),
+                        _ => (name, ""),
+                    };
+                    let mut n = 1;
+                    let candidate = loop {
+                        let cand = if n == 1 {
+                            Path::new(dest_dir).join(name)
+                        } else {
+                            Path::new(dest_dir).join(format!("{stem} ({n}){ext}"))
+                        };
+                        n += 1;
+                        if !entry_exists(&cand)? && !planned(&cand) {
+                            break cand;
+                        }
+                    };
+                    (candidate, PlanKind::Fresh)
+                }
                 PasteConflict::Replace => {
-                    // A folder cannot merge with `cp -T`, and overwriting in place
-                    // would leave stale children, so the target is swapped whole.
                     if same_path {
                         continue;
                     }
-                    replace_target(src, &target, is_copy, step)?;
-                    out.push(ResolvedItem {
-                        from: src.clone(),
-                        to: target.to_string_lossy().to_string(),
-                    });
-                    continue;
+                    if planned(&target) {
+                        return Err(format!("two items would replace the same name: {name}"));
+                    }
+                    (target, PlanKind::Replace)
                 }
             }
         } else {
-            target
+            (target, PlanKind::Fresh)
         };
-        let dest_str = dest.to_string_lossy().to_string();
+        plan.push(PlanItem { src: src.clone(), dest, kind, stage: None });
+    }
 
-        if is_copy {
-            run_cmd_capture("cp", &["-a", "-T", "--", src, &dest_str])?;
-        } else {
-            run_cmd_capture("mv", &["-T", "--", src, &dest_str])?;
+    let cross = |item: &PlanItem| -> Result<bool, String> {
+        Ok(force_cross_device
+            || fs::symlink_metadata(&item.src).map_err(|e| e.to_string())?.dev() != dest_dev)
+    };
+
+    let mut stages: Vec<PathBuf> = Vec::new();
+    let mut journal: Vec<JournalOp> = Vec::new();
+    let mut retire: Vec<PathBuf> = Vec::new();
+    let mut run = || -> Result<(), String> {
+        // Prepare every incoming object beside its destination.
+        for item in plan.iter_mut() {
+            let src_fp = &before
+                .iter()
+                .find(|s| s.path == item.src)
+                .ok_or("transfer check: no record of a source")?
+                .fp;
+            if is_copy || cross(item)? {
+                let dir = item.dest.parent().ok_or("bad target")?;
+                let stage = internal_sibling(dir, "new");
+                stages.push(stage.clone());
+                let stage_str = stage.to_string_lossy().to_string();
+                run_cmd_capture("cp", &["-a", "-T", "--", &item.src, &stage_str])?;
+                if fingerprint(&stage_str)? != *src_fp {
+                    return Err("the prepared copy does not match its source".to_string());
+                }
+                item.stage = Some(stage);
+            }
+            step("prepare")?;
         }
-
-        out.push(ResolvedItem {
-            from: src.clone(),
-            to: dest_str,
+        // Commit in order, journaling every live change.
+        for item in plan.iter() {
+            if matches!(item.kind, PlanKind::Replace) {
+                step("backup")?;
+                let dir = item.dest.parent().ok_or("bad target")?;
+                let backup = internal_sibling(dir, "old");
+                fs::rename(&item.dest, &backup).map_err(|e| e.to_string())?;
+                journal.push(JournalOp::Backup { target: item.dest.clone(), backup: backup.clone() });
+                retire.push(backup);
+            }
+            match (&item.stage, is_copy) {
+                (Some(stage), true) => {
+                    step("place")?;
+                    fs::rename(stage, &item.dest).map_err(|e| e.to_string())?;
+                    journal.push(JournalOp::Placed { dest: item.dest.clone() });
+                }
+                (Some(stage), false) => {
+                    step("hold")?;
+                    let src = Path::new(&item.src);
+                    let hold = internal_sibling(src.parent().ok_or("bad source")?, "hold");
+                    fs::rename(src, &hold).map_err(|e| e.to_string())?;
+                    journal.push(JournalOp::Hold { src: src.to_path_buf(), hold: hold.clone() });
+                    retire.push(hold);
+                    step("place")?;
+                    fs::rename(stage, &item.dest).map_err(|e| e.to_string())?;
+                    journal.push(JournalOp::Placed { dest: item.dest.clone() });
+                }
+                (None, _) => {
+                    step("place")?;
+                    fs::rename(&item.src, &item.dest).map_err(|e| e.to_string())?;
+                    journal.push(JournalOp::Moved {
+                        src: PathBuf::from(&item.src),
+                        dest: item.dest.clone(),
+                    });
+                }
+            }
+        }
+        step("verify")?;
+        let items: Vec<ResolvedItem> = plan
+            .iter()
+            .map(|i| ResolvedItem { from: i.src.clone(), to: i.dest.to_string_lossy().to_string() })
+            .collect();
+        verify_transfer(&before, &items, is_copy)
+    };
+    if let Err(err) = run() {
+        let failures = roll_back(&journal, &stages);
+        return Err(if failures.is_empty() {
+            err
+        } else {
+            format!("{err}; rollback incomplete: {}", failures.join("; "))
         });
     }
-    Ok(out)
+
+    // Committed and verified: retire owned backups and holds; problems are warnings.
+    let mut warnings = Vec::new();
+    for path in &retire {
+        if let Err(err) = step("cleanup").and_then(|_| remove_any(path)) {
+            warnings.push(format!("could not remove {}: {err}", path.display()));
+        }
+    }
+    for stage in &stages {
+        let _ = remove_any(stage);
+    }
+    let items = plan
+        .iter()
+        .map(|i| ResolvedItem { from: i.src.clone(), to: i.dest.to_string_lossy().to_string() })
+        .collect();
+    Ok(TransferResult { items, warnings })
 }
 
 pub fn restore_moved_items(items: &[ResolvedItem]) -> Result<(), String> {
@@ -1990,6 +2101,170 @@ mod tests {
                 }
                 assert_eq!(names_in(&dest_dir), vec!["item".to_string()], "no stage or backup left");
             }
+        }
+    }
+
+    /// Fixture for D-24: `src/{a.txt, b/, c.txt}` incoming, `dest/{a.txt, b/}` existing.
+    fn batch_fixture(root: &Path) -> (Vec<String>, String) {
+        let (src, dest) = (root.join("src"), root.join("dest"));
+        for (base, tag) in [(&src, "new"), (&dest, "old")] {
+            fs::create_dir_all(base.join("b/sub")).unwrap();
+            fs::write(base.join("a.txt"), format!("{tag} a")).unwrap();
+            fs::write(base.join("b/sub/file.txt"), format!("{tag} deep")).unwrap();
+            fs::write(base.join(format!("b/{tag}-only.txt")), tag).unwrap();
+        }
+        fs::write(src.join("c.txt"), "new c").unwrap();
+        let srcs = ["a.txt", "b", "c.txt"].iter().map(|n| src.join(n).to_string_lossy().to_string()).collect();
+        (srcs, dest.to_string_lossy().to_string())
+    }
+
+    fn no_owned_names(dir: &Path) -> bool {
+        fn walk(dir: &Path) -> bool {
+            fs::read_dir(dir).unwrap().all(|e| {
+                let e = e.unwrap();
+                !e.file_name().to_string_lossy().starts_with(".wf-replace-")
+                    && (!e.path().is_dir() || walk(&e.path()))
+            })
+        }
+        walk(dir)
+    }
+
+    #[test]
+    fn batch_failures_roll_everything_back_exactly_d24() {
+        let cases: [(&str, usize); 5] = [("prepare", 2), ("place", 2), ("place", 3), ("verify", 1), ("backup", 2)];
+        for conflict in [PasteConflict::KeepBoth, PasteConflict::Replace] {
+            for is_copy in [true, false] {
+                for force_cross in [false, true] {
+                    for (phase, nth) in cases {
+                        if phase == "backup" && conflict == PasteConflict::KeepBoth {
+                            continue;
+                        }
+                        let root = scratch_case("wf-d24-fail");
+                        let (srcs, dest) = batch_fixture(&root);
+                        let before = fingerprint(root.to_str().unwrap()).unwrap();
+                        let seen = std::cell::Cell::new(0);
+                        let step = |name: &str| {
+                            if name == phase {
+                                seen.set(seen.get() + 1);
+                                if seen.get() == nth {
+                                    return Err(format!("injected failure at {phase} #{nth}"));
+                                }
+                            }
+                            Ok(())
+                        };
+                        let result = transfer_batch(&srcs, &dest, is_copy, conflict, &step, force_cross);
+                        let label = format!("{conflict:?} copy={is_copy} cross={force_cross} {phase}#{nth}");
+                        assert!(result.is_err(), "{label}: {result:?}");
+                        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "exact rollback: {label}");
+                        assert!(no_owned_names(&root), "no owned residue: {label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forced_cross_device_move_failures_restore_source_and_old_destination_d24() {
+        for phase in ["hold", "place", "verify"] {
+            let root = scratch_case("wf-d24-cross");
+            let (srcs, dest) = batch_fixture(&root);
+            let before = fingerprint(root.to_str().unwrap()).unwrap();
+            let step = |name: &str| if name == phase { Err(format!("injected {phase}")) } else { Ok(()) };
+            let result = transfer_batch(&srcs, &dest, false, PasteConflict::Replace, &step, true);
+            assert!(result.is_err(), "{phase}");
+            assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "{phase}");
+            assert!(no_owned_names(&root), "{phase}");
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_after_commit_is_a_committed_warning_d24() {
+        for is_copy in [true, false] {
+            for force_cross in [false, true] {
+                let root = scratch_case("wf-d24-warn");
+                let (srcs, dest) = batch_fixture(&root);
+                let before = snapshot_sources(&srcs).unwrap();
+                let step = |name: &str| if name == "cleanup" { Err("injected cleanup".to_string()) } else { Ok(()) };
+                let result = transfer_batch(&srcs, &dest, is_copy, PasteConflict::Replace, &step, force_cross)
+                    .expect("a checked commit is not an error");
+                assert_eq!(result.items.len(), 3);
+                verify_transfer(&before, &result.items, is_copy).unwrap();
+                assert!(!result.warnings.is_empty(), "cleanup problem is reported as a warning");
+                for item in &result.items {
+                    assert_eq!(fingerprint(&item.to).unwrap(), before.iter().find(|s| s.path == item.from).unwrap().fp);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_batches_verify_and_leave_no_owned_residue_d24() {
+        for conflict in [PasteConflict::KeepBoth, PasteConflict::Replace] {
+            for is_copy in [true, false] {
+                for force_cross in [false, true] {
+                    let root = scratch_case("wf-d24-ok");
+                    let (srcs, dest) = batch_fixture(&root);
+                    let before = snapshot_sources(&srcs).unwrap();
+                    let result = transfer_batch(&srcs, &dest, is_copy, conflict, &|_| Ok(()), force_cross).unwrap();
+                    assert!(result.warnings.is_empty());
+                    assert_eq!(result.items.len(), 3);
+                    verify_transfer(&before, &result.items, is_copy).unwrap();
+                    assert!(no_owned_names(&root), "{conflict:?} copy={is_copy} cross={force_cross}");
+                    if conflict == PasteConflict::KeepBoth {
+                        // The old destination stays; incoming items get new names.
+                        assert_eq!(fs::read_to_string(Path::new(&dest).join("a.txt")).unwrap(), "old a");
+                        assert!(Path::new(&dest).join("a (2).txt").exists());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn broken_symlink_destination_is_an_entry_that_is_never_lost_d24() {
+        let setup = |name: &str| {
+            let root = scratch_case(name);
+            let (src, dest) = (root.join("src"), root.join("dest"));
+            fs::create_dir_all(&src).unwrap();
+            fs::create_dir_all(&dest).unwrap();
+            fs::write(src.join("link"), "incoming").unwrap();
+            std::os::unix::fs::symlink("missing-target", dest.join("link")).unwrap();
+            let srcs = vec![src.join("link").to_string_lossy().to_string()];
+            (root, srcs, dest.to_string_lossy().to_string())
+        };
+        // KeepBoth: the broken link stays exact, the incoming file gets a new name.
+        for is_copy in [true, false] {
+            let (root, srcs, dest) = setup("wf-d24-link-keep");
+            let out = transfer_batch(&srcs, &dest, is_copy, PasteConflict::KeepBoth, &|_| Ok(()), false).unwrap();
+            let link = Path::new(&dest).join("link");
+            assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("missing-target"));
+            assert_ne!(out.items[0].to, link.to_string_lossy());
+            assert_eq!(fs::read_to_string(&out.items[0].to).unwrap(), "incoming");
+            assert!(no_owned_names(&root));
+        }
+        // Replace, failure after the backup: the exact broken link and source return.
+        for is_copy in [true, false] {
+            for phase in ["place", "verify"] {
+                let (root, srcs, dest) = setup("wf-d24-link-fail");
+                let before = fingerprint(root.to_str().unwrap()).unwrap();
+                let step = |name: &str| if name == phase { Err("injected".to_string()) } else { Ok(()) };
+                assert!(transfer_batch(&srcs, &dest, is_copy, PasteConflict::Replace, &step, false).is_err());
+                assert_eq!(fs::read_link(Path::new(&dest).join("link")).unwrap(), PathBuf::from("missing-target"));
+                assert_eq!(fs::read_to_string(&srcs[0]).unwrap(), "incoming");
+                assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+                assert!(no_owned_names(&root));
+            }
+        }
+        // Replace, success: only the named entry is replaced by the incoming object.
+        for is_copy in [true, false] {
+            let (root, srcs, dest) = setup("wf-d24-link-ok");
+            let out = transfer_batch(&srcs, &dest, is_copy, PasteConflict::Replace, &|_| Ok(()), false).unwrap();
+            let link = Path::new(&dest).join("link");
+            assert!(!fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_to_string(&link).unwrap(), "incoming");
+            assert_eq!(out.items.len(), 1);
+            assert_eq!(names_in(&dest), vec!["link".to_string()]);
+            assert!(no_owned_names(&root));
         }
     }
 
