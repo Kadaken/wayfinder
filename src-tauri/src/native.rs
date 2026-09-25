@@ -1197,8 +1197,7 @@ fn main() {
         export_file_manager1(app);
     });
     app.connect_activate(|app| {
-        let existing_ui = CURRENT_UI.with(|current| current.borrow().clone());
-        if let Some(ui) = existing_ui {
+        if let Some((_, ui)) = active_window() {
             ui.window.present();
         } else {
             build_ui(
@@ -1216,9 +1215,7 @@ fn main() {
         // selected for the user.
         let initial_path = initial_path_from_files(files);
         let select_path = select_path_from_files(files);
-        let existing = CURRENT_STATE.with(|current| current.borrow().clone());
-        let existing_ui = CURRENT_UI.with(|current| current.borrow().clone());
-        if let (Some(state), Some(ui)) = (existing, existing_ui) {
+        if let Some((state, ui)) = active_window() {
             if let Some(target) = select_path {
                 state.borrow_mut().pinned_top = Some(target.clone());
                 let parent = Path::new(&target)
@@ -1829,15 +1826,14 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     // but an initial GApplication `open` request can otherwise return before
     // GTK has taken that hold. Pair an explicit hold with the window lifecycle
     // so folder launches and regular launches behave identically.
-    APP_HOLD.with(|hold| *hold.borrow_mut() = Some(app.hold()));
-    ui.window.connect_close_request(move |_| {
-        APP_HOLD.with(|hold| {
-            hold.borrow_mut().take();
+    register_window(&state, &ui, app.hold());
+    {
+        let state = state.clone();
+        ui.window.connect_close_request(move |_| {
+            unregister_window(&state);
+            glib::Propagation::Proceed
         });
-        glib::Propagation::Proceed
-    });
-    CURRENT_UI.with(|current| *current.borrow_mut() = Some(ui.clone()));
-    CURRENT_STATE.with(|current| *current.borrow_mut() = Some(state.clone()));
+    }
 
     rebuild_tabs(&state, &ui);
     rebuild_sidebar(&state, &ui);
@@ -3605,7 +3601,7 @@ fn navigate_without_history(state: &Rc<RefCell<AppState>>, path: String) {
 
 fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, record_history: bool) {
     let show_hidden = state.borrow().show_hidden;
-    let ui = current_ui_for_state(state);
+    let ui = ui_for_state(state);
     // Refreshing the SAME folder (e.g. after a delete) should keep the scroll
     // position; only real navigation to a different folder resets to the top.
     let same_folder = state.borrow().cwd == path;
@@ -3868,13 +3864,30 @@ fn update_nav_buttons(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 thread_local! {
-    static CURRENT_UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
-    static CURRENT_STATE: RefCell<Option<Rc<RefCell<AppState>>>> = const { RefCell::new(None) };
-    static APP_HOLD: RefCell<Option<gio::ApplicationHoldGuard>> = const { RefCell::new(None) };
+    static WINDOWS: RefCell<native_core::WindowRegistry<AppState, Ui, gio::ApplicationHoldGuard>> =
+        RefCell::new(native_core::WindowRegistry::default());
 }
 
-fn current_ui_for_state(_state: &Rc<RefCell<AppState>>) -> Option<Ui> {
-    CURRENT_UI.with(|ui| ui.borrow().clone())
+fn register_window(state: &Rc<RefCell<AppState>>, ui: &Ui, hold: gio::ApplicationHoldGuard) {
+    WINDOWS.with(|windows| windows.borrow_mut().register(state, ui.clone(), hold));
+}
+
+/// Drops only this window's entry, which releases only its hold.
+fn unregister_window(state: &Rc<RefCell<AppState>>) {
+    let removed = WINDOWS.with(|windows| windows.borrow_mut().unregister(state));
+    drop(removed);
+}
+
+fn ui_for_state(state: &Rc<RefCell<AppState>>) -> Option<Ui> {
+    WINDOWS.with(|windows| windows.borrow().ui_for_state(state))
+}
+
+fn state_for_ui(ui: &Ui) -> Option<Rc<RefCell<AppState>>> {
+    WINDOWS.with(|windows| windows.borrow().state_for_ui(|other| other.window == ui.window))
+}
+
+fn active_window() -> Option<(Rc<RefCell<AppState>>, Ui)> {
+    WINDOWS.with(|windows| windows.borrow().active(|ui| ui.window.is_active()))
 }
 
 /// Rebuild the address bar as one clickable button per path segment.
@@ -4347,8 +4360,6 @@ fn selected_indices(ui: &Ui) -> Vec<usize> {
 }
 
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    CURRENT_UI.with(|current| *current.borrow_mut() = Some(ui.clone()));
-
     ui.list_store.remove_all();
     while let Some(child) = ui.grid.first_child() {
         ui.grid.remove(&child);
@@ -7340,18 +7351,18 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     }
 }
 
+fn preview_zoom_for(ui: &Ui) -> f64 {
+    state_for_ui(ui)
+        .map(|state| state.borrow().preview_zoom)
+        .unwrap_or(1.0)
+}
+
 fn set_preview_text(ui: &Ui, text: &str) {
     ui.preview_media_controls
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
         .set_paintable(None::<&gdk::Paintable>);
-    let zoom = CURRENT_STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .map(|state| state.borrow().preview_zoom)
-            .unwrap_or(1.0)
-    });
+    let zoom = preview_zoom_for(ui);
     if text == "Select a file" {
         ui.preview.add_css_class("wf-preview-empty");
         ui.preview.set_xalign(0.5);
@@ -7384,13 +7395,7 @@ fn set_preview_image(ui: &Ui, path: &str) {
     ui.preview_media_picture
         .set_paintable(None::<&gdk::Paintable>);
     let file = gio::File::for_path(PathBuf::from(path));
-    let zoom = CURRENT_STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .map(|state| state.borrow().preview_zoom)
-            .unwrap_or(1.0)
-    });
+    let zoom = preview_zoom_for(ui);
     let size = if zoom <= 1.0 {
         0
     } else {
@@ -7404,13 +7409,7 @@ fn set_preview_image(ui: &Ui, path: &str) {
 fn set_preview_media(ui: &Ui, path: &str) {
     let file = gio::File::for_path(PathBuf::from(path));
     let media = gtk::MediaFile::for_file(&file);
-    let zoom = CURRENT_STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .map(|state| state.borrow().preview_zoom)
-            .unwrap_or(1.0)
-    });
+    let zoom = preview_zoom_for(ui);
     let size = if zoom <= 1.0 {
         0
     } else {
