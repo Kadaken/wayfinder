@@ -3462,6 +3462,22 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
     popover.popup();
 }
 
+/// Ctrl+N alone. Ctrl+Shift+N stays New Folder and Ctrl+T stays New Tab.
+fn is_new_window_shortcut(ctrl: bool, shift: bool, alt: bool, key: gdk::Key) -> bool {
+    ctrl && !shift && !alt && (key == gdk::Key::n || key == gdk::Key::N)
+}
+
+/// Opens `path` in its own independent window of this same application.
+fn open_new_window(ui: &Ui, path: String) {
+    if let Some(app) = ui
+        .window
+        .application()
+        .and_then(|app| app.downcast::<adw::Application>().ok())
+    {
+        build_ui(&app, Some(path), None);
+    }
+}
+
 fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
     let key = gtk::EventControllerKey::new();
     let window = ui.window.clone();
@@ -3478,6 +3494,10 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         }
         if ctrl && shift && (key == gdk::Key::N || key == gdk::Key::n) {
             create_folder_action(state_for_keys.clone(), ui_for_keys.clone());
+            return glib::Propagation::Stop;
+        }
+        if is_new_window_shortcut(ctrl, shift, alt, key) {
+            open_new_window(&ui_for_keys, state_for_keys.borrow().cwd.clone());
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::D || key == gdk::Key::d) {
@@ -6529,6 +6549,13 @@ fn show_item_context_menu(
             open_path_in_new_tab(&state, &ui, path.clone())
         }));
     }
+    if entry.is_dir {
+        let ui = ui.clone();
+        let path = entry.path.clone();
+        menu.append(&context_item("window-new-symbolic", "Open in New Window", "", &popover, move || {
+            open_new_window(&ui, path.clone())
+        }));
+    }
     if !entry.is_dir {
         let ui = ui.clone();
         let path = entry.path.clone();
@@ -8318,6 +8345,17 @@ mod tests {
         update_config_at(&path, |c| remove_favorite(&mut c.favorites, &p1));
         assert_eq!(read_config_at(&path).favorites.len(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_n_opens_a_window_and_leaves_the_other_shortcuts_d19() {
+        assert!(is_new_window_shortcut(true, false, false, gdk::Key::n));
+        assert!(!is_new_window_shortcut(true, true, false, gdk::Key::N), "Ctrl+Shift+N is New Folder");
+        assert!(!is_new_window_shortcut(true, false, false, gdk::Key::t), "Ctrl+T is New Tab");
+        assert!(!is_new_window_shortcut(false, false, false, gdk::Key::n));
+        let all = include_str!("native.rs");
+        assert!(all.contains("open_new_window(&ui_for_keys, state_for_keys.borrow().cwd.clone())"));
+        assert!(all.contains("\"Open in New Window\""));
     }
 
     /// D-18 (23 Sep 2026): the drag picture is a compact translucent ghost of the
