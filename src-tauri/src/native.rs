@@ -1096,7 +1096,9 @@ struct AppState {
     /// notifications from the folder we just left.
     directory_monitor: Option<gio::FileMonitor>,
     monitor_generation: u64,
-    monitor_refresh_generation: u64,
+    /// Realized Size/Modified labels by path, kept by the list bind/unbind so a
+    /// metadata-only refresh can update text without touching the rows.
+    meta_labels: HashMap<String, (glib::WeakRef<gtk::Label>, glib::WeakRef<gtk::Label>)>,
     thumbnail_queue: Option<Rc<RefCell<ThumbnailQueue>>>,
 }
 
@@ -1415,7 +1417,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         listing_cancel: None,
         directory_monitor: None,
         monitor_generation: 0,
-        monitor_refresh_generation: 0,
+        meta_labels: HashMap::new(),
         thumbnail_queue: None,
     }));
 
@@ -3866,6 +3868,7 @@ fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str)
     };
 
     let watched_path = path.to_string();
+    let coalescer = Rc::new(RefCell::new(native_core::RefreshCoalescer::default()));
     let state_weak = Rc::downgrade(state);
     let ui = ui.clone();
     monitor.connect_changed(move |_, _, _, event| {
@@ -3887,35 +3890,214 @@ fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str)
         let Some(state) = state_weak.upgrade() else {
             return;
         };
-        let refresh_generation = {
-            let mut state_ref = state.borrow_mut();
+        if state.borrow().monitor_generation != monitor_generation
+            || state.borrow().cwd != watched_path
+        {
+            return;
+        }
+        let Some(delay) = coalescer.borrow_mut().on_event(monotonic_ms()) else {
+            return;
+        };
+        arm_monitor_scan(&state, &ui, &coalescer, monitor_generation, &watched_path, delay);
+    });
+    state.borrow_mut().directory_monitor = Some(monitor);
+}
+
+#[cfg(any(test))]
+thread_local! {
+    /// (start, end) of every monitor scan, in monotonic ms; end is 0 while running.
+    static SCAN_LOG: RefCell<Vec<(u64, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Arms the one timer the coalescer asked for; when it fires the scan starts.
+fn arm_monitor_scan(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    coalescer: &Rc<RefCell<native_core::RefreshCoalescer>>,
+    monitor_generation: u64,
+    watched_path: &str,
+    delay_ms: u64,
+) {
+    let state_weak = Rc::downgrade(state);
+    let ui = ui.clone();
+    let coalescer = coalescer.clone();
+    let watched_path = watched_path.to_string();
+    glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+        let Some(state) = state_weak.upgrade() else {
+            return;
+        };
+        {
+            let state_ref = state.borrow();
             if state_ref.monitor_generation != monitor_generation || state_ref.cwd != watched_path {
                 return;
             }
-            state_ref.monitor_refresh_generation =
-                state_ref.monitor_refresh_generation.wrapping_add(1);
-            state_ref.monitor_refresh_generation
-        };
-        let state_weak = Rc::downgrade(&state);
-        let ui = ui.clone();
-        let watched_path = watched_path.clone();
-        glib::timeout_add_local_once(Duration::from_millis(300), move || {
-            let Some(state) = state_weak.upgrade() else {
-                return;
-            };
-            let should_refresh = {
-                let state_ref = state.borrow();
-                state_ref.monitor_generation == monitor_generation
-                    && state_ref.monitor_refresh_generation == refresh_generation
-                    && state_ref.cwd == watched_path
-            };
-            if should_refresh {
-                ui.status.set_label("Refreshing after a file change…");
-                navigate_without_history(&state, watched_path);
-            }
-        });
+        }
+        coalescer.borrow_mut().on_timer(monotonic_ms());
+        start_monitor_scan(&state, &ui, &coalescer, monitor_generation, watched_path);
     });
-    state.borrow_mut().directory_monitor = Some(monitor);
+}
+
+/// One background scan of the watched folder. It never goes through
+/// navigation: no monitor reinstall, search reset or tab/breadcrumb rebuild.
+fn start_monitor_scan(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    coalescer: &Rc<RefCell<native_core::RefreshCoalescer>>,
+    monitor_generation: u64,
+    path: String,
+) {
+    let show_hidden = state.borrow().show_hidden;
+    #[cfg(any(test))]
+    SCAN_LOG.with(|log| log.borrow_mut().push((monotonic_ms(), 0)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let path_for_worker = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(native_core::list_dir_cancellable(
+            &path_for_worker,
+            show_hidden,
+            &cancelled,
+        ));
+    });
+    let state = state.clone();
+    let ui = ui.clone();
+    let coalescer = coalescer.clone();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        let result = match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let current = {
+            let state_ref = state.borrow();
+            state_ref.monitor_generation == monitor_generation && state_ref.cwd == path
+        };
+        if current {
+            if let Some(Ok(listing)) = result {
+                apply_monitor_scan(&state, &ui, listing);
+            }
+            #[cfg(any(test))]
+            SCAN_LOG.with(|log| {
+                if let Some(last) = log.borrow_mut().last_mut() {
+                    last.1 = monotonic_ms();
+                }
+            });
+            if let Some(delay) = coalescer.borrow_mut().on_scan_done(monotonic_ms()) {
+                arm_monitor_scan(&state, &ui, &coalescer, monitor_generation, &path, delay);
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Applies a monitor scan. Size/modified-only changes are merged in place so the
+/// hovered and selected GTK objects survive; anything structural rebuilds the
+/// rows and restores the surviving selection.
+fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_core::DirectoryListing) {
+    let kind = native_core::classify_refresh(&state.borrow().entries, &listing.entries);
+    if kind == native_core::RefreshKind::MetadataOnly {
+        let fresh: HashMap<&str, &Entry> =
+            listing.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+        let merge = |entry: &mut Entry| -> bool {
+            let Some(new) = fresh.get(entry.path.as_str()) else {
+                return false;
+            };
+            let changed = entry.size != new.size || entry.modified != new.modified;
+            entry.size = new.size;
+            entry.modified = new.modified;
+            changed
+        };
+        let mut changed_paths: Vec<Entry> = Vec::new();
+        {
+            let mut state_ref = state.borrow_mut();
+            for entry in state_ref.entries.iter_mut() {
+                merge(entry);
+            }
+            for entry in state_ref.visible_entries.iter_mut() {
+                if merge(entry) {
+                    changed_paths.push(entry.clone());
+                }
+            }
+        }
+        for index in 0..ui.list_store.n_items() {
+            if let Some(boxed) = ui
+                .list_store
+                .item(index)
+                .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+            {
+                merge(&mut boxed.borrow_mut::<Entry>());
+            }
+        }
+        let labels = state.borrow().meta_labels.clone();
+        for entry in changed_paths {
+            if let Some((size, modified)) = labels.get(&entry.path) {
+                if let Some(size) = size.upgrade() {
+                    size.set_label(&row_size_text(&entry));
+                }
+                if let Some(modified) = modified.upgrade() {
+                    modified.set_label(&row_modified_text(&entry));
+                }
+            }
+        }
+        return;
+    }
+
+    let selected = selected_paths(state, ui);
+    let saved_scroll = ui.list_scroll.vadjustment().value();
+    let (item_count, metadata_unavailable, unreadable_entries) = (
+        listing.entries.len(),
+        listing.metadata_unavailable,
+        listing.unreadable_entries,
+    );
+    state.borrow_mut().entries = listing.entries;
+    repopulate_rows(state, ui);
+    restore_selection(state, ui, &selected);
+    update_selection(state, ui);
+    ui.status.set_label(&listing_status(
+        item_count,
+        metadata_unavailable,
+        unreadable_entries,
+    ));
+    let adj = ui.list_scroll.vadjustment();
+    glib::timeout_add_local_once(Duration::from_millis(16), move || adj.set_value(saved_scroll));
+}
+
+/// Re-selects every surviving path after a structural rebuild.
+fn restore_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, paths: &[String]) {
+    let (view_mode, indices): (ViewMode, Vec<usize>) = {
+        let state = state.borrow();
+        (
+            state.view_mode,
+            paths
+                .iter()
+                .filter_map(|path| state.visible_entries.iter().position(|e| &e.path == path))
+                .collect(),
+        )
+    };
+    if indices.is_empty() {
+        return;
+    }
+    match view_mode {
+        ViewMode::Grid => {
+            ui.grid.unselect_all();
+            for index in indices {
+                if let Some(child) = ui.grid.child_at_index(index as i32) {
+                    ui.grid.select_child(&child);
+                }
+            }
+        }
+        ViewMode::Details | ViewMode::Compact => {
+            ui.list_selection.unselect_all();
+            for index in indices {
+                ui.list_selection.select_item(index as u32, false);
+            }
+        }
+    }
 }
 
 fn listing_status(
@@ -4273,8 +4455,27 @@ fn connect_name_slow_click(
     label.add_controller(click);
 }
 
+fn row_size_text(entry: &Entry) -> String {
+    if entry.metadata_error.is_some() {
+        "—".to_string()
+    } else if entry.is_dir {
+        String::new()
+    } else {
+        native_core::fmt_size(entry.size)
+    }
+}
+
+fn row_modified_text(entry: &Entry) -> String {
+    entry
+        .metadata_error
+        .as_ref()
+        .map(|_| "unavailable".to_string())
+        .unwrap_or_else(|| native_core::fmt_modified(entry.modified))
+}
+
 fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.clone();
+    let state_for_unbind = state.clone();
     let ui_for_unbind = ui.clone();
     let ui = ui.clone();
     factory.connect_bind(move |_, item| {
@@ -4322,13 +4523,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 name.upcast()
             }
         };
-        let size_text = if entry.metadata_error.is_some() {
-            "—".to_string()
-        } else if entry.is_dir {
-            String::new()
-        } else {
-            native_core::fmt_size(entry.size)
-        };
+        let size_text = row_size_text(&entry);
         // max_width_chars is deliberately small on all three: it only sets the
         // shrink floor. The real width comes from the header's size_request via
         // the shared SizeGroups, so dragging a column resizes every row with it.
@@ -4348,11 +4543,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .build();
         kind.add_css_class("wf-file-meta");
         ui.columns.kind.add_widget(&kind);
-        let modified_text = entry
-            .metadata_error
-            .as_ref()
-            .map(|_| "unavailable".to_string())
-            .unwrap_or_else(|| native_core::fmt_modified(entry.modified));
+        let modified_text = row_modified_text(&entry);
         let modified = gtk::Label::builder()
             .label(&modified_text)
             .xalign(0.0)
@@ -4361,6 +4552,10 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .build();
         modified.add_css_class("wf-file-meta");
         ui.columns.modified.add_widget(&modified);
+        state
+            .borrow_mut()
+            .meta_labels
+            .insert(entry.path.clone(), (size.downgrade(), modified.downgrade()));
 
         line.append(&icon);
         line.append(&name);
@@ -4427,6 +4622,19 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             }
             // Order matches the bind above: icon, name, size, kind, modified.
             if children.len() >= 5 {
+                if let Some(path) = item
+                    .item()
+                    .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
+                    .map(|b| b.borrow::<Entry>().path.clone())
+                {
+                    let mut state = state_for_unbind.borrow_mut();
+                    let ours = state.meta_labels.get(&path).is_some_and(|(size, _)| {
+                        size.upgrade().is_some_and(|l| l.upcast_ref::<gtk::Widget>() == &children[2])
+                    });
+                    if ours {
+                        state.meta_labels.remove(&path);
+                    }
+                }
                 ui_for_unbind.columns.size.remove_widget(&children[2]);
                 ui_for_unbind.columns.kind.remove_widget(&children[3]);
                 ui_for_unbind.columns.modified.remove_widget(&children[4]);
@@ -8083,6 +8291,275 @@ mod tests {
         drag_ghost_builds_compact_translucent_item();
         emptied_folder_keeps_focus_on_the_view_root_d20();
         new_folder_menu_and_shared_inline_editor_d21();
+        metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
+        sustained_stream_keeps_objects_pointer_and_timing_d22();
+    }
+
+    fn metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d22-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "1").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d22test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        let b_path = dir.join("b.txt").to_string_lossy().to_string();
+        let b_labels = |state: &Rc<RefCell<AppState>>| {
+            state
+                .borrow()
+                .meta_labels
+                .get(&b_path)
+                .and_then(|(size, modified)| Some((size.upgrade()?, modified.upgrade()?)))
+        };
+
+        // ---- Details: a real monitor event updates size/time in place.
+        wait_for("row b realized", || b_labels(&state).is_some());
+        select_entry_by_path(&state, &ui, &b_path);
+        let (size_before, modified_before) = b_labels(&state).unwrap();
+        let row_before = size_before.parent().unwrap();
+        let object_before = ui.list_store.item(1).unwrap();
+        assert_eq!(size_before.label(), "1 B");
+        std::fs::write(dir.join("b.txt"), vec![b'x'; 2048]).unwrap();
+        wait_for("size text changes", || size_before.label() != "1 B");
+        let (size_after, modified_after) = b_labels(&state).unwrap();
+        assert_eq!(size_after, size_before, "the same size label object");
+        assert_eq!(modified_after, modified_before, "the same modified label object");
+        assert_eq!(size_after.parent().unwrap(), row_before, "the same row widget");
+        assert_eq!(ui.list_store.item(1).unwrap(), object_before, "the same model object, no splice");
+        assert_eq!(size_after.label(), native_core::fmt_size(2048));
+        assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()], "selection kept");
+        assert_eq!(state.borrow().visible_entries[1].size, 2048);
+        assert_eq!(state.borrow().entries.iter().find(|e| e.path == b_path).unwrap().size, 2048);
+        assert_eq!(object_before.downcast::<glib::BoxedAnyObject>().unwrap().borrow::<Entry>().size, 2048);
+
+        // ---- Structural: a created file rebuilds, the selection survives.
+        std::fs::write(dir.join("d.txt"), "d").unwrap();
+        wait_for("structural rebuild", || state.borrow().visible_entries.len() == 4);
+        wait_for("selection restored", || selected_paths(&state, &ui) == vec![b_path.clone()]);
+        // ---- Structural: a deletion rebuilds too.
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        wait_for("deletion rebuild", || state.borrow().visible_entries.len() == 3);
+        wait_for("selection restored again", || selected_paths(&state, &ui) == vec![b_path.clone()]);
+
+        // ---- Compact: a second metadata-only change keeps every object.
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        wait_for("compact rows", || b_labels(&state).is_some());
+        select_entry_by_path(&state, &ui, &b_path);
+        let (c_size, c_modified) = b_labels(&state).unwrap();
+        let c_row = c_size.parent().unwrap();
+        let b_index = state.borrow().visible_entries.iter().position(|e| e.path == b_path).unwrap() as u32;
+        let c_object = ui.list_store.item(b_index).unwrap();
+        let c_text = c_size.label();
+        std::fs::write(dir.join("b.txt"), vec![b'z'; 8192]).unwrap();
+        wait_for("compact size text advances", || c_size.label() != c_text);
+        let (c_size_after, c_modified_after) = b_labels(&state).unwrap();
+        assert_eq!(c_size_after, c_size, "Compact: same size label object");
+        assert_eq!(c_modified_after, c_modified, "Compact: same modified label object");
+        assert_eq!(c_size_after.parent().unwrap(), c_row, "Compact: same row widget");
+        assert_eq!(ui.list_store.item(b_index).unwrap(), c_object, "Compact: same model object");
+        assert_eq!(c_size_after.label(), native_core::fmt_size(8192));
+        assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()], "Compact: selection kept");
+
+        // ---- Grid: a metadata-only scan does not remove or recreate children.
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        wait_for("grid children", || ui.grid.observe_children().n_items() == 3);
+        select_entry_by_path(&state, &ui, &b_path);
+        let children_before: Vec<gtk::Widget> = (0..3)
+            .map(|i| ui.grid.child_at_index(i).unwrap().upcast())
+            .collect();
+        std::fs::write(dir.join("b.txt"), vec![b'y'; 4096]).unwrap();
+        wait_for("grid state merged", || {
+            state.borrow().visible_entries.iter().any(|e| e.path == b_path && e.size == 4096)
+        });
+        for _ in 0..40 {
+            pump();
+        }
+        let children_after: Vec<gtk::Widget> = (0..3)
+            .map(|i| ui.grid.child_at_index(i).unwrap().upcast())
+            .collect();
+        assert_eq!(children_before, children_after, "same Grid child objects");
+        assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()]);
+        // Grid structural change still rebuilds and keeps the selection.
+        std::fs::write(dir.join("e.txt"), "e").unwrap();
+        wait_for("grid rebuild", || ui.grid.observe_children().n_items() == 4);
+        wait_for("grid selection restored", || selected_paths(&state, &ui) == vec![b_path.clone()]);
+
+        ui.window.destroy();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Joins a background writer on success and on panic.
+    struct WriterGuard {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl WriterGuard {
+        /// Appends to `path` every 40 ms until stopped; bounded to 30 s in any case.
+        fn start(path: std::path::PathBuf) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let handle = std::thread::spawn(move || {
+                use std::io::Write;
+                let began = Instant::now();
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+                while !flag.load(Ordering::SeqCst) && began.elapsed() < Duration::from_secs(30) {
+                    let _ = file.write_all(&[b'g'; 700]);
+                    let _ = file.flush();
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            });
+            Self { stop, handle: Some(handle) }
+        }
+
+        fn finish(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for WriterGuard {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+
+    /// A background writer grows `g.part` for 2.6+ seconds in each view. Selection
+    /// of a stable row is driven in code; the same row object and selection must
+    /// survive every refresh, and scan starts are timed. A real pointer click and
+    /// hover are not covered here: they are carried to the watched gate.
+    fn sustained_stream_keeps_objects_pointer_and_timing_d22() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d22s-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt", "g.part"] {
+            std::fs::write(dir.join(name), "1").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d22stream")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 600);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 4);
+        let a_path = dir.join("a.txt").to_string_lossy().to_string();
+        let b_path = dir.join("b.txt").to_string_lossy().to_string();
+        let index_of = |path: &str| state.borrow().visible_entries.iter().position(|e| e.path == path).unwrap();
+        let row_widget = |mode: ViewMode, path: &str| -> Option<gtk::Widget> {
+            if mode == ViewMode::Grid {
+                ui.grid.child_at_index(index_of(path) as i32).map(|c| c.upcast())
+            } else {
+                state
+                    .borrow()
+                    .meta_labels
+                    .get(path)
+                    .and_then(|(size, _)| size.upgrade())
+                    .and_then(|l| l.parent())
+            }
+        };
+        let mut report = Vec::new();
+
+        for mode in [ViewMode::Details, ViewMode::Compact, ViewMode::Grid] {
+            let mode_name = match mode {
+                ViewMode::Details => "Details",
+                ViewMode::Compact => "Compact",
+                ViewMode::Grid => "Grid",
+            };
+            set_view_mode(&state, &ui, mode);
+            wait_for("rows realized", || {
+                row_widget(mode, &b_path).is_some_and(|r| r.width() > 0 && r.height() > 0)
+            });
+            for _ in 0..5 {
+                pump();
+            }
+            select_entry_by_path(&state, &ui, &a_path);
+            assert_eq!(selected_paths(&state, &ui), vec![a_path.clone()]);
+
+            // Earlier fixture events must drain before the timed stream: no scan
+            // may start for 1.3 s.
+            let mut quiet_since = monotonic_ms();
+            let mut seen = SCAN_LOG.with(|log| log.borrow().len());
+            while monotonic_ms() - quiet_since < 1300 {
+                pump();
+                let now_seen = SCAN_LOG.with(|log| log.borrow().len());
+                if now_seen != seen {
+                    seen = now_seen;
+                    quiet_since = monotonic_ms();
+                }
+            }
+            SCAN_LOG.with(|log| log.borrow_mut().clear());
+            let t0 = monotonic_ms();
+            let mut writer = WriterGuard::start(dir.join("g.part"));
+
+            // The stable row is selected in code while the writer runs; the real
+            // pointer click is carried to the watched gate.
+            let row = row_widget(mode, &b_path).expect("b.txt row is realized");
+            select_entry_by_path(&state, &ui, &b_path);
+            assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()]);
+            let object = ui.list_store.item(index_of(&b_path) as u32);
+
+            // Refreshes keep running while the writer grows the file.
+            while monotonic_ms() - t0 < 2800 {
+                pump();
+                assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()], "{mode_name}: selection kept");
+                assert_eq!(row_widget(mode, &b_path).expect("row still realized"), row, "{mode_name}: same row object");
+                if mode != ViewMode::Grid {
+                    assert_eq!(ui.list_store.item(index_of(&b_path) as u32), object, "{mode_name}: same model object");
+                }
+            }
+            writer.finish();
+            let grown = std::fs::metadata(dir.join("g.part")).unwrap().len();
+            let log = SCAN_LOG.with(|log| log.borrow().clone());
+            assert!(log.len() >= 3, "{mode_name}: scans keep running: {log:?}");
+            assert!(log[0].0 >= t0 + 500, "{mode_name}: the first scan waits 500 ms: t0={t0} {log:?}");
+            for pair in log.windows(2) {
+                assert!(pair[1].0 >= pair[0].0 + 500, "{mode_name}: scans start 500 ms apart: {log:?}");
+                assert!(pair[0].1 != 0 && pair[1].0 >= pair[0].1, "{mode_name}: scans never overlap: {log:?}");
+            }
+            assert!(grown > 5000, "{mode_name}: the background writer really grew the file: {grown}");
+            report.push(format!(
+                "{mode_name}: selected {} ; scans {} ; g.part {grown} bytes",
+                b_path.rsplit('/').next().unwrap(),
+                log.len()
+            ));
+        }
+        eprintln!("wf-event: d22 sustained writer gate: {report:?}");
+        ui.window.destroy();
+    }
+
+    /// Removes a scratch fixture on success and on a failed assertion.
+    struct ScratchCleanup(std::path::PathBuf);
+    impl Drop for ScratchCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn descendants(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
@@ -8145,7 +8622,9 @@ mod tests {
     /// toolbar, the options menu and Ctrl+Shift+N all reach one action, which
     /// creates a real numbered folder and opens the shared inline editor on it.
     fn new_folder_menu_and_shared_inline_editor_d21() {
-        let root = std::env::temp_dir().join(format!("wf-d21-{}", std::process::id()));
+        let root = crate::native_core::scratch_root().join(format!("wf-d21-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
         let home = root.join("home");
         let dir = root.join("dir");
         std::fs::create_dir_all(&home).unwrap();
@@ -8821,8 +9300,9 @@ mod tests {
     /// concurrent favorite/recent updates must both survive.
     #[test]
     fn config_updates_preserve_fields_changed_by_another_window_d19() {
-        let dir = std::env::temp_dir().join(format!("wf-cfg-{}", std::process::id()));
+        let dir = crate::native_core::scratch_root().join(format!("wf-cfg-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
+        let _cleanup = ScratchCleanup(dir.clone());
         let path = dir.join("native-config.json");
         let (d1, d2) = (dir.join("one"), dir.join("two"));
         fs::create_dir_all(&d1).unwrap();
@@ -8854,8 +9334,9 @@ mod tests {
     /// window changing one setting must not write back another window's change.
     #[test]
     fn view_settings_persist_only_the_changed_field_d19() {
-        let dir = std::env::temp_dir().join(format!("wf-view-{}", std::process::id()));
+        let dir = crate::native_core::scratch_root().join(format!("wf-view-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
+        let _cleanup = ScratchCleanup(dir.clone());
         let path = dir.join("native-config.json");
         update_config_at(&path, |c| *c = AppConfig::default());
         // A changes every field; stale B (which still thinks the defaults hold)
