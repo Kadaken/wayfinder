@@ -6023,10 +6023,13 @@ fn open_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
 }
 
 /// Only a verified mountpoint announces a location and navigates; an error has
-/// no `refresh_to`, so the current folder stays.
-fn mount_outcome(result: Result<String, String>) -> Result<JobOutcome, String> {
-    let mountpoint = result?;
-    Ok(JobOutcome::navigate(format!("Mounted at {mountpoint}"), mountpoint))
+/// no `refresh_to`, so the current folder stays. A mount another component won
+/// the race for is reported as already mounted.
+fn mount_outcome(result: Result<native_core::Mounted, String>) -> Result<JobOutcome, String> {
+    Ok(match result? {
+        native_core::Mounted::New(path) => JobOutcome::navigate(format!("Mounted at {path}"), path),
+        native_core::Mounted::Already(path) => JobOutcome::navigate(format!("Already mounted at {path}"), path),
+    })
 }
 
 fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
@@ -9390,10 +9393,14 @@ mod tests {
 
     #[test]
     fn only_a_verified_mountpoint_navigates_d26() {
-        let ok = mount_outcome(Ok("/run/media/u/USB DRIVE".into())).unwrap();
+        let ok = mount_outcome(Ok(native_core::Mounted::New("/run/media/u/USB DRIVE".into()))).unwrap();
         assert_eq!(ok.message, "Mounted at /run/media/u/USB DRIVE");
         assert_eq!(ok.refresh_to.as_deref(), Some("/run/media/u/USB DRIVE"));
         assert!(ok.undo.is_none());
+        let already = mount_outcome(Ok(native_core::Mounted::Already("/run/media/u/USB DRIVE".into()))).unwrap();
+        assert_eq!(already.message, "Already mounted at /run/media/u/USB DRIVE");
+        assert_eq!(already.refresh_to.as_deref(), Some("/run/media/u/USB DRIVE"));
+        assert!(already.undo.is_none());
         let err = mount_outcome(Err("Mount command completed but no usable mountpoint was found".into()));
         assert!(err.is_err());
     }
