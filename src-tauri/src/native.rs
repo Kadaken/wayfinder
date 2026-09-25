@@ -3844,6 +3844,19 @@ fn history_step(state: &Rc<RefCell<AppState>>, forward: bool) {
 }
 
 fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, mode: NavMode) {
+    navigate_to_with_message(state, path, mode, None);
+}
+
+/// `done_message` is a one-use status (a finished job's result). It is shown
+/// only after THIS request's listing succeeds and settles, so the refresh the
+/// job triggered cannot overwrite it. A listing error, a stale or cancelled
+/// request, or any newer navigation never shows it.
+fn navigate_to_with_message(
+    state: &Rc<RefCell<AppState>>,
+    path: String,
+    mode: NavMode,
+    done_message: Option<String>,
+) {
     let show_hidden = state.borrow().show_hidden;
     // The tab this request belongs to; a completion for any other tab is dropped.
     let tab_id = state.borrow().tabs.active().id;
@@ -3967,6 +3980,9 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, mode: NavMode) {
                     metadata_unavailable,
                     unreadable_entries,
                 ));
+                if let Some(message) = &done_message {
+                    ui.status.set_label(message);
+                }
                 // Restore the pre-refresh scroll position once the rebuilt rows
                 // have been allocated (so the vadjustment upper bound is valid).
                 if let Some(value) = saved_scroll {
@@ -6332,8 +6348,12 @@ where
                 .refresh_to
                 .clone()
                 .unwrap_or_else(|| refresh_path.clone());
-            navigate(&state, target);
-            ui.status.set_label(&outcome.message);
+            navigate_to_with_message(
+                &state,
+                target,
+                NavMode::Record,
+                Some(outcome.message.clone()),
+            );
             glib::ControlFlow::Break
         }
         Ok(Err(err)) => {
@@ -8509,6 +8529,7 @@ mod tests {
         show_hidden_toolbar_and_options_stay_in_sync_d28();
         invert_selection_is_the_exact_complement_d29();
         preview_pane_toggle_is_one_safe_route_d30();
+        job_result_survives_its_own_refresh_d32();
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
@@ -8645,6 +8666,93 @@ mod tests {
         let (_app2, _state2, ui2) = open("io.github.legendofzito.wayfinder.d30test2");
         assert!(ui2.preview_toggle.is_active() && ui2.preview_scroll.is_visible());
         ui2.window.destroy();
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn job_result_survives_its_own_refresh_d32() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d32-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let other = root.join("other");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        std::fs::write(other.join("o.txt"), "O").unwrap();
+        std::env::set_var("HOME", &home);
+        let dir_str = dir.to_string_lossy().to_string();
+        let other_str = other.to_string_lossy().to_string();
+        let missing = root.join("missing").to_string_lossy().to_string();
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d32test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        wait_for("first status", || ui.status.label() == "1 item shown");
+
+        // A successful job: busy label, its own same-folder refresh, then its result stays.
+        run_job(
+            state.clone(),
+            ui.clone(),
+            "Working D32".to_string(),
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(JobOutcome::message("D32 job finished"))
+            },
+            |_, _, _| {},
+        );
+        assert_eq!(ui.status.label(), "Working D32");
+        wait_for("job result", || ui.status.label() == "D32 job finished");
+        assert!(state.borrow().listing_cancel.is_none(), "the refresh had already completed");
+        assert_eq!(state.borrow().visible_entries.len(), 1);
+        pump();
+        pump();
+        assert_eq!(ui.status.label(), "D32 job finished", "the result survives its own refresh");
+
+        // Ordinary navigation replaces it with the normal listing status.
+        navigate(&state, other_str.clone());
+        wait_for("ordinary status", || ui.status.label() == "1 item shown");
+        assert_eq!(state.borrow().cwd, other_str);
+
+        // A failed listing shows its error, never the queued success.
+        run_job(
+            state.clone(),
+            ui.clone(),
+            "Working ghost".to_string(),
+            {
+                let missing = missing.clone();
+                move || Ok(JobOutcome::navigate("D32 ghost success", missing))
+            },
+            |_, _, _| {},
+        );
+        wait_for("listing error", || ui.status.label().starts_with("Cannot open"));
+        pump();
+        assert!(ui.status.label().starts_with("Cannot open"), "{}", ui.status.label());
+        assert!(!ui.status.label().contains("D32 ghost success"));
+
+        // An overtaken request cannot put its old message on the newer path.
+        navigate_to_with_message(&state, other_str.clone(), NavMode::Keep, Some("D32 stale".to_string()));
+        navigate(&state, dir_str.clone());
+        wait_for("newer path", || {
+            state.borrow().cwd == dir_str && ui.status.label() == "1 item shown"
+        });
+        pump();
+        pump();
+        assert_eq!(state.borrow().cwd, dir_str);
+        assert_eq!(ui.status.label(), "1 item shown", "the stale message never appears");
+
         ui.window.destroy();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
