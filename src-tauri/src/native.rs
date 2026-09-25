@@ -5665,17 +5665,30 @@ where
     dialog.present(Some(&ui.window));
 }
 
-/// The disk work of every transfer, checked against the disk afterwards.
+/// The disk work of every transfer: one transaction for the whole batch, checked
+/// against the disk before it is committed.
 fn perform_transfer(
     srcs: &[String],
     dest: &str,
     is_copy: bool,
     on_conflict: native_core::PasteConflict,
-) -> Result<Vec<native_core::ResolvedItem>, String> {
-    let before = native_core::snapshot_sources(srcs)?;
-    let items = native_core::resolve_paste(srcs, dest, is_copy, on_conflict)?;
-    native_core::verify_transfer(&before, &items, is_copy)?;
-    Ok(items)
+) -> Result<native_core::TransferResult, String> {
+    native_core::transfer_batch(srcs, dest, is_copy, on_conflict, &|_| Ok(()), false)
+}
+
+/// A committed transfer always yields Undo, even with cleanup warnings; an error
+/// means nothing changed and yields none.
+fn transfer_outcome(
+    ed: &str,
+    is_copy: bool,
+    result: Result<native_core::TransferResult, String>,
+) -> Result<JobOutcome, String> {
+    let native_core::TransferResult { items, warnings } = result?;
+    let mut message = format!("{ed} {} item{}", items.len(), plural(items.len()));
+    if !warnings.is_empty() {
+        message.push_str(&format!(" (warning: {})", warnings.join("; ")));
+    }
+    Ok(JobOutcome::undo(message, UndoAction::Pasted { items, was_copy: is_copy }))
 }
 
 /// True when keyboard focus is `root` or somewhere inside it.
@@ -5725,14 +5738,7 @@ fn run_transfer(
         label,
         move || {
             // A failed MOVE is reported as a failure and never retried as COPY.
-            let items = perform_transfer(&srcs, &dest, is_copy, on_conflict)?;
-            Ok(JobOutcome::undo(
-                format!("{ed} {} item{}", items.len(), plural(items.len())),
-                UndoAction::Pasted {
-                    items,
-                    was_copy: is_copy,
-                },
-            ))
+            transfer_outcome(ed, is_copy, perform_transfer(&srcs, &dest, is_copy, on_conflict))
         },
         move |state, _, _| {
             // after_success only runs when the job succeeded.
@@ -7951,7 +7957,7 @@ mod tests {
         let ino = std::fs::metadata(s("copy-me.txt")).unwrap().ino();
         let t = txn.into_transfer();
         assert_eq!(plan_transfer(&t), TransferPlan::Run);
-        let items = perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap();
+        let items = perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap().items;
         assert_eq!(items.len(), 1);
         assert_eq!(std::fs::metadata(s("copy-me.txt")).unwrap().ino(), ino);
         assert_eq!(std::fs::read(s("copy-me.txt")).unwrap(), body(11264));
@@ -8560,6 +8566,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn committed_transfer_warning_keeps_undo_and_an_error_has_none_d24() {
+        let item = native_core::ResolvedItem { from: "/s/a".into(), to: "/d/a".into() };
+        let committed = native_core::TransferResult {
+            items: vec![item.clone()],
+            warnings: vec!["could not remove a backup".into()],
+        };
+        let outcome = transfer_outcome("Pasted", true, Ok(committed)).unwrap();
+        assert!(outcome.message.contains("warning"));
+        assert!(matches!(outcome.undo, Some(UndoAction::Pasted { was_copy: true, ref items }) if items.len() == 1));
+        assert!(transfer_outcome("Pasted", true, Err("rolled back".into())).is_err());
     }
 
     fn descendants(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
