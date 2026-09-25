@@ -5828,14 +5828,17 @@ fn open_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
         ui,
         format!("Mounting {}", drive.name),
         move || {
-            let mountpoint = native_core::mount_drive(&device)?;
-            Ok(JobOutcome::navigate(
-                format!("Mounted at {mountpoint}"),
-                mountpoint,
-            ))
+            mount_outcome(native_core::mount_drive(&device))
         },
         |state, ui, _| rebuild_sidebar(state, ui),
     );
+}
+
+/// Only a verified mountpoint announces a location and navigates; an error has
+/// no `refresh_to`, so the current folder stays.
+fn mount_outcome(result: Result<String, String>) -> Result<JobOutcome, String> {
+    let mountpoint = result?;
+    Ok(JobOutcome::navigate(format!("Mounted at {mountpoint}"), mountpoint))
 }
 
 fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
@@ -8579,6 +8582,16 @@ mod tests {
         assert!(outcome.message.contains("warning"));
         assert!(matches!(outcome.undo, Some(UndoAction::Pasted { was_copy: true, ref items }) if items.len() == 1));
         assert!(transfer_outcome("Pasted", true, Err("rolled back".into())).is_err());
+    }
+
+    #[test]
+    fn only_a_verified_mountpoint_navigates_d26() {
+        let ok = mount_outcome(Ok("/run/media/u/USB DRIVE".into())).unwrap();
+        assert_eq!(ok.message, "Mounted at /run/media/u/USB DRIVE");
+        assert_eq!(ok.refresh_to.as_deref(), Some("/run/media/u/USB DRIVE"));
+        assert!(ok.undo.is_none());
+        let err = mount_outcome(Err("Mount command completed but no usable mountpoint was found".into()));
+        assert!(err.is_err());
     }
 
     fn descendants(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
