@@ -429,7 +429,7 @@ pub fn list_drives() -> Vec<Drive> {
 /// a nonzero one. The outer `Result` is a failure to run it at all.
 pub type MountRun = Result<Result<(), String>, String>;
 
-pub fn mount_drive(device: &str) -> Result<String, String> {
+pub fn mount_drive(device: &str) -> Result<Mounted, String> {
     mount_drive_with(
         device,
         &|device| {
@@ -456,17 +456,40 @@ pub fn mount_drive(device: &str) -> Result<String, String> {
     )
 }
 
+/// How a drive came to be mounted at the verified location.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Mounted {
+    /// The mount command exited zero and system state confirms the location.
+    New(String),
+    /// The mount command failed, but system state proves this exact device is
+    /// already mounted at the location (another component mounted it first).
+    Already(String),
+}
+
 /// A zero exit only means the command finished. The location comes from system
 /// state (`lookup` returns structured `lsblk -J` output), never from stdout.
+/// A nonzero exit is recovered only when that same state proves the device is
+/// already mounted at one verified directory; the command's wording is never
+/// inspected, and any other failure keeps its original error.
 pub fn mount_drive_with(
     device: &str,
     run: &dyn Fn(&str) -> MountRun,
     lookup: &dyn Fn(&str) -> Result<String, String>,
-) -> Result<String, String> {
-    run(device)??;
-    let none = "Mount command completed but no usable mountpoint was found";
-    let json = lookup(device).map_err(|err| format!("{none}: {err}"))?;
-    verified_mountpoint(device, &json).map_err(|err| format!("{none}: {err}"))
+) -> Result<Mounted, String> {
+    match run(device)? {
+        Ok(()) => {
+            let none = "Mount command completed but no usable mountpoint was found";
+            let json = lookup(device).map_err(|err| format!("{none}: {err}"))?;
+            verified_mountpoint(device, &json)
+                .map(Mounted::New)
+                .map_err(|err| format!("{none}: {err}"))
+        }
+        Err(original) => lookup(device)
+            .ok()
+            .and_then(|json| verified_mountpoint(device, &json).ok())
+            .map(Mounted::Already)
+            .ok_or(original),
+    }
 }
 
 /// The one directory `device` is mounted at, or an error. Fail-closed on parse
@@ -3293,10 +3316,18 @@ mod tests {
         let s = |p: &Path| p.to_string_lossy().to_string();
         let ok: &dyn Fn(&str) -> MountRun = &|_| Ok(Ok(()));
         let dev = "/dev/sdx1";
-        let with = |json: String| mount_drive_with(dev, ok, &move |_| Ok(json.clone()));
+        let with = |json: String| match mount_drive_with(dev, ok, &move |_| Ok(json.clone())) {
+            Ok(Mounted::New(path)) => Ok(path),
+            Ok(Mounted::Already(path)) => panic!("a zero exit is a new mount: {path}"),
+            Err(err) => Err(err),
+        };
 
-        // nonzero exit keeps its stderr; lookup never consulted
-        let failed = mount_drive_with(dev, &|_| Ok(Err("Error mounting: busy".into())), &|_| panic!("no lookup"));
+        // nonzero exit with nothing mounted keeps its stderr
+        let failed = mount_drive_with(
+            dev,
+            &|_| Ok(Err("Error mounting: busy".into())),
+            &|_| Ok(lsblk_json(&[(dev, serde_json::json!([null]))])),
+        );
         assert_eq!(failed.unwrap_err(), "Error mounting: busy");
         assert!(mount_drive_with(dev, &|_| Err("no udisksctl".into()), &|_| panic!()).is_err());
 
@@ -3330,6 +3361,62 @@ mod tests {
             "children": [{"path": dev, "mountpoints": [s(&spaced)]}]}]})
         .to_string();
         assert_eq!(with(nested).unwrap(), s(&spaced));
+    }
+
+    #[test]
+    fn already_mounted_is_recovered_from_verified_state_only_d26() {
+        let root = scratch_case("wf-d26 already");
+        let spaced = root.join("USB DRIVE");
+        fs::create_dir(&spaced).unwrap();
+        let file = root.join("plain.txt");
+        fs::write(&file, "x").unwrap();
+        let s = |p: &Path| p.to_string_lossy().to_string();
+        let dev = "/dev/sdx1";
+        let refused: &dyn Fn(&str) -> MountRun =
+            &|_| Ok(Err("Error mounting: GDBus.Error:org.freedesktop.UDisks2.Error.AlreadyMounted".into()));
+        let after = |json: String| mount_drive_with(dev, refused, &move |_| Ok(json.clone()));
+
+        // zero exit plus one verified mountpoint is a new mount
+        let new = mount_drive_with(dev, &|_| Ok(Ok(())), &|_| Ok(lsblk_json(&[(dev, serde_json::json!([s(&spaced)]))])));
+        assert_eq!(new, Ok(Mounted::New(s(&spaced))));
+
+        // nonzero exit plus one verified mountpoint is already mounted
+        assert_eq!(
+            after(lsblk_json(&[(dev, serde_json::json!([s(&spaced)]))])),
+            Ok(Mounted::Already(s(&spaced)))
+        );
+
+        // the command's wording is irrelevant: any nonzero exit with the same state recovers
+        let other = mount_drive_with(
+            dev,
+            &|_| Ok(Err("something else entirely".into())),
+            &|_| Ok(lsblk_json(&[(dev, serde_json::json!([s(&spaced)]))])),
+        );
+        assert_eq!(other, Ok(Mounted::Already(s(&spaced))));
+
+        // no / invalid / multiple mountpoints keep the original error
+        let original = "Error mounting: GDBus.Error:org.freedesktop.UDisks2.Error.AlreadyMounted";
+        assert_eq!(after(lsblk_json(&[(dev, serde_json::json!([null]))])).unwrap_err(), original);
+        for bad in ["", "relative/dir", &s(&root.join("missing")), &s(&file)] {
+            assert_eq!(after(lsblk_json(&[(dev, serde_json::json!([bad]))])).unwrap_err(), original, "{bad}");
+        }
+        let two = lsblk_json(&[(dev, serde_json::json!([s(&spaced), s(&root)]))]);
+        assert_eq!(after(two).unwrap_err(), original);
+        assert_eq!(after("not json".into()).unwrap_err(), original);
+        assert_eq!(
+            after(lsblk_json(&[("/dev/sdy1", serde_json::json!([s(&spaced)]))])).unwrap_err(),
+            original
+        );
+
+        // a failed lookup does not mask the original error
+        assert_eq!(
+            mount_drive_with(dev, refused, &|_| Err("lsblk gone".into())).unwrap_err(),
+            original
+        );
+
+        // failing to start the command stays an error and never consults the lookup
+        let spawn = mount_drive_with(dev, &|_| Err("no udisksctl".into()), &|_| panic!("no lookup"));
+        assert_eq!(spawn.unwrap_err(), "no udisksctl");
     }
 
     #[test]
