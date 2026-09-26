@@ -5,6 +5,7 @@ description = "A fast, native file manager for Linux with a docked preview pane"
 authors = ["LegendofZito"]
 license = "LicenseRef-Proprietary"
 edition = "2021"
+exclude = ["src/guide-names.json"]
 
 # The Tauri/WebKit shell was removed on 2026-08-13. This crate is now a single
 # GTK4/libadwaita binary; there is no library target, no build script and no
