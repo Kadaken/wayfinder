@@ -1052,6 +1052,27 @@ fn remove_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
     ui.status.set_label("Removed from Favorites");
 }
 
+/// True when the shared config on disk holds no recents. Read from disk, not
+/// from this window, because another window may have added visits since.
+fn recents_are_empty(state: &Rc<RefCell<AppState>>) -> bool {
+    match config_path() {
+        Some(path) => read_config_at(&path).recents.is_empty(),
+        None => state.borrow().recents.is_empty(),
+    }
+}
+
+/// Clears only `AppConfig.recents`, then makes every live window match the
+/// committed result, so a stale window cannot write the old entries back.
+fn clear_recents(ui: &Ui) {
+    let committed = update_config(|config| config.recents.clear()).map(|config| config.recents);
+    let windows = WINDOWS.with(|windows| windows.borrow().windows());
+    for (window_state, window_ui) in windows {
+        window_state.borrow_mut().recents = committed.clone().unwrap_or_default();
+        rebuild_sidebar(&window_state, &window_ui);
+    }
+    ui.status.set_label("Recent folders cleared");
+}
+
 /// One tab: its current folder plus its own back/forward history. `id` is stable
 /// for the tab's lifetime, so an async listing can never land in another tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3594,6 +3615,13 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         menu.append(&context_item("", "Invert Selection", "", &popover, move || {
             invert_selection(&state, &ui)
         }));
+    }
+    {
+        let row_state = state.clone();
+        let ui = ui.clone();
+        let row = context_item("", "Clear Recents", "", &popover, move || clear_recents(&ui));
+        row.set_sensitive(!recents_are_empty(&row_state));
+        menu.append(&row);
     }
 
     menu.append(&context_separator());
@@ -8614,6 +8642,7 @@ mod tests {
         job_result_survives_its_own_refresh_d32();
         folder_activation_waits_for_gtk_to_finish_d33();
         navigation_hands_focus_to_the_view_root_d34();
+        clear_recents_is_durable_and_live_d35();
         item_right_click_menu_opens_bounded_and_stays_d41();
         open_with_opens_a_side_menu_not_a_dialog_d42();
     }
@@ -9168,6 +9197,152 @@ mod tests {
         pump();
 
         ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-35: Clear Recents empties only `recents`, on disk and in every live
+    /// window, and no stale window can bring an old entry back.
+    fn clear_recents_is_durable_and_live_d35() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d35-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dirs: Vec<_> = ["recent-one-35", "recent-two-35", "fav-35", "win-a-35", "win-b-35", "new-visit-35"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect();
+        for d in &dirs {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(format!("marker-{}.txt", d.file_name().unwrap().to_string_lossy())), "M").unwrap();
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        // Every seeded directory, its entries and their exact bytes.
+        let tree = || {
+            let mut all = Vec::new();
+            for d in &dirs {
+                let mut names: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).collect();
+                names.sort();
+                all.push((d.clone(), names.iter().map(|n| (n.clone(), std::fs::read(n).unwrap())).collect::<Vec<_>>()));
+            }
+            all
+        };
+        let tree_before = tree();
+        let p = |i: usize| dirs[i].to_string_lossy().to_string();
+        let path = config_path().unwrap();
+        update_config_at(&path, |c| {
+            push_recent(&mut c.recents, &p(0));
+            push_recent(&mut c.recents, &p(1));
+            add_favorite(&mut c.favorites, &p(2));
+            c.show_hidden = true;
+            c.sort_ascending = false;
+            c.search_in_files = true;
+        });
+        let others = || {
+            let c = read_config_at(&path);
+            serde_json::to_string(&(c.favorites, c.show_hidden, c.view_mode, c.search_in_files, c.sort_key, c.sort_ascending)).unwrap()
+        };
+        let others_before = others();
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d35test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(p(3)), None);
+        build_ui(&app, Some(p(4)), None);
+        let mine = |(_, u): &(Rc<RefCell<AppState>>, Ui)| u.window.application().as_ref() == Some(app.upcast_ref());
+        let windows: Vec<_> = WINDOWS.with(|w| w.borrow().windows()).into_iter().filter(|w| mine(w)).collect();
+        assert_eq!(windows.len(), 2);
+        let find = |cwd: &str| {
+            windows.iter().find(|(s, _)| s.borrow().cwd == cwd).cloned().expect("window by cwd")
+        };
+        let (sa, ua) = find(&p(3));
+        let (sb, ub) = find(&p(4));
+        wait_for("both listings", || {
+            sa.borrow().visible_entries.len() == 1 && sb.borrow().visible_entries.len() == 1
+        });
+        ua.list_selection.select_item(0, true);
+        pump();
+        let snap = |s: &Rc<RefCell<AppState>>, u: &Ui| {
+            let s = s.borrow();
+            (s.cwd.clone(), s.tabs.tabs.clone(), selected_indices(u))
+        };
+        let (snap_a, snap_b) = (snap(&sa, &ua), snap(&sb, &ub));
+        assert_eq!(snap_a.2, vec![0]);
+        let recent_heading = |u: &Ui| {
+            all_widgets(u.sidebar.upcast_ref())
+                .iter()
+                .any(|w| w.downcast_ref::<gtk::Label>().is_some_and(|l| l.label() == "Recent"))
+        };
+        assert!(recent_heading(&ua) && recent_heading(&ub), "recents shown before clearing");
+        let rows_before = all_widgets(ua.sidebar.upcast_ref()).iter().filter(|w| w.is::<gtk::ListBoxRow>()).count();
+        let disk_recents = || read_config_at(&path).recents.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
+        assert!(disk_recents().contains(&p(0)) && disk_recents().contains(&p(1)));
+
+        // Real Options popover in window A.
+        let options_a = all_widgets(ua.window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.tooltip_text().as_deref() == Some("View and folder options"))
+            .expect("Options button");
+        options_a.emit_clicked();
+        let pop = popovers_of(options_a.upcast_ref()).pop().expect("options popover");
+        let clear = button_labelled(pop.upcast_ref(), "Clear Recents").expect("Clear Recents row exists");
+        assert!(clear.is_sensitive() && clear.is_visible(), "visible and enabled with recents present");
+        clear.emit_clicked();
+        pump();
+
+        assert!(disk_recents().is_empty(), "disk recents cleared");
+        assert_eq!(others(), others_before, "favorites and settings unchanged");
+        assert_eq!(tree(), tree_before, "every seeded directory and marker is byte-identical");
+        let old_path_shown = |u: &Ui| {
+            all_widgets(u.sidebar.upcast_ref()).iter().any(|w| {
+                w.downcast_ref::<gtk::Label>().is_some_and(|l| l.label().contains("recent-one-35") || l.label().contains("recent-two-35"))
+            })
+        };
+        assert!(!old_path_shown(&ua) && !old_path_shown(&ub), "no cleared path in either sidebar");
+        assert!(sa.borrow().recents.is_empty() && sb.borrow().recents.is_empty(), "both live states empty");
+        assert!(!recent_heading(&ua) && !recent_heading(&ub), "no Recent heading in either sidebar");
+        let rows_after = all_widgets(ua.sidebar.upcast_ref()).iter().filter(|w| w.is::<gtk::ListBoxRow>()).count();
+        assert!(rows_after < rows_before, "the Recent rows are gone");
+        assert_eq!(ua.status.label(), "Recent folders cleared");
+        assert_eq!(snap(&sa, &ua), snap_a, "window A unchanged");
+        assert_eq!(snap(&sb, &ub), snap_b, "window B unchanged");
+
+        // The row stays, disabled.
+        options_a.emit_clicked();
+        let pop = popovers_of(options_a.upcast_ref()).pop().expect("options popover");
+        let clear = button_labelled(pop.upcast_ref(), "Clear Recents").expect("row still present");
+        assert!(clear.is_visible() && !clear.is_sensitive(), "visible but disabled when empty");
+        pop.popdown();
+
+        // Stale window B navigates: only its new visit appears.
+        navigate(&sb, p(5));
+        wait_for("new visit", || sb.borrow().cwd == p(5) && sb.borrow().visible_entries.len() == 1);
+        assert_eq!(disk_recents(), vec![p(5)], "only the new visit is on disk");
+        assert_eq!(sb.borrow().recents.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), vec![p(5)]);
+        assert_eq!(others(), others_before);
+        assert_eq!(tree(), tree_before, "still byte-identical after the stale-window visit");
+
+        // A fresh window loads no cleared entry.
+        update_config_at(&path, |c| c.recents.clear());
+        let fresh = read_config_at(&path);
+        assert!(fresh.recents.is_empty());
+        build_ui(&app, Some(p(4)), None);
+        let (sf, _uf) = WINDOWS.with(|w| w.borrow().windows()).into_iter().filter(|w| mine(w)).last().unwrap();
+        wait_for("fresh listing", || sf.borrow().visible_entries.len() == 1);
+        for old in [p(0), p(1)] {
+            assert!(!sf.borrow().recents.iter().any(|r| r.path == old), "old recent resurrected");
+            assert!(!disk_recents().contains(&old));
+        }
+
+        for (_, u) in WINDOWS.with(|w| w.borrow().windows()).into_iter().filter(|w| mine(w)) {
+            u.window.destroy();
+        }
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
@@ -10692,6 +10867,13 @@ mod tests {
         assert!(c.show_hidden && !c.sort_ascending);
         update_config_at(&path, |c| remove_favorite(&mut c.favorites, &p1));
         assert_eq!(read_config_at(&path).favorites.len(), 1);
+        // D-35: clearing recents touches only recents, and a later visit reads the cleared file.
+        update_config_at(&path, |c| c.recents.clear());
+        let c = read_config_at(&path);
+        assert!(c.recents.is_empty() && c.favorites.len() == 1 && c.show_hidden && !c.sort_ascending);
+        update_config_at(&path, |c| push_recent(&mut c.recents, &p1));
+        let rec: Vec<_> = read_config_at(&path).recents.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(rec, vec![p1.clone()], "only the new visit follows a clear");
         let _ = fs::remove_dir_all(&dir);
     }
 

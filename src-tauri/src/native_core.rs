@@ -2166,6 +2166,11 @@ impl<S, U: Clone, H> WindowRegistry<S, U, H> {
             .map(|(state, _, _)| state.clone())
     }
 
+    /// Every live window, so a change to shared data can reach all of them.
+    pub fn windows(&self) -> Vec<(std::rc::Rc<std::cell::RefCell<S>>, U)> {
+        self.entries.iter().map(|(state, ui, _)| (state.clone(), ui.clone())).collect()
+    }
+
     /// The window a desktop request should reuse: the one `is_active` picks,
     /// else the most recently opened.
     pub fn active(
