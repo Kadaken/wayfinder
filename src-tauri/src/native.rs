@@ -7132,9 +7132,7 @@ fn show_item_context_menu(
     if !entry.is_dir {
         let ui = ui.clone();
         let path = entry.path.clone();
-        menu.append(&context_item("application-x-executable-symbolic", "Open With...", "", &popover, move || {
-            show_open_with_dialog(ui.clone(), path.clone())
-        }));
+        menu.append(&context_open_with(&popover, ui.clone(), path.clone()));
     }
     if entry.is_dir {
         let favorite = is_favorite(&state.borrow(), &entry.path);
@@ -7489,50 +7487,73 @@ fn context_separator() -> gtk::Separator {
     sep
 }
 
-#[allow(deprecated)]
-fn show_open_with_dialog(ui: Ui, path: String) {
-    let apps = native_core::open_with_apps(&path);
-    if apps.is_empty() {
-        ui.status.set_label("No Open With applications found");
-        return;
+fn open_with_apps_for(path: &str) -> Vec<native_core::AppEntry> {
+    open_with_test_apps().unwrap_or_else(|| native_core::open_with_apps(path))
+}
+
+fn launch_open_with(app_id: &str, path: &str) -> Result<(), String> {
+    match open_with_test_launch(app_id, path) {
+        Some(result) => result,
+        None => native_core::open_with(app_id, path),
     }
+}
 
-    let dialog = gtk::Dialog::with_buttons(
-        Some("Open With"),
-        Some(&ui.window),
-        gtk::DialogFlags::MODAL,
-        &[("Cancel", gtk::ResponseType::Cancel)],
-    );
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    content.set_margin_top(16);
-    content.set_margin_end(16);
-    content.set_margin_bottom(16);
-    content.set_margin_start(16);
-
-    for app in apps {
-        let button = gtk::Button::builder()
-            .label(&app.name)
-            .halign(gtk::Align::Fill)
+/// The `Open With...` row. Opens a compact side popover beside the row and
+/// leaves the item menu open behind it, so no window or grab is ever created.
+/// Choosing an app closes both menus, then launches it.
+fn context_open_with(parent: &gtk::Popover, ui: Ui, path: String) -> gtk::Button {
+    let row = menu_row("application-x-executable-symbolic", "Open With...", "");
+    let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+    arrow.set_pixel_size(12);
+    row.append(&arrow);
+    let button = gtk::Button::builder().child(&row).halign(gtk::Align::Fill).build();
+    button.add_css_class("flat");
+    button.add_css_class("wf-menu-item");
+    let parent = parent.clone();
+    button.connect_clicked(move |button| {
+        let apps = open_with_apps_for(&path);
+        if apps.is_empty() {
+            parent.popdown();
+            ui.status.set_label("No Open With applications found");
+            return;
+        }
+        let side = gtk::Popover::new();
+        side.set_has_arrow(false);
+        side.set_position(gtk::PositionType::Right);
+        side.set_parent(button);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.set_margin_top(4);
+        menu.set_margin_end(4);
+        menu.set_margin_bottom(4);
+        menu.set_margin_start(4);
+        for app in apps {
+            let parent = parent.clone();
+            let ui = ui.clone();
+            let path = path.clone();
+            let name = app.name.clone();
+            menu.append(&context_item("application-x-executable-symbolic", &name, "", &side, move || {
+                parent.popdown();
+                match launch_open_with(&app.id, &path) {
+                    Ok(()) => ui.status.set_label(&format!("Opened with {}", app.name)),
+                    Err(err) => ui.status.set_label(&format!("Open With failed: {err}")),
+                }
+            }));
+        }
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(ITEM_MENU_MAX_HEIGHT)
+            .child(&menu)
             .build();
-        let ui_for_app = ui.clone();
-        let dialog_for_app = dialog.clone();
-        let path_for_app = path.clone();
-        button.connect_clicked(move |_| {
-            match native_core::open_with(&app.id, &path_for_app) {
-                Ok(()) => ui_for_app
-                    .status
-                    .set_label(&format!("Opened with {}", app.name)),
-                Err(err) => ui_for_app
-                    .status
-                    .set_label(&format!("Open With failed: {err}")),
-            }
-            dialog_for_app.close();
+        side.set_child(Some(&scroller));
+        side.connect_closed(|side| {
+            let side = side.clone();
+            glib::idle_add_local_once(move || side.unparent());
         });
-        content.append(&button);
-    }
-
-    dialog.content_area().append(&content);
-    dialog.present();
+        side.popup();
+    });
+    button
 }
 
 #[allow(deprecated)]
@@ -8154,6 +8175,38 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
+#[cfg(not(test))]
+fn open_with_test_apps() -> Option<Vec<native_core::AppEntry>> {
+    None
+}
+
+#[cfg(not(test))]
+fn open_with_test_launch(_app_id: &str, _path: &str) -> Option<Result<(), String>> {
+    None
+}
+
+thread_local! {
+    /// Test-only stand-ins so a test never launches a real application.
+    #[cfg(test)]
+    static TEST_OPEN_WITH_APPS: RefCell<Option<Vec<native_core::AppEntry>>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static TEST_OPEN_WITH_LAUNCHES: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn open_with_test_apps() -> Option<Vec<native_core::AppEntry>> {
+    TEST_OPEN_WITH_APPS.with(|a| a.borrow().clone())
+}
+
+#[cfg(test)]
+fn open_with_test_launch(app_id: &str, path: &str) -> Option<Result<(), String>> {
+    if TEST_OPEN_WITH_APPS.with(|a| a.borrow().is_none()) {
+        return None;
+    }
+    TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().push((app_id.to_string(), path.to_string())));
+    Some(Ok(()))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -8562,6 +8615,7 @@ mod tests {
         folder_activation_waits_for_gtk_to_finish_d33();
         navigation_hands_focus_to_the_view_root_d34();
         item_right_click_menu_opens_bounded_and_stays_d41();
+        open_with_opens_a_side_menu_not_a_dialog_d42();
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
@@ -8945,6 +8999,97 @@ mod tests {
         popover.popdown();
         pump();
         assert!(!popover.is_mapped());
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn open_with_opens_a_side_menu_not_a_dialog_d42() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d42-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("with-me.txt"), "hello").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        TEST_OPEN_WITH_APPS.with(|a| {
+            *a.borrow_mut() = Some(vec![
+                native_core::AppEntry { id: "fake-editor-a.desktop".into(), name: "Fake Editor A".into() },
+                native_core::AppEntry { id: "fake-editor-b.desktop".into(), name: "Fake Editor B".into() },
+            ])
+        });
+        TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d42test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        let has_right_click = |w: &gtk::Widget| {
+            let controllers = w.observe_controllers();
+            (0..controllers.n_items()).any(|i| {
+                controllers
+                    .item(i)
+                    .and_then(|o| o.downcast::<gtk::GestureClick>().ok())
+                    .is_some_and(|g| g.button() == 3)
+            })
+        };
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a file row carries the right-click gesture");
+        ui.list_selection.select_item(0, true);
+        update_selection(&state, &ui);
+        let entry = state.borrow().visible_entries[0].clone();
+        let file_path = entry.path.clone();
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
+        pump();
+        pump();
+        let item_menu = popovers_of(&row).pop().expect("the item menu popover");
+        assert!(item_menu.is_mapped(), "the item menu is open");
+
+        // The real Open With row, through its connected click route.
+        let open_with = button_labelled(item_menu.upcast_ref(), "Open With...").expect("the Open With row");
+        open_with.emit_clicked();
+        pump();
+        pump();
+
+        assert!(
+            !gtk::Window::list_toplevels().iter().any(|w| w.is::<gtk::Dialog>() && w.is_visible()),
+            "Open With opens no dialog or separate window"
+        );
+        assert!(item_menu.is_mapped(), "the parent item menu stays open behind the side menu");
+        let side = popovers_of(open_with.upcast_ref()).pop().expect("a popover anchored to the Open With row");
+        assert!(side.is_visible() && side.is_mapped(), "the side menu is open");
+        assert!(side.height() > 0 && side.height() <= ITEM_MENU_MAX_HEIGHT, "the side menu is compact: {} px", side.height());
+        assert!(button_labelled(side.upcast_ref(), "Fake Editor A").is_some());
+        assert!(button_labelled(side.upcast_ref(), "Fake Editor B").is_some());
+        assert!(ui.window.is_sensitive() && ui.window.is_visible(), "the file window stays usable");
+        assert!(TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow().is_empty()), "nothing launches before a choice");
+
+        button_labelled(side.upcast_ref(), "Fake Editor A").unwrap().emit_clicked();
+        pump();
+        pump();
+        assert!(!side.is_mapped() && !item_menu.is_mapped(), "choosing an app closes both menus");
+        let launches = TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow().clone());
+        assert_eq!(launches, vec![("fake-editor-a.desktop".to_string(), file_path)], "launches exactly once");
+        assert_eq!(ui.status.label(), "Opened with Fake Editor A");
+        assert!(ui.window.is_sensitive() && ui.window.is_visible());
+
+        TEST_OPEN_WITH_APPS.with(|a| *a.borrow_mut() = None);
         ui.window.destroy();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
