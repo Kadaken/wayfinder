@@ -7828,9 +7828,10 @@ fn show_item_context_menu(
         }));
     }
 
-    // The full item menu is about 490 px tall. A popover that cannot fit is
-    // popped down again by GTK on its first layout, so the menu never appears
-    // and the window is left grabbed. Bound it and let the rest scroll.
+    // A popover that cannot fit its monitor is popped down again by GTK on its first
+    // layout, so the menu never appears and the window is left grabbed. Start from a safe
+    // bound so it can map, then size it to the real menu when it maps: the whole menu when
+    // its monitor has room, a scrolling bounded one only when it does not.
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -7839,16 +7840,28 @@ fn show_item_context_menu(
         .child(&menu)
         .build();
     popover.set_child(Some(&scroller));
-    // ITEM_MENU_MAX_HEIGHT bounds the whole popover. GTK adds its own chrome around the
-    // scroller and only measures it once mapped, so take the measured overhead off the
-    // scroller's cap when the popover maps, before its first allocation.
+    // GTK adds its own chrome around the scroller and only measures it once mapped, so the
+    // final cap is computed when the popover maps, before its first allocation.
     popover.connect_map({
         let scroller = scroller.clone();
+        let menu = menu.clone();
+        let window = ui.window.clone();
         move |popover| {
             let (_, popover_natural, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
             let (_, scroller_natural, _, _) = scroller.measure(gtk::Orientation::Vertical, -1);
+            let (_, content_natural, _, _) = menu.measure(gtk::Orientation::Vertical, -1);
             let chrome = (popover_natural - scroller_natural).max(0);
-            scroller.set_max_content_height((ITEM_MENU_MAX_HEIGHT - chrome).max(1));
+            let monitor_h = popover
+                .native()
+                .and_then(|n| n.surface())
+                .or_else(|| window.surface())
+                .and_then(|surface| gdk::Display::default()?.monitor_at_surface(&surface))
+                .map(|m| m.geometry().height());
+            let cap = match monitor_h {
+                Some(h) => item_menu_content_cap(content_natural, chrome, h),
+                None => (ITEM_MENU_MAX_HEIGHT - chrome).max(1),
+            };
+            scroller.set_max_content_height(cap);
         }
     });
     unparent_when_closed(&popover);
@@ -7859,8 +7872,22 @@ fn show_item_context_menu(
     guide_resolve(&state);
 }
 
-/// Tallest an item context menu may be before it scrolls.
+/// Safe first bound that lets an item menu map before its real size is known.
 const ITEM_MENU_MAX_HEIGHT: i32 = 400;
+
+/// Room kept between an item menu and the monitor edges.
+const ITEM_MENU_EDGE_ALLOWANCE: i32 = 32;
+
+/// Content height for the item menu's scroller: the whole menu when the outer menu (content
+/// plus chrome) fits the monitor with the edge allowance, otherwise what is left after chrome.
+fn item_menu_content_cap(content_natural: i32, chrome: i32, monitor_h: i32) -> i32 {
+    let room = monitor_h - ITEM_MENU_EDGE_ALLOWANCE;
+    if content_natural + chrome <= room {
+        content_natural
+    } else {
+        (room - chrome).max(1)
+    }
+}
 
 fn show_background_context_menu(
     list: &impl IsA<gtk::Widget>,
@@ -11120,12 +11147,46 @@ mod tests {
             .map(|m| m.geometry().height())
             .expect("a monitor");
         assert!(popover.is_visible() && popover.is_mapped(), "the item menu stays open after its first layout");
-        assert!(
-            popover.height() > 0 && popover.height() <= ITEM_MENU_MAX_HEIGHT.min(monitor_h),
-            "the menu is bounded: {} px on a {monitor_h} px screen",
-            popover.height()
-        );
-        assert!(button_labelled(popover.upcast_ref(), "Open With...").is_some(), "every action is still in the menu");
+        let scroller = all_widgets(popover.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ScrolledWindow>().ok())
+            .expect("the item menu scroller");
+        let adj = scroller.vadjustment();
+        let range = adj.upper() - adj.page_size();
+        let actions = [
+            "Open With...", "Copy Paths", "Compress to ZIP", "Move to Trash", "Delete Permanently",
+            "Properties", "Open Terminal Here",
+        ];
+        for label in actions {
+            assert!(button_labelled(popover.upcast_ref(), label).is_some(), "the real menu keeps its action {label}");
+        }
+        let terminal = button_labelled(popover.upcast_ref(), "Open Terminal Here").expect("Open Terminal Here");
+        eprintln!("D60 monitor_h={monitor_h} popover_h={} scroller_h={} range={range} scrollbar_mapped={}", popover.height(), scroller.height(), scroller.vscrollbar().is_mapped());
+        if monitor_h >= 800 {
+            // D-60: a screen with room shows the whole real menu at once, no scrolling.
+            assert!(range <= 0.5, "large screen ({monitor_h} px): no scroll range, got {range}");
+            assert!(!scroller.vscrollbar().is_mapped(), "large screen: no visible vertical scrollbar");
+            let b = terminal.compute_bounds(&scroller).expect("terminal bounds");
+            assert!(
+                b.y() >= 0.0 && b.y() + b.height() <= scroller.height() as f32 + 0.5,
+                "large screen: Open Terminal Here is visible without scrolling"
+            );
+            assert!(popover.height() > 0 && popover.height() <= monitor_h, "large screen: outer menu {} px", popover.height());
+        } else if monitor_h <= 480 {
+            assert!(popover.height() > 0 && popover.height() <= monitor_h, "tiny screen: outer menu {} px on {monitor_h}", popover.height());
+            assert!(range > 1.0, "tiny screen ({monitor_h} px): the menu scrolls, range {range}");
+            adj.set_value(adj.upper() - adj.page_size());
+            pump();
+            let b = terminal.compute_bounds(&scroller).expect("terminal bounds");
+            assert!(
+                b.y() >= 0.0 && b.y() + b.height() <= scroller.height() as f32 + 0.5,
+                "tiny screen: the bottom action is reachable by scrolling"
+            );
+        }
+        // The sizing policy itself.
+        assert_eq!(item_menu_content_cap(490, 26, 1080), 490, "fits: the whole content");
+        assert_eq!(item_menu_content_cap(490, 26, 480), 480 - ITEM_MENU_EDGE_ALLOWANCE - 26, "does not fit: bounded");
+        assert_eq!(item_menu_content_cap(490, 26, 10), 1, "never below one pixel");
         assert!(ui.window.is_sensitive() && ui.window.is_visible(), "the file window stays usable");
 
         popover.popdown();
