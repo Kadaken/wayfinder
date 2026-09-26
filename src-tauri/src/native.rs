@@ -1407,11 +1407,12 @@ fn export_file_manager1(app: &adw::Application) {
 #[cfg(feature = "guide")]
 #[inline(never)]
 fn guide_markers_inert() -> usize {
-    const MARKERS: [&str; 4] = [
+    const MARKERS: [&str; 5] = [
         "/.local/share/crew/guide/",
         "WF_GUIDE_FILE",
         "WAYFINDER_GUIDE_ONLY_V1",
         "WAYFINDER_GUIDE_CIRCLE_V1",
+        "WAYFINDER_GUIDE_ARROW_V1",
     ];
     std::hint::black_box(MARKERS).iter().map(|m| m.len()).sum()
 }
@@ -1534,6 +1535,7 @@ fn guide_resolve(state: &Rc<RefCell<AppState>>) {
 #[derive(Clone)]
 struct GuideVisual {
     target: glib::WeakRef<gtk::Widget>,
+    mark: GuideMark,
     label: gtk::Popover,
     /// The clear-on-use callback on the target button, so it can be removed.
     hook: Rc<RefCell<Option<GuideHook>>>,
@@ -1578,44 +1580,175 @@ fn guide_connect_use(state: &Rc<RefCell<AppState>>, target: &gtk::Widget) -> Opt
 }
 
 /// How a registry entry wants its target marked. Chosen only by the entry's own
-/// `mark` field, never from the target's size or widget type. `LegacyRing` is the
-/// temporary fallback for entries not yet migrated.
+/// `mark` field, never from the target's size or widget type. An entry whose mark
+/// is missing or is neither value gets no mark at all.
 #[cfg(feature = "guide")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuideMark {
     Circle,
-    LegacyRing,
+    Arrow,
 }
 
 #[cfg(feature = "guide")]
-impl GuideMark {
-    fn class(self) -> &'static str {
-        match self {
-            GuideMark::Circle => "wf-guide-circle",
-            GuideMark::LegacyRing => "wf-guide-ring",
-        }
-    }
-}
-
-#[cfg(feature = "guide")]
-fn guide_mark_for(name: &str) -> GuideMark {
+fn guide_mark_for(name: &str) -> Option<GuideMark> {
     let mark = serde_json::from_str::<serde_json::Value>(GUIDE_REGISTRY)
         .ok()
         .and_then(|r| r.get(name)?.get("mark")?.as_str().map(str::to_owned));
     match mark.as_deref() {
-        Some("circle") => GuideMark::Circle,
-        _ => GuideMark::LegacyRing,
+        Some("circle") => Some(GuideMark::Circle),
+        Some("arrow") => Some(GuideMark::Arrow),
+        _ => None,
     }
 }
 
 // The circle is a target-side stroke: a fully rounded 4 px magenta outline pulled
 // 3 px inside the control's own box, so it covers the edge, leaves the centre
-// clear, takes no input and changes no allocation.
+// clear, takes no input and changes no allocation. The arrow surface is drawn
+// bare: no popover chrome, only the magenta polygon and its white label.
 #[cfg(feature = "guide")]
-const GUIDE_CSS: &str = ".wf-guide-ring { outline: 3px solid #ff2fd0; outline-offset: 2px; } \
-    .wf-guide-circle { outline: 4px solid #ff2fd0; outline-offset: -3px; border-radius: 9999px; } \
+const GUIDE_CSS: &str = ".wf-guide-circle { outline: 4px solid #ff2fd0; outline-offset: -3px; border-radius: 9999px; } \
     popover.wf-guide-label > contents { background: #ff2fd0; color: #ffffff; padding: 2px 8px; border-radius: 6px; } \
-    popover.wf-guide-label label { font-weight: 700; }";
+    popover.wf-guide-label label { font-weight: 700; } \
+    popover.wf-guide-arrow, popover.wf-guide-arrow > contents, popover.wf-guide-arrow > contents > * { \
+        background: none; background-color: transparent; box-shadow: none; border: none; border-width: 0; \
+        padding: 0; margin: 0; border-radius: 0; outline: none; } \
+    popover.wf-guide-arrow label { color: #ffffff; }";
+
+// Arrow drawing geometry, in pixels.
+#[cfg(feature = "guide")]
+const GUIDE_ARROW_H: f64 = 40.0; // head height
+#[cfg(feature = "guide")]
+const GUIDE_ARROW_SHAFT: f64 = 24.0; // shaft height: broad, 60% of the head
+#[cfg(feature = "guide")]
+const GUIDE_ARROW_HEAD: f64 = 22.0; // head length
+#[cfg(feature = "guide")]
+const GUIDE_ARROW_PAD: i32 = 10; // shaft padding around the label
+#[cfg(feature = "guide")]
+const GUIDE_ARROW_OVERLAP: i32 = 4; // the tip reaches this far over the target edge
+
+/// The arrow polygon for a `w` x `h` surface: a triangular head of `head` length
+/// spanning the full height, then a shaft of `shaft` height to the far edge. The
+/// tip is on the left edge when `tip_left`, else on the right.
+#[cfg(feature = "guide")]
+fn guide_arrow_polygon(w: f64, h: f64, head: f64, shaft: f64, tip_left: bool) -> [(f64, f64); 7] {
+    let (t, b) = ((h - shaft) / 2.0, (h + shaft) / 2.0);
+    let pts = [(0.0, h / 2.0), (head, 0.0), (head, t), (w, t), (w, b), (head, b), (head, h)];
+    pts.map(|(x, y)| (if tip_left { x } else { w - x }, y))
+}
+
+/// Which way the placed arrow points: tip left when GTK put the surface to the
+/// right of the target, tip right when it flipped to the left. Read from the
+/// placed popup position, so a side flip can never make it point away.
+#[cfg(feature = "guide")]
+fn guide_arrow_tip_left(pop: &gtk::Popover, target: &gtk::Widget) -> Option<bool> {
+    if !pop.is_mapped() || pop.root().is_none() || target.root().is_none() {
+        return None;
+    }
+    let native = pop.native()?;
+    let surface = native.surface()?;
+    let popup = surface.downcast_ref::<gdk::Popup>()?;
+    let pop_centre = popup.position_x() as f64 + surface.width() as f64 / 2.0;
+    let target_native = target.native()?;
+    let b = target.compute_bounds(&target_native)?;
+    let (tx, _) = target_native.surface_transform();
+    Some(pop_centre > tx + b.x() as f64 + b.width() as f64 / 2.0)
+}
+
+/// One arrow surface anchored to `target`: a non-modal popover whose child is the
+/// arrow drawing with its label on top. Nothing in it can be targeted or focused,
+/// and its surface gets an empty input region so a real pointer over the tip
+/// reaches the row underneath.
+#[cfg(feature = "guide")]
+fn guide_arrow_popover(target: &gtk::Widget, label: &str) -> gtk::Popover {
+    let text = gtk::Label::new(Some(label));
+    text.set_can_target(false);
+    text.set_focusable(false);
+    text.set_halign(gtk::Align::Start);
+    text.set_valign(gtk::Align::Center);
+    let tip_left = Rc::new(std::cell::Cell::new(true));
+    // Label margins and the tip overlap follow the side the arrow points from.
+    let place = |text: &gtk::Label, tip_left: bool| {
+        let (near, far) = (GUIDE_ARROW_HEAD as i32 + GUIDE_ARROW_PAD, GUIDE_ARROW_PAD);
+        text.set_margin_start(if tip_left { near } else { far });
+        text.set_margin_end(if tip_left { far } else { near });
+    };
+    place(&text, true);
+    let area = gtk::DrawingArea::new();
+    area.set_content_height(GUIDE_ARROW_H as i32);
+    area.set_can_target(false);
+    area.set_focusable(false);
+    let overlay = gtk::Overlay::new();
+    overlay.set_can_target(false);
+    overlay.set_focusable(false);
+    overlay.set_child(Some(&area));
+    overlay.add_overlay(&text);
+    overlay.set_measure_overlay(&text, true);
+    let pop = gtk::Popover::new();
+    pop.set_autohide(false);
+    pop.set_has_arrow(false);
+    pop.set_position(gtk::PositionType::Right);
+    pop.set_offset(-GUIDE_ARROW_OVERLAP, 0);
+    pop.set_can_target(false);
+    pop.set_focusable(false);
+    pop.set_can_focus(false);
+    pop.add_css_class("wf-guide-label");
+    pop.add_css_class("wf-guide-arrow");
+    pop.set_child(Some(&overlay));
+    {
+        let (pop_w, target_w, text) = (pop.downgrade(), target.downgrade(), text.clone());
+        area.set_draw_func(move |_, cr, w, h| {
+            // The placement is only known once the surface exists: read it on every draw
+            // and re-lay-out once if the side changed.
+            if let (Some(pop), Some(target)) = (pop_w.upgrade(), target_w.upgrade()) {
+                if let Some(now) = guide_arrow_tip_left(&pop, &target) {
+                    if now != tip_left.get() {
+                        tip_left.set(now);
+                        let (pop_w, text) = (pop_w.clone(), text.clone());
+                        glib::idle_add_local_once(move || {
+                            if let Some(pop) = pop_w.upgrade() {
+                                let (near, far) = (GUIDE_ARROW_HEAD as i32 + GUIDE_ARROW_PAD, GUIDE_ARROW_PAD);
+                                text.set_margin_start(if now { near } else { far });
+                                text.set_margin_end(if now { far } else { near });
+                                pop.set_offset(if now { -GUIDE_ARROW_OVERLAP } else { GUIDE_ARROW_OVERLAP }, 0);
+                                pop.child().map(|c| c.queue_draw());
+                            }
+                        });
+                    }
+                }
+            }
+            // GTK restores the input region on some layouts; keep it empty on every draw.
+            if let Some(pop) = pop_w.upgrade().filter(|p| p.is_mapped() && p.root().is_some()) {
+                if let Some(surface) = pop.native().and_then(|n| n.surface()) {
+                    surface.set_input_region(Some(&gtk::cairo::Region::create()));
+                }
+            }
+            let poly = guide_arrow_polygon(w as f64, h as f64, GUIDE_ARROW_HEAD, GUIDE_ARROW_SHAFT, tip_left.get());
+            cr.set_source_rgb(1.0, 47.0 / 255.0, 208.0 / 255.0);
+            cr.move_to(poly[0].0, poly[0].1);
+            for p in &poly[1..] {
+                cr.line_to(p.0, p.1);
+            }
+            cr.close_path();
+            let _ = cr.fill();
+        });
+    }
+    pop.connect_map(|p| {
+        if p.root().is_none() {
+            return;
+        }
+        let Some(surface) = p.native().and_then(|n| n.surface()) else { return };
+        surface.set_input_region(Some(&gtk::cairo::Region::create()));
+        // GTK can restore the region when the surface is laid out again: keep it empty.
+        surface.connect_layout(|surface, _, _| surface.set_input_region(Some(&gtk::cairo::Region::create())));
+        let weak = surface.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(surface) = weak.upgrade() {
+                surface.set_input_region(Some(&gtk::cairo::Region::create()));
+            }
+        });
+    });
+    pop
+}
 
 #[cfg(feature = "guide")]
 fn guide_install_css() {
@@ -1637,8 +1770,8 @@ fn guide_unpaint(state: &Rc<RefCell<AppState>>) {
     visual.label.popdown();
     visual.label.unparent();
     if let Some(target) = visual.target.upgrade() {
-        for mark in [GuideMark::Circle, GuideMark::LegacyRing] {
-            target.remove_css_class(mark.class());
+        if visual.mark == GuideMark::Circle {
+            target.remove_css_class("wf-guide-circle");
         }
     }
 }
@@ -1653,24 +1786,32 @@ fn guide_paint(state: &Rc<RefCell<AppState>>) {
     if !target.is_visible() {
         return;
     }
+    // A missing or malformed registry mark draws nothing rather than guessing.
+    let Some(mark) = guide_mark_for(&name) else { return };
     guide_install_css();
-    let text = gtk::Label::new(Some(&label));
-    text.set_can_target(false);
-    text.set_focusable(false);
-    let pop = gtk::Popover::new();
-    pop.set_autohide(false);
-    pop.set_has_arrow(false);
-    pop.set_position(gtk::PositionType::Right);
-    pop.set_can_target(false);
-    pop.set_focusable(false);
-    pop.set_can_focus(false);
-    pop.add_css_class("wf-guide-label");
-    pop.set_child(Some(&text));
-    target.add_css_class(guide_mark_for(&name).class());
+    let pop = match mark {
+        GuideMark::Circle => {
+            let text = gtk::Label::new(Some(&label));
+            text.set_can_target(false);
+            text.set_focusable(false);
+            let pop = gtk::Popover::new();
+            pop.set_autohide(false);
+            pop.set_has_arrow(false);
+            pop.set_position(gtk::PositionType::Right);
+            pop.set_can_target(false);
+            pop.set_focusable(false);
+            pop.set_can_focus(false);
+            pop.add_css_class("wf-guide-label");
+            pop.set_child(Some(&text));
+            target.add_css_class("wf-guide-circle");
+            pop
+        }
+        GuideMark::Arrow => guide_arrow_popover(&target, &label),
+    };
     pop.set_parent(&target);
     pop.popup();
     let hook = Rc::new(RefCell::new(guide_connect_use(state, &target)));
-    state.borrow_mut().guide_visual = Some(GuideVisual { target: target.downgrade(), label: pop, hook });
+    state.borrow_mut().guide_visual = Some(GuideVisual { target: target.downgrade(), mark, label: pop, hook });
 }
 
 /// A menu closing takes its target out of view: repaint so no visual stays.
@@ -9463,6 +9604,22 @@ mod tests {
         guide_pending_targets_resolve_d51();
     }
 
+    /// The marked targets: the ones carrying the circle class, and the parent of every
+    /// arrow surface. Also fails if the retired ring class is anywhere in the tree.
+    #[cfg(feature = "guide")]
+    fn guide_marked(tree: Vec<gtk::Widget>) -> Vec<gtk::Widget> {
+        assert!(tree.iter().all(|w| !w.has_css_class("wf-guide-ring")), "the retired ring class is on a widget");
+        let mut out: Vec<gtk::Widget> = tree.iter().filter(|w| w.has_css_class("wf-guide-circle")).cloned().collect();
+        for w in &tree {
+            if let Some(p) = w.downcast_ref::<gtk::Popover>() {
+                if p.has_css_class("wf-guide-arrow") {
+                    out.extend(p.parent());
+                }
+            }
+        }
+        out
+    }
+
     #[cfg(feature = "guide")]
     fn guide_ring_and_label_are_drawn_d52() {
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
@@ -9525,7 +9682,7 @@ mod tests {
             pump();
         };
         let tree = || all_widgets(ui.window.upcast_ref());
-        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring") || w.has_css_class("wf-guide-circle")).collect() };
+        let rings = || -> Vec<gtk::Widget> { guide_marked(tree()) };
         let label_pops = || -> Vec<gtk::Popover> {
             tree()
                 .into_iter()
@@ -9580,6 +9737,88 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().parse().expect("pixel count")
         };
 
+
+        // D-64: screen rectangle of any widget, in the main window or inside its own popover surface.
+        let rect_of = |w: &gtk::Widget| -> (i32, i32, i32, i32) {
+            use glib::translate::ToGlibPtr;
+            if let Some(pop) = w.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()) {
+                let native = pop.native().expect("popover native");
+                let surface = native.surface().expect("popover surface");
+                let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) };
+                let g = xdo(&["getwindowgeometry", "--shell", &xid.to_string()]);
+                let n = |k: &str| -> i32 { g.lines().find_map(|l| l.strip_prefix(k)).and_then(|v| v.trim().parse().ok()).expect(k) };
+                let (tx, ty) = native.surface_transform();
+                let b = w.compute_bounds(&pop).expect("bounds in popover");
+                (n("X=") + (tx + b.x() as f64) as i32, n("Y=") + (ty + b.y() as f64) as i32, b.width() as i32, b.height() as i32)
+            } else {
+                let b = w.compute_bounds(&ui.window).expect("bounds");
+                let (sx, sy) = gtk::prelude::NativeExt::surface_transform(&ui.window);
+                (wx + (sx + b.x() as f64) as i32, wy + (sy + b.y() as f64) as i32, b.width() as i32, b.height() as i32)
+            }
+        };
+        let arrow_pops = || -> Vec<gtk::Popover> {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-arrow")).collect()
+        };
+        let d64_png = crate::native_core::scratch_root().join(format!("wf-d64-{}.png", std::process::id()));
+        // D-64: the one arrow must be a broad magenta head and shaft whose tip touches the row from the
+        // side GTK actually placed it. Returns the pixel just inside the tip, where the arrow covers the row.
+        let arrow_check = |key: &str, row: &gtk::Widget, frame_name: &str| -> (i32, i32) {
+            for _ in 0..4 {
+                pump();
+            }
+            let pops = arrow_pops();
+            assert_eq!(pops.len(), 1, "{key}: exactly one arrow surface");
+            assert!(!pops[0].can_target() && !pops[0].is_focusable() && !pops[0].can_focus(), "{key}: the arrow cannot take input");
+            assert!(
+                all_widgets(pops[0].upcast_ref())
+                    .iter()
+                    .filter(|w| w.is::<gtk::Label>() || w.is::<gtk::DrawingArea>() || w.is::<gtk::Overlay>())
+                    .all(|w| !w.can_target() && !w.is_focusable()),
+                "{key}: nothing inside the arrow can take input"
+            );
+            let area = all_widgets(pops[0].upcast_ref()).into_iter().find(|w| w.is::<gtk::DrawingArea>()).expect("arrow drawing");
+            frame(frame_name);
+            let (ax, ay, aw, ah) = rect_of(&area);
+            let (rx, ry, rw, rh) = rect_of(row);
+            let tip_left = rx + rw / 2 < ax + aw / 2;
+            let (head, shaft) = (GUIDE_ARROW_HEAD as i32, GUIDE_ARROW_SHAFT as i32);
+            assert_eq!(ah, GUIDE_ARROW_H as i32, "{key}: the head is the full arrow height");
+            let tip_x = if tip_left { ax } else { ax + aw - 1 };
+            let tip_y = ay + ah / 2;
+            let edge = if tip_left { rx + rw } else { rx };
+            let depth = if tip_left { edge - tip_x } else { tip_x - edge + 1 };
+            assert!(
+                (1..=GUIDE_ARROW_OVERLAP + 1).contains(&depth),
+                "{key}: the tip lies over the row edge by {depth} px (arrow {ax},{ay} {aw}x{ah}, row {rx},{ry} {rw}x{rh}, tip_left {tip_left})"
+            );
+            assert!((tip_y - (ry + rh / 2)).abs() <= 3, "{key}: the tip is at the row's vertical middle: {tip_y} vs {}", ry + rh / 2);
+            let cap = std::process::Command::new("/usr/bin/import").args(["-window", "root"]).arg(&d64_png).output().expect("import");
+            assert!(cap.status.success(), "arrow capture: {}", String::from_utf8_lossy(&cap.stderr));
+            let (hx, sx_) = if tip_left { (ax + head - 2, ax + aw - 2) } else { (ax + aw - 1 - (head - 2), ax + 1) };
+            let head_px = magenta(&d64_png, hx, ay, 1, ah);
+            let shaft_px = magenta(&d64_png, sx_, ay, 1, ah);
+            let tip_px = magenta(&d64_png, if tip_left { tip_x } else { tip_x - 3 }, tip_y - 1, 4, 3);
+            assert!(head_px >= (ah - 7) as f64, "{key}: broad triangular head: {head_px} magenta px in its base column");
+            assert!(
+                (shaft as f64 - 3.0..=shaft as f64 + 3.0).contains(&shaft_px),
+                "{key}: broad shaft of {shaft} px: {shaft_px}"
+            );
+            assert!(tip_px >= 3.0, "{key}: the tip is drawn: {tip_px}");
+            let covered = if tip_left { tip_x + 2 } else { tip_x - 2 };
+            assert!(magenta(&d64_png, covered, tip_y, 1, 1) > 0.5, "{key}: the pixel just inside the tip is magenta");
+            assert!(covered >= rx && covered < rx + rw, "{key}: that pixel lies over the row itself");
+            (covered, tip_y)
+        };
+        let click_at = |x: i32, y: i32| {
+            xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            pump();
+            xdo(&["mousedown", "1"]);
+            pump();
+            xdo(&["mouseup", "1"]);
+            pump();
+            pump();
+        };
+
         frame("d52-0-before.png");
 
         // Static target: one ring, one visible label with the exact text, anchored to it.
@@ -9587,11 +9826,12 @@ mod tests {
         let term = by_name("terminal-here-folder").pop().expect("terminal button");
         assert_eq!(rings(), vec![term.clone()], "exactly the one real target is ringed");
         // D-63: the registry entry, not the size or type, chose the circle for this target.
-        assert_eq!(guide_mark_for("terminal-here-folder"), GuideMark::Circle);
-        assert_eq!(guide_mark_for("trash-and-restore-file"), GuideMark::Circle);
-        assert_eq!(guide_mark_for("open-with-other-app"), GuideMark::LegacyRing, "unmigrated entries keep the old ring");
+        assert_eq!(guide_mark_for("terminal-here-folder"), Some(GuideMark::Circle));
+        assert_eq!(guide_mark_for("trash-and-restore-file"), Some(GuideMark::Circle));
+        assert_eq!(guide_mark_for("open-with-other-app"), Some(GuideMark::Arrow), "a row entry is an arrow");
+        assert_eq!(guide_mark_for("no-such-control"), None, "no entry, no mark");
         assert!(term.has_css_class("wf-guide-circle"), "the compact target carries the circle class");
-        assert!(!term.has_css_class("wf-guide-ring"), "and not the old rectangle class");
+        assert!(label_pops().iter().all(|p| !p.has_css_class("wf-guide-arrow")), "a circle entry draws no arrow");
         assert_eq!(geometry(&term0), g_before, "drawing the circle moved nothing and took no focus");
         let pops = label_pops();
         assert_eq!(pops.len(), 1);
@@ -9627,8 +9867,8 @@ mod tests {
         drop(pops);
         put("trash-and-restore-file", "Trash it");
         let trash = by_name("trash-and-restore-file").pop().expect("trash button");
-        assert!(!term.has_css_class("wf-guide-ring") && !term.has_css_class("wf-guide-circle"), "the old mark is gone");
-        assert!(trash.has_css_class("wf-guide-circle") && !trash.has_css_class("wf-guide-ring"), "the second compact entry is a circle too");
+        assert!(!term.has_css_class("wf-guide-circle"), "the old mark is gone");
+        assert!(trash.has_css_class("wf-guide-circle"), "the second compact entry is a circle too");
         assert!(old_label.parent().is_none(), "the old label surface is gone");
         assert_eq!(rings(), vec![trash.clone()]);
         assert_eq!(label_texts(), vec!["Trash it".to_string()]);
@@ -9759,7 +9999,9 @@ mod tests {
         assert_eq!(pops[0].parent().as_ref(), Some(&first));
         let item_menu = popovers_of(&row).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("item menu");
         assert!(item_menu.is_mapped(), "the parent menu stays open under the visual");
-        frame("d52-2-open-with-other-app.png");
+        assert!(pops[0].has_css_class("wf-guide-arrow"), "the row entry draws the arrow surface");
+        assert!(!first.has_css_class("wf-guide-circle"), "and no circle class on the row");
+        arrow_check("open-with-other-app", &first, "d52-2-open-with-other-app.png");
         let stale_label = pops[0].clone();
         drop((pops, item_menu));
         close_menu();
@@ -9774,6 +10016,46 @@ mod tests {
         drop(second);
         close_menu();
         no_visual("closed again");
+
+        // D-64: circles and arrows replace one another cleanly, and the row never changes.
+        put("", "");
+        open_menu();
+        let opener = by_name("open-with-other-app").pop().expect("opener");
+        let g0 = geometry(&opener);
+        put("open-with-other-app", "Click the tip");
+        assert_eq!(rings(), vec![opener.clone()]);
+        assert_eq!(arrow_pops().len(), 1);
+        assert_eq!(geometry(&opener), g0, "during: the arrow moved, resized or refocused nothing");
+        put("terminal-here-folder", "circle now");
+        assert!(arrow_pops().is_empty(), "the arrow is gone when a circle entry replaces it");
+        assert_eq!(rings(), vec![term.clone()], "one circle and no arrow");
+        put("open-with-other-app", "Click the tip");
+        assert_eq!(arrow_pops().len(), 1);
+        assert!(!term.has_css_class("wf-guide-circle"), "the arrow entry replaced the circle");
+        put_raw("{not json", GuideRequest::Clear);
+        no_visual("malformed after an arrow");
+        put("open-with-other-app", "Click the tip");
+        put_raw(r#"{"highlight":"no-such-control","label":"Hmm"}"#, GuideRequest::Clear);
+        no_visual("unknown after an arrow");
+        put("open-with-other-app", "Click the tip");
+        put("", "");
+        no_visual("clear after an arrow");
+        assert_eq!(geometry(&opener), g0, "after clearing: nothing was left changed");
+        // A real pointer press at a pixel the arrow tip covers reaches the row exactly once.
+        put("open-with-other-app", "Click the tip");
+        let (cx_, cy_) = arrow_check("tip click", &opener, "d52-3-tip-click.png");
+        let taps = Rc::new(std::cell::Cell::new(0));
+        {
+            let taps = taps.clone();
+            opener.downcast_ref::<gtk::Button>().expect("a real button").connect_clicked(move |_| taps.set(taps.get() + 1));
+        }
+        click_at(cx_, cy_);
+        assert_eq!(taps.get(), 1, "the click at the arrow tip fired the row action exactly once");
+        assert_eq!(pending(), GuideRequest::Clear, "and the guide cleared");
+        no_visual("after the tip click");
+        drop(opener);
+        close_menu();
+        no_visual("menu closed after the tip click");
 
         // Drive menus: a mounted and an unmounted real target show without closing their menu.
         let sidebar_row = all_widgets(ui.sidebar.upcast_ref())
@@ -9806,6 +10088,18 @@ mod tests {
                 .find(|p| !p.has_css_class("wf-guide-label"))
                 .expect("drive menu");
             assert!(menu.is_mapped(), "{key}: the menu stays open");
+            let (cx_, cy_) = arrow_check(key, &target, &format!("d52-4-{key}.png"));
+            if key == "drive-open-crucial" {
+                let taps = Rc::new(std::cell::Cell::new(0));
+                {
+                    let taps = taps.clone();
+                    target.downcast_ref::<gtk::Button>().expect("a real button").connect_clicked(move |_| taps.set(taps.get() + 1));
+                }
+                click_at(cx_, cy_);
+                assert_eq!(taps.get(), 1, "{key}: the click at the arrow tip fired the row action once");
+                assert_eq!(pending(), GuideRequest::Clear, "{key}: and the guide cleared");
+                no_visual("drive tip click");
+            }
             drop((target, menu));
             for pop in popovers_of(sidebar_row.upcast_ref()) {
                 pop.popdown();
@@ -9815,7 +10109,16 @@ mod tests {
             no_visual("drive menu closed");
         }
 
+        // Teardown: closing the window with an arrow up removes it.
+        put("drive-remount-stick", "teardown");
+        show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), drive("Stick", true, false), 5.0, 5.0);
+        pump();
+        assert_eq!(arrow_pops().len(), 1);
+        let weak = arrow_pops()[0].downgrade();
         ui.window.destroy();
+        pump();
+        assert!(weak.upgrade().is_none_or(|p| p.parent().is_none()), "window teardown removed the arrow");
+        let _ = std::fs::remove_file(&d64_png);
         match old_env {
             Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
             None => std::env::remove_var("WF_GUIDE_FILE"),
@@ -9895,7 +10198,7 @@ mod tests {
             pump();
         };
         let tree = || all_widgets(ui.window.upcast_ref());
-        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring") || w.has_css_class("wf-guide-circle")).collect() };
+        let rings = || -> Vec<gtk::Widget> { guide_marked(tree()) };
         let labels = || -> usize {
             tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).count()
         };
@@ -10667,7 +10970,7 @@ mod tests {
         let seen = GUIDE_RESPONSE_TEMPS.with(|t| t.borrow().len());
         let temps = || GUIDE_RESPONSE_TEMPS.with(|t| t.borrow()[seen..].to_vec());
         let tree = || all_widgets(ui.window.upcast_ref());
-        let rings = || tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring") || w.has_css_class("wf-guide-circle")).count();
+        let rings = || guide_marked(tree()).len();
         let labels = || {
             tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).count()
         };

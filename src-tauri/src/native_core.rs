@@ -3942,10 +3942,9 @@ mod tests {
             let fields = entry.as_object().expect("each entry is an object");
             let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
             names.sort_unstable();
-            // D-63: `mark` is the one optional field; an entry without it keeps the
-            // temporary legacy ring, and the only mark drawn so far is `circle`.
-            let want: &[&str] = if fields.contains_key("mark") { &["kind", "mark", "where"] } else { &["kind", "where"] };
-            assert_eq!(names, want, "{name}");
+            // D-64: every entry carries `mark`, exactly `circle` or `arrow`; none is optional.
+            assert_eq!(names, ["kind", "mark", "where"], "{name}");
+            assert!(matches!(fields["mark"].as_str(), Some("circle" | "arrow")), "{name}: mark is circle or arrow");
             for f in fields.values() {
                 assert!(f.as_str().is_some_and(|x| !x.is_empty()), "{name}");
             }
@@ -3954,7 +3953,22 @@ mod tests {
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("circle")).map(|(k, _)| k.as_str()).collect();
         circles.sort_unstable();
         assert_eq!(circles, ["terminal-here-folder", "trash-and-restore-file"], "the compact toolbar entries choose circle");
-        assert!(obj.values().all(|e| e.get("mark").is_none_or(|m| m == "circle")), "no other mark exists yet");
+        let mut arrows: Vec<&str> =
+            obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("arrow")).map(|(k, _)| k.as_str()).collect();
+        arrows.sort_unstable();
+        assert_eq!(
+            arrows,
+            [
+                "drive-open-crucial",
+                "drive-open-stick",
+                "drive-remount-crucial",
+                "drive-remount-stick",
+                "drive-unmount-crucial",
+                "drive-unmount-stick",
+                "open-with-other-app",
+            ],
+            "every row entry chooses arrow"
+        );
         assert!(!obj.contains_key("take-me-back-start"));
     }
 
