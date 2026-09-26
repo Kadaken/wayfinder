@@ -751,40 +751,73 @@ pub fn open_with_apps(path: &str) -> Vec<AppEntry> {
     out
 }
 
-pub fn open_with(app_id: &str, path: &str) -> Result<(), String> {
+/// The desktop file that `app_id` names, searched in the same order the Open
+/// With list is built from.
+pub fn open_with_desktop_file(app_id: &str) -> Result<String, String> {
     for dir in app_dirs() {
         let desktop_file = format!("{dir}/{app_id}");
         if Path::new(&desktop_file).exists() {
-            let mut command = Command::new("gio");
-            command.args(["launch", &desktop_file, path]);
-            return spawn_reaped(command)
-                .map(|_| ())
-                .map_err(|err| err.to_string());
+            return Ok(desktop_file);
         }
     }
     Err("app not found".into())
 }
 
-pub fn open_terminal(path: &str) -> Result<(), String> {
-    let candidates: &[(&str, &[&str])] = &[
-        ("konsole", &["--workdir"]),
-        ("kgx", &["--working-directory"]),
-        ("gnome-terminal", &["--working-directory"]),
-        ("x-terminal-emulator", &[]),
-        ("xterm", &[]),
-    ];
+/// One terminal to try: the program that must exist, and the full command line
+/// that opens it in the wanted directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCandidate {
+    pub program: &'static str,
+    pub argv: Vec<String>,
+}
 
-    for (cmd, args) in candidates {
-        let mut command = Command::new(cmd);
-        if args.is_empty() {
-            command.current_dir(path);
-        } else {
-            command.args(*args).arg(path);
-        }
-        match spawn_reaped(command) {
-            Ok(_) => return Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.to_string()),
+/// Konsole first, then the rest, in the order they are tried. Terminals with no
+/// working-directory flag are started through `sh`, which changes directory
+/// first, so the directory is exact for every candidate.
+pub fn terminal_candidates(path: &str) -> Vec<TerminalCandidate> {
+    let with_flag = |program: &'static str, flag: &str| TerminalCandidate {
+        program,
+        argv: vec![program.to_string(), flag.to_string(), path.to_string()],
+    };
+    let via_sh = |program: &'static str| TerminalCandidate {
+        program,
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cd \"$1\" && exec {program}"),
+            "sh".to_string(),
+            path.to_string(),
+        ],
+    };
+    vec![
+        with_flag("konsole", "--workdir"),
+        with_flag("kgx", "--working-directory"),
+        with_flag("gnome-terminal", "--working-directory"),
+        via_sh("x-terminal-emulator"),
+        via_sh("xterm"),
+    ]
+}
+
+/// What one attempt to start a child application came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchError {
+    /// The program is not installed: try the next candidate.
+    NotFound,
+    /// It exists but could not be started: report once and stop.
+    Failed(String),
+}
+
+/// Walks the terminal candidates in order. A missing program falls through to
+/// the next; any other failure is returned at once, and only once.
+pub fn open_terminal_with(
+    path: &str,
+    mut launch: impl FnMut(&TerminalCandidate) -> Result<(), LaunchError>,
+) -> Result<(), String> {
+    for candidate in terminal_candidates(path) {
+        match launch(&candidate) {
+            Ok(()) => return Ok(()),
+            Err(LaunchError::NotFound) => continue,
+            Err(LaunchError::Failed(err)) => return Err(err),
         }
     }
     Err("no supported terminal found".into())
