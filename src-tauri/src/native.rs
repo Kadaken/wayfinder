@@ -7543,6 +7543,7 @@ fn show_drive_context_menu(
     }
 
     popover.set_child(Some(&menu));
+    unparent_when_closed(&popover);
     #[cfg(feature = "guide")]
     guide_repaint_on_close(&popover, &state);
     popover.popup();
@@ -7622,9 +7623,11 @@ fn show_item_context_menu(
             button.set_tooltip_text(Some(tooltip));
             button.add_css_class("flat");
             button.add_css_class("wf-menu-tool");
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             button.connect_clicked(move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 action();
             });
             strip.append(&button);
@@ -7797,6 +7800,7 @@ fn show_item_context_menu(
         .child(&menu)
         .build();
     popover.set_child(Some(&scroller));
+    unparent_when_closed(&popover);
     #[cfg(feature = "guide")]
     guide_repaint_on_close(&popover, &state);
     popover.popup();
@@ -7899,6 +7903,7 @@ fn show_background_context_menu(
     }
 
     popover.set_child(Some(&menu));
+    unparent_when_closed(&popover);
     popover.popup();
 }
 
@@ -7960,12 +7965,48 @@ where
         .build();
     button.add_css_class("flat");
     button.add_css_class("wf-menu-item");
-    let popover = popover.clone();
+    let popover = popover.downgrade();
     button.connect_clicked(move |_| {
-        popover.popdown();
+        if let Some(popover) = popover.upgrade() {
+            popover.popdown();
+        }
         action();
     });
     button
+}
+
+/// Every dynamic context popover, root or side, is unparented once it has closed,
+/// so nothing keeps the closed tree alive. (Emptying one with `set_child(None)` was
+/// tried and aborts other GTK tests.) GTK may keep a closed shell, and a side shell
+/// keeps its own rows. It waits for the
+/// popover to be fully unmapped, then one more turn: unparenting while GTK is still
+/// finishing the close leaks a reference. A side popover still hanging off a button
+/// of a closing menu is unparented with it, since one left on a finalised button is
+/// leaked. GTK itself may keep the empty closed root shell alive.
+fn unparent_when_closed(popover: &gtk::Popover) {
+    fn side_popovers(widget: &gtk::Widget, out: &mut Vec<gtk::Popover>) {
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            side_popovers(&current, out);
+            if let Ok(side) = current.downcast::<gtk::Popover>() {
+                out.push(side);
+            }
+        }
+    }
+    popover.connect_unmap(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || {
+            let mut sides = Vec::new();
+            side_popovers(popover.upcast_ref(), &mut sides);
+            for side in sides.iter().filter(|side| side.parent().is_some()) {
+                side.unparent();
+            }
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        });
+    });
 }
 
 /// A menu row that opens a second popover to its right (Explorer's `New >`).
@@ -7983,7 +8024,7 @@ fn context_submenu(
     let button = gtk::Button::builder().child(&row).halign(gtk::Align::Fill).build();
     button.add_css_class("flat");
     button.add_css_class("wf-menu-item");
-    let parent = popover.clone();
+    let parent = popover.downgrade();
     button.connect_clicked(move |button| {
         let side = gtk::Popover::new();
         side.set_has_arrow(false);
@@ -7998,15 +8039,14 @@ fn context_submenu(
             let parent = parent.clone();
             let action = action.clone();
             menu.append(&context_item(icon, label, accel, &side, move || {
-                parent.popdown();
+                if let Some(parent) = parent.upgrade() {
+                    parent.popdown();
+                }
                 action();
             }));
         }
         side.set_child(Some(&menu));
-        side.connect_closed(|side| {
-            let side = side.clone();
-            glib::idle_add_local_once(move || side.unparent());
-        });
+        unparent_when_closed(&side);
         side.popup();
     });
     button
@@ -8042,11 +8082,13 @@ fn context_open_with(parent: &gtk::Popover, ui: Ui, path: String) -> gtk::Button
     button.add_css_class("wf-menu-item");
     #[cfg(feature = "guide")]
     guide_name(&button, "open-with-other-app");
-    let parent = parent.clone();
+    let parent = parent.downgrade();
     button.connect_clicked(move |button| {
         let apps = open_with_apps_for(&path);
         if apps.is_empty() {
-            parent.popdown();
+            if let Some(parent) = parent.upgrade() {
+                parent.popdown();
+            }
             ui.status.set_label("No Open With applications found");
             return;
         }
@@ -8065,7 +8107,9 @@ fn context_open_with(parent: &gtk::Popover, ui: Ui, path: String) -> gtk::Button
             let path = path.clone();
             let name = app.name.clone();
             menu.append(&context_item("application-x-executable-symbolic", &name, "", &side, move || {
-                parent.popdown();
+                if let Some(parent) = parent.upgrade() {
+                    parent.popdown();
+                }
                 match launch_open_with(&app.id, &path) {
                     Ok(()) => ui.status.set_label(&format!("Opened with {}", app.name)),
                     Err(err) => ui.status.set_label(&format!("Open With failed: {err}")),
@@ -8080,10 +8124,7 @@ fn context_open_with(parent: &gtk::Popover, ui: Ui, path: String) -> gtk::Button
             .child(&menu)
             .build();
         side.set_child(Some(&scroller));
-        side.connect_closed(|side| {
-            let side = side.clone();
-            glib::idle_add_local_once(move || side.unparent());
-        });
+        unparent_when_closed(&side);
         side.popup();
     });
     button
@@ -9171,6 +9212,7 @@ mod tests {
         item_right_click_menu_opens_bounded_and_stays_d41();
         open_with_opens_a_side_menu_not_a_dialog_d42();
         drive_space_bars_refresh_off_thread_and_stay_cached_d46();
+        context_menu_actions_fire_once_and_leave_no_popover_d54();
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
         #[cfg(feature = "guide")]
@@ -10745,6 +10787,165 @@ mod tests {
         popover.popdown();
         pump();
         assert!(!popover.is_mapped());
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-54: representative actions fire exactly once and a closed menu no longer stays under its
+    /// anchor. GTK may keep the closed root shell and its buttons, so nothing here asserts that
+    /// a root or child widget is released.
+    fn context_menu_actions_fire_once_and_leave_no_popover_d54() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d54-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let mount = root.join("mount");
+        for d in [&home, &dir, &mount] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("with-me.txt"), "hello").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        TEST_OPEN_WITH_APPS.with(|a| {
+            *a.borrow_mut() =
+                Some(vec![native_core::AppEntry { id: "fake-editor-a.desktop".into(), name: "Fake Editor A".into() }])
+        });
+        TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d54test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3))
+        };
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a file row carries the right-click gesture");
+        ui.list_selection.select_item(0, true);
+        update_selection(&state, &ui);
+        let entry = state.borrow().visible_entries[0].clone();
+        let sidebar_row = all_widgets(ui.sidebar.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .expect("a sidebar row");
+        let drive = Drive {
+            name: "Synthetic".into(),
+            path: "/dev/synthetic-d54".into(),
+            mountpoint: mount.to_string_lossy().to_string(),
+            size: 1,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable: true,
+            space: None,
+        };
+
+        for i in 0..3 {
+            // File menu, closed directly or through its Open With side menu.
+            show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), 5.0, 5.0);
+            pump();
+            {
+                let menu = popovers_of(&row).pop().expect("the item menu");
+                if i % 2 == 0 {
+                    menu.popdown();
+                } else {
+                    let open_with = button_labelled(menu.upcast_ref(), "Open With...").expect("Open With");
+                    open_with.emit_clicked();
+                    pump();
+                    let side = popovers_of(open_with.upcast_ref()).pop().expect("the side menu");
+                    button_labelled(side.upcast_ref(), "Fake Editor A").expect("editor row").emit_clicked();
+                }
+            }
+            pump();
+            assert!(popovers_of(&row).is_empty(), "no closed popover is left under the row");
+
+            // Drive menu.
+            show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), drive.clone(), 5.0, 5.0);
+            pump();
+            popovers_of(sidebar_row.upcast_ref()).pop().expect("the drive menu").popdown();
+            pump();
+            assert!(popovers_of(sidebar_row.upcast_ref()).is_empty(), "no closed popover is left under the sidebar row");
+
+            // Background menu with its New side menu.
+            show_background_context_menu(&ui.list, state.clone(), ui.clone(), 10.0, 10.0);
+            pump();
+            {
+                let menu = popovers_of(ui.list.upcast_ref()).pop().expect("the background menu");
+                let new = button_labelled(menu.upcast_ref(), "New").expect("New");
+                new.emit_clicked();
+                pump();
+                popovers_of(new.upcast_ref()).pop().expect("the New side menu").popdown();
+                menu.popdown();
+            }
+            pump();
+            assert!(popovers_of(ui.list.upcast_ref()).is_empty(), "no closed popover is left under the list");
+        }
+
+        TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
+        // Real actions still fire exactly once.
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), 5.0, 5.0);
+        pump();
+        let menu = popovers_of(&row).pop().expect("the item menu");
+        let open_with = button_labelled(menu.upcast_ref(), "Open With...").unwrap();
+        open_with.emit_clicked();
+        pump();
+        let side = popovers_of(open_with.upcast_ref()).pop().unwrap();
+        button_labelled(side.upcast_ref(), "Fake Editor A").unwrap().emit_clicked();
+        pump();
+        assert_eq!(TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow().len()), 1, "the side-menu action fired exactly once");
+        assert!(!menu.is_mapped(), "choosing an app still closes the parent menu");
+        drop((menu, open_with, side));
+        pump();
+
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), 5.0, 5.0);
+        pump();
+        let menu = popovers_of(&row).pop().unwrap();
+        button_labelled(menu.upcast_ref(), "Copy").unwrap().emit_clicked();
+        pump();
+        assert!(state.borrow().clipboard.is_some(), "Copy still copies");
+        assert!(!menu.is_mapped(), "Copy still closes the menu");
+        drop(menu);
+        pump();
+
+        show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), drive.clone(), 5.0, 5.0);
+        pump();
+        let menu = popovers_of(sidebar_row.upcast_ref()).pop().unwrap();
+        button_labelled(menu.upcast_ref(), "Open").unwrap().emit_clicked();
+        pump();
+        assert_eq!(
+            state.borrow().tabs.active().path,
+            mount.to_string_lossy().to_string(),
+            "the drive Open action navigated to the mountpoint"
+        );
+        assert_eq!(state.borrow().tabs.active().history.len(), 2, "one navigation, one history entry");
+        drop(menu);
+        pump();
+
+        // A button whose popover is already gone still runs its action once.
+        let fired = Rc::new(std::cell::Cell::new(0));
+        let popover = gtk::Popover::new();
+        let button = context_item("", "Lone", "", &popover, {
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        drop(popover);
+        button.emit_clicked();
+        assert_eq!(fired.get(), 1, "the action runs once even when its popover is gone");
+
         ui.window.destroy();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
