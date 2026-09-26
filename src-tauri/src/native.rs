@@ -10479,6 +10479,18 @@ mod tests {
         // a valid non-default divider position
         ui.window.set_size_request(1400, 600);
         wait_for("paned width", || ui.file_preview.width() > 900);
+        // The window may still be growing toward the requested size on a screen that cannot
+        // show it whole; a divider chosen from a transient width is rescaled by the resize.
+        // Settle first: the paned width must be unchanged across consecutive main-loop turns.
+        let last = std::cell::Cell::new(-1);
+        let stable = std::cell::Cell::new(0);
+        wait_for("paned width settles", || {
+            let now = ui.file_preview.width();
+            stable.set(if now == last.get() { stable.get() + 1 } else { 0 });
+            last.set(now);
+            pump();
+            stable.get() >= 5
+        });
         let width = ui.file_preview.width();
         let default_pos = ui.file_preview.position();
         let custom = default_pos + (width - 190 - default_pos) / 2;
