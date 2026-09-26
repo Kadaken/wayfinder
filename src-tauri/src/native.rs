@@ -1256,6 +1256,11 @@ struct AppState {
     /// A refresh was asked for while one ran; run once more when it lands.
     drive_refresh_again: bool,
     drive_scan: DriveScan,
+    /// The one newest guide request for this window (never queued).
+    #[cfg(feature = "guide")]
+    guide_pending: GuideRequest,
+    #[cfg(feature = "guide")]
+    guide_monitor: Option<gio::FileMonitor>,
 }
 
 struct ThumbnailJob {
@@ -1398,6 +1403,85 @@ fn guide_markers_inert() -> usize {
         "WAYFINDER_GUIDE_ONLY_V1",
     ];
     std::hint::black_box(MARKERS).iter().map(|m| m.len()).sum()
+}
+
+/// One guide request from the transport file (guide builds only). Names are
+/// classified by exact key equality against the tracked registry; an unknown
+/// name is kept exactly for the later writeback round.
+#[cfg(feature = "guide")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GuideRequest {
+    Clear,
+    Known { name: String, label: String },
+    Unknown { name: String, label: String },
+}
+
+#[cfg(feature = "guide")]
+const GUIDE_REGISTRY: &str = include_str!("guide-names.json");
+
+#[cfg(feature = "guide")]
+fn guide_file_path() -> PathBuf {
+    match std::env::var("WF_GUIDE_FILE") {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".local/share/crew/guide/wayfinder.json"),
+    }
+}
+
+#[cfg(feature = "guide")]
+fn guide_parse(text: &str) -> GuideRequest {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return GuideRequest::Clear;
+    };
+    let name = value.get("highlight").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return GuideRequest::Clear;
+    }
+    let label = value.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let known = serde_json::from_str::<serde_json::Value>(GUIDE_REGISTRY)
+        .ok()
+        .and_then(|r| r.as_object().map(|o| o.contains_key(name)))
+        .unwrap_or(false);
+    let name = name.to_string();
+    if known {
+        GuideRequest::Known { name, label }
+    } else {
+        GuideRequest::Unknown { name, label }
+    }
+}
+
+/// A missing or unreadable file clears, like malformed JSON.
+#[cfg(feature = "guide")]
+fn guide_read(path: &Path) -> GuideRequest {
+    fs::read_to_string(path).map(|t| guide_parse(&t)).unwrap_or(GuideRequest::Clear)
+}
+
+/// Reads the guide file once, then watches its directory so creation and
+/// atomic replacement of the exact filename are both seen. Siblings are ignored.
+#[cfg(feature = "guide")]
+fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
+    let path = guide_file_path();
+    state.borrow_mut().guide_pending = guide_read(&path);
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name().map(|n| n.to_os_string())) else {
+        return;
+    };
+    let Ok(monitor) = gio::File::for_path(dir)
+        .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+    else {
+        return;
+    };
+    let weak = Rc::downgrade(state);
+    monitor.connect_changed(move |_, file, other, _| {
+        let is_guide = |f: &gio::File| f.basename().is_some_and(|b| b == file_name);
+        if !(is_guide(file) || other.is_some_and(is_guide)) {
+            return;
+        }
+        if let Some(state) = weak.upgrade() {
+            let request = guide_read(&path);
+            state.borrow_mut().guide_pending = request;
+        }
+    });
+    state.borrow_mut().guide_monitor = Some(monitor);
 }
 
 fn main() {
@@ -1597,6 +1681,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         drive_refresh_in_flight: false,
         drive_refresh_again: false,
         drive_scan: drive_scan(),
+        #[cfg(feature = "guide")]
+        guide_pending: GuideRequest::Clear,
+        #[cfg(feature = "guide")]
+        guide_monitor: None,
     }));
 
     // Each path segment is its own button, so "Computer > home > zito > Downloads"
@@ -2092,6 +2180,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     rebuild_tabs(&state, &ui);
     rebuild_sidebar(&state, &ui);
     start_drive_refresh(&state);
+    #[cfg(feature = "guide")]
+    start_guide_watch(&state);
     {
         let state = state.clone();
         let ui = ui.clone();
@@ -4418,6 +4508,10 @@ fn register_window(state: &Rc<RefCell<AppState>>, ui: &Ui, hold: gio::Applicatio
 
 /// Drops only this window's entry, which releases only its hold.
 fn unregister_window(state: &Rc<RefCell<AppState>>) {
+    #[cfg(feature = "guide")]
+    if let Some(monitor) = state.borrow_mut().guide_monitor.take() {
+        monitor.cancel();
+    }
     let removed = WINDOWS.with(|windows| windows.borrow_mut().unregister(state));
     drop(removed);
 }
@@ -8797,6 +8891,102 @@ mod tests {
         item_right_click_menu_opens_bounded_and_stays_d41();
         open_with_opens_a_side_menu_not_a_dialog_d42();
         drive_space_bars_refresh_off_thread_and_stay_cached_d46();
+        #[cfg(feature = "guide")]
+        guide_request_transport_d48();
+    }
+
+    #[cfg(feature = "guide")]
+    fn guide_request_transport_d48() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d48-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("guide");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let file = dir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        assert_eq!(guide_file_path(), file);
+        std::env::set_var("WF_GUIDE_FILE", "");
+        assert_eq!(guide_file_path(), home.join(".local/share/crew/guide/wayfinder.json"));
+        std::env::set_var("WF_GUIDE_FILE", &file);
+
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d48test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let open_window = || {
+            build_ui(&app, Some(home.to_string_lossy().to_string()), None);
+            WINDOWS.with(|w| w.borrow().windows().pop()).expect("the test window is registered")
+        };
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let (state, ui) = open_window();
+        let pending = |s: &Rc<RefCell<AppState>>| s.borrow().guide_pending.clone();
+        assert_eq!(pending(&state), GuideRequest::Clear, "a missing file is clear");
+        assert!(state.borrow().guide_monitor.is_some());
+
+        std::fs::write(&file, r#"{"highlight":"drive-open-crucial","label":"Open it"}"#).unwrap();
+        wait_for("direct creation", || pending(&state) == known("drive-open-crucial", "Open it"));
+
+        let tmp = dir.join("wayfinder.json.tmp");
+        std::fs::write(&tmp, r#"{"highlight":"trash-and-restore-file","label":"Trash"}"#).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+        wait_for("atomic replace", || pending(&state) == known("trash-and-restore-file", "Trash"));
+
+        std::fs::write(dir.join("other.json"), r#"{"highlight":"","label":""}"#).unwrap();
+        pump();
+        assert_eq!(pending(&state), known("trash-and-restore-file", "Trash"), "a sibling changed nothing");
+
+        std::fs::write(&file, r#"{"highlight":"","label":"gone"}"#).unwrap();
+        wait_for("empty highlight", || pending(&state) == GuideRequest::Clear);
+        std::fs::write(&file, r#"{"highlight":"drive-open-stick","label":"x"}"#).unwrap();
+        wait_for("reload", || pending(&state) == known("drive-open-stick", "x"));
+        std::fs::write(&file, "{not json").unwrap();
+        wait_for("malformed", || pending(&state) == GuideRequest::Clear);
+
+        let before = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, r#"{"highlight":"no-such-control","label":"Hmm"}"#).unwrap();
+        let unknown = GuideRequest::Unknown { name: "no-such-control".into(), label: "Hmm".into() };
+        wait_for("unknown", || pending(&state) == unknown);
+        pump();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"highlight":"no-such-control","label":"Hmm"}"#,
+            "the app never writes the guide file (was: {before})"
+        );
+
+        // A second live window keeps its own single, newest request.
+        let (state2, ui2) = open_window();
+        assert!(!Rc::ptr_eq(&state, &state2));
+        assert_eq!(pending(&state2), unknown, "the initial read takes the file as it is");
+        std::fs::write(&file, r#"{"highlight":"open-with-other-app","label":"Newest"}"#).unwrap();
+        wait_for("both windows update", || {
+            pending(&state) == known("open-with-other-app", "Newest") && pending(&state2) == known("open-with-other-app", "Newest")
+        });
+
+        // Closing one window releases its watcher; the other keeps working.
+        let monitor = state2.borrow().guide_monitor.clone().expect("second monitor");
+        ui2.window.close();
+        pump();
+        assert!(monitor.is_cancelled() && state2.borrow().guide_monitor.is_none(), "closed window kept its watcher");
+        std::fs::write(&file, r#"{"highlight":"drive-open-crucial","label":"After"}"#).unwrap();
+        wait_for("first window still live", || pending(&state) == known("drive-open-crucial", "After"));
+        assert_eq!(pending(&state2), known("open-with-other-app", "Newest"), "a closed window is not updated");
+
+        ui.window.destroy();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
