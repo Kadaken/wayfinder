@@ -1952,7 +1952,7 @@ fn main() {
     }
 
     let app = adw::Application::builder()
-        .application_id("io.github.legendofzito.wayfinder")
+        .application_id("com.kadaken.wayfinder")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
@@ -9589,6 +9589,7 @@ mod tests {
         folder_activation_waits_for_gtk_to_finish_d33();
         navigation_hands_focus_to_the_view_root_d34();
         clear_recents_is_durable_and_live_d35();
+        settings_survive_the_application_id_d65();
         item_right_click_menu_opens_bounded_and_stays_d41();
         open_with_opens_a_side_menu_not_a_dialog_d42();
         drive_space_bars_refresh_off_thread_and_stay_cached_d46();
@@ -9640,7 +9641,7 @@ mod tests {
         let file = gdir.join("wayfinder.json");
         std::env::set_var("WF_GUIDE_FILE", &file);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d52test")
+            .application_id("com.kadaken.wayfinder.d52test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -10162,7 +10163,7 @@ mod tests {
         });
         TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d53test")
+            .application_id("com.kadaken.wayfinder.d53test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -10532,7 +10533,7 @@ mod tests {
         let file = gdir.join("wayfinder.json");
         std::env::set_var("WF_GUIDE_FILE", &file);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d51test")
+            .application_id("com.kadaken.wayfinder.d51test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -10760,7 +10761,7 @@ mod tests {
         std::env::set_var("HOME", &home);
         std::env::set_var("WF_GUIDE_FILE", root.join("none/wayfinder.json"));
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d50test")
+            .application_id("com.kadaken.wayfinder.d50test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -10957,7 +10958,7 @@ mod tests {
         let file = gdir.join("wayfinder.json");
         std::env::set_var("WF_GUIDE_FILE", &file);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d58test")
+            .application_id("com.kadaken.wayfinder.d58test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11086,7 +11087,7 @@ mod tests {
         std::env::set_var("WF_GUIDE_FILE", &file);
 
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d48test")
+            .application_id("com.kadaken.wayfinder.d48test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11186,7 +11187,7 @@ mod tests {
                 .expect("the test window is registered");
             (app, found.0, found.1)
         };
-        let (_app, state, ui) = open("io.github.legendofzito.wayfinder.d30test");
+        let (_app, state, ui) = open("com.kadaken.wayfinder.d30test");
         wait_for("listing", || state.borrow().visible_entries.len() == 2);
         let path = |n: &str| dir.join(n).to_string_lossy().to_string();
         let invariants = || {
@@ -11304,7 +11305,7 @@ mod tests {
         assert_eq!(invariants(), before);
 
         // a new window defaults to visible and active
-        let (_app2, _state2, ui2) = open("io.github.legendofzito.wayfinder.d30test2");
+        let (_app2, _state2, ui2) = open("com.kadaken.wayfinder.d30test2");
         assert!(ui2.preview_toggle.is_active() && ui2.preview_scroll.is_visible());
         ui2.window.destroy();
         ui.window.destroy();
@@ -11332,7 +11333,7 @@ mod tests {
         let other_str = other.to_string_lossy().to_string();
         let missing = root.join("missing").to_string_lossy().to_string();
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d32test")
+            .application_id("com.kadaken.wayfinder.d32test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11418,7 +11419,7 @@ mod tests {
         let dir_str = dir.to_string_lossy().to_string();
         let sub_str = sub.to_string_lossy().to_string();
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d33test")
+            .application_id("com.kadaken.wayfinder.d33test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11501,7 +11502,7 @@ mod tests {
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d41test")
+            .application_id("com.kadaken.wayfinder.d41test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11619,7 +11620,7 @@ mod tests {
         TEST_CHILD_MISSING.with(|m| m.borrow_mut().clear());
         TEST_CHILD_FAILS.with(|f| f.set(false));
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d57test")
+            .application_id("com.kadaken.wayfinder.d57test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11716,7 +11717,7 @@ mod tests {
         });
         TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d54test")
+            .application_id("com.kadaken.wayfinder.d54test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11872,7 +11873,7 @@ mod tests {
         });
         TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d42test")
+            .application_id("com.kadaken.wayfinder.d42test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -11961,7 +11962,7 @@ mod tests {
         let dir_str = dir.to_string_lossy().to_string();
         let sub_str = sub.to_string_lossy().to_string();
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d34test")
+            .application_id("com.kadaken.wayfinder.d34test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -12023,6 +12024,60 @@ mod tests {
 
     /// D-35: Clear Recents empties only `recents`, on disk and in every live
     /// window, and no stale window can bring an old entry back.
+    /// D-65: the only app-owned settings path is `$HOME/.config/wayfinder/native-config.json`,
+    /// independent of the application ID, so an ID change needs no migration.
+    fn settings_survive_the_application_id_d65() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d65-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let cwd = root.join("cwd-65");
+        let fav = root.join("fav-65");
+        let recent = root.join("recent-65");
+        for d in [&home, &cwd, &fav, &recent] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let path = config_path().unwrap();
+        assert_eq!(path, home.join(".config").join("wayfinder").join("native-config.json"));
+        let fav_s = fav.to_string_lossy().to_string();
+        let recent_s = recent.to_string_lossy().to_string();
+        update_config_at(&path, |c| {
+            add_favorite(&mut c.favorites, &fav_s);
+            push_recent(&mut c.recents, &recent_s);
+            c.show_hidden = true;
+            c.view_mode = "grid".to_string();
+        });
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        assert_eq!(app.application_id().as_deref(), Some("com.kadaken.wayfinder"));
+        build_ui(&app, Some(cwd.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().windows())
+            .into_iter()
+            .find(|(_, u)| u.window.application().as_ref() == Some(app.upcast_ref()))
+            .expect("window under the new application id");
+        {
+            let s = state.borrow();
+            assert!(s.show_hidden, "sentinel show_hidden was read");
+            assert!(s.view_mode == ViewMode::Grid, "sentinel view mode was read");
+            assert_eq!(s.favorites.iter().map(|b| b.path.clone()).collect::<Vec<_>>(), vec![fav_s.clone()]);
+        }
+        assert_eq!(read_config_at(&path).recents.iter().map(|b| b.path.clone()).collect::<Vec<_>>(), vec![recent_s]);
+        // No app state lives under an application-ID-named directory.
+        assert!(!home.join(".var").exists() && !home.join(".config").join("com.kadaken.wayfinder").exists());
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn clear_recents_is_durable_and_live_d35() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d35-{}", std::process::id()));
@@ -12066,7 +12121,7 @@ mod tests {
         };
         let others_before = others();
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d35test")
+            .application_id("com.kadaken.wayfinder.d35test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -12218,7 +12273,7 @@ mod tests {
             TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = Some(scan));
         }
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d46test")
+            .application_id("com.kadaken.wayfinder.d46test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -12343,7 +12398,7 @@ mod tests {
         }
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d29test")
+            .application_id("com.kadaken.wayfinder.d29test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -12555,7 +12610,7 @@ mod tests {
             popover.unparent();
         };
 
-        let (_app, state, ui) = open("io.github.legendofzito.wayfinder.d28test");
+        let (_app, state, ui) = open("com.kadaken.wayfinder.d28test");
         wait_for("listing", || state.borrow().visible_entries.len() == 1);
         let tab = || {
             let s = state.borrow();
@@ -12612,7 +12667,7 @@ mod tests {
 
         // a new window starts with both controls on and the rows visible
         ui.window.destroy();
-        let (_app2, state2, ui2) = open("io.github.legendofzito.wayfinder.d28test2");
+        let (_app2, state2, ui2) = open("com.kadaken.wayfinder.d28test2");
         wait_for("new window listing", || state2.borrow().visible_entries.len() == 3);
         assert!(ui2.hidden.is_active() && state2.borrow().show_hidden);
         let (pop, row) = option_row(&ui2);
@@ -12640,7 +12695,7 @@ mod tests {
         let missing = root.join("missing").to_string_lossy().to_string();
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d27test")
+            .application_id("com.kadaken.wayfinder.d27test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -12779,7 +12834,7 @@ mod tests {
         }
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d22test")
+            .application_id("com.kadaken.wayfinder.d22test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -12929,7 +12984,7 @@ mod tests {
         }
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d22stream")
+            .application_id("com.kadaken.wayfinder.d22stream")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
@@ -13155,7 +13210,7 @@ mod tests {
         std::env::set_var("HOME", &home);
 
         let app = adw::Application::builder()
-            .application_id("io.github.legendofzito.wayfinder.d21test")
+            .application_id("com.kadaken.wayfinder.d21test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");

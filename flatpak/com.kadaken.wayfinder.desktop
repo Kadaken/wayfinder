@@ -2,7 +2,7 @@
 Name=Wayfinder
 Comment=Fast, native Linux file manager with a docked preview pane
 Exec=wayfinder %U
-Icon=io.github.legendofzito.wayfinder
+Icon=com.kadaken.wayfinder
 Terminal=false
 Type=Application
 Categories=System;FileManager;

@@ -1,4 +1,4 @@
-id: io.github.legendofzito.wayfinder
+id: com.kadaken.wayfinder
 
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
@@ -44,20 +44,20 @@ modules:
       # Install binary
       - install -Dm755 src-tauri/target/release/wayfinder /app/bin/wayfinder
       # Install desktop file (Tauri generates this during a full bundle; we provide it here)
-      - install -Dm644 flatpak/io.github.legendofzito.wayfinder.desktop
-          /app/share/applications/io.github.legendofzito.wayfinder.desktop
+      - install -Dm644 flatpak/com.kadaken.wayfinder.desktop
+          /app/share/applications/com.kadaken.wayfinder.desktop
       # Install metainfo
-      - install -Dm644 src-tauri/io.github.legendofzito.wayfinder.metainfo.xml
-          /app/share/metainfo/io.github.legendofzito.wayfinder.metainfo.xml
+      - install -Dm644 src-tauri/com.kadaken.wayfinder.metainfo.xml
+          /app/share/metainfo/com.kadaken.wayfinder.metainfo.xml
       # Install icons
       - install -Dm644 src-tauri/icons/32x32.png
-          /app/share/icons/hicolor/32x32/apps/io.github.legendofzito.wayfinder.png
+          /app/share/icons/hicolor/32x32/apps/com.kadaken.wayfinder.png
       - install -Dm644 src-tauri/icons/128x128.png
-          /app/share/icons/hicolor/128x128/apps/io.github.legendofzito.wayfinder.png
+          /app/share/icons/hicolor/128x128/apps/com.kadaken.wayfinder.png
       - install -Dm644 src-tauri/icons/128x128@2x.png
-          /app/share/icons/hicolor/256x256/apps/io.github.legendofzito.wayfinder.png
+          /app/share/icons/hicolor/256x256/apps/com.kadaken.wayfinder.png
       - install -Dm644 src-tauri/icons/icon.png
-          /app/share/icons/hicolor/scalable/apps/io.github.legendofzito.wayfinder.png
+          /app/share/icons/hicolor/scalable/apps/com.kadaken.wayfinder.png
     sources:
       - type: git
         url: https://github.com/LegendofZito/wayfinder.git

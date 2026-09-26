@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.legendofzito.wayfinder</id>
+  <id>com.kadaken.wayfinder</id>
   <name>Wayfinder</name>
   <summary>Fast, native Linux file manager with a docked preview pane</summary>
   <metadata_license>MIT</metadata_license>
@@ -27,7 +27,7 @@
     </ul>
   </description>
 
-  <launchable type="desktop-id">io.github.legendofzito.wayfinder.desktop</launchable>
+  <launchable type="desktop-id">com.kadaken.wayfinder.desktop</launchable>
 
   <url type="homepage">https://github.com/LegendofZito/wayfinder</url>
   <url type="bugtracker">https://github.com/LegendofZito/wayfinder/issues</url>
