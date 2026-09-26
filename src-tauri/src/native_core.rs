@@ -3808,4 +3808,38 @@ mod tests {
         assert_eq!((reg.len(), dropped.get()), (0, 2));
         assert!(reg.active(|_| true).is_none());
     }
+
+    #[test]
+    fn guide_names_registry_is_exact() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/guide-names.json");
+        let raw = fs::read_to_string(&path).expect("guide-names.json exists");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let obj = v.as_object().expect("top level is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "drive-open-crucial",
+                "drive-open-stick",
+                "drive-remount-crucial",
+                "drive-remount-stick",
+                "drive-unmount-crucial",
+                "drive-unmount-stick",
+                "open-with-other-app",
+                "terminal-here-folder",
+                "trash-and-restore-file",
+            ]
+        );
+        for (name, entry) in obj {
+            let fields = entry.as_object().expect("each entry is an object");
+            let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["kind", "where"], "{name}");
+            for f in fields.values() {
+                assert!(f.as_str().is_some_and(|x| !x.is_empty()), "{name}");
+            }
+        }
+        assert!(!obj.contains_key("take-me-back-start"));
+    }
 }
