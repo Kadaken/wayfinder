@@ -1261,6 +1261,9 @@ struct AppState {
     guide_pending: GuideRequest,
     #[cfg(feature = "guide")]
     guide_monitor: Option<gio::FileMonitor>,
+    /// The directory `guide_monitor` watches (the guide directory itself once promoted).
+    #[cfg(feature = "guide")]
+    guide_watch_dir: Option<PathBuf>,
 }
 
 struct ThumbnailJob {
@@ -1456,32 +1459,54 @@ fn guide_read(path: &Path) -> GuideRequest {
     fs::read_to_string(path).map(|t| guide_parse(&t)).unwrap_or(GuideRequest::Clear)
 }
 
-/// Reads the guide file once, then watches its directory so creation and
-/// atomic replacement of the exact filename are both seen. Siblings are ignored.
+/// Watches the nearest existing ancestor of the guide file for only the next
+/// path component, so a guide directory created later is still seen. Creates
+/// nothing. Every arm first replaces the old monitor, then reads the file, so a
+/// file written right after a directory appears is never missed.
 #[cfg(feature = "guide")]
 fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
     let path = guide_file_path();
-    state.borrow_mut().guide_pending = guide_read(&path);
-    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name().map(|n| n.to_os_string())) else {
-        return;
-    };
-    let Ok(monitor) = gio::File::for_path(dir)
-        .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
-    else {
-        return;
-    };
-    let weak = Rc::downgrade(state);
-    monitor.connect_changed(move |_, file, other, _| {
-        let is_guide = |f: &gio::File| f.basename().is_some_and(|b| b == file_name);
-        if !(is_guide(file) || other.is_some_and(is_guide)) {
-            return;
+    if let Some(old) = state.borrow_mut().guide_monitor.take() {
+        old.cancel();
+    }
+    state.borrow_mut().guide_watch_dir = None;
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if dir.is_dir() {
+            break;
         }
-        if let Some(state) = weak.upgrade() {
-            let request = guide_read(&path);
-            state.borrow_mut().guide_pending = request;
-        }
+        ancestor = dir.parent();
+    }
+    let watched = ancestor.and_then(|dir| {
+        let component = path.strip_prefix(dir).ok()?.components().next()?.as_os_str().to_os_string();
+        let monitor = gio::File::for_path(dir)
+            .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            .ok()?;
+        Some((dir.to_path_buf(), component, monitor))
     });
-    state.borrow_mut().guide_monitor = Some(monitor);
+    if let Some((dir, component, monitor)) = watched {
+        let is_final = dir == path.parent().unwrap_or(Path::new(""));
+        let weak = Rc::downgrade(state);
+        let file_path = path.clone();
+        monitor.connect_changed(move |_, file, other, _| {
+            let named = |f: &gio::File| f.basename().is_some_and(|b| b == component);
+            if !(named(file) || other.is_some_and(named)) {
+                return;
+            }
+            let Some(state) = weak.upgrade() else { return };
+            if is_final {
+                let request = guide_read(&file_path);
+                state.borrow_mut().guide_pending = request;
+            } else {
+                start_guide_watch(&state);
+            }
+        });
+        let mut st = state.borrow_mut();
+        st.guide_monitor = Some(monitor);
+        st.guide_watch_dir = Some(dir);
+    }
+    let request = guide_read(&path);
+    state.borrow_mut().guide_pending = request;
 }
 
 fn main() {
@@ -1685,6 +1710,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         guide_pending: GuideRequest::Clear,
         #[cfg(feature = "guide")]
         guide_monitor: None,
+        #[cfg(feature = "guide")]
+        guide_watch_dir: None,
     }));
 
     // Each path segment is its own button, so "Computer > home > zito > Downloads"
@@ -4509,8 +4536,12 @@ fn register_window(state: &Rc<RefCell<AppState>>, ui: &Ui, hold: gio::Applicatio
 /// Drops only this window's entry, which releases only its hold.
 fn unregister_window(state: &Rc<RefCell<AppState>>) {
     #[cfg(feature = "guide")]
-    if let Some(monitor) = state.borrow_mut().guide_monitor.take() {
-        monitor.cancel();
+    {
+        let mut st = state.borrow_mut();
+        st.guide_watch_dir = None;
+        if let Some(monitor) = st.guide_monitor.take() {
+            monitor.cancel();
+        }
     }
     let removed = WINDOWS.with(|windows| windows.borrow_mut().unregister(state));
     drop(removed);
@@ -8896,6 +8927,55 @@ mod tests {
     }
 
     #[cfg(feature = "guide")]
+    fn guide_watch_promotes_from_missing_directory_d49(app: &adw::Application, root: &std::path::Path) {
+        let base = root.join("d49");
+        std::fs::create_dir_all(&base).unwrap();
+        let guide_dir = base.join("a/b/guide");
+        let file = guide_dir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        build_ui(app, Some(root.join("home").to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        let pending = |s: &Rc<RefCell<AppState>>| s.borrow().guide_pending.clone();
+        let live = |s: &Rc<RefCell<AppState>>| {
+            s.borrow().guide_monitor.as_ref().is_some_and(|m| !m.is_cancelled())
+        };
+        assert!(!base.join("a").exists(), "opening the window created a directory");
+        assert_eq!(state.borrow().guide_watch_dir.as_deref(), Some(base.as_path()));
+        assert!(live(&state));
+        assert_eq!(pending(&state), GuideRequest::Clear);
+        let first = state.borrow().guide_monitor.clone().unwrap();
+
+        // Siblings at the watched level change nothing.
+        std::fs::create_dir(base.join("elsewhere")).unwrap();
+        pump();
+        assert_eq!(state.borrow().guide_watch_dir.as_deref(), Some(base.as_path()));
+        assert!(!first.is_cancelled());
+
+        // Checkrun: create the directories, then write atomically at once.
+        std::fs::create_dir_all(&guide_dir).unwrap();
+        let tmp = guide_dir.join("wayfinder.json.tmp");
+        std::fs::write(&tmp, r#"{"highlight":"drive-remount-stick","label":"Remount"}"#).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+        let want = GuideRequest::Known { name: "drive-remount-stick".into(), label: "Remount".into() };
+        wait_for("promotion and first request", || {
+            pending(&state) == want && state.borrow().guide_watch_dir.as_deref() == Some(guide_dir.as_path())
+        });
+        assert!(first.is_cancelled(), "the old monitor was replaced");
+        assert!(live(&state));
+
+        // After promotion a sibling changes nothing and the watch stays.
+        std::fs::write(guide_dir.join("other.json"), r#"{"highlight":"","label":""}"#).unwrap();
+        pump();
+        assert_eq!(pending(&state), want);
+        assert_eq!(state.borrow().guide_watch_dir.as_deref(), Some(guide_dir.as_path()));
+
+        let last = state.borrow().guide_monitor.clone().unwrap();
+        ui.window.close();
+        pump();
+        assert!(last.is_cancelled() && state.borrow().guide_monitor.is_none());
+    }
+
+    #[cfg(feature = "guide")]
     fn guide_request_transport_d48() {
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
@@ -8979,6 +9059,7 @@ mod tests {
         assert_eq!(pending(&state2), known("open-with-other-app", "Newest"), "a closed window is not updated");
 
         ui.window.destroy();
+        guide_watch_promotes_from_missing_directory_d49(&app, &root);
         match old_env {
             Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
             None => std::env::remove_var("WF_GUIDE_FILE"),
