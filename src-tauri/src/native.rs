@@ -1263,6 +1263,9 @@ struct AppState {
     /// closed dynamic popover is never kept alive.
     #[cfg(feature = "guide")]
     guide_target: Option<glib::WeakRef<gtk::Widget>>,
+    /// The ring and label currently drawn for `guide_target`, if any.
+    #[cfg(feature = "guide")]
+    guide_visual: Option<GuideVisual>,
     #[cfg(feature = "guide")]
     guide_monitor: Option<gio::FileMonitor>,
     /// The directory `guide_monitor` watches (the guide directory itself once promoted).
@@ -1520,6 +1523,85 @@ fn guide_resolve(state: &Rc<RefCell<AppState>>) {
         _ => None,
     };
     state.borrow_mut().guide_target = target;
+    guide_paint(state);
+}
+
+/// Ring on the target (a CSS outline, so nothing moves) plus one label surface
+/// anchored to it. The label is a non-modal popover that cannot be targeted or
+/// focused, so it never grabs input or dismisses a containing menu.
+#[cfg(feature = "guide")]
+#[derive(Clone)]
+struct GuideVisual {
+    target: glib::WeakRef<gtk::Widget>,
+    label: gtk::Popover,
+}
+
+#[cfg(feature = "guide")]
+const GUIDE_CSS: &str = ".wf-guide-ring { outline: 3px solid #ff2fd0; outline-offset: 2px; } \
+    popover.wf-guide-label > contents { background: #ff2fd0; color: #ffffff; padding: 2px 8px; border-radius: 6px; } \
+    popover.wf-guide-label label { font-weight: 700; }";
+
+#[cfg(feature = "guide")]
+fn guide_install_css() {
+    thread_local!(static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if DONE.with(|d| d.replace(true)) {
+        return;
+    }
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(GUIDE_CSS);
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
+
+#[cfg(feature = "guide")]
+fn guide_unpaint(state: &Rc<RefCell<AppState>>) {
+    let Some(visual) = state.borrow_mut().guide_visual.take() else { return };
+    visual.label.popdown();
+    visual.label.unparent();
+    if let Some(target) = visual.target.upgrade() {
+        target.remove_css_class("wf-guide-ring");
+    }
+}
+
+/// Redraws from scratch: tears down the old visual, then draws one only for a
+/// known request whose live target is also showing (a closed menu is not).
+#[cfg(feature = "guide")]
+fn guide_paint(state: &Rc<RefCell<AppState>>) {
+    guide_unpaint(state);
+    let GuideRequest::Known { label, .. } = state.borrow().guide_pending.clone() else { return };
+    let Some(target) = guide_live_target(state) else { return };
+    if !target.is_visible() {
+        return;
+    }
+    guide_install_css();
+    let text = gtk::Label::new(Some(&label));
+    text.set_can_target(false);
+    text.set_focusable(false);
+    let pop = gtk::Popover::new();
+    pop.set_autohide(false);
+    pop.set_has_arrow(false);
+    pop.set_position(gtk::PositionType::Right);
+    pop.set_can_target(false);
+    pop.set_focusable(false);
+    pop.set_can_focus(false);
+    pop.add_css_class("wf-guide-label");
+    pop.set_child(Some(&text));
+    target.add_css_class("wf-guide-ring");
+    pop.set_parent(&target);
+    pop.popup();
+    state.borrow_mut().guide_visual = Some(GuideVisual { target: target.downgrade(), label: pop });
+}
+
+/// A menu closing takes its target out of view: repaint so no visual stays.
+#[cfg(feature = "guide")]
+fn guide_repaint_on_close(popover: &gtk::Popover, state: &Rc<RefCell<AppState>>) {
+    let weak = Rc::downgrade(state);
+    popover.connect_closed(move |_| {
+        if let Some(state) = weak.upgrade() {
+            guide_paint(&state);
+        }
+    });
 }
 
 /// The bound widget, only while it is still live in this window's tree. A
@@ -1795,6 +1877,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         guide_pending: GuideRequest::Clear,
         #[cfg(feature = "guide")]
         guide_target: None,
+        #[cfg(feature = "guide")]
+        guide_visual: None,
         #[cfg(feature = "guide")]
         guide_monitor: None,
         #[cfg(feature = "guide")]
@@ -4632,6 +4716,9 @@ fn unregister_window(state: &Rc<RefCell<AppState>>) {
         let mut st = state.borrow_mut();
         st.guide_watch_dir = None;
         st.guide_target = None;
+        drop(st);
+        guide_unpaint(state);
+        let mut st = state.borrow_mut();
         if let Some(monitor) = st.guide_monitor.take() {
             monitor.cancel();
         }
@@ -7410,6 +7497,8 @@ fn show_drive_context_menu(
     }
 
     popover.set_child(Some(&menu));
+    #[cfg(feature = "guide")]
+    guide_repaint_on_close(&popover, &state);
     popover.popup();
     #[cfg(feature = "guide")]
     guide_resolve(&state);
@@ -7662,6 +7751,8 @@ fn show_item_context_menu(
         .child(&menu)
         .build();
     popover.set_child(Some(&scroller));
+    #[cfg(feature = "guide")]
+    guide_repaint_on_close(&popover, &state);
     popover.popup();
     #[cfg(feature = "guide")]
     guide_resolve(&state);
@@ -9010,6 +9101,9 @@ mod tests {
         );
         // First: earlier tests leave modal dialogs that would swallow real pointer input.
         real_pointer_drag_carries_the_press_time_selection();
+        // Also real pointer input, so it runs before anything can leave a modal behind.
+        #[cfg(feature = "guide")]
+        guide_ring_and_label_are_drawn_d52();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
@@ -9035,6 +9129,312 @@ mod tests {
         guide_target_names_are_exact_d50();
         #[cfg(feature = "guide")]
         guide_pending_targets_resolve_d51();
+    }
+
+    #[cfg(feature = "guide")]
+    fn guide_ring_and_label_are_drawn_d52() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d52-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let gdir = root.join("guide");
+        for d in [&home, &dir, &gdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d52test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        ui.window.set_title(Some("wf-d52-proof"));
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        let frames = std::env::var("WF_D52_FRAMES").ok().map(std::path::PathBuf::from);
+        let frame = |name: &str| {
+            if let Some(dir) = &frames {
+                pump();
+                std::thread::sleep(Duration::from_millis(400));
+                pump();
+                let out = std::process::Command::new("/usr/bin/import")
+                    .args(["-window", "root"])
+                    .arg(dir.join(name))
+                    .output()
+                    .expect("import");
+                assert!(out.status.success(), "frame capture: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        };
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let pending = || state.borrow().guide_pending.clone();
+        let put = |name: &str, label: &str| -> GuideRequest {
+            let tmp = gdir.join("wayfinder.json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || pending() == want);
+            pump();
+            want
+        };
+        let put_raw = |text: &str, want: GuideRequest| {
+            std::fs::write(&file, text).unwrap();
+            wait_for("guide request (raw)", || pending() == want);
+            pump();
+        };
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring")).collect() };
+        let label_pops = || -> Vec<gtk::Popover> {
+            tree()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Popover>().ok())
+                .filter(|p| p.has_css_class("wf-guide-label"))
+                .collect()
+        };
+        let label_text = |p: &gtk::Popover| -> String {
+            all_widgets(p.upcast_ref())
+                .iter()
+                .find_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.label().to_string()))
+                .expect("label text")
+        };
+        let label_texts = || -> Vec<String> { label_pops().iter().map(|p| label_text(p)).collect() };
+        let no_visual = |why: &str| {
+            assert!(rings().is_empty(), "{why}: a ring is still drawn");
+            assert!(label_pops().is_empty(), "{why}: a label is still drawn");
+        };
+        let by_name = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+
+        no_visual("no request");
+        frame("d52-0-before.png");
+
+        // Static target: one ring, one visible label with the exact text, anchored to it.
+        put("terminal-here-folder", "Open a terminal here");
+        let term = by_name("terminal-here-folder").pop().expect("terminal button");
+        assert_eq!(rings(), vec![term.clone()], "exactly the one real target is ringed");
+        let pops = label_pops();
+        assert_eq!(pops.len(), 1);
+        assert_eq!(label_text(&pops[0]), "Open a terminal here");
+        assert_eq!(pops[0].parent().as_ref(), Some(&term), "label anchored to the target");
+        assert!(pops[0].is_visible());
+        frame("d52-1-terminal-here-folder.png");
+
+        // Replacement: the old visual is gone, the new one is the only one.
+        let old_label = pops[0].clone();
+        drop(pops);
+        put("trash-and-restore-file", "Trash it");
+        let trash = by_name("trash-and-restore-file").pop().expect("trash button");
+        assert!(!term.has_css_class("wf-guide-ring"), "the old ring is gone");
+        assert!(old_label.parent().is_none(), "the old label surface is gone");
+        assert_eq!(rings(), vec![trash.clone()]);
+        assert_eq!(label_texts(), vec!["Trash it".to_string()]);
+
+        // An empty label is drawn exactly.
+        put("trash-and-restore-file", "");
+        assert_eq!(rings(), vec![trash.clone()]);
+        assert_eq!(label_texts(), vec![String::new()]);
+
+        // Every non-target state has no visual.
+        put("", "");
+        no_visual("clear");
+        put("terminal-here-folder", "again");
+        assert_eq!(rings().len(), 1);
+        put_raw("{not json", GuideRequest::Clear);
+        no_visual("malformed");
+        put("terminal-here-folder", "again");
+        put_raw(
+            r#"{"highlight":"no-such-control","label":"Hmm"}"#,
+            GuideRequest::Unknown { name: "no-such-control".into(), label: "Hmm".into() },
+        );
+        no_visual("unknown");
+        put("open-with-other-app", "no menu yet");
+        no_visual("zero matches");
+        put("terminal-here-folder", "again");
+        assert_eq!(rings().len(), 1);
+        trash.set_widget_name("terminal-here-folder");
+        put("terminal-here-folder", "dup");
+        no_visual("duplicate matches");
+        trash.set_widget_name("trash-and-restore-file");
+        put("terminal-here-folder", "back");
+        assert_eq!(rings(), vec![term.clone()]);
+        put("", "");
+        no_visual("cleared again");
+
+        // Real pointer through the visual: the ordinary click still fires once, nothing moves.
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let geo = xdo(&["search", "--name", "wf-d52-proof", "getwindowgeometry", "--shell"]);
+        let num = |key: &str| -> i32 {
+            geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
+        };
+        let (wx, wy) = (num("X="), num("Y="));
+        let b = term.compute_bounds(&ui.window).expect("terminal bounds");
+        let (cx, cy) = (b.x() + b.width() / 2.0, b.y() + b.height() / 2.0);
+        let clicks = Rc::new(std::cell::Cell::new(0));
+        {
+            let clicks = clicks.clone();
+            let term = term.clone().downcast::<gtk::Button>().expect("button");
+            term.connect_clicked(move |_| clicks.set(clicks.get() + 1));
+        }
+        let old_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "");
+        let click = || {
+            xdo(&["mousemove", &(wx + cx as i32).to_string(), &(wy + cy as i32).to_string()]);
+            pump();
+            xdo(&["mousedown", "1"]);
+            pump();
+            xdo(&["mouseup", "1"]);
+            pump();
+        };
+        let shape = || {
+            let t = &term;
+            (
+                (ui.window.width(), ui.window.height()),
+                (ui.files_stack.width(), ui.files_stack.height()),
+                (t.width(), t.height(), t.is_focusable(), t.can_target(), t.is_sensitive()),
+            )
+        };
+        // Baseline with no request: what an ordinary click does to focus.
+        put("", "");
+        click();
+        assert_eq!(clicks.get(), 1, "ordinary click fires once");
+        let plain_focus = GtkWindowExt::focus(&ui.window);
+        assert!(ui.status.label().contains("Terminal failed"), "the real handler ran: {}", ui.status.label());
+        // Same click with the visual up.
+        put("terminal-here-folder", "Click me");
+        let (before, focus_before) = (shape(), GtkWindowExt::focus(&ui.window));
+        assert_eq!(rings(), vec![term.clone()]);
+        let pop = label_pops().pop().expect("label");
+        assert!(!pop.can_target() && !pop.is_focusable() && !pop.can_focus(), "label cannot take input");
+        let inner = all_widgets(pop.upcast_ref());
+        assert!(inner.iter().filter(|w| w.is::<gtk::Label>()).all(|w| !w.can_target() && !w.is_focusable()));
+        let hit = ui.window.pick(cx as f64, cy as f64, gtk::PickFlags::DEFAULT).expect("something under the pointer");
+        assert!(hit == term || hit.is_ancestor(&term), "the pointer reaches the real control, not the visual");
+        assert!(!inner.contains(&hit));
+        assert_eq!(shape(), before, "showing the visual moved nothing");
+        assert_eq!(GtkWindowExt::focus(&ui.window), focus_before, "showing the visual moved focus");
+        click();
+        assert_eq!(clicks.get(), 2, "the click through the visual fired exactly once");
+        assert_eq!(GtkWindowExt::focus(&ui.window), plain_focus, "same focus result as an unguided click");
+        assert_eq!(shape(), before, "the click moved nothing");
+        assert_eq!(pending(), known("terminal-here-folder", "Click me"), "no clear-on-use yet");
+        assert_eq!(rings(), vec![term.clone()], "the ring stays after the click");
+        match old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        // The real file menu: its live row alone is ringed, the menu stays open.
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| {
+                c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3)
+            })
+        };
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a file row");
+        ui.list_selection.select_item(0, true);
+        update_selection(&state, &ui);
+        let entry = state.borrow().visible_entries[0].clone();
+        let open_menu = || {
+            show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), 5.0, 5.0);
+            pump();
+        };
+        let close_menu = || {
+            for pop in popovers_of(&row) {
+                pop.popdown();
+                pop.unparent();
+            }
+            pump();
+        };
+        put("open-with-other-app", "Open With here");
+        no_visual("pending before the menu");
+        open_menu();
+        let first = by_name("open-with-other-app").pop().expect("opener");
+        assert_eq!(rings(), vec![first.clone()], "the live row alone is ringed");
+        let pops = label_pops();
+        assert_eq!(pops.len(), 1);
+        assert_eq!(label_text(&pops[0]), "Open With here");
+        assert_eq!(pops[0].parent().as_ref(), Some(&first));
+        let item_menu = popovers_of(&row).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("item menu");
+        assert!(item_menu.is_mapped(), "the parent menu stays open under the visual");
+        frame("d52-2-open-with-other-app.png");
+        let stale_label = pops[0].clone();
+        drop((pops, item_menu));
+        close_menu();
+        no_visual("closed menu");
+        assert!(stale_label.parent().is_none());
+        assert_eq!(pending(), known("open-with-other-app", "Open With here"), "still pending");
+        drop(first);
+        open_menu();
+        let second = by_name("open-with-other-app").pop().expect("new opener");
+        assert_eq!(rings(), vec![second.clone()], "the fresh row is ringed");
+        assert_eq!(label_texts(), vec!["Open With here".to_string()]);
+        drop(second);
+        close_menu();
+        no_visual("closed again");
+
+        // Drive menus: a mounted and an unmounted real target show without closing their menu.
+        let sidebar_row = all_widgets(ui.sidebar.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .expect("a sidebar row");
+        let drive = |name: &str, removable: bool, mounted: bool| Drive {
+            name: name.to_string(),
+            path: format!("/dev/synthetic-{name}"),
+            mountpoint: if mounted { "/nonexistent/synthetic".into() } else { String::new() },
+            size: 1,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable,
+            space: None,
+        };
+        for (key, d) in [
+            ("drive-open-crucial", drive("Launch Box SSD 2TB", false, true)),
+            ("drive-remount-stick", drive("Stick", true, false)),
+        ] {
+            put(key, "Drive step");
+            no_visual("drive pending");
+            show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), d, 5.0, 5.0);
+            pump();
+            let target = by_name(key).pop().expect("drive target");
+            assert_eq!(rings(), vec![target.clone()], "{key} is ringed");
+            assert_eq!(label_texts(), vec!["Drive step".to_string()]);
+            let menu = popovers_of(sidebar_row.upcast_ref())
+                .into_iter()
+                .find(|p| !p.has_css_class("wf-guide-label"))
+                .expect("drive menu");
+            assert!(menu.is_mapped(), "{key}: the menu stays open");
+            drop((target, menu));
+            for pop in popovers_of(sidebar_row.upcast_ref()) {
+                pop.popdown();
+                pop.unparent();
+            }
+            pump();
+            no_visual("drive menu closed");
+        }
+
+        ui.window.destroy();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[cfg(feature = "guide")]
@@ -9083,15 +9483,28 @@ mod tests {
             std::fs::write(&file, text).unwrap();
             wait_for("guide request (raw)", || pending() == want);
         };
+        // The D-52 ring/label surface is measured by the D-52 test, not here.
+        let in_guide_label = |w: &gtk::Widget| {
+            let mut cur = Some(w.clone());
+            while let Some(c) = cur {
+                if c.has_css_class("wf-guide-label") {
+                    return true;
+                }
+                cur = c.parent();
+            }
+            false
+        };
         let snapshot = || -> Vec<(i32, i32, bool, bool, bool)> {
             all_widgets(ui.window.upcast_ref())
                 .iter()
+                .filter(|w| !in_guide_label(w))
                 .map(|w| (w.width(), w.height(), w.is_focusable(), w.can_target(), w.is_sensitive()))
                 .collect()
         };
         let labels = || -> Vec<String> {
             all_widgets(ui.window.upcast_ref())
                 .iter()
+                .filter(|w| !in_guide_label(w))
                 .filter_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.label().to_string()))
                 .collect()
         };
