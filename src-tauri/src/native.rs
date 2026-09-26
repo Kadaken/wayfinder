@@ -7261,9 +7261,22 @@ fn show_item_context_menu(
         }));
     }
 
-    popover.set_child(Some(&menu));
+    // The full item menu is about 490 px tall. A popover that cannot fit is
+    // popped down again by GTK on its first layout, so the menu never appears
+    // and the window is left grabbed. Bound it and let the rest scroll.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(ITEM_MENU_MAX_HEIGHT)
+        .child(&menu)
+        .build();
+    popover.set_child(Some(&scroller));
     popover.popup();
 }
+
+/// Tallest an item context menu may be before it scrolls.
+const ITEM_MENU_MAX_HEIGHT: i32 = 400;
 
 fn show_background_context_menu(
     list: &impl IsA<gtk::Widget>,
@@ -8548,6 +8561,7 @@ mod tests {
         job_result_survives_its_own_refresh_d32();
         folder_activation_waits_for_gtk_to_finish_d33();
         navigation_hands_focus_to_the_view_root_d34();
+        item_right_click_menu_opens_bounded_and_stays_d41();
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
@@ -8866,6 +8880,78 @@ mod tests {
 
     /// D-34: navigating to a different folder clears the focused row; focus must
     /// already sit on the surviving view root, and only when it was in the file pane.
+    fn item_right_click_menu_opens_bounded_and_stays_d41() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d41-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("with-me.txt"), "hello").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d41test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        // The row's own right-click handler, the same route a real click takes.
+        let has_right_click = |w: &gtk::Widget| {
+            let controllers = w.observe_controllers();
+            (0..controllers.n_items()).any(|i| {
+                controllers
+                    .item(i)
+                    .and_then(|o| o.downcast::<gtk::GestureClick>().ok())
+                    .is_some_and(|g| g.button() == 3)
+            })
+        };
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a file row carries the right-click gesture");
+        ui.list_selection.select_item(0, true);
+        update_selection(&state, &ui);
+        let entry = state.borrow().visible_entries[0].clone();
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
+        // Several frames: GTK pops an oversized popover down on its first layout.
+        pump();
+        pump();
+
+        let popover = popovers_of(&row).pop().expect("the item menu popover");
+        let monitor_h = gdk::Display::default()
+            .and_then(|d| d.monitors().item(0))
+            .and_then(|m| m.downcast::<gdk::Monitor>().ok())
+            .map(|m| m.geometry().height())
+            .expect("a monitor");
+        assert!(popover.is_visible() && popover.is_mapped(), "the item menu stays open after its first layout");
+        assert!(
+            popover.height() > 0 && popover.height() <= ITEM_MENU_MAX_HEIGHT.min(monitor_h),
+            "the menu is bounded: {} px on a {monitor_h} px screen",
+            popover.height()
+        );
+        assert!(button_labelled(popover.upcast_ref(), "Open With...").is_some(), "every action is still in the menu");
+        assert!(ui.window.is_sensitive() && ui.window.is_visible(), "the file window stays usable");
+
+        popover.popdown();
+        pump();
+        assert!(!popover.is_mapped());
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn navigation_hands_focus_to_the_view_root_d34() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d34-{}", std::process::id()));
