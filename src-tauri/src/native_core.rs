@@ -1906,6 +1906,12 @@ fn same_day(a: &glib::DateTime, b: &glib::DateTime) -> bool {
 /// Formats in-process via glib. This used to shell out to `date(1)` once per
 /// entry, which spawned a process for every row in a listing.
 pub fn fmt_modified(seconds: i64) -> String {
+    fmt_modified_with_now(seconds, glib::DateTime::now_local().ok())
+}
+
+/// The formatter with the local "now" supplied, so tests need not depend on
+/// the wall clock. `None` means the clock could not be read.
+fn fmt_modified_with_now(seconds: i64, now: Option<glib::DateTime>) -> String {
     if seconds <= 0 {
         return "unknown".to_string();
     }
@@ -1917,7 +1923,7 @@ pub fn fmt_modified(seconds: i64) -> String {
             .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_else(|_| seconds.to_string())
     };
-    let Ok(now) = glib::DateTime::now_local() else {
+    let Some(now) = now else {
         return absolute();
     };
 
@@ -2889,14 +2895,18 @@ mod tests {
 
     #[test]
     fn fmt_modified_counts_minutes_then_hours() {
-        assert_eq!(fmt_modified(now_unix() - 10 * 60), "10 min ago");
-        // 3h ago is "3 hr ago" only while it is still the same local day.
-        let three_hours = now_unix() - 3 * 3600;
-        let dt = glib::DateTime::from_unix_local(three_hours).unwrap();
-        let now = glib::DateTime::now_local().unwrap();
-        if same_day(&dt, &now) {
-            assert_eq!(fmt_modified(three_hours), "3 hr ago");
-        }
+        // A fixed mid-afternoon "now", so no interval crosses local midnight.
+        let now = glib::DateTime::new(&glib::TimeZone::local(), 2026, 6, 15, 14, 0, 0.0).unwrap();
+        let at = |back: i64| fmt_modified_with_now(now.to_unix() - back, Some(now.clone()));
+        assert_eq!(at(10 * 60), "10 min ago");
+        assert_eq!(at(3 * 3600), "3 hr ago");
+    }
+
+    #[test]
+    fn fmt_modified_across_midnight_says_yesterday() {
+        // Ten minutes old but on the prior local day: the existing policy.
+        let now = glib::DateTime::new(&glib::TimeZone::local(), 2026, 6, 15, 0, 5, 0.0).unwrap();
+        assert_eq!(fmt_modified_with_now(now.to_unix() - 10 * 60, Some(now.clone())), "Yesterday, 11:55 PM");
     }
 
     #[test]
