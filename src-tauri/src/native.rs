@@ -1387,7 +1387,22 @@ fn export_file_manager1(app: &adw::Application) {
     );
 }
 
+// Inert guide-only markers: kept in `--features guide` builds so the release
+// ship check can tell them apart from a default build. No I/O, no state.
+#[cfg(feature = "guide")]
+#[inline(never)]
+fn guide_markers_inert() -> usize {
+    const MARKERS: [&str; 3] = [
+        "/.local/share/crew/guide/",
+        "WF_GUIDE_FILE",
+        "WAYFINDER_GUIDE_ONLY_V1",
+    ];
+    std::hint::black_box(MARKERS).iter().map(|m| m.len()).sum()
+}
+
 fn main() {
+    #[cfg(feature = "guide")]
+    let _ = guide_markers_inert();
     if std::env::args().any(|arg| arg == "--pick-capable") {
         std::process::exit(0);
     }
