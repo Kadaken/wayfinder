@@ -92,6 +92,68 @@ pub struct Drive {
     pub fstype: String,
     pub kind: String,
     pub removable: bool,
+    /// Filesystem total and user-available bytes; `None` when unmounted or unreadable.
+    pub space: Option<Space>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Space {
+    pub total: u64,
+    pub available: u64,
+}
+
+/// What a drive row shows: the words, and the bar fill when there is one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpaceView {
+    pub words: String,
+    pub fraction: Option<f64>,
+}
+
+/// Bytes from statvfs block counts. `bavail` is what a user can use; `bfree`
+/// is never consulted. Zero total is no space at all.
+pub fn space_from_blocks(frsize: u64, blocks: u64, bavail: u64) -> Option<Space> {
+    let total = blocks.saturating_mul(frsize);
+    if total == 0 {
+        return None;
+    }
+    Some(Space {
+        total,
+        available: bavail.saturating_mul(frsize).min(total),
+    })
+}
+
+pub fn probe_space(mountpoint: &str) -> Option<Space> {
+    let path = std::ffi::CString::new(mountpoint).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    space_from_blocks(stat.f_frsize as u64, stat.f_blocks as u64, stat.f_bavail as u64)
+}
+
+pub fn space_view(space: Option<Space>) -> SpaceView {
+    match space.filter(|s| s.total > 0) {
+        Some(s) => {
+            let available = s.available.min(s.total);
+            SpaceView {
+                words: format!("{} available", fmt_size(available)),
+                fraction: Some((s.total - available) as f64 / s.total as f64),
+            }
+        }
+        None => SpaceView {
+            words: "Space unavailable".to_string(),
+            fraction: None,
+        },
+    }
+}
+
+impl Drive {
+    pub fn space_view(&self) -> SpaceView {
+        if self.mountpoint.is_empty() {
+            return space_view(None);
+        }
+        space_view(self.space)
+    }
 }
 
 pub fn parent_dir(path: &str) -> String {
@@ -332,6 +394,11 @@ pub fn search_dir(
 }
 
 pub fn list_drives() -> Vec<Drive> {
+    list_drives_with(&probe_space)
+}
+
+/// Discovery plus one space probe per mounted drive; blocking, so callers run it off the window thread.
+pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
     let mut out = Vec::new();
 
     if let Ok(output) = Command::new("lsblk")
@@ -370,6 +437,7 @@ pub fn list_drives() -> Vec<Drive> {
                         fstype: fstype.to_string(),
                         kind: "drive".to_string(),
                         removable,
+                        space: None,
                     });
                 }
 
@@ -404,6 +472,7 @@ pub fn list_drives() -> Vec<Drive> {
                     fstype: "rclone".to_string(),
                     kind: "gdrive".to_string(),
                     removable: false,
+                    space: None,
                 });
             } else if (fstype.starts_with("nfs") || fstype == "cifs" || fstype.starts_with("fuse."))
                 && mountpoint.starts_with("/home")
@@ -417,9 +486,14 @@ pub fn list_drives() -> Vec<Drive> {
                     fstype: fstype.to_string(),
                     kind: "network".to_string(),
                     removable: false,
+                    space: None,
                 });
             }
         }
+    }
+
+    for drive in out.iter_mut().filter(|d| !d.mountpoint.is_empty()) {
+        drive.space = probe(&drive.mountpoint);
     }
 
     out
@@ -3841,5 +3915,65 @@ mod tests {
             }
         }
         assert!(!obj.contains_key("take-me-back-start"));
+    }
+
+    #[test]
+    fn drive_space_uses_available_bytes_clamped_d46() {
+        // f_bavail (250 blocks) is the value; there is no free-block input at all.
+        let space = space_from_blocks(4096, 1000, 250).unwrap();
+        assert_eq!((space.total, space.available), (4_096_000, 1_024_000));
+        let clamped = space_from_blocks(4096, 1000, 5000).unwrap();
+        assert_eq!(clamped.available, clamped.total);
+        assert_eq!(space_from_blocks(4096, 0, 0), None);
+        assert_eq!(space_from_blocks(0, 1000, 10), None);
+        assert_eq!(space_from_blocks(u64::MAX, 2, 1).map(|s| s.available <= s.total), Some(true));
+    }
+
+    #[test]
+    fn drive_space_words_and_fraction_agree_d46() {
+        let gb: u64 = 1024 * 1024 * 1024;
+        let view = space_view(Some(Space { total: 100 * gb, available: 25 * gb }));
+        assert_eq!(view.words, "25 GB available");
+        assert_eq!(view.fraction, Some(0.75));
+        let over = space_view(Some(Space { total: 100 * gb, available: 900 * gb }));
+        assert_eq!(over.fraction, Some(0.0));
+        assert_eq!(over.words, "100 GB available");
+        let full = space_view(Some(Space { total: 100 * gb, available: 0 }));
+        assert_eq!((full.words.as_str(), full.fraction), ("0 B available", Some(1.0)));
+        for none in [None, Some(Space { total: 0, available: 0 })] {
+            let view = space_view(none);
+            assert_eq!((view.words.as_str(), view.fraction), ("Space unavailable", None));
+        }
+        let mut drive = Drive {
+            name: "d".into(),
+            path: "/dev/x".into(),
+            mountpoint: String::new(),
+            size: 5,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable: false,
+            space: Some(Space { total: 100 * gb, available: 25 * gb }),
+        };
+        let unmounted = drive.space_view();
+        assert_eq!((unmounted.words.as_str(), unmounted.fraction), ("Space unavailable", None));
+        drive.mountpoint = "/mnt/x".into();
+        assert_eq!(drive.space_view().fraction, Some(0.75));
+    }
+
+    #[test]
+    fn drive_scan_probes_only_mounted_drives_with_the_injected_probe_d46() {
+        let probed = std::cell::RefCell::new(Vec::new());
+        let drives = list_drives_with(&|mountpoint| {
+            probed.borrow_mut().push(mountpoint.to_string());
+            Some(Space { total: 1000, available: 1 })
+        });
+        let mounted: Vec<_> = drives.iter().filter(|d| !d.mountpoint.is_empty()).collect();
+        assert_eq!(probed.borrow().len(), mounted.len(), "one probe per mounted drive");
+        for d in &drives {
+            let expected = (!d.mountpoint.is_empty()).then_some(Space { total: 1000, available: 1 });
+            assert_eq!(d.space, expected, "{}", d.name);
+        }
+        let failed = list_drives_with(&|_| None);
+        assert!(failed.iter().all(|d| d.space.is_none()), "a failed probe leaves no space");
     }
 }

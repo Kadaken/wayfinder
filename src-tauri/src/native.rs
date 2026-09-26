@@ -290,6 +290,33 @@ row:focus-visible {
     font-size: 11px;
 }
 
+progressbar.wf-space-bar.horizontal {
+    margin-top: 3px;
+    min-width: 0;
+    min-height: 4px;
+}
+
+progressbar.wf-space-bar.horizontal trough {
+    min-width: 0;
+    min-height: 4px;
+    border-radius: 2px;
+    background: @wf_border;
+}
+
+progressbar.wf-space-bar.horizontal progress {
+    min-height: 4px;
+    border-radius: 2px;
+    background: @wf_accent_hover;
+}
+
+.wf-sidebar row.wf-sidebar-active progressbar.wf-space-bar.horizontal trough {
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.wf-sidebar row.wf-sidebar-active progressbar.wf-space-bar.horizontal progress {
+    background: #ffffff;
+}
+
 .wf-files-pane {
     background: @wf_base;
 }
@@ -1222,6 +1249,13 @@ struct AppState {
     /// metadata-only refresh can update text without touching the rows.
     meta_labels: HashMap<String, (glib::WeakRef<gtk::Label>, glib::WeakRef<gtk::Label>)>,
     thumbnail_queue: Option<Rc<RefCell<ThumbnailQueue>>>,
+    /// Last drive scan (with space), filled off the window thread. The sidebar and
+    /// row activation read only this, never a fresh scan.
+    drives: Vec<Drive>,
+    drive_refresh_in_flight: bool,
+    /// A refresh was asked for while one ran; run once more when it lands.
+    drive_refresh_again: bool,
+    drive_scan: DriveScan,
 }
 
 struct ThumbnailJob {
@@ -1544,6 +1578,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         monitor_generation: 0,
         meta_labels: HashMap::new(),
         thumbnail_queue: None,
+        drives: Vec::new(),
+        drive_refresh_in_flight: false,
+        drive_refresh_again: false,
+        drive_scan: drive_scan(),
     }));
 
     // Each path segment is its own button, so "Computer > home > zito > Downloads"
@@ -2038,6 +2076,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     rebuild_tabs(&state, &ui);
     rebuild_sidebar(&state, &ui);
+    start_drive_refresh(&state);
     {
         let state = state.clone();
         let ui = ui.clone();
@@ -2819,18 +2858,12 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.sidebar.append(&row);
     }
 
-    let drives = native_core::list_drives();
+    let drives = state.borrow().drives.clone();
     if !drives.is_empty() {
         append_sidebar_heading(&ui.sidebar, "Devices");
         for drive in drives {
-            let detail = if drive.mountpoint.is_empty() {
-                "mount".to_string()
-            } else if drive.size > 0 {
-                native_core::fmt_size(drive.size)
-            } else {
-                String::new()
-            };
-            let row = sidebar_row(&drive.name, &detail, drive_icon(&drive));
+            let view = drive.space_view();
+            let row = sidebar_row_with_bar(&drive.name, &view.words, drive_icon(&drive), view.fraction);
             if !drive.mountpoint.is_empty() {
                 mark_sidebar_active(
                     &row,
@@ -2925,10 +2958,13 @@ fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListB
         return;
     }
 
-    if let Some(drive) = native_core::list_drives()
-        .into_iter()
+    let cached = state
+        .borrow()
+        .drives
+        .iter()
         .find(|drive| drive.mountpoint == path || drive.path == path)
-    {
+        .cloned();
+    if let Some(drive) = cached {
         open_drive_action(state.clone(), ui.clone(), drive);
     } else {
         navigate(state, path);
@@ -3080,6 +3116,16 @@ fn append_sidebar_heading(sidebar: &gtk::ListBox, text: &str) {
 }
 
 fn sidebar_row(name: &str, detail: &str, icon_name: &str) -> gtk::ListBoxRow {
+    sidebar_row_with_bar(name, detail, icon_name, None)
+}
+
+/// The one sidebar row layout; a drive row adds a fill bar below its words.
+fn sidebar_row_with_bar(
+    name: &str,
+    detail: &str,
+    icon_name: &str,
+    fraction: Option<f64>,
+) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::builder().activatable(true).build();
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     line.set_margin_top(4);
@@ -3101,11 +3147,19 @@ fn sidebar_row(name: &str, detail: &str, icon_name: &str) -> gtk::ListBoxRow {
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
         .build();
-    detail.set_max_width_chars(12);
+    detail.set_max_width_chars(14);
     detail.add_css_class("wf-sidebar-detail");
     text.append(&name);
     if !detail.label().is_empty() {
         text.append(&detail);
+    }
+    if let Some(fraction) = fraction {
+        let bar = gtk::ProgressBar::new();
+        bar.add_css_class("wf-space-bar");
+        bar.set_fraction(fraction.clamp(0.0, 1.0));
+        bar.set_can_target(false);
+        bar.set_can_focus(false);
+        text.append(&bar);
     }
     line.append(&icon);
     line.append(&text);
@@ -6056,6 +6110,73 @@ fn terminal_here(state: Rc<RefCell<AppState>>, ui: Ui) {
     }
 }
 
+/// The drive list is refreshed every 30 seconds while the window lives.
+const DRIVE_REFRESH_SECS: u32 = 30;
+
+type DriveScan = Arc<dyn Fn() -> Vec<Drive> + Send + Sync>;
+
+/// One refresh now, then one every 30 seconds until the window is gone.
+fn start_drive_refresh(state: &Rc<RefCell<AppState>>) {
+    request_drive_refresh(state);
+    let weak = Rc::downgrade(state);
+    glib::timeout_add_seconds_local(DRIVE_REFRESH_SECS, move || {
+        let Some(state) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if ui_for_state(&state).is_none() {
+            return glib::ControlFlow::Break;
+        }
+        request_drive_refresh(&state);
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Scans drives and space on a worker and applies the result on the GTK loop.
+/// At most one worker runs; a request that arrives meanwhile reruns afterwards
+/// so a mount or unmount is never shown from a scan that began before it.
+fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
+    {
+        let mut state = state.borrow_mut();
+        if state.drive_refresh_in_flight {
+            state.drive_refresh_again = true;
+            return;
+        }
+        state.drive_refresh_in_flight = true;
+    }
+    let scan = state.borrow().drive_scan.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(scan());
+    });
+    let weak = Rc::downgrade(state);
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        let Some(state) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let result = match rx.try_recv() {
+            Ok(drives) => Some(drives),
+            Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let again = {
+            let mut state = state.borrow_mut();
+            state.drive_refresh_in_flight = false;
+            std::mem::take(&mut state.drive_refresh_again)
+        };
+        let Some(ui) = ui_for_state(&state) else {
+            return glib::ControlFlow::Break;
+        };
+        if let Some(drives) = result {
+            state.borrow_mut().drives = drives;
+            rebuild_sidebar(&state, &ui);
+        }
+        if again {
+            request_drive_refresh(&state);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 fn open_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
     if !drive.mountpoint.is_empty() {
         navigate(&state, drive.mountpoint);
@@ -6070,7 +6191,7 @@ fn open_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
         move || {
             mount_outcome(native_core::mount_drive(&device))
         },
-        |state, ui, _| rebuild_sidebar(state, ui),
+        |state, _, _| request_drive_refresh(state),
     );
 }
 
@@ -6094,7 +6215,7 @@ fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
             native_core::unmount_drive(&device)?;
             Ok(JobOutcome::message("Unmounted drive"))
         },
-        |state, ui, _| rebuild_sidebar(state, ui),
+        |state, _, _| request_drive_refresh(state),
     );
 }
 
@@ -6108,7 +6229,7 @@ fn eject_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
             native_core::eject_drive(&device)?;
             Ok(JobOutcome::message("Drive is safe to remove"))
         },
-        |state, ui, _| rebuild_sidebar(state, ui),
+        |state, _, _| request_drive_refresh(state),
     );
 }
 
@@ -8216,9 +8337,24 @@ fn open_with_test_launch(_app_id: &str, _path: &str) -> Option<Result<(), String
 thread_local! {
     /// Test-only stand-ins so a test never launches a real application.
     #[cfg(test)]
+    static TEST_DRIVE_SCAN: RefCell<Option<DriveScan>> = const { RefCell::new(None) };
+    #[cfg(test)]
     static TEST_OPEN_WITH_APPS: RefCell<Option<Vec<native_core::AppEntry>>> = const { RefCell::new(None) };
     #[cfg(test)]
     static TEST_OPEN_WITH_LAUNCHES: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The real scan, or in tests a synthetic one; tests never touch a real drive.
+#[cfg(not(test))]
+fn drive_scan() -> DriveScan {
+    Arc::new(native_core::list_drives)
+}
+
+#[cfg(test)]
+fn drive_scan() -> DriveScan {
+    TEST_DRIVE_SCAN
+        .with(|scan| scan.borrow().clone())
+        .unwrap_or_else(|| Arc::new(Vec::new))
 }
 
 #[cfg(test)]
@@ -8645,6 +8781,7 @@ mod tests {
         clear_recents_is_durable_and_live_d35();
         item_right_click_menu_opens_bounded_and_stays_d41();
         open_with_opens_a_side_menu_not_a_dialog_d42();
+        drive_space_bars_refresh_off_thread_and_stay_cached_d46();
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
@@ -9343,6 +9480,168 @@ mod tests {
         for (_, u) in WINDOWS.with(|w| w.borrow().windows()).into_iter().filter(|w| mine(w)) {
             u.window.destroy();
         }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn drive_space_bars_refresh_off_thread_and_stay_cached_d46() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+        assert_eq!(DRIVE_REFRESH_SECS, 30, "the refresh interval is exactly 30 seconds");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d46-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let mount_a = root.join("mount-a");
+        for d in [&home, &mount_a] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let gb: u64 = 1024 * 1024 * 1024;
+        let drive = |name: &str, mount: Option<&std::path::Path>, space: Option<native_core::Space>| Drive {
+            name: name.to_string(),
+            path: format!("/dev/synthetic-{name}"),
+            mountpoint: mount.map(|m| m.to_string_lossy().to_string()).unwrap_or_default(),
+            size: 100 * gb,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable: false,
+            space,
+        };
+        let space = |total_gb: u64, free_gb: u64| Some(native_core::Space { total: total_gb * gb, available: free_gb * gb });
+        let listing = Arc::new(Mutex::new(vec![
+            drive("SynA", Some(&mount_a), space(100, 25)),
+            drive("SynB", None, None),
+            drive("SynC", Some(&mount_a), None),
+            drive("SynZ", Some(&mount_a), space(0, 0).map(|s| native_core::Space { total: 0, ..s })),
+        ]));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let main_thread = std::thread::current().id();
+        {
+            let (listing, gate, calls, threads) = (listing.clone(), gate.clone(), calls.clone(), threads.clone());
+            let scan: DriveScan = Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                threads.lock().unwrap().push(std::thread::current().id());
+                let (open, cv) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                listing.lock().unwrap().clone()
+            });
+            TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = Some(scan));
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d46test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        // The bar's size comes from the app stylesheet, which build_ui does not install.
+        install_app_css();
+        build_ui(&app, Some(home.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("first scan started", || calls.load(Ordering::SeqCst) == 1);
+
+        // The scan is blocked: the GTK loop must still run, and repeated requests
+        // must not start a second worker.
+        let ticks = Rc::new(std::cell::Cell::new(0));
+        {
+            let ticks = ticks.clone();
+            glib::timeout_add_local(Duration::from_millis(10), move || {
+                ticks.set(ticks.get() + 1);
+                glib::ControlFlow::Continue
+            });
+        }
+        for _ in 0..3 {
+            request_drive_refresh(&state);
+        }
+        pump();
+        assert!(ticks.get() >= 3, "GTK loop stalled while the drive scan was blocked");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one refresh in flight at most");
+        assert!(state.borrow().drive_refresh_in_flight && state.borrow().drive_refresh_again);
+        assert!(state.borrow().drives.is_empty());
+
+        let rows = |ui: &Ui| -> Vec<(String, String, usize, gtk::ListBoxRow)> {
+            all_widgets(ui.sidebar.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+                .map(|row| {
+                    let inner = all_widgets(row.upcast_ref());
+                    let text = |class: &str| {
+                        inner
+                            .iter()
+                            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                            .find(|l| l.has_css_class(class))
+                            .map(|l| l.label().to_string())
+                            .unwrap_or_default()
+                    };
+                    let bars = inner.iter().filter(|w| w.is::<gtk::ProgressBar>()).count();
+                    (text("wf-sidebar-title"), text("wf-sidebar-detail"), bars, row.clone())
+                })
+                .collect()
+        };
+        let row_named = |ui: &Ui, name: &str| rows(ui).into_iter().find(|r| r.0 == name);
+        let geometry = |ui: &Ui| {
+            let places = rows(ui).into_iter().find(|r| r.0 == "Home").expect("Home row").3;
+            (ui.sidebar.width(), places.height(), places.width(), ui.list_scroll.width(), ui.file_preview.position())
+        };
+        assert!(row_named(&ui, "SynA").is_none(), "no drive rows before the first scan lands");
+        wait_for("laid out", || ui.list_scroll.width() > 0);
+        let before = geometry(&ui);
+
+        {
+            let (open, cv) = &*gate;
+            *open.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        wait_for("rerun after the in-flight scan", || {
+            calls.load(Ordering::SeqCst) == 2 && !state.borrow().drive_refresh_in_flight
+        });
+        assert!(threads.lock().unwrap().iter().all(|t| *t != main_thread), "scan ran on the window thread");
+        pump();
+
+        let (_, words, bars, row_a) = row_named(&ui, "SynA").expect("mounted drive row");
+        assert_eq!((words.as_str(), bars), ("25 GB available", 1));
+        for name in ["SynB", "SynC", "SynZ"] {
+            let (_, words, bars, _) = row_named(&ui, name).expect(name);
+            assert_eq!((words.as_str(), bars), ("Space unavailable", 0), "{name}");
+        }
+        let bar = all_widgets(row_a.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ProgressBar>().ok())
+            .expect("progress bar");
+        assert!((bar.fraction() - 0.75).abs() < 1e-9, "fill is the used share of user-available space");
+        assert!(!bar.can_target() && !bar.can_focus());
+        assert!(bar.height() > 0 && bar.height() <= 8, "bar is small: {}", bar.height());
+        assert_eq!(geometry(&ui), before, "protected sidebar and row geometry moved");
+
+        // Activating a drive row uses the cache: no new scan.
+        let scans = calls.load(Ordering::SeqCst);
+        activate_sidebar_row(&state, &ui, &row_a);
+        wait_for("navigated to the drive", || state.borrow().cwd == mount_a.to_string_lossy());
+        assert_eq!(calls.load(Ordering::SeqCst), scans, "row activation scanned drives");
+
+        // A later result replaces the cache: no stale rows, and an unmount clears the bar.
+        *listing.lock().unwrap() = vec![drive("SynA", None, None)];
+        request_drive_refresh(&state);
+        wait_for("replacement scan", || {
+            calls.load(Ordering::SeqCst) == scans + 1 && !state.borrow().drive_refresh_in_flight
+        });
+        pump();
+        assert!(["SynB", "SynC", "SynZ"].iter().all(|n| row_named(&ui, n).is_none()), "stale drive rows");
+        let (_, words, bars, _) = row_named(&ui, "SynA").expect("unmounted drive row");
+        assert_eq!((words.as_str(), bars), ("Space unavailable", 0));
+
+        ui.window.destroy();
+        TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
