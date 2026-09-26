@@ -6471,9 +6471,7 @@ fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 fn terminal_here(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.clone();
-    if let Err(err) = native_core::open_terminal(&cwd) {
-        ui.status.set_label(&format!("Terminal failed: {err}"));
-    }
+    launch_terminal(&ui, &cwd);
 }
 
 /// The drive list is refreshed every 30 seconds while the window lives.
@@ -7783,9 +7781,7 @@ fn show_item_context_menu(
             native_core::parent_dir(&entry.path)
         };
         menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
-            if let Err(err) = native_core::open_terminal(&terminal_path) {
-                ui.status.set_label(&format!("Terminal failed: {err}"));
-            }
+            launch_terminal(&ui, &terminal_path);
         }));
     }
 
@@ -8074,10 +8070,86 @@ fn open_with_apps_for(path: &str) -> Vec<native_core::AppEntry> {
     open_with_test_apps().unwrap_or_else(|| native_core::open_with_apps(path))
 }
 
-fn launch_open_with(app_id: &str, path: &str) -> Result<(), String> {
-    match open_with_test_launch(app_id, path) {
-        Some(result) => result,
-        None => native_core::open_with(app_id, path),
+/// Everything a child application launch needs, decided before any process is
+/// created, so a test can stop at `spawn_child` and see exactly what would run.
+#[cfg_attr(not(test), allow(dead_code))] // some fields are read only by the test seam
+enum ChildLaunch<'a> {
+    /// A desktop application opening one file.
+    DesktopApp { app_id: &'a str, desktop_file: &'a str, path: &'a str },
+    /// A terminal command line that must already be installed.
+    Terminal { candidate: &'a native_core::TerminalCandidate, dir: &'a str },
+}
+
+/// The launch context of the window the user acted in. KDE reads the startup
+/// and activation data from it, which is what places the child on that window's
+/// screen instead of wherever a context-free process lands.
+fn child_launch_context(ui: &Ui) -> gdk::AppLaunchContext {
+    let context = gtk::prelude::WidgetExt::display(&ui.window).app_launch_context();
+    context.set_timestamp(gdk::CURRENT_TIME);
+    context
+}
+
+fn launch_open_with(ui: &Ui, app_id: &str, path: &str) -> Result<(), String> {
+    let desktop_file = open_with_desktop_file(app_id)?;
+    spawn_child(ui, ChildLaunch::DesktopApp { app_id, desktop_file: &desktop_file, path })
+        .map_err(|err| match err {
+            native_core::LaunchError::NotFound => "app not found".to_string(),
+            native_core::LaunchError::Failed(err) => err,
+        })
+}
+
+fn launch_terminal(ui: &Ui, dir: &str) {
+    let result = native_core::open_terminal_with(dir, |candidate| {
+        spawn_child(ui, ChildLaunch::Terminal { candidate, dir })
+    });
+    if let Err(err) = result {
+        ui.status.set_label(&format!("Terminal failed: {err}"));
+    }
+}
+
+#[cfg(not(test))]
+fn open_with_desktop_file(app_id: &str) -> Result<String, String> {
+    native_core::open_with_desktop_file(app_id)
+}
+
+/// The one place a child application is started, always with the initiating
+/// window's launch context.
+#[cfg(not(test))]
+fn spawn_child(ui: &Ui, launch: ChildLaunch) -> Result<(), native_core::LaunchError> {
+    use native_core::LaunchError;
+    let context = child_launch_context(ui);
+    let failed = |err: glib::Error| LaunchError::Failed(err.message().to_string());
+    match launch {
+        ChildLaunch::DesktopApp { desktop_file, path, .. } => {
+            let app_id = std::path::Path::new(desktop_file)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let info = gio::AppInfo::all()
+                .into_iter()
+                .find(|info| info.id().is_some_and(|id| id == app_id))
+                .ok_or_else(|| LaunchError::Failed("app not found".into()))?;
+            let uri = gio::File::for_path(path).uri();
+            info.launch_uris(&[uri.as_str()], Some(&context)).map_err(failed)
+        }
+        ChildLaunch::Terminal { candidate, .. } => {
+            if glib::find_program_in_path(candidate.program).is_none() {
+                return Err(LaunchError::NotFound);
+            }
+            let line = candidate
+                .argv
+                .iter()
+                .map(|arg| glib::shell_quote(arg).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let info = gio::AppInfo::create_from_commandline(
+                line,
+                Some(candidate.program),
+                gio::AppInfoCreateFlags::SUPPORTS_STARTUP_NOTIFICATION,
+            )
+            .map_err(failed)?;
+            info.launch(&[], Some(&context)).map_err(failed)
+        }
     }
 }
 
@@ -8122,7 +8194,7 @@ fn context_open_with(parent: &gtk::Popover, ui: Ui, path: String) -> gtk::Button
                 if let Some(parent) = parent.upgrade() {
                     parent.popdown();
                 }
-                match launch_open_with(&app.id, &path) {
+                match launch_open_with(&ui, &app.id, &path) {
                     Ok(()) => ui.status.set_label(&format!("Opened with {}", app.name)),
                     Err(err) => ui.status.set_label(&format!("Open With failed: {err}")),
                 }
@@ -8766,11 +8838,6 @@ fn open_with_test_apps() -> Option<Vec<native_core::AppEntry>> {
     None
 }
 
-#[cfg(not(test))]
-fn open_with_test_launch(_app_id: &str, _path: &str) -> Option<Result<(), String>> {
-    None
-}
-
 thread_local! {
     /// Test-only stand-ins so a test never launches a real application.
     #[cfg(test)]
@@ -8779,6 +8846,12 @@ thread_local! {
     static TEST_OPEN_WITH_APPS: RefCell<Option<Vec<native_core::AppEntry>>> = const { RefCell::new(None) };
     #[cfg(test)]
     static TEST_OPEN_WITH_LAUNCHES: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static TEST_CHILD_ATTEMPTS: RefCell<Vec<ChildRecord>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static TEST_CHILD_MISSING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static TEST_CHILD_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The real scan, or in tests a synthetic one; tests never touch a real drive.
@@ -8799,13 +8872,59 @@ fn open_with_test_apps() -> Option<Vec<native_core::AppEntry>> {
     TEST_OPEN_WITH_APPS.with(|a| a.borrow().clone())
 }
 
+/// What one `spawn_child` call would have started, and the launch context it
+/// carried. Nothing is started in a test.
 #[cfg(test)]
-fn open_with_test_launch(app_id: &str, path: &str) -> Option<Result<(), String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildRecord {
+    /// The desktop file, or the terminal program.
+    target: String,
+    /// The file for Open With, the directory for a terminal.
+    subject: String,
+    /// The full terminal command line; empty for Open With.
+    argv: Vec<String>,
+    /// Whether the context was built from the initiating window's display.
+    context_from_display: bool,
+}
+
+#[cfg(test)]
+fn open_with_desktop_file(app_id: &str) -> Result<String, String> {
     if TEST_OPEN_WITH_APPS.with(|a| a.borrow().is_none()) {
-        return None;
+        return native_core::open_with_desktop_file(app_id);
     }
-    TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().push((app_id.to_string(), path.to_string())));
-    Some(Ok(()))
+    Ok(format!("/test/{app_id}"))
+}
+
+#[cfg(test)]
+fn spawn_child(ui: &Ui, launch: ChildLaunch) -> Result<(), native_core::LaunchError> {
+    use native_core::LaunchError;
+    let context = child_launch_context(ui);
+    let from_display = context.property::<gdk::Display>("display") == gtk::prelude::WidgetExt::display(&ui.window);
+    let record = match launch {
+        ChildLaunch::DesktopApp { app_id, desktop_file, path } => {
+            TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().push((app_id.to_string(), path.to_string())));
+            ChildRecord { target: desktop_file.into(), subject: path.into(), argv: vec![], context_from_display: from_display }
+        }
+        ChildLaunch::Terminal { candidate, dir } => {
+            let record = ChildRecord {
+                target: candidate.program.into(),
+                subject: dir.into(),
+                argv: candidate.argv.clone(),
+                context_from_display: from_display,
+            };
+            if TEST_CHILD_MISSING.with(|m| m.borrow().iter().any(|p| p == candidate.program)) {
+                TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().push(record));
+                return Err(LaunchError::NotFound);
+            }
+            if TEST_CHILD_FAILS.with(|f| f.get()) {
+                TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().push(record));
+                return Err(LaunchError::Failed("test launch failure".into()));
+            }
+            record
+        }
+    };
+    TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().push(record));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -9225,6 +9344,7 @@ mod tests {
         open_with_opens_a_side_menu_not_a_dialog_d42();
         drive_space_bars_refresh_off_thread_and_stay_cached_d46();
         context_menu_actions_fire_once_and_leave_no_popover_d54();
+        child_apps_launch_with_the_window_context_d57();
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
         #[cfg(feature = "guide")]
@@ -10812,6 +10932,105 @@ mod tests {
         pump();
         assert!(!popover.is_mapped());
         ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-57: Terminal Here and Open With start their child through one path that carries the
+    /// initiating window's launch context. Nothing real is started; the seam records the
+    /// decision. Where the child lands on screen is not asserted: that needs the installed gate.
+    fn child_apps_launch_with_the_window_context_d57() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d57-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir with space");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("with-me.txt"), "hello").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        TEST_OPEN_WITH_APPS.with(|a| {
+            *a.borrow_mut() =
+                Some(vec![native_core::AppEntry { id: "fake-editor-a.desktop".into(), name: "Fake Editor A".into() }])
+        });
+        TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
+        TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().clear());
+        TEST_CHILD_MISSING.with(|m| m.borrow_mut().clear());
+        TEST_CHILD_FAILS.with(|f| f.set(false));
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d57test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+        let dir_str = dir.to_string_lossy().to_string();
+        let attempts = || TEST_CHILD_ATTEMPTS.with(|a| a.borrow().clone());
+
+        // Open With: the chosen app and file, one launch, context from this window's display.
+        let file = dir.join("with-me.txt").to_string_lossy().to_string();
+        launch_open_with(&ui, "fake-editor-a.desktop", &file).expect("open with succeeds");
+        let got = attempts();
+        assert_eq!(got.len(), 1, "one launch");
+        assert_eq!(got[0].target, "/test/fake-editor-a.desktop");
+        assert_eq!(got[0].subject, file);
+        assert!(got[0].context_from_display, "Open With carries the initiating window's display context");
+        assert_eq!(TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow().clone()), vec![("fake-editor-a.desktop".to_string(), file.clone())]);
+
+        // Terminal Here: Konsole first, exact directory, same context, one launch.
+        TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().clear());
+        launch_terminal(&ui, &dir_str);
+        let got = attempts();
+        assert_eq!(got.len(), 1, "one launch");
+        assert_eq!(got[0].target, "konsole");
+        assert_eq!(got[0].subject, dir_str);
+        assert_eq!(got[0].argv, vec!["konsole".to_string(), "--workdir".to_string(), dir_str.clone()]);
+        assert!(got[0].context_from_display, "Terminal Here carries the same window context");
+
+        // Missing candidates fall through in order; the working directory stays exact for each.
+        TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().clear());
+        TEST_CHILD_MISSING.with(|m| *m.borrow_mut() = vec!["konsole".into(), "kgx".into(), "gnome-terminal".into()]);
+        launch_terminal(&ui, &dir_str);
+        let names: Vec<String> = attempts().iter().map(|r| r.target.clone()).collect();
+        assert_eq!(names, ["konsole", "kgx", "gnome-terminal", "x-terminal-emulator"]);
+        let last = attempts().pop().unwrap();
+        assert_eq!(last.argv[..4], ["sh", "-c", "cd \"$1\" && exec x-terminal-emulator", "sh"]);
+        assert_eq!(last.argv[4], dir_str);
+        assert!(!ui.status.label().contains("failed"), "a fallthrough that succeeds reports nothing");
+
+        // Every candidate missing: reported once, in order, none started.
+        TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().clear());
+        TEST_CHILD_MISSING.with(|m| {
+            *m.borrow_mut() =
+                ["konsole", "kgx", "gnome-terminal", "x-terminal-emulator", "xterm"].map(String::from).to_vec()
+        });
+        ui.status.set_label("");
+        launch_terminal(&ui, &dir_str);
+        assert_eq!(attempts().len(), 5);
+        assert_eq!(ui.status.label(), "Terminal failed: no supported terminal found");
+
+        // A launch that fails is reported once and no later candidate is tried.
+        TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().clear());
+        TEST_CHILD_MISSING.with(|m| m.borrow_mut().clear());
+        TEST_CHILD_FAILS.with(|f| f.set(true));
+        ui.status.set_label("");
+        launch_terminal(&ui, &dir_str);
+        assert_eq!(attempts().len(), 1, "a failed launch stops the walk");
+        assert_eq!(ui.status.label(), "Terminal failed: test launch failure");
+
+        TEST_CHILD_FAILS.with(|f| f.set(false));
+        TEST_OPEN_WITH_APPS.with(|a| *a.borrow_mut() = None);
+        ui.window.destroy();
+        pump();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
