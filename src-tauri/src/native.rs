@@ -1453,6 +1453,35 @@ fn guide_parse(text: &str) -> GuideRequest {
     }
 }
 
+/// The one name source: a widget is named only with a key that exists in the
+/// registry, byte for byte.
+#[cfg(feature = "guide")]
+fn guide_name(widget: &impl IsA<gtk::Widget>, key: &str) {
+    let known = serde_json::from_str::<serde_json::Value>(GUIDE_REGISTRY)
+        .ok()
+        .and_then(|r| r.as_object().map(|o| o.contains_key(key)))
+        .unwrap_or(false);
+    if known {
+        widget.set_widget_name(key);
+    }
+}
+
+/// Names a drive-menu control for the two fixture drives only: the non-removable
+/// `drive` row "Launch Box SSD 2TB" (crucial) and any removable `drive` row (stick).
+#[cfg(feature = "guide")]
+fn guide_name_drive(widget: &impl IsA<gtk::Widget>, action: &str, drive: &Drive) {
+    let tag = if drive.kind != "drive" {
+        return;
+    } else if drive.removable {
+        "stick"
+    } else if drive.name == "Launch Box SSD 2TB" {
+        "crucial"
+    } else {
+        return;
+    };
+    guide_name(widget, &format!("drive-{action}-{tag}"));
+}
+
 /// A missing or unreadable file clears, like malformed JSON.
 #[cfg(feature = "guide")]
 fn guide_read(path: &Path) -> GuideRequest {
@@ -1870,6 +1899,11 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     let paste = icon_button("edit-paste-symbolic", "Paste");
     let trash = icon_button("user-trash-symbolic", "Move to Trash");
     let terminal = icon_button("utilities-terminal-symbolic", "Terminal here");
+    #[cfg(feature = "guide")]
+    {
+        guide_name(&terminal, "terminal-here-folder");
+        guide_name(&trash, "trash-and-restore-file");
+    }
     let details_view = gtk::ToggleButton::builder()
         .icon_name("view-list-symbolic")
         .tooltip_text("Details")
@@ -7285,18 +7319,26 @@ fn show_drive_context_menu(
         } else {
             "Open"
         };
-        menu.append(&context_button(label, &popover, move || {
-            open_drive_action(state.clone(), ui.clone(), drive.clone())
-        }));
+        let button = context_button(label, &popover, {
+            let drive = drive.clone();
+            move || open_drive_action(state.clone(), ui.clone(), drive.clone())
+        });
+        #[cfg(feature = "guide")]
+        guide_name_drive(&button, if drive.mountpoint.is_empty() { "remount" } else { "open" }, &drive);
+        menu.append(&button);
     }
 
     if drive.kind == "drive" && !drive.mountpoint.is_empty() {
         let state = state.clone();
         let ui = ui.clone();
         let drive = drive.clone();
-        menu.append(&context_item("media-eject-symbolic", "Unmount", "", &popover, move || {
-            unmount_drive_action(state.clone(), ui.clone(), drive.clone())
-        }));
+        let button = context_item("media-eject-symbolic", "Unmount", "", &popover, {
+            let drive = drive.clone();
+            move || unmount_drive_action(state.clone(), ui.clone(), drive.clone())
+        });
+        #[cfg(feature = "guide")]
+        guide_name_drive(&button, "unmount", &drive);
+        menu.append(&button);
     }
 
     if drive.removable {
@@ -7798,6 +7840,8 @@ fn context_open_with(parent: &gtk::Popover, ui: Ui, path: String) -> gtk::Button
     let button = gtk::Button::builder().child(&row).halign(gtk::Align::Fill).build();
     button.add_css_class("flat");
     button.add_css_class("wf-menu-item");
+    #[cfg(feature = "guide")]
+    guide_name(&button, "open-with-other-app");
     let parent = parent.clone();
     button.connect_clicked(move |button| {
         let apps = open_with_apps_for(&path);
@@ -8924,6 +8968,156 @@ mod tests {
         drive_space_bars_refresh_off_thread_and_stay_cached_d46();
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
+        #[cfg(feature = "guide")]
+        guide_target_names_are_exact_d50();
+    }
+
+    #[cfg(feature = "guide")]
+    fn guide_target_names_are_exact_d50() {
+        let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
+        let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), 9);
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("WF_GUIDE_FILE", root.join("none/wayfinder.json"));
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d50test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        let named = |root: &gtk::Widget| -> Vec<String> {
+            let mut v: Vec<String> = all_widgets(root)
+                .iter()
+                .map(|w| w.widget_name().to_string())
+                .filter(|n| keys.contains(n))
+                .collect();
+            v.sort();
+            v
+        };
+        // Static targets: the real toolbar buttons, found by tooltip.
+        let toolbar_button = |tip: &str| -> Vec<gtk::Button> {
+            all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .filter(|b| b.tooltip_text().as_deref() == Some(tip))
+                .collect()
+        };
+        let twin = icon_button("edit-undo-symbolic", "twin");
+        for (tip, key) in [("Terminal here", "terminal-here-folder"), ("Move to Trash", "trash-and-restore-file")] {
+            let found = toolbar_button(tip);
+            assert_eq!(found.len(), 1, "one command-bar button for {tip}");
+            let b = &found[0];
+            assert_eq!(b.widget_name(), key);
+            assert!(b.has_css_class("wf-icon-button"), "{tip} is the real toolbar button");
+            assert_eq!((b.is_focusable(), b.can_target()), (twin.is_focusable(), twin.can_target()));
+            assert_eq!(b.width(), toolbar_button("Copy")[0].width(), "naming moved nothing");
+        }
+        assert_eq!(named(ui.window.upcast_ref()), vec!["terminal-here-folder", "trash-and-restore-file"]);
+
+        // Open With: the real connected opener in the item menu.
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| {
+                c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3)
+            })
+        };
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a file row");
+        ui.list_selection.select_item(0, true);
+        update_selection(&state, &ui);
+        let entry = state.borrow().visible_entries[0].clone();
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
+        pump();
+        let item_menu = popovers_of(&row).pop().expect("item menu");
+        let open_with = button_labelled(item_menu.upcast_ref(), "Open With...").expect("Open With row");
+        assert_eq!(open_with.widget_name(), "open-with-other-app");
+        assert_eq!(named(item_menu.upcast_ref()), vec!["open-with-other-app"]);
+        assert!(open_with.is_focusable() == twin.is_focusable() && open_with.can_target());
+        item_menu.popdown();
+
+        // Drive menus, synthetic drives only.
+        let sidebar_row = all_widgets(ui.sidebar.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .expect("a sidebar row");
+        let drive = |name: &str, kind: &str, removable: bool, mounted: bool| Drive {
+            name: name.to_string(),
+            path: format!("/dev/synthetic-{name}"),
+            mountpoint: if mounted { "/nonexistent/synthetic".into() } else { String::new() },
+            size: 1,
+            fstype: "ext4".into(),
+            kind: kind.into(),
+            removable,
+            space: None,
+        };
+        let menu_for = |d: Drive| -> (gtk::Popover, Vec<String>) {
+            show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), d, 5.0, 5.0);
+            pump();
+            let pop = popovers_of(sidebar_row.upcast_ref()).pop().expect("drive menu");
+            let names = named(pop.upcast_ref());
+            (pop, names)
+        };
+        let crucial = "Launch Box SSD 2TB";
+        let cases: Vec<(Drive, Vec<&str>, Option<(&str, &str)>)> = vec![
+            (drive(crucial, "drive", false, true), vec!["drive-open-crucial", "drive-unmount-crucial"], Some(("Open", "drive-open-crucial"))),
+            (drive(crucial, "drive", false, false), vec!["drive-remount-crucial"], Some(("Mount & Open", "drive-remount-crucial"))),
+            (drive("Stick", "drive", true, true), vec!["drive-open-stick", "drive-unmount-stick"], Some(("Open", "drive-open-stick"))),
+            (drive("Stick", "drive", true, false), vec!["drive-remount-stick"], Some(("Mount & Open", "drive-remount-stick"))),
+            (drive("Network", "network", false, true), vec![], None),
+            (drive("Google Drive", "google", false, true), vec![], None),
+            (drive("Some Other Disk", "drive", false, true), vec![], None),
+            (drive("Some Other Disk", "drive", false, false), vec![], None),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (d, expect, label) in cases {
+            let title = format!("{} mounted={}", d.name, !d.mountpoint.is_empty());
+            let (pop, names) = menu_for(d);
+            let mut expect: Vec<String> = expect.iter().map(|s| s.to_string()).collect();
+            expect.sort();
+            assert_eq!(names, expect, "names in the menu for {title}");
+            if let Some((text, key)) = label {
+                assert_eq!(button_labelled(pop.upcast_ref(), text).unwrap().widget_name(), key, "{title}");
+            }
+            if title.starts_with("Launch") || title.starts_with("Stick") {
+                assert!(button_labelled(pop.upcast_ref(), "Eject").map_or(true, |b| !keys.contains(&b.widget_name().to_string())));
+            }
+            seen.extend(names);
+            pop.popdown();
+        }
+        seen.extend(named(ui.window.upcast_ref()));
+        seen.insert("open-with-other-app".to_string());
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all nine keys, each on its real control");
+        for w in all_widgets(sidebar_row.upcast_ref()) {
+            assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
+        }
+        assert!(!keys.contains(&sidebar_row.widget_name().to_string()));
+
+        ui.window.destroy();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[cfg(feature = "guide")]
