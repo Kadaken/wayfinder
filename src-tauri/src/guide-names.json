@@ -1,5 +1,5 @@
 {
-  "terminal-here-folder": { "kind": "toolbar button", "where": "command bar, immediately after Undo" },
+  "terminal-here-folder": { "kind": "toolbar button", "mark": "circle", "where": "command bar, immediately after Undo" },
   "open-with-other-app": { "kind": "context-menu side-menu opener", "where": "file right-click menu" },
   "drive-open-crucial": { "kind": "drive context-menu item", "where": "DEVICES row right-click menu" },
   "drive-open-stick": { "kind": "drive context-menu item", "where": "DEVICES row right-click menu" },
@@ -7,5 +7,5 @@
   "drive-unmount-stick": { "kind": "drive context-menu item", "where": "mounted stick's DEVICES row right-click menu" },
   "drive-remount-crucial": { "kind": "drive context-menu item", "where": "unmounted drive's DEVICES row right-click menu" },
   "drive-remount-stick": { "kind": "drive context-menu item", "where": "unmounted stick's DEVICES row right-click menu" },
-  "trash-and-restore-file": { "kind": "toolbar button", "where": "command bar, before the divider that precedes Undo" }
+  "trash-and-restore-file": { "kind": "toolbar button", "mark": "circle", "where": "command bar, before the divider that precedes Undo" }
 }

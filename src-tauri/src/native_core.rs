@@ -3942,11 +3942,19 @@ mod tests {
             let fields = entry.as_object().expect("each entry is an object");
             let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
             names.sort_unstable();
-            assert_eq!(names, ["kind", "where"], "{name}");
+            // D-63: `mark` is the one optional field; an entry without it keeps the
+            // temporary legacy ring, and the only mark drawn so far is `circle`.
+            let want: &[&str] = if fields.contains_key("mark") { &["kind", "mark", "where"] } else { &["kind", "where"] };
+            assert_eq!(names, want, "{name}");
             for f in fields.values() {
                 assert!(f.as_str().is_some_and(|x| !x.is_empty()), "{name}");
             }
         }
+        let mut circles: Vec<&str> =
+            obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("circle")).map(|(k, _)| k.as_str()).collect();
+        circles.sort_unstable();
+        assert_eq!(circles, ["terminal-here-folder", "trash-and-restore-file"], "the compact toolbar entries choose circle");
+        assert!(obj.values().all(|e| e.get("mark").is_none_or(|m| m == "circle")), "no other mark exists yet");
         assert!(!obj.contains_key("take-me-back-start"));
     }
 

@@ -1407,10 +1407,11 @@ fn export_file_manager1(app: &adw::Application) {
 #[cfg(feature = "guide")]
 #[inline(never)]
 fn guide_markers_inert() -> usize {
-    const MARKERS: [&str; 3] = [
+    const MARKERS: [&str; 4] = [
         "/.local/share/crew/guide/",
         "WF_GUIDE_FILE",
         "WAYFINDER_GUIDE_ONLY_V1",
+        "WAYFINDER_GUIDE_CIRCLE_V1",
     ];
     std::hint::black_box(MARKERS).iter().map(|m| m.len()).sum()
 }
@@ -1576,8 +1577,43 @@ fn guide_connect_use(state: &Rc<RefCell<AppState>>, target: &gtk::Widget) -> Opt
     Some((button.downgrade(), id))
 }
 
+/// How a registry entry wants its target marked. Chosen only by the entry's own
+/// `mark` field, never from the target's size or widget type. `LegacyRing` is the
+/// temporary fallback for entries not yet migrated.
+#[cfg(feature = "guide")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuideMark {
+    Circle,
+    LegacyRing,
+}
+
+#[cfg(feature = "guide")]
+impl GuideMark {
+    fn class(self) -> &'static str {
+        match self {
+            GuideMark::Circle => "wf-guide-circle",
+            GuideMark::LegacyRing => "wf-guide-ring",
+        }
+    }
+}
+
+#[cfg(feature = "guide")]
+fn guide_mark_for(name: &str) -> GuideMark {
+    let mark = serde_json::from_str::<serde_json::Value>(GUIDE_REGISTRY)
+        .ok()
+        .and_then(|r| r.get(name)?.get("mark")?.as_str().map(str::to_owned));
+    match mark.as_deref() {
+        Some("circle") => GuideMark::Circle,
+        _ => GuideMark::LegacyRing,
+    }
+}
+
+// The circle is a target-side stroke: a fully rounded 4 px magenta outline pulled
+// 3 px inside the control's own box, so it covers the edge, leaves the centre
+// clear, takes no input and changes no allocation.
 #[cfg(feature = "guide")]
 const GUIDE_CSS: &str = ".wf-guide-ring { outline: 3px solid #ff2fd0; outline-offset: 2px; } \
+    .wf-guide-circle { outline: 4px solid #ff2fd0; outline-offset: -3px; border-radius: 9999px; } \
     popover.wf-guide-label > contents { background: #ff2fd0; color: #ffffff; padding: 2px 8px; border-radius: 6px; } \
     popover.wf-guide-label label { font-weight: 700; }";
 
@@ -1601,7 +1637,9 @@ fn guide_unpaint(state: &Rc<RefCell<AppState>>) {
     visual.label.popdown();
     visual.label.unparent();
     if let Some(target) = visual.target.upgrade() {
-        target.remove_css_class("wf-guide-ring");
+        for mark in [GuideMark::Circle, GuideMark::LegacyRing] {
+            target.remove_css_class(mark.class());
+        }
     }
 }
 
@@ -1610,7 +1648,7 @@ fn guide_unpaint(state: &Rc<RefCell<AppState>>) {
 #[cfg(feature = "guide")]
 fn guide_paint(state: &Rc<RefCell<AppState>>) {
     guide_unpaint(state);
-    let GuideRequest::Known { label, .. } = state.borrow().guide_pending.clone() else { return };
+    let GuideRequest::Known { name, label } = state.borrow().guide_pending.clone() else { return };
     let Some(target) = guide_live_target(state) else { return };
     if !target.is_visible() {
         return;
@@ -1628,7 +1666,7 @@ fn guide_paint(state: &Rc<RefCell<AppState>>) {
     pop.set_can_focus(false);
     pop.add_css_class("wf-guide-label");
     pop.set_child(Some(&text));
-    target.add_css_class("wf-guide-ring");
+    target.add_css_class(guide_mark_for(&name).class());
     pop.set_parent(&target);
     pop.popup();
     let hook = Rc::new(RefCell::new(guide_connect_use(state, &target)));
@@ -9487,7 +9525,7 @@ mod tests {
             pump();
         };
         let tree = || all_widgets(ui.window.upcast_ref());
-        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring")).collect() };
+        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring") || w.has_css_class("wf-guide-circle")).collect() };
         let label_pops = || -> Vec<gtk::Popover> {
             tree()
                 .into_iter()
@@ -9509,25 +9547,88 @@ mod tests {
         let by_name = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
 
         no_visual("no request");
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let geo = xdo(&["search", "--name", "wf-d52-proof", "getwindowgeometry", "--shell"]);
+        let num = |key: &str| -> i32 {
+            geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
+        };
+        let (wx, wy) = (num("X="), num("Y="));
+        // D-63: everything the mark must not change, read before, during and after.
+        let term0 = by_name("terminal-here-folder").pop().expect("terminal button");
+        let geometry = |w: &gtk::Widget| {
+            (
+                w.compute_bounds(&ui.window).map(|b| (b.x(), b.y(), b.width(), b.height())),
+                (w.width(), w.height(), w.is_focusable(), w.can_target(), w.is_sensitive()),
+                (ui.window.width(), ui.window.height()),
+                GtkWindowExt::focus(&ui.window),
+            )
+        };
+        let g_before = geometry(&term0);
+        // Magenta stroke pixels in a crop of the captured root frame (guide magenta #ff2fd0).
+        let magenta = |png: &std::path::Path, x: i32, y: i32, w: i32, h: i32| -> f64 {
+            let out = std::process::Command::new("/usr/bin/magick")
+                .arg(png)
+                .args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage", "-fuzz", "8%", "-fill", "black", "+opaque", "#ff2fd0"])
+                .args(["-fill", "white", "-opaque", "#ff2fd0", "-format", "%[fx:mean*w*h]", "info:"])
+                .output()
+                .expect("magick");
+            assert!(out.status.success(), "magick crop: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().parse().expect("pixel count")
+        };
+
         frame("d52-0-before.png");
 
         // Static target: one ring, one visible label with the exact text, anchored to it.
         put("terminal-here-folder", "Open a terminal here");
         let term = by_name("terminal-here-folder").pop().expect("terminal button");
         assert_eq!(rings(), vec![term.clone()], "exactly the one real target is ringed");
+        // D-63: the registry entry, not the size or type, chose the circle for this target.
+        assert_eq!(guide_mark_for("terminal-here-folder"), GuideMark::Circle);
+        assert_eq!(guide_mark_for("trash-and-restore-file"), GuideMark::Circle);
+        assert_eq!(guide_mark_for("open-with-other-app"), GuideMark::LegacyRing, "unmigrated entries keep the old ring");
+        assert!(term.has_css_class("wf-guide-circle"), "the compact target carries the circle class");
+        assert!(!term.has_css_class("wf-guide-ring"), "and not the old rectangle class");
+        assert_eq!(geometry(&term0), g_before, "drawing the circle moved nothing and took no focus");
         let pops = label_pops();
         assert_eq!(pops.len(), 1);
         assert_eq!(label_text(&pops[0]), "Open a terminal here");
         assert_eq!(pops[0].parent().as_ref(), Some(&term), "label anchored to the target");
         assert!(pops[0].is_visible());
         frame("d52-1-terminal-here-folder.png");
+        {
+            // The circle is on the button itself: stroke pixels sit inside its bounds on all four
+            // sides, the icon centre stays clear, and the label is outside the button.
+            let shot = crate::native_core::scratch_root().join(format!("wf-d63-crop-{}.png", std::process::id()));
+            pump();
+            std::thread::sleep(Duration::from_millis(400));
+            pump();
+            let cap = std::process::Command::new("/usr/bin/import").args(["-window", "root"]).arg(&shot).output().expect("import");
+            assert!(cap.status.success(), "crop capture: {}", String::from_utf8_lossy(&cap.stderr));
+            let b = term.compute_bounds(&ui.window).expect("terminal bounds");
+            // The X window includes the client-side shadow; the surface transform is that margin.
+            let (sx, sy) = gtk::prelude::NativeExt::surface_transform(&ui.window);
+            let (bx, by, bw, bh) = (wx + (sx + b.x() as f64) as i32, wy + (sy + b.y() as f64) as i32, b.width() as i32, b.height() as i32);
+            let whole = magenta(&shot, bx, by, bw, bh);
+            let (top, bottom) = (magenta(&shot, bx, by, bw, bh / 6), magenta(&shot, bx, by + bh - bh / 6, bw, bh / 6));
+            let (left, right) = (magenta(&shot, bx, by, bw / 6, bh), magenta(&shot, bx + bw - bw / 6, by, bw / 6, bh));
+            let centre = magenta(&shot, bx + bw / 4, by + bh / 4, bw / 2, bh / 2);
+            let _ = std::fs::remove_file(&shot);
+            assert!(whole > 150.0, "stroke pixels inside the button bounds: {whole}");
+            assert!(top > 0.0 && bottom > 0.0 && left > 0.0 && right > 0.0, "stroke on every side: {top} {bottom} {left} {right}");
+            assert_eq!(centre, 0.0, "the icon centre is left clear: {centre} (crop {bx},{by} {bw}x{bh}, window {wx},{wy})");
+        }
 
         // Replacement: the old visual is gone, the new one is the only one.
         let old_label = pops[0].clone();
         drop(pops);
         put("trash-and-restore-file", "Trash it");
         let trash = by_name("trash-and-restore-file").pop().expect("trash button");
-        assert!(!term.has_css_class("wf-guide-ring"), "the old ring is gone");
+        assert!(!term.has_css_class("wf-guide-ring") && !term.has_css_class("wf-guide-circle"), "the old mark is gone");
+        assert!(trash.has_css_class("wf-guide-circle") && !trash.has_css_class("wf-guide-ring"), "the second compact entry is a circle too");
         assert!(old_label.parent().is_none(), "the old label surface is gone");
         assert_eq!(rings(), vec![trash.clone()]);
         assert_eq!(label_texts(), vec!["Trash it".to_string()]);
@@ -9540,6 +9641,7 @@ mod tests {
         // Every non-target state has no visual.
         put("", "");
         no_visual("clear");
+        assert_eq!(geometry(&term0), g_before, "clearing the circle left the control exactly as before");
         put("terminal-here-folder", "again");
         assert_eq!(rings().len(), 1);
         put_raw("{not json", GuideRequest::Clear);
@@ -9564,16 +9666,6 @@ mod tests {
         no_visual("cleared again");
 
         // Real pointer through the visual: the ordinary click still fires once, nothing moves.
-        let xdo = |args: &[&str]| {
-            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
-            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        let geo = xdo(&["search", "--name", "wf-d52-proof", "getwindowgeometry", "--shell"]);
-        let num = |key: &str| -> i32 {
-            geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
-        };
-        let (wx, wy) = (num("X="), num("Y="));
         let b = term.compute_bounds(&ui.window).expect("terminal bounds");
         let (cx, cy) = (b.x() + b.width() / 2.0, b.y() + b.height() / 2.0);
         let clicks = Rc::new(std::cell::Cell::new(0));
@@ -9598,6 +9690,7 @@ mod tests {
                 (ui.window.width(), ui.window.height()),
                 (ui.files_stack.width(), ui.files_stack.height()),
                 (t.width(), t.height(), t.is_focusable(), t.can_target(), t.is_sensitive()),
+                t.compute_bounds(&ui.window).map(|b| (b.x(), b.y(), b.width(), b.height())),
             )
         };
         // Baseline with no request: what an ordinary click does to focus.
@@ -9802,7 +9895,7 @@ mod tests {
             pump();
         };
         let tree = || all_widgets(ui.window.upcast_ref());
-        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring")).collect() };
+        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring") || w.has_css_class("wf-guide-circle")).collect() };
         let labels = || -> usize {
             tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).count()
         };
@@ -10574,7 +10667,7 @@ mod tests {
         let seen = GUIDE_RESPONSE_TEMPS.with(|t| t.borrow().len());
         let temps = || GUIDE_RESPONSE_TEMPS.with(|t| t.borrow()[seen..].to_vec());
         let tree = || all_widgets(ui.window.upcast_ref());
-        let rings = || tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring")).count();
+        let rings = || tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring") || w.has_css_class("wf-guide-circle")).count();
         let labels = || {
             tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).count()
         };
