@@ -9928,26 +9928,37 @@ mod tests {
             let c = w.observe_controllers();
             (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3))
         };
-        let row = all_widgets(ui.list.upcast_ref()).into_iter().find(|w| w.is::<gtk::Box>() && has_right_click(w)).expect("a file row");
-        ui.list_selection.select_item(0, true);
-        update_selection(&state, &ui);
-        let entry = state.borrow().visible_entries[0].clone();
-        let close_menu = || {
-            for pop in popovers_of(&row) {
-                pop.popdown();
-                pop.unparent();
-            }
-            pump();
+        // D-59: a row is only ever used in the same step it was found; put() pumps and can rebuild rows.
+        let rooted = |w: &gtk::Widget| w.root().is_some_and(|r| r.upcast::<gtk::Widget>() == ui.window.clone().upcast::<gtk::Widget>());
+        let file_row = || {
+            all_widgets(ui.list.upcast_ref())
+                .into_iter()
+                .find(|w| w.is::<gtk::Box>() && has_right_click(w) && rooted(w))
+                .expect("a rooted file row")
         };
         for route in ["pointer", "keyboard"] {
-            put("open-with-other-app", "Open With here");
-            show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), 5.0, 5.0);
-            pump();
-            pump();
-            let opener = by_name("open-with-other-app").pop().expect("opener");
+            let mut attempt = 0;
+            let (row, opener, item_menu) = loop {
+                attempt += 1;
+                put("open-with-other-app", "Open With here");
+                let row = file_row();
+                ui.list_selection.select_item(0, true);
+                update_selection(&state, &ui);
+                let entry = state.borrow().visible_entries[0].clone();
+                assert!(rooted(&row), "{route}: the file anchor is rooted in the window before its menu opens");
+                show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
+                pump();
+                pump();
+                let found = by_name("open-with-other-app").pop().filter(|t| t.is_mapped() && t.is_ancestor(&row));
+                let menu = popovers_of(&row).into_iter().find(|p| !p.has_css_class("wf-guide-label"));
+                if let (Some(opener), Some(item_menu)) = (found, menu) {
+                    break (row, opener, item_menu);
+                }
+                assert!(attempt < 10, "{route}: the file menu never stood");
+                close_menu_of(&row);
+            };
             assert_eq!(rings(), vec![opener.clone()], "{route}: ringed before use");
             assert_eq!(labels(), 1);
-            let item_menu = popovers_of(&row).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("item menu");
             let seen = observe(&opener);
             let before = file_sig();
             if route == "pointer" {
@@ -9967,12 +9978,17 @@ mod tests {
             assert!(button_labelled(sides[0].upcast_ref(), "Fake Editor A").is_some());
             assert!(TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow().is_empty()), "nothing launched");
             drop((sides, item_menu, opener));
-            close_menu();
+            close_menu_of(&row);
+            assert!(popovers_of(&row).is_empty(), "{route}: every popover of the attempt's anchor is closed");
         }
 
         // Dynamic: all six real drive buttons, synthetic drives, empty PATH so nothing real can run.
         let sidebar_row = || {
-            all_widgets(ui.sidebar.upcast_ref()).into_iter().find_map(|w| w.downcast::<gtk::ListBoxRow>().ok()).expect("row")
+            all_widgets(ui.sidebar.upcast_ref())
+                .into_iter()
+                .filter(|w| rooted(w))
+                .find_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+                .expect("a rooted sidebar row")
         };
         let drive = |name: &str, removable: bool, mounted: bool| Drive {
             name: name.to_string(),
@@ -9999,11 +10015,12 @@ mod tests {
                 // A finished job refreshes the sidebar and can rebuild its rows under an open menu:
                 // reopen on the live row until the menu really stands before it is used.
                 let mut attempt = 0;
-                let (target, seen, before) = loop {
+                let (sidebar_row, target, seen, before) = loop {
                     attempt += 1;
                     pump();
-                    let sidebar_row = sidebar_row();
                     put(key_name, "Drive step");
+                    let sidebar_row = sidebar_row();
+                    assert!(rooted(sidebar_row.upcast_ref()), "{key_name}: the sidebar anchor is rooted before its menu opens");
                     ui.status.set_label("");
                     show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), d.clone(), 5.0, 5.0);
                     pump();
@@ -10012,7 +10029,7 @@ mod tests {
                     if let Some(target) = found.filter(|t| t.is_mapped() && t.is_ancestor(&sidebar_row)) {
                         assert_eq!(rings(), vec![target.clone()], "{key_name}: ringed");
                         let seen = observe(&target);
-                        break (target, seen, file_sig());
+                        break (sidebar_row, target, seen, file_sig());
                     }
                     assert!(attempt < 10, "{key_name}: the drive menu never stood");
                     close_menu_of(&sidebar_row);
@@ -10034,7 +10051,8 @@ mod tests {
                 } else {
                     assert!(!status.is_empty(), "{key_name} {route}: the ordinary action ran (it failed safely with no PATH)");
                 }
-                close_menu_of(&sidebar_row());
+                close_menu_of(&sidebar_row);
+                assert!(popovers_of(sidebar_row.upcast_ref()).is_empty(), "{key_name} {route}: the attempt's popovers are closed");
             }
         }
 
@@ -10062,6 +10080,10 @@ mod tests {
 
     #[cfg(feature = "guide")]
     fn close_menu_of(widget: &impl IsA<gtk::Widget>) {
+        // D-59: keyboard focus left inside a menu would be moved by GTK's next paint after the unparent.
+        if let Some(window) = widget.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+            gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+        }
         for pop in popovers_of(widget.upcast_ref()) {
             pop.popdown();
             pop.unparent();
