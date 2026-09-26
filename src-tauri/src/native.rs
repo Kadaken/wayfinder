@@ -7800,6 +7800,18 @@ fn show_item_context_menu(
         .child(&menu)
         .build();
     popover.set_child(Some(&scroller));
+    // ITEM_MENU_MAX_HEIGHT bounds the whole popover. GTK adds its own chrome around the
+    // scroller and only measures it once mapped, so take the measured overhead off the
+    // scroller's cap when the popover maps, before its first allocation.
+    popover.connect_map({
+        let scroller = scroller.clone();
+        move |popover| {
+            let (_, popover_natural, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
+            let (_, scroller_natural, _, _) = scroller.measure(gtk::Orientation::Vertical, -1);
+            let chrome = (popover_natural - scroller_natural).max(0);
+            scroller.set_max_content_height((ITEM_MENU_MAX_HEIGHT - chrome).max(1));
+        }
+    });
     unparent_when_closed(&popover);
     #[cfg(feature = "guide")]
     guide_repaint_on_close(&popover, &state);
