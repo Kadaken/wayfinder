@@ -10059,10 +10059,12 @@ mod tests {
         no_visual("menu closed after the tip click");
 
         // Drive menus: a mounted and an unmounted real target show without closing their menu.
-        let sidebar_row = all_widgets(ui.sidebar.upcast_ref())
-            .into_iter()
-            .find_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
-            .expect("a sidebar row");
+        let find_sidebar_row = || {
+            all_widgets(ui.sidebar.upcast_ref())
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+                .expect("a sidebar row")
+        };
         let drive = |name: &str, removable: bool, mounted: bool| Drive {
             name: name.to_string(),
             path: format!("/dev/synthetic-{name}"),
@@ -10079,6 +10081,7 @@ mod tests {
         ] {
             put(key, "Drive step");
             no_visual("drive pending");
+            let sidebar_row = find_sidebar_row();
             show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), d, 5.0, 5.0);
             pump();
             let target = by_name(key).pop().expect("drive target");
@@ -10112,6 +10115,7 @@ mod tests {
 
         // Teardown: closing the window with an arrow up removes it.
         put("drive-remount-stick", "teardown");
+        let sidebar_row = find_sidebar_row();
         show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), drive("Stick", true, false), 5.0, 5.0);
         pump();
         assert_eq!(arrow_pops().len(), 1);
