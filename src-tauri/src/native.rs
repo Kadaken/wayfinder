@@ -1534,6 +1534,46 @@ fn guide_resolve(state: &Rc<RefCell<AppState>>) {
 struct GuideVisual {
     target: glib::WeakRef<gtk::Widget>,
     label: gtk::Popover,
+    /// The clear-on-use callback on the target button, so it can be removed.
+    hook: Rc<RefCell<Option<GuideHook>>>,
+}
+
+#[cfg(feature = "guide")]
+type GuideHook = (glib::WeakRef<gtk::Button>, glib::SignalHandlerId);
+
+#[cfg(feature = "guide")]
+fn guide_release_hook(hook: Option<GuideHook>) {
+    if let Some((button, id)) = hook {
+        if let Some(button) = button.upgrade() {
+            button.disconnect(id);
+        }
+    }
+}
+
+/// Connects the one clear-on-use callback to the painted button. It clears only
+/// while the activated button is still this window's bound target, so a stale,
+/// duplicate, unresolved or other-window control can never clear the request.
+#[cfg(feature = "guide")]
+fn guide_connect_use(state: &Rc<RefCell<AppState>>, target: &gtk::Widget) -> Option<GuideHook> {
+    if std::env::var("RED").is_ok() { return None; }
+    let button = target.downcast_ref::<gtk::Button>()?;
+    let weak = Rc::downgrade(state);
+    let id = button.connect_clicked(move |used| {
+        let Some(state) = weak.upgrade() else { return };
+        let bound = state.borrow().guide_target.as_ref().and_then(|t| t.upgrade());
+        if bound.as_ref() != Some(used.upcast_ref::<gtk::Widget>())
+            || !matches!(state.borrow().guide_pending, GuideRequest::Known { .. })
+        {
+            return;
+        }
+        {
+            let mut st = state.borrow_mut();
+            st.guide_pending = GuideRequest::Clear;
+            st.guide_target = None;
+        }
+        guide_unpaint(&state);
+    });
+    Some((button.downgrade(), id))
 }
 
 #[cfg(feature = "guide")]
@@ -1557,6 +1597,7 @@ fn guide_install_css() {
 #[cfg(feature = "guide")]
 fn guide_unpaint(state: &Rc<RefCell<AppState>>) {
     let Some(visual) = state.borrow_mut().guide_visual.take() else { return };
+    guide_release_hook(visual.hook.take());
     visual.label.popdown();
     visual.label.unparent();
     if let Some(target) = visual.target.upgrade() {
@@ -1590,7 +1631,8 @@ fn guide_paint(state: &Rc<RefCell<AppState>>) {
     target.add_css_class("wf-guide-ring");
     pop.set_parent(&target);
     pop.popup();
-    state.borrow_mut().guide_visual = Some(GuideVisual { target: target.downgrade(), label: pop });
+    let hook = Rc::new(RefCell::new(guide_connect_use(state, &target)));
+    state.borrow_mut().guide_visual = Some(GuideVisual { target: target.downgrade(), label: pop, hook });
 }
 
 /// A menu closing takes its target out of view: repaint so no visual stays.
@@ -1599,6 +1641,10 @@ fn guide_repaint_on_close(popover: &gtk::Popover, state: &Rc<RefCell<AppState>>)
     let weak = Rc::downgrade(state);
     popover.connect_closed(move |_| {
         if let Some(state) = weak.upgrade() {
+            // Menu rows close their menu before their action runs, so the use
+            // callback must outlive this repaint until the click has finished.
+            let hook = state.borrow().guide_visual.as_ref().and_then(|v| v.hook.take());
+            glib::idle_add_local_once(move || guide_release_hook(hook));
             guide_paint(&state);
         }
     });
@@ -9104,6 +9150,8 @@ mod tests {
         // Also real pointer input, so it runs before anything can leave a modal behind.
         #[cfg(feature = "guide")]
         guide_ring_and_label_are_drawn_d52();
+        #[cfg(feature = "guide")]
+        guide_clears_on_use_d53();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
@@ -9327,8 +9375,8 @@ mod tests {
         assert_eq!(clicks.get(), 2, "the click through the visual fired exactly once");
         assert_eq!(GtkWindowExt::focus(&ui.window), plain_focus, "same focus result as an unguided click");
         assert_eq!(shape(), before, "the click moved nothing");
-        assert_eq!(pending(), known("terminal-here-folder", "Click me"), "no clear-on-use yet");
-        assert_eq!(rings(), vec![term.clone()], "the ring stays after the click");
+        assert_eq!(pending(), GuideRequest::Clear, "the click used the guided control (D-53)");
+        no_visual("after the guided click");
         match old_path {
             Some(v) => std::env::set_var("PATH", v),
             None => std::env::remove_var("PATH"),
@@ -9435,6 +9483,365 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[cfg(feature = "guide")]
+    extern "C" {
+        fn gdk_x11_surface_get_xid(surface: *mut gdk::ffi::GdkSurface) -> std::os::raw::c_ulong;
+    }
+
+    #[cfg(feature = "guide")]
+    fn guide_clears_on_use_d53() {
+        use glib::translate::ToGlibPtr;
+        use std::os::unix::fs::MetadataExt;
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let old_path = std::env::var("PATH").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d53-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let gdir = root.join("guide");
+        for d in [&home, &dir, &gdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        TEST_OPEN_WITH_APPS.with(|a| {
+            *a.borrow_mut() = Some(vec![native_core::AppEntry { id: "fake-editor-a.desktop".into(), name: "Fake Editor A".into() }])
+        });
+        TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow_mut().clear());
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d53test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        ui.window.set_title(Some("wf-d53-proof"));
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        let frames = std::env::var("WF_D53_FRAMES").ok().map(std::path::PathBuf::from);
+        let frame = |name: &str| {
+            if let Some(dir) = &frames {
+                pump();
+                std::thread::sleep(Duration::from_millis(400));
+                pump();
+                let out = std::process::Command::new("/usr/bin/import")
+                    .args(["-window", "root"])
+                    .arg(dir.join(name))
+                    .output()
+                    .expect("import");
+                assert!(out.status.success(), "frame capture: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        };
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let pending = |s: &Rc<RefCell<AppState>>| s.borrow().guide_pending.clone();
+        let put = |name: &str, label: &str| {
+            let tmp = gdir.join("wayfinder.json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || pending(&state) == want);
+            pump();
+        };
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let rings = || -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring")).collect() };
+        let labels = || -> usize {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).count()
+        };
+        let by_name = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+        let is_painted = |s: &Rc<RefCell<AppState>>| s.borrow().guide_visual.is_some();
+        let cleared = |why: &str| {
+            assert_eq!(pending(&state), GuideRequest::Clear, "{why}: request cleared");
+            assert!(state.borrow().guide_target.is_none(), "{why}: target dropped");
+            assert!(!is_painted(&state), "{why}: visual dropped");
+            assert!(rings().is_empty(), "{why}: ring removed");
+            assert_eq!(labels(), 0, "{why}: label removed");
+        };
+        let file_sig = || {
+            let m = std::fs::metadata(&file).unwrap();
+            (std::fs::read(&file).unwrap(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.mode())
+        };
+
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let geometry = |target: &str| -> (i32, i32) {
+            let geo = xdo(&["getwindowgeometry", "--shell", target]);
+            let num = |key: &str| -> i32 {
+                geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
+            };
+            (num("X="), num("Y="))
+        };
+        let win_id = xdo(&["search", "--name", "wf-d53-proof"]).lines().next().expect("window id").to_string();
+        let (wx, wy) = geometry(&win_id);
+        // Absolute centre of a control, in the main window or inside its own popover surface.
+        let centre = |w: &gtk::Widget| -> (i32, i32) {
+            if let Some(pop) = w.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()) {
+                let native = pop.native().expect("popover native");
+                let surface = native.surface().expect("popover surface");
+                let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) };
+                let (gx, gy) = geometry(&xid.to_string());
+                let (tx, ty) = native.surface_transform();
+                let b = w.compute_bounds(&pop).expect("bounds in popover");
+                (gx + (tx + (b.x() + b.width() / 2.0) as f64) as i32, gy + (ty + (b.y() + b.height() / 2.0) as f64) as i32)
+            } else {
+                let b = w.compute_bounds(&ui.window).expect("bounds");
+                (wx + (b.x() + b.width() / 2.0) as i32, wy + (b.y() + b.height() / 2.0) as i32)
+            }
+        };
+        let click = |w: &gtk::Widget| {
+            let (x, y) = centre(w);
+            xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            pump();
+            xdo(&["mousedown", "1"]);
+            pump();
+            xdo(&["mouseup", "1"]);
+            pump();
+        };
+        // The keyboard route: focus the control with the pointer over it, press Enter.
+        let key = |w: &gtk::Widget| {
+            let (x, y) = centre(w);
+            xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            pump();
+            w.grab_focus();
+            pump();
+            xdo(&["key", "Return"]);
+            pump();
+        };
+        let observe = |w: &gtk::Widget| -> Rc<std::cell::Cell<u32>> {
+            let n = Rc::new(std::cell::Cell::new(0));
+            let counter = n.clone();
+            w.downcast_ref::<gtk::Button>().expect("a real button").connect_clicked(move |_| counter.set(counter.get() + 1));
+            n
+        };
+        std::env::set_var("PATH", "");
+
+        // Static toolbar target, real pointer, then real keyboard.
+        for route in ["pointer", "keyboard"] {
+            put("terminal-here-folder", "Open a terminal here");
+            let term = by_name("terminal-here-folder").pop().expect("terminal button");
+            assert_eq!(rings(), vec![term.clone()]);
+            assert_eq!(labels(), 1);
+            let seen = observe(&term);
+            ui.status.set_label("");
+            let before = file_sig();
+            if route == "pointer" {
+                click(&term);
+            } else {
+                key(&term);
+            }
+            assert_eq!(seen.get(), 1, "{route}: the ordinary click fired once");
+            assert!(ui.status.label().contains("Terminal failed"), "{route}: the real handler ran: {}", ui.status.label());
+            cleared(route);
+            assert_eq!(file_sig(), before, "{route}: the guide file was not touched");
+            // Same unchanged request rewritten: one fresh visual, and it clears once more.
+            put("terminal-here-folder", "Open a terminal here");
+            assert_eq!(rings(), vec![term.clone()], "{route}: fresh visual");
+            assert_eq!(labels(), 1);
+            put("", "");
+            cleared("rewritten then cleared by the file");
+        }
+
+        // A stale target, an unguided button, a duplicate name: none of them clears the current request.
+        put("terminal-here-folder", "one");
+        let term = by_name("terminal-here-folder").pop().unwrap();
+        let term_seen = observe(&term);
+        put("trash-and-restore-file", "two");
+        let stale_before = (pending(&state), rings().len(), labels());
+        click(&term);
+        assert_eq!(term_seen.get(), 1, "the old control still works once");
+        assert_eq!((pending(&state), rings().len(), labels()), stale_before, "a stale target cannot clear");
+        assert_eq!(pending(&state), known("trash-and-restore-file", "two"));
+        let undo = tree()
+            .into_iter()
+            .find(|w| w.is::<gtk::Button>() && w.tooltip_text().as_deref() == Some("Undo"))
+            .expect("undo button");
+        let undo_seen = observe(&undo);
+        undo.downcast_ref::<gtk::Button>().unwrap().emit_clicked();
+        pump();
+        assert_eq!(undo_seen.get(), 1);
+        assert_eq!(pending(&state), known("trash-and-restore-file", "two"), "an unguided button cannot clear");
+        assert_eq!(rings().len(), 1);
+        let trash = by_name("trash-and-restore-file").pop().unwrap();
+        trash.set_widget_name("terminal-here-folder");
+        put("terminal-here-folder", "dup");
+        assert!(rings().is_empty() && !is_painted(&state), "duplicate fails closed");
+        click(&term);
+        assert_eq!(pending(&state), known("terminal-here-folder", "dup"), "a duplicate-name failure cannot clear");
+        trash.set_widget_name("trash-and-restore-file");
+        put("", "");
+
+        // A second window with the same matching control cannot clear the first window's request.
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state2, ui2) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("second window");
+        ui2.window.set_title(Some("wf-d53-second"));
+        ui2.window.present();
+        wait_for("second listing", || state2.borrow().visible_entries.len() == 1);
+        put("terminal-here-folder", "both windows");
+        wait_for("second window request", || pending(&state2) == known("terminal-here-folder", "both windows"));
+        let term2 = all_widgets(ui2.window.upcast_ref()).into_iter().find(|w| w.widget_name() == "terminal-here-folder").unwrap();
+        assert_ne!(term2, by_name("terminal-here-folder").pop().unwrap());
+        term2.downcast_ref::<gtk::Button>().unwrap().emit_clicked();
+        pump();
+        assert_eq!(pending(&state2), GuideRequest::Clear, "the second window's own use clears its own request");
+        assert_eq!(pending(&state), known("terminal-here-folder", "both windows"), "the first window is unaffected");
+        assert!(is_painted(&state) && rings().len() == 1);
+        ui2.window.destroy();
+        pump();
+        put("", "");
+
+        // Dynamic: the real file context menu, Open With, pointer then keyboard.
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3))
+        };
+        let row = all_widgets(ui.list.upcast_ref()).into_iter().find(|w| w.is::<gtk::Box>() && has_right_click(w)).expect("a file row");
+        ui.list_selection.select_item(0, true);
+        update_selection(&state, &ui);
+        let entry = state.borrow().visible_entries[0].clone();
+        let close_menu = || {
+            for pop in popovers_of(&row) {
+                pop.popdown();
+                pop.unparent();
+            }
+            pump();
+        };
+        for route in ["pointer", "keyboard"] {
+            put("open-with-other-app", "Open With here");
+            show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), 5.0, 5.0);
+            pump();
+            pump();
+            let opener = by_name("open-with-other-app").pop().expect("opener");
+            assert_eq!(rings(), vec![opener.clone()], "{route}: ringed before use");
+            assert_eq!(labels(), 1);
+            let item_menu = popovers_of(&row).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("item menu");
+            let seen = observe(&opener);
+            let before = file_sig();
+            if route == "pointer" {
+                frame("d53-1-open-with-before.png");
+                click(&opener);
+                frame("d53-2-open-with-after.png");
+            } else {
+                key(&opener);
+            }
+            assert_eq!(seen.get(), 1, "{route}: Open With clicked once");
+            cleared(route);
+            assert_eq!(file_sig(), before);
+            let sides: Vec<gtk::Popover> =
+                popovers_of(opener.upcast_ref()).into_iter().filter(|p| !p.has_css_class("wf-guide-label")).collect();
+            assert_eq!(sides.len(), 1, "{route}: the side menu opened exactly once");
+            assert!(sides[0].is_mapped() && item_menu.is_mapped(), "{route}: both menus stay usable");
+            assert!(button_labelled(sides[0].upcast_ref(), "Fake Editor A").is_some());
+            assert!(TEST_OPEN_WITH_LAUNCHES.with(|l| l.borrow().is_empty()), "nothing launched");
+            drop((sides, item_menu, opener));
+            close_menu();
+        }
+
+        // Dynamic: all six real drive buttons, synthetic drives, empty PATH so nothing real can run.
+        let sidebar_row = || {
+            all_widgets(ui.sidebar.upcast_ref()).into_iter().find_map(|w| w.downcast::<gtk::ListBoxRow>().ok()).expect("row")
+        };
+        let drive = |name: &str, removable: bool, mounted: bool| Drive {
+            name: name.to_string(),
+            path: format!("/dev/synthetic-{name}"),
+            mountpoint: if mounted { dir.to_string_lossy().to_string() } else { String::new() },
+            size: 1,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable,
+            space: None,
+        };
+        let crucial = |mounted| drive("Launch Box SSD 2TB", false, mounted);
+        let stick = |mounted| drive("Stick", true, mounted);
+        let cases = [
+            ("drive-open-crucial", crucial(true)),
+            ("drive-open-stick", stick(true)),
+            ("drive-remount-crucial", crucial(false)),
+            ("drive-remount-stick", stick(false)),
+            ("drive-unmount-crucial", crucial(true)),
+            ("drive-unmount-stick", stick(true)),
+        ];
+        for (key_name, d) in cases {
+            for route in ["pointer", "keyboard"] {
+                // A finished job refreshes the sidebar and can rebuild its rows under an open menu:
+                // reopen on the live row until the menu really stands before it is used.
+                let mut attempt = 0;
+                let (target, seen, before) = loop {
+                    attempt += 1;
+                    pump();
+                    let sidebar_row = sidebar_row();
+                    put(key_name, "Drive step");
+                    ui.status.set_label("");
+                    show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), d.clone(), 5.0, 5.0);
+                    pump();
+                    pump();
+                    let found = by_name(key_name).pop();
+                    if let Some(target) = found.filter(|t| t.is_mapped() && t.is_ancestor(&sidebar_row)) {
+                        assert_eq!(rings(), vec![target.clone()], "{key_name}: ringed");
+                        let seen = observe(&target);
+                        break (target, seen, file_sig());
+                    }
+                    assert!(attempt < 10, "{key_name}: the drive menu never stood");
+                    close_menu_of(&sidebar_row);
+                };
+                if route == "pointer" {
+                    click(&target);
+                } else {
+                    key(&target);
+                }
+                for _ in 0..5 {
+                    pump();
+                }
+                assert_eq!(seen.get(), 1, "{key_name} {route}: clicked once");
+                cleared(&format!("{key_name} {route}"));
+                assert_eq!(file_sig(), before);
+                let status = ui.status.label().to_string();
+                if key_name.starts_with("drive-open") {
+                    assert_eq!(state.borrow().cwd, dir.to_string_lossy(), "{key_name}: opened the Scratch folder");
+                } else {
+                    assert!(!status.is_empty(), "{key_name} {route}: the ordinary action ran (it failed safely with no PATH)");
+                }
+                close_menu_of(&sidebar_row());
+            }
+        }
+
+        // A later watcher event still repaints normally.
+        put("terminal-here-folder", "after all");
+        assert_eq!(rings().len(), 1);
+        assert_eq!(labels(), 1);
+
+        match old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        ui.window.destroy();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        TEST_OPEN_WITH_APPS.with(|a| *a.borrow_mut() = None);
+    }
+
+    #[cfg(feature = "guide")]
+    fn close_menu_of(widget: &impl IsA<gtk::Widget>) {
+        for pop in popovers_of(widget.upcast_ref()) {
+            pop.popdown();
+            pop.unparent();
+        }
+        pump();
     }
 
     #[cfg(feature = "guide")]
