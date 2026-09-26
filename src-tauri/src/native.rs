@@ -1664,12 +1664,55 @@ fn guide_live_target(state: &Rc<RefCell<AppState>>) -> Option<gtk::Widget> {
 /// Stores the newest request, drops any old target, and looks for the new one.
 #[cfg(feature = "guide")]
 fn guide_apply(state: &Rc<RefCell<AppState>>, request: GuideRequest) {
+    let unknown = match &request {
+        GuideRequest::Unknown { name, .. } => Some(name.clone()),
+        _ => None,
+    };
     {
         let mut st = state.borrow_mut();
         st.guide_pending = request;
         st.guide_target = None;
     }
     guide_resolve(state);
+    if let Some(name) = unknown {
+        guide_write_unknown(&guide_file_path(), &name);
+    }
+}
+
+#[cfg(all(feature = "guide", test))]
+thread_local! {
+    /// Test seam: every temp sibling a response write used, in order.
+    static GUIDE_RESPONSE_TEMPS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(feature = "guide", test))]
+fn guide_note_temp(temp: &Path) {
+    GUIDE_RESPONSE_TEMPS.with(|t| t.borrow_mut().push(temp.to_path_buf()));
+}
+
+#[cfg(all(feature = "guide", not(test)))]
+fn guide_note_temp(_temp: &Path) {}
+
+/// D-58: acknowledges an unknown name by atomically replacing the guide file with
+/// `{"unknown":"<name>"}`: a uniquely named temp sibling in the same directory,
+/// then a rename over the file. Creates no directory; a failed write or rename
+/// removes the temp and reports nothing.
+#[cfg(feature = "guide")]
+fn guide_write_unknown(path: &Path, name: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let (Some(dir), Some(base)) = (path.parent(), path.file_name()) else { return };
+    let temp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        base.to_string_lossy(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    guide_note_temp(&temp);
+    let body = serde_json::json!({ "unknown": name }).to_string();
+    if fs::write(&temp, body).and_then(|_| fs::rename(&temp, path)).is_err() {
+        let _ = fs::remove_file(&temp);
+    }
 }
 
 /// Watches the nearest existing ancestor of the guide file for only the next
@@ -9348,6 +9391,8 @@ mod tests {
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
         #[cfg(feature = "guide")]
+        guide_unknown_response_is_atomic_d58();
+        #[cfg(feature = "guide")]
         guide_target_names_are_exact_d50();
         #[cfg(feature = "guide")]
         guide_pending_targets_resolve_d51();
@@ -9357,6 +9402,8 @@ mod tests {
     fn guide_ring_and_label_are_drawn_d52() {
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
+        // D-57: the launch seam succeeds by default; these proofs need the failing handler.
+        TEST_CHILD_FAILS.with(|f| f.set(true));
         let root = crate::native_core::scratch_root().join(format!("wf-d52-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let _cleanup = ScratchCleanup(root.clone());
@@ -9473,7 +9520,7 @@ mod tests {
         put("terminal-here-folder", "again");
         put_raw(
             r#"{"highlight":"no-such-control","label":"Hmm"}"#,
-            GuideRequest::Unknown { name: "no-such-control".into(), label: "Hmm".into() },
+            GuideRequest::Clear,
         );
         no_visual("unknown");
         put("open-with-other-app", "no menu yet");
@@ -9657,6 +9704,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        TEST_CHILD_FAILS.with(|f| f.set(false));
     }
 
     #[cfg(feature = "guide")]
@@ -9670,6 +9718,8 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
+        // D-57: the launch seam succeeds by default; these proofs need the failing handler.
+        TEST_CHILD_FAILS.with(|f| f.set(true));
         let old_path = std::env::var("PATH").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d53-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -10007,6 +10057,7 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         TEST_OPEN_WITH_APPS.with(|a| *a.borrow_mut() = None);
+        TEST_CHILD_FAILS.with(|f| f.set(false));
     }
 
     #[cfg(feature = "guide")]
@@ -10121,7 +10172,7 @@ mod tests {
         assert!(target().is_some());
         put_raw(
             r#"{"highlight":"no-such-control","label":"Hmm"}"#,
-            GuideRequest::Unknown { name: "no-such-control".into(), label: "Hmm".into() },
+            GuideRequest::Clear,
         );
         assert!(target().is_none(), "unknown leaves no target");
 
@@ -10444,6 +10495,132 @@ mod tests {
     }
 
     #[cfg(feature = "guide")]
+    fn guide_unknown_response_is_atomic_d58() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d58-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let gdir = root.join("guide");
+        for d in [&home, &dir, &gdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d58test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+        let pending = |s: &Rc<RefCell<AppState>>| s.borrow().guide_pending.clone();
+        let seen = GUIDE_RESPONSE_TEMPS.with(|t| t.borrow().len());
+        let temps = || GUIDE_RESPONSE_TEMPS.with(|t| t.borrow()[seen..].to_vec());
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let rings = || tree().into_iter().filter(|w| w.has_css_class("wf-guide-ring")).count();
+        let labels = || {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).count()
+        };
+        let siblings = || -> Vec<String> {
+            let mut n: Vec<String> =
+                std::fs::read_dir(&gdir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+            n.sort();
+            n
+        };
+
+        // A painted known target, then an unknown name with JSON-significant characters.
+        std::fs::write(&file, r#"{"highlight":"terminal-here-folder","label":"Here"}"#).unwrap();
+        wait_for("painted", || state.borrow().guide_visual.is_some() && rings() == 1);
+        assert_eq!(temps().len(), 0, "a known request never writes");
+        let name = "we\"ird \\ na\u{e9}me\n{\"x\":1}";
+        let request = serde_json::json!({"highlight": name, "label": "L"}).to_string();
+        let tmp = gdir.join("wayfinder.json.tmp");
+        std::fs::write(&tmp, request).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+        wait_for("response written and settled", || {
+            pending(&state) == GuideRequest::Clear
+                && std::fs::read_to_string(&file).is_ok_and(|t| t.contains("unknown"))
+        });
+        for _ in 0..20 {
+            pump();
+        }
+        assert!(state.borrow().guide_visual.is_none() && state.borrow().guide_target.is_none(), "visual and target dropped");
+        assert_eq!((rings(), labels()), (0, 0), "ring and label removed");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).expect("the response is whole JSON");
+        let obj = value.as_object().expect("an object");
+        assert_eq!(obj.len(), 1, "only one field: {text}");
+        assert_eq!(obj["unknown"].as_str(), Some(name), "byte-exact original name");
+        assert_eq!(temps().len(), 1, "one response write, then stable: {:?}", temps());
+        assert_eq!(temps()[0].parent(), Some(gdir.as_path()), "temp is a same-directory sibling");
+        assert_eq!(siblings(), vec!["wayfinder.json".to_string()], "no temp sibling remains");
+        assert_eq!(pending(&state), GuideRequest::Clear);
+
+        // Clear, malformed and missing never write.
+        for text in [r#"{"highlight":"","label":""}"#, "{not json", r#"{"unknown":"x"}"#] {
+            std::fs::write(&file, text).unwrap();
+            wait_for("clear", || pending(&state) == GuideRequest::Clear);
+            for _ in 0..10 {
+                pump();
+            }
+        }
+        std::fs::remove_file(&file).unwrap();
+        for _ in 0..10 {
+            pump();
+        }
+        assert_eq!(temps().len(), 1, "no path but Unknown writes");
+
+        // Two live windows on the same file: no temp collision, both settle to Clear.
+        let (state2, ui2) = {
+            build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+            WINDOWS.with(|w| w.borrow().windows().pop()).expect("second window")
+        };
+        assert!(!Rc::ptr_eq(&state, &state2));
+        let before = temps().len();
+        std::fs::write(&file, r#"{"highlight":"no-such-control","label":"Hmm"}"#).unwrap();
+        wait_for("both clear", || pending(&state) == GuideRequest::Clear && pending(&state2) == GuideRequest::Clear);
+        for _ in 0..40 {
+            pump();
+        }
+        let after = temps();
+        let n = after.len() - before;
+        assert!((1..=2).contains(&n), "one or two identical responses, got {n}");
+        let unique: std::collections::HashSet<_> = after.iter().collect();
+        assert_eq!(unique.len(), after.len(), "no temp name was reused");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"unknown":"no-such-control"}"#);
+        assert_eq!(siblings(), vec!["wayfinder.json".to_string()]);
+        for _ in 0..40 {
+            pump();
+        }
+        assert_eq!(temps().len(), after.len(), "no further writes, no loop");
+        assert_eq!((pending(&state), pending(&state2)), (GuideRequest::Clear, GuideRequest::Clear));
+
+        // A missing guide directory is not created and leaves no temp.
+        let gone = root.join("absent").join("wayfinder.json");
+        guide_write_unknown(&gone, "x");
+        assert!(!root.join("absent").exists(), "the guide directory is never created");
+
+        ui2.window.destroy();
+        ui.window.destroy();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[cfg(feature = "guide")]
     fn guide_request_transport_d48() {
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
@@ -10497,21 +10674,22 @@ mod tests {
         std::fs::write(&file, "{not json").unwrap();
         wait_for("malformed", || pending(&state) == GuideRequest::Clear);
 
-        let before = std::fs::read_to_string(&file).unwrap();
         std::fs::write(&file, r#"{"highlight":"no-such-control","label":"Hmm"}"#).unwrap();
-        let unknown = GuideRequest::Unknown { name: "no-such-control".into(), label: "Hmm".into() };
-        wait_for("unknown", || pending(&state) == unknown);
+        wait_for("unknown settles to clear", || {
+            pending(&state) == GuideRequest::Clear
+                && std::fs::read_to_string(&file).is_ok_and(|t| t == r#"{"unknown":"no-such-control"}"#)
+        });
         pump();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            r#"{"highlight":"no-such-control","label":"Hmm"}"#,
-            "the app never writes the guide file (was: {before})"
+            r#"{"unknown":"no-such-control"}"#,
+            "the app answers an unknown name with the locked response (D-58)"
         );
 
         // A second live window keeps its own single, newest request.
         let (state2, ui2) = open_window();
         assert!(!Rc::ptr_eq(&state, &state2));
-        assert_eq!(pending(&state2), unknown, "the initial read takes the file as it is");
+        assert_eq!(pending(&state2), GuideRequest::Clear, "the initial read takes the response as clear");
         std::fs::write(&file, r#"{"highlight":"open-with-other-app","label":"Newest"}"#).unwrap();
         wait_for("both windows update", || {
             pending(&state) == known("open-with-other-app", "Newest") && pending(&state2) == known("open-with-other-app", "Newest")
