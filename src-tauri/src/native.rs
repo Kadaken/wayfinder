@@ -3897,7 +3897,13 @@ fn navigate_to_with_message(
         ui.path_stack.set_visible_child_name("label");
         ui.search.set_text("");
         if !same_folder {
+            // D-34: clearing removes the focused row; hand focus to the view root
+            // before GTK's next-frame focus search can reach the preview label.
+            let focus_was_in_list = focus_within(&ui.window, &ui.list);
+            let focus_was_in_grid = focus_within(&ui.window, &ui.grid);
             clear_file_views(ui);
+            keep_focus_on_empty_view(&ui.list, focus_was_in_list, true);
+            keep_focus_on_empty_view(&ui.grid, focus_was_in_grid, true);
         }
         set_preview_text(ui, "Loading folder…");
         ui.status.set_label(&format!("Loading {path}"));
@@ -8541,6 +8547,7 @@ mod tests {
         preview_pane_toggle_is_one_safe_route_d30();
         job_result_survives_its_own_refresh_d32();
         folder_activation_waits_for_gtk_to_finish_d33();
+        navigation_hands_focus_to_the_view_root_d34();
     }
 
     fn preview_pane_toggle_is_one_safe_route_d30() {
@@ -8849,6 +8856,85 @@ mod tests {
         std::fs::remove_file(dir.join("b.txt")).unwrap();
         state.borrow_mut().visible_entries.reverse();
         wait_for("captured entry refused", || ui.status.label() == "b.txt no longer exists");
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-34: navigating to a different folder clears the focused row; focus must
+    /// already sit on the surviving view root, and only when it was in the file pane.
+    fn navigation_hands_focus_to_the_view_root_d34() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d34-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "I").unwrap();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        std::fs::write(dir.join("b.txt"), "B").unwrap();
+        std::env::set_var("HOME", &home);
+        let dir_str = dir.to_string_lossy().to_string();
+        let sub_str = sub.to_string_lossy().to_string();
+        let app = adw::Application::builder()
+            .application_id("io.github.legendofzito.wayfinder.d34test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        let focus = || gtk::prelude::GtkWindowExt::focus(&ui.window);
+        let back_to_dir = |mode: ViewMode| {
+            navigate(&state, dir_str.clone());
+            wait_for("listing", || state.borrow().cwd == dir_str && state.borrow().visible_entries.len() == 3);
+            set_view_mode(&state, &ui, mode);
+            pump();
+        };
+
+        for mode in [ViewMode::Details, ViewMode::Compact, ViewMode::Grid] {
+            back_to_dir(mode);
+            let (root_widget, rows): (gtk::Widget, Box<dyn Fn() -> u32>) = if mode == ViewMode::Grid {
+                let child = ui.grid.child_at_index(0).expect("grid child");
+                child.grab_focus();
+                (ui.grid.clone().upcast(), Box::new(|| {
+                    let mut n = 0;
+                    let mut c = ui.grid.first_child();
+                    while let Some(w) = c { n += 1; c = w.next_sibling(); }
+                    n
+                }))
+            } else {
+                ui.list.grab_focus();
+                (ui.list.clone().upcast(), Box::new(|| ui.list_store.n_items()))
+            };
+            pump();
+            assert!(focus_within(&ui.window, &root_widget) && focus().as_ref() != Some(&root_widget), "focus is on a row");
+            navigate(&state, sub_str.clone());
+            assert_eq!(rows(), 0, "the old rows are removed synchronously");
+            assert_eq!(focus(), Some(root_widget.clone()), "the view root owns focus before the next frame");
+            wait_for("sub listing", || state.borrow().cwd == sub_str && state.borrow().visible_entries.len() == 1);
+            pump();
+            assert_eq!(state.borrow().cwd, sub_str);
+        }
+
+        // Focus outside the file pane is never taken.
+        back_to_dir(ViewMode::Details);
+        ui.search.grab_focus();
+        pump();
+        let outside = focus();
+        assert!(outside.is_some() && !focus_within(&ui.window, &ui.list) && !focus_within(&ui.window, &ui.grid));
+        navigate(&state, sub_str.clone());
+        assert_eq!(focus(), outside, "focus outside the file view is not stolen");
+        wait_for("sub listing", || state.borrow().cwd == sub_str && state.borrow().visible_entries.len() == 1);
+        pump();
 
         ui.window.destroy();
         match old_home {
