@@ -4732,7 +4732,11 @@ fn navigate_to_with_message(
     // Refreshing the SAME folder (e.g. after a delete) should keep the scroll
     // position; only real navigation to a different folder resets to the top.
     let same_folder = state.borrow().cwd == path;
-    let saved_scroll = if same_folder {
+    // A pending reveal (e.g. the just-renamed row) owns the scroll position for
+    // this reload via `apply_pending_reveal`; restoring the pre-reload scroll
+    // 16ms later would silently drag the view back off the revealed row.
+    let has_pending_reveal = state.borrow().reveal_path.is_some();
+    let saved_scroll = if same_folder && !has_pending_reveal {
         ui.as_ref().map(|ui| ui.list_scroll.vadjustment().value())
     } else {
         None
@@ -5321,6 +5325,10 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
         Ok(to) => {
             state.borrow_mut().inline_rename = None;
             push_undo(state, UndoAction::Renamed { from: path, to: to.clone() });
+            // D-91 follow-up: arm the one-shot reveal so the reload below reselects
+            // and scrolls to the renamed row, at its natural sorted position
+            // (never pinned_top, which would jump it out of sort order).
+            state.borrow_mut().reveal_path = Some(to);
             let cwd = state.borrow().cwd.clone();
             navigate(state, cwd);
             ui.status.set_label(&format!("Renamed {old_name} to {typed}"));
@@ -5955,6 +5963,39 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             ui.grid.unselect_all();
             if let Some(child) = ui.grid.child_at_index(index as i32) {
                 ui.grid.select_child(&child);
+                // D-91 follow-up: FlowBox has no scroll_to like ListView; selecting
+                // a child does not move the view. Compute the child's position
+                // against its ScrolledWindow ancestor and nudge the adjustment only
+                // far enough to bring it fully into the viewport. A later inline
+                // editor (creation's own reveal) still wins focus once it opens,
+                // so grabbing focus here never fights that case.
+                child.grab_focus();
+                // The freshly-built grid children have not been allocated a
+                // position yet this frame; compute_bounds would read zeros.
+                // One frame later (matches this file's own next-frame convention,
+                // e.g. the post-rename scroll restore above) their real geometry
+                // is in place.
+                let child_for_scroll = child.clone();
+                glib::timeout_add_local_once(Duration::from_millis(16), move || {
+                    let Some(scroller) = child_for_scroll
+                        .ancestor(gtk::ScrolledWindow::static_type())
+                        .and_then(|w| w.downcast::<gtk::ScrolledWindow>().ok())
+                    else {
+                        return;
+                    };
+                    let widget: gtk::Widget = child_for_scroll.clone().upcast();
+                    if let Some(bounds) = widget.compute_bounds(&scroller) {
+                        let adj = scroller.vadjustment();
+                        let top = adj.value() + f64::from(bounds.y());
+                        let bottom = top + f64::from(bounds.height());
+                        let page = adj.page_size();
+                        if top < adj.value() {
+                            adj.set_value(top);
+                        } else if bottom > adj.value() + page {
+                            adj.set_value(bottom - page);
+                        }
+                    }
+                });
             }
         }
         ViewMode::Details | ViewMode::Compact => {
@@ -10223,6 +10264,9 @@ mod tests {
         drag_ghost_builds_compact_translucent_item();
         emptied_folder_keeps_focus_on_the_view_root_d20();
         new_folder_menu_and_shared_inline_editor_d21();
+        rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
+        rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
+        rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
         sustained_stream_keeps_objects_pointer_and_timing_d22();
         tabs_keep_independent_history_d27();
@@ -15797,6 +15841,163 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// D-91 follow-up: after a real F2 -> Enter rename, the renamed row must be
+    /// reselected, scrolled into view, and left at its natural sorted position
+    /// (never pinned, which would violate this round's locked sorting rule).
+    /// Runs through all three views via the shared `reveal_path` mechanism.
+    fn rename_reselects_and_reveals_at_natural_sort_position_d91(view: ViewMode, tag: &str) {
+        let root = crate::native_core::scratch_root().join(format!("wf-d91-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Enough siblings, all sorting ahead of the target's old name and (once
+        // renamed) mostly ahead of its new name too, to push the target well
+        // outside a freshly-opened window's initial viewport either way.
+        for i in 0..80 {
+            std::fs::write(dir.join(format!("sib-{i:03}.txt")), "s").unwrap();
+        }
+        let old_name = "aaa-target.txt";
+        std::fs::write(dir.join(old_name), "TARGET-BYTES").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id(format!("com.kadaken.wayfinder.d91test{tag}"))
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 81);
+        set_view_mode(&state, &ui, view);
+        wait_for("laid out", || ui.files_stack.width() > 0);
+
+        let old_path = dir.join(old_name).to_string_lossy().to_string();
+        let new_name = "zzz-renamed.txt";
+        let new_path = dir.join(new_name).to_string_lossy().to_string();
+        let pinned_before = state.borrow().pinned_top.clone();
+
+        let index_of = |st: &Rc<RefCell<AppState>>, path: &str| {
+            st.borrow().visible_entries.iter().position(|e| e.path == path)
+        };
+        let start_index = index_of(&state, &old_path).expect("target present before rename");
+        match view {
+            ViewMode::Grid => {
+                let child = ui.grid.child_at_index(start_index as i32).expect("target grid child");
+                ui.grid.unselect_all();
+                ui.grid.select_child(&child);
+            }
+            ViewMode::Details | ViewMode::Compact => {
+                ui.list_selection.select_item(start_index as u32, true);
+            }
+        }
+        update_selection(&state, &ui);
+        assert_eq!(selected_paths(&state, &ui), vec![old_path.clone()], "{tag}: target selected before rename");
+
+        // Details/Compact: the real F2 route (rename_action gates on the F2 key
+        // path). Grid: F2 is deliberately not wired to inline rename there (see
+        // f2_starts_inline_rename's own "grid is not in this round" case); the
+        // real Grid route is the slow-second-click on an already-selected name,
+        // which calls this same production function directly.
+        match view {
+            ViewMode::Grid => {
+                let entry = state.borrow().visible_entries.iter().find(|e| e.path == old_path).cloned();
+                begin_inline_rename(&state, &ui, &entry.expect("target entry"));
+            }
+            ViewMode::Details | ViewMode::Compact => rename_action(state.clone(), ui.clone()),
+        }
+        let root_widget: gtk::Widget = if view == ViewMode::Grid { ui.grid.clone().upcast() } else { ui.list.clone().upcast() };
+        wait_for("inline editor", || inline_field(&root_widget).is_some());
+        let field = inline_field(&root_widget).unwrap();
+        field.set_text(new_name);
+        field.emit_activate();
+        wait_for("rename on disk", || Path::new(&new_path).exists() && !Path::new(&old_path).exists());
+        wait_for("editor gone", || inline_field(&root_widget).is_none());
+        wait_for("reload settled", || state.borrow().visible_entries.len() == 81);
+
+        // ---- Correctness of the rename itself.
+        assert!(!Path::new(&old_path).exists(), "{tag}: old path gone");
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"TARGET-BYTES", "{tag}: new path present, same bytes");
+
+        // ---- Reselection at the natural sorted position.
+        assert_eq!(selected_paths(&state, &ui), vec![new_path.clone()], "{tag}: exactly the renamed row is selected");
+        let new_index = index_of(&state, &new_path).expect("renamed entry present after reload");
+        let mut expected = state.borrow().visible_entries.clone();
+        sort_entries(&mut expected, state.borrow().sort_key, state.borrow().sort_ascending);
+        let names: Vec<&str> = expected.iter().map(|e| e.name.as_str()).collect();
+        let sorted_index = names.iter().position(|&n| n == new_name).expect("renamed name in freshly-sorted order");
+        assert_eq!(new_index, sorted_index, "{tag}: row sits at its natural sort position, not pinned or moved");
+        assert_eq!(state.borrow().pinned_top, pinned_before, "{tag}: pinned_top untouched by rename reveal");
+
+        // ---- reveal_path is a one-shot: consumed by the reveal it armed.
+        assert!(state.borrow().reveal_path.is_none(), "{tag}: reveal_path consumed");
+
+        // ---- The row is inside the visible scroll viewport (Details/Compact via
+        // the real ScrolledWindow's adjustment; Grid via GTK's own child-visible
+        // scroll target, proven by the adjustment actually having moved off zero
+        // for a target this far outside the initial viewport).
+        match view {
+            ViewMode::Details | ViewMode::Compact => {
+                let adj = ui.list_scroll.vadjustment();
+                let total = ui.list_selection.n_items().max(1) as f64;
+                let row_h = adj.upper() / total;
+                let target_top = row_h * new_index as f64;
+                wait_for(&format!("{tag}: renamed row scrolled into view"), || {
+                    let value = adj.value();
+                    let page = adj.page_size();
+                    target_top >= value - 1.0 && target_top < value + page + 1.0
+                });
+            }
+            ViewMode::Grid => {
+                let child = ui.grid.child_at_index(new_index as i32).expect("renamed grid child");
+                assert!(child.is_selected(), "{tag}: renamed grid child is selected");
+                let grid_scroll = ui
+                    .files_stack
+                    .child_by_name("grid")
+                    .and_then(|w| w.downcast::<gtk::ScrolledWindow>().ok())
+                    .expect("grid scroller");
+                let child_widget: gtk::Widget = child.clone().upcast();
+                wait_for(&format!("{tag}: renamed grid child scrolled into view"), || {
+                    let Some(bounds) = child_widget.compute_bounds(&grid_scroll) else {
+                        return false;
+                    };
+                    let viewport_h = grid_scroll.height() as f32;
+                    bounds.y() >= -1.0 && bounds.y() + bounds.height() <= viewport_h + 1.0
+                });
+            }
+        }
+
+        // ---- A later, unrelated refresh (the directory monitor noticing an
+        // untouched sibling's mtime) must not resurrect the already-consumed
+        // reveal and reselect the renamed file.
+        ui.list_selection.unselect_all();
+        ui.grid.unselect_all();
+        update_selection(&state, &ui);
+        assert!(selected_paths(&state, &ui).is_empty(), "{tag}: selection cleared for the refresh check");
+        let listing = crate::native_core::list_dir_cancellable(&dir_str, false, &AtomicBool::new(false))
+            .expect("relist for the unrelated-refresh check");
+        apply_monitor_scan(&state, &ui, listing);
+        assert!(
+            selected_paths(&state, &ui).is_empty(),
+            "{tag}: an unrelated refresh must not reselect the renamed row via a stale reveal"
+        );
+
+        // ---- Everything the brief locks stays unchanged.
+        assert_eq!(dir_names(&dir).len(), 81, "{tag}: no sibling lost or gained");
+
+        if let Some(home) = old_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     /// D-21: New > Folder from the file-pane background (Details and Grid), the
