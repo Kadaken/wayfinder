@@ -240,6 +240,49 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// One directory entry as the listing shows it, plus whether its stat failed.
+fn entry_from_dirent(ent: &fs::DirEntry) -> (Entry, bool) {
+    let name = ent.file_name().to_string_lossy().to_string();
+    let path_buf = ent.path();
+    // Use `fs::metadata` rather than `DirEntry::metadata`: the latter can
+    // describe the symlink itself, which hides a broken target. We want the
+    // same stat operation a file manager needs for size/date/type, while
+    // keeping the entry visible when that stat fails.
+    let (is_dir, size, modified, metadata_error) = match fs::metadata(&path_buf) {
+        Ok(metadata) => (
+            metadata.is_dir(),
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0),
+            None,
+        ),
+        Err(error) => (
+            ent.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
+            0,
+            0,
+            Some(error.to_string()),
+        ),
+    };
+    let unavailable = metadata_error.is_some();
+    (
+        Entry {
+            name,
+            path: path_buf.to_string_lossy().to_string(),
+            is_dir,
+            size,
+            modified,
+            is_image: is_image(&path_buf),
+            icon: icon_name(&path_buf, is_dir).to_string(),
+            metadata_error,
+        },
+        unavailable,
+    )
+}
+
 pub fn list_dir_cancellable(
     path: &str,
     show_hidden: bool,
@@ -249,61 +292,61 @@ pub fn list_dir_cancellable(
         return Err(ListDirError::Cancelled);
     }
     let rd = fs::read_dir(path).map_err(|err| ListDirError::Open(err.to_string()))?;
-    let mut out = Vec::new();
-    let mut metadata_unavailable = 0;
     let mut unreadable_entries = 0;
+    let mut dirents = Vec::new();
     for item in rd {
         if cancelled.load(Ordering::Relaxed) {
             return Err(ListDirError::Cancelled);
         }
-        let ent = match item {
-            Ok(entry) => entry,
-            Err(_) => {
-                unreadable_entries += 1;
-                continue;
+        match item {
+            Ok(entry) => {
+                if show_hidden || !entry.file_name().to_string_lossy().starts_with('.') {
+                    dirents.push(entry);
+                }
             }
-        };
-        let name = ent.file_name().to_string_lossy().to_string();
-        if !show_hidden && name.starts_with('.') {
-            continue;
+            Err(_) => unreadable_entries += 1,
         }
-        let path_buf = ent.path();
-        // Use `fs::metadata` rather than `DirEntry::metadata`: the latter can
-        // describe the symlink itself, which hides a broken target. We want the
-        // same stat operation a file manager needs for size/date/type, while
-        // keeping the entry visible when that stat fails.
-        let (is_dir, size, modified, metadata_error) = match fs::metadata(&path_buf) {
-            Ok(metadata) => (
-                metadata.is_dir(),
-                metadata.len(),
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs() as i64)
-                    .unwrap_or(0),
-                None,
-            ),
-            Err(error) => {
-                metadata_unavailable += 1;
-                (
-                    ent.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
-                    0,
-                    0,
-                    Some(error.to_string()),
-                )
+    }
+    // Stat every entry. Big folders are split across a few threads; the
+    // chunks are joined in order, so the result is identical to a serial pass.
+    let stat_chunk = |chunk: &[fs::DirEntry]| -> Result<Vec<(Entry, bool)>, ListDirError> {
+        let mut part = Vec::with_capacity(chunk.len());
+        for ent in chunk {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ListDirError::Cancelled);
             }
-        };
-        out.push(Entry {
-            name,
-            path: path_buf.to_string_lossy().to_string(),
-            is_dir,
-            size,
-            modified,
-            is_image: is_image(&path_buf),
-            icon: icon_name(&path_buf, is_dir).to_string(),
-            metadata_error,
+            part.push(entry_from_dirent(ent));
+        }
+        Ok(part)
+    };
+    const PARALLEL_MIN: usize = 2048;
+    let threads = if dirents.len() >= PARALLEL_MIN {
+        std::thread::available_parallelism().map_or(1, |n| n.get()).min(4)
+    } else {
+        1
+    };
+    let mut stat_parts: Vec<Result<Vec<(Entry, bool)>, ListDirError>> = Vec::new();
+    if threads <= 1 {
+        stat_parts.push(stat_chunk(&dirents));
+    } else {
+        let chunk_len = dirents.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = dirents
+                .chunks(chunk_len)
+                .map(|chunk| scope.spawn(|| stat_chunk(chunk)))
+                .collect();
+            for handle in handles {
+                stat_parts.push(handle.join().unwrap_or(Err(ListDirError::Cancelled)));
+            }
         });
+    }
+    let mut out = Vec::with_capacity(dirents.len());
+    let mut metadata_unavailable = 0;
+    for part in stat_parts {
+        for (entry, unavailable) in part? {
+            metadata_unavailable += usize::from(unavailable);
+            out.push(entry);
+        }
     }
     out.sort_by(|a, b| {
         b.is_dir
@@ -2892,6 +2935,44 @@ mod tests {
             .expect("a metadata failure must not hide the filename");
         assert!(entry.metadata_error.is_some());
         assert_eq!(listing.metadata_unavailable, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// D-82: a big folder is statted on several threads. The listing must be
+    /// exactly what a serial pass gives: every visible entry once, hidden files
+    /// filtered, broken links kept and counted, and a cancel still honoured.
+    #[test]
+    fn large_listing_split_across_threads_matches_the_folder_d82() {
+        let dir = test_dir("large-listing");
+        let total = 5000usize;
+        for i in 0..total {
+            fs::write(dir.join(format!("f{i:05}.txt")), vec![b'x'; i % 7]).unwrap();
+        }
+        fs::create_dir(dir.join("adir")).unwrap();
+        fs::write(dir.join(".hidden"), "h").unwrap();
+        #[cfg(unix)]
+        for i in 0..3 {
+            std::os::unix::fs::symlink(dir.join("nope"), dir.join(format!("broken{i}"))).unwrap();
+        }
+        let cancelled = AtomicBool::new(false);
+        let listing = list_dir_cancellable(dir.to_str().unwrap(), false, &cancelled).unwrap();
+        assert_eq!(listing.entries.len(), total + 1 + 3, "files, the folder and the broken links; not .hidden");
+        assert_eq!(listing.metadata_unavailable, 3);
+        assert_eq!(listing.unreadable_entries, 0);
+        assert!(listing.entries[0].is_dir && listing.entries[0].name == "adir", "folders first");
+        let mut names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), listing.entries.len(), "no entry lost or doubled across chunks");
+        let f = listing.entries.iter().find(|e| e.name == "f00006.txt").unwrap();
+        assert_eq!((f.size, f.is_dir, f.metadata_error.is_none()), (6, false, true));
+        let with_hidden = list_dir_cancellable(dir.to_str().unwrap(), true, &cancelled).unwrap();
+        assert_eq!(with_hidden.entries.len(), listing.entries.len() + 1);
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            list_dir_cancellable(dir.to_str().unwrap(), false, &cancelled),
+            Err(ListDirError::Cancelled)
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
 
