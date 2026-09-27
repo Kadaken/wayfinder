@@ -7976,9 +7976,13 @@ fn show_drive_context_menu(
         let state = state.clone();
         let ui = ui.clone();
         let drive = drive.clone();
-        menu.append(&context_item("media-eject-symbolic", "Eject", "", &popover, move || {
-            eject_drive_action(state.clone(), ui.clone(), drive.clone())
-        }));
+        let button = context_item("media-eject-symbolic", "Eject", "", &popover, {
+            let drive = drive.clone();
+            move || eject_drive_action(state.clone(), ui.clone(), drive.clone())
+        });
+        #[cfg(feature = "guide")]
+        guide_name_drive(&button, "eject", &drive);
+        menu.append(&button);
     }
 
     popover.set_child(Some(&menu));
@@ -11543,7 +11547,7 @@ mod tests {
             .expect("a sidebar row");
         let drive = |name: &str, removable: bool, mounted: bool| Drive {
             name: name.to_string(),
-            path: format!("/dev/synthetic-{name}"),
+            path: format!("synthetic:{name}"),
             mountpoint: if mounted { "/nonexistent/synthetic".into() } else { String::new() },
             size: 1,
             fstype: "ext4".into(),
@@ -11555,14 +11559,14 @@ mod tests {
         let states: Vec<(Drive, Vec<&str>)> = vec![
             (drive(crucial, false, true), vec!["drive-open-crucial", "drive-unmount-crucial"]),
             (drive(crucial, false, false), vec!["drive-remount-crucial"]),
-            (drive("Stick", true, true), vec!["drive-open-stick", "drive-unmount-stick"]),
-            (drive("Stick", true, false), vec!["drive-remount-stick"]),
+            (drive("Stick", true, true), vec!["drive-eject-stick", "drive-open-stick", "drive-unmount-stick"]),
+            (drive("Stick", true, false), vec!["drive-eject-stick", "drive-remount-stick"]),
         ];
-        let six = [
+        let seven = [
             "drive-open-crucial", "drive-unmount-crucial", "drive-remount-crucial",
-            "drive-open-stick", "drive-unmount-stick", "drive-remount-stick",
+            "drive-open-stick", "drive-unmount-stick", "drive-remount-stick", "drive-eject-stick",
         ];
-        for key in six {
+        for key in seven {
             let want = put(key);
             assert!(target().is_none(), "{key} is pending before any drive menu exists");
             for (d, has) in &states {
@@ -11590,6 +11594,47 @@ mod tests {
             }
         }
 
+        // Removable but not kind "drive": the pre-existing Eject row still follows `removable`,
+        // but it carries no guide name, so the pending request never binds or paints.
+        let want = put("drive-eject-stick");
+        let mut odd = drive("Stick", true, true);
+        odd.kind = "network".into();
+        show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), odd, 5.0, 5.0);
+        pump();
+        let odd_menu = popovers_of(sidebar_row.upcast_ref()).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("wrong-kind menu");
+        let odd_eject = button_labelled(odd_menu.upcast_ref(), "Eject").expect("Eject follows removable");
+        assert_ne!(odd_eject.widget_name(), "drive-eject-stick", "no guide name on a wrong-kind Eject row");
+        assert!(target().is_none(), "the wrong-kind menu never binds the request");
+        assert!(by_name("drive-eject-stick").is_empty());
+        assert!(
+            popovers_of(ui.window.upcast_ref()).iter().all(|p| !p.has_css_class("wf-guide-label")),
+            "nothing painted for a wrong-kind Eject row"
+        );
+        assert_eq!(pending(), want, "still pending");
+        drop((odd_eject, odd_menu));
+        for pop in popovers_of(sidebar_row.upcast_ref()) {
+            pop.popdown();
+            pop.unparent();
+        }
+        pump();
+
+        // Two live targets with the exact name fail closed (the generic duplicate-name
+        // regression is D-52's `no_visual("duplicate name")`; this is the Eject-specific case).
+        show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), drive("Stick", true, true), 5.0, 5.0);
+        pump();
+        let menu = popovers_of(sidebar_row.upcast_ref()).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("stick menu");
+        assert!(target().is_some(), "one Eject row binds");
+        button_labelled(menu.upcast_ref(), "Open").expect("Open row").set_widget_name("drive-eject-stick");
+        let want = put("drive-eject-stick");
+        assert!(target().is_none(), "a second live target of the same name fails closed");
+        assert_eq!(pending(), want, "the fresh request stays pending");
+        drop(menu);
+        for pop in popovers_of(sidebar_row.upcast_ref()) {
+            pop.popdown();
+            pop.unparent();
+        }
+        pump();
+
         ui.window.destroy();
         match old_env {
             Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
@@ -11605,7 +11650,7 @@ mod tests {
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 14);
+        assert_eq!(keys.len(), 15);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -11688,7 +11733,7 @@ mod tests {
             .expect("a sidebar row");
         let drive = |name: &str, kind: &str, removable: bool, mounted: bool| Drive {
             name: name.to_string(),
-            path: format!("/dev/synthetic-{name}"),
+            path: format!("synthetic:{name}"),
             mountpoint: if mounted { "/nonexistent/synthetic".into() } else { String::new() },
             size: 1,
             fstype: "ext4".into(),
@@ -11707,9 +11752,10 @@ mod tests {
         let cases: Vec<(Drive, Vec<&str>, Option<(&str, &str)>)> = vec![
             (drive(crucial, "drive", false, true), vec!["drive-open-crucial", "drive-unmount-crucial"], Some(("Open", "drive-open-crucial"))),
             (drive(crucial, "drive", false, false), vec!["drive-remount-crucial"], Some(("Mount & Open", "drive-remount-crucial"))),
-            (drive("Stick", "drive", true, true), vec!["drive-open-stick", "drive-unmount-stick"], Some(("Open", "drive-open-stick"))),
-            (drive("Stick", "drive", true, false), vec!["drive-remount-stick"], Some(("Mount & Open", "drive-remount-stick"))),
+            (drive("Stick", "drive", true, true), vec!["drive-eject-stick", "drive-open-stick", "drive-unmount-stick"], Some(("Open", "drive-open-stick"))),
+            (drive("Stick", "drive", true, false), vec!["drive-eject-stick", "drive-remount-stick"], Some(("Mount & Open", "drive-remount-stick"))),
             (drive("Network", "network", false, true), vec![], None),
+            (drive("Removable Network", "network", true, true), vec![], None),
             (drive("Google Drive", "google", false, true), vec![], None),
             (drive("Some Other Disk", "drive", false, true), vec![], None),
             (drive("Some Other Disk", "drive", false, false), vec![], None),
@@ -11724,8 +11770,24 @@ mod tests {
             if let Some((text, key)) = label {
                 assert_eq!(button_labelled(pop.upcast_ref(), text).unwrap().widget_name(), key, "{title}");
             }
-            if title.starts_with("Launch") || title.starts_with("Stick") {
-                assert!(button_labelled(pop.upcast_ref(), "Eject").map_or(true, |b| !keys.contains(&b.widget_name().to_string())));
+            // Eject exists only on a removable drive; there it is the one real row, named, never duplicated.
+            let ejects: Vec<gtk::Widget> = all_widgets(pop.upcast_ref())
+                .into_iter()
+                .filter(|w| {
+                    w.is::<gtk::Button>()
+                        && all_widgets(w).iter().any(|c| c.downcast_ref::<gtk::Label>().is_some_and(|l| l.label() == "Eject"))
+                })
+                .collect();
+            if title.starts_with("Stick") {
+                assert_eq!(ejects.len(), 1, "{title}: exactly one Eject row");
+                assert_eq!(ejects[0].widget_name(), "drive-eject-stick", "{title}");
+                assert_eq!(names.iter().filter(|n| *n == "drive-eject-stick").count(), 1, "{title}: one named row");
+            } else if title.starts_with("Removable Network") {
+                // The pre-existing Eject row follows `removable`; only the guide name follows kind too.
+                assert_eq!(ejects.len(), 1, "{title}: the ordinary Eject row is still there");
+                assert_ne!(ejects[0].widget_name(), "drive-eject-stick", "{title}: but never named");
+            } else {
+                assert!(ejects.is_empty(), "{title}: no Eject row");
             }
             seen.extend(names);
             pop.popdown();
@@ -11737,7 +11799,7 @@ mod tests {
         seen.insert("open-file-other-app".to_string());
         seen.insert("drive-space-bars".to_string());
         seen.insert("drive-mounted-again-crucial".to_string());
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all fourteen keys, each on its real control");
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all fifteen keys, each on its real control");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
         }

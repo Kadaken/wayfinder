@@ -6,6 +6,7 @@
   "drive-open-stick": { "kind": "drive context-menu item", "mark": "arrow", "where": "DEVICES row right-click menu" },
   "drive-unmount-crucial": { "kind": "drive context-menu item", "mark": "arrow", "where": "mounted drive's DEVICES row right-click menu" },
   "drive-unmount-stick": { "kind": "drive context-menu item", "mark": "arrow", "where": "mounted stick's DEVICES row right-click menu" },
+  "drive-eject-stick": { "kind": "drive context-menu item", "mark": "arrow", "where": "removable stick's DEVICES row right-click menu, the Eject row" },
   "drive-remount-crucial": { "kind": "drive context-menu item", "mark": "arrow", "where": "unmounted drive's DEVICES row right-click menu" },
   "drive-remount-stick": { "kind": "drive context-menu item", "mark": "arrow", "where": "unmounted stick's DEVICES row right-click menu" },
   "item-menu-full-d60": { "kind": "item context-menu content", "mark": "arrow", "where": "file right-click item menu, the list of every action" },
