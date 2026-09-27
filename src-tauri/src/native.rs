@@ -1808,6 +1808,14 @@ fn guide_paint(state: &Rc<RefCell<AppState>>) {
         }
         GuideMark::Arrow => guide_arrow_popover(&target, &label),
     };
+    if target.is::<gtk::ScrolledWindow>() {
+        // A scroller is allocated only after its menu maps: the item menu resolves again once
+        // laid out, so this places the popover once against the real box, never an empty one.
+        if target.width() <= 0 || target.height() <= 0 {
+            return;
+        }
+        pop.set_pointing_to(Some(&gdk::Rectangle::new(0, 0, target.width(), target.height())));
+    }
     pop.set_parent(&target);
     pop.popup();
     let hook = Rc::new(RefCell::new(guide_connect_use(state, &target)));
@@ -8018,6 +8026,8 @@ fn show_item_context_menu(
         .max_content_height(ITEM_MENU_MAX_HEIGHT)
         .child(&menu)
         .build();
+    #[cfg(feature = "guide")]
+    guide_name(&scroller, "item-menu-cap-d56");
     popover.set_child(Some(&scroller));
     // GTK adds its own chrome around the scroller and only measures it once mapped, so the
     // final cap is computed when the popover maps, before its first allocation.
@@ -8025,6 +8035,8 @@ fn show_item_context_menu(
         let scroller = scroller.clone();
         let menu = menu.clone();
         let window = ui.window.clone();
+        #[cfg(feature = "guide")]
+        let state = state.clone();
         move |popover| {
             let (_, popover_natural, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
             let (_, scroller_natural, _, _) = scroller.measure(gtk::Orientation::Vertical, -1);
@@ -8041,6 +8053,17 @@ fn show_item_context_menu(
                 None => (ITEM_MENU_MAX_HEIGHT - chrome).max(1),
             };
             scroller.set_max_content_height(cap);
+            // The scroller has no allocation yet: bind its pending arrow once it has one.
+            #[cfg(feature = "guide")]
+            {
+                let state = state.clone();
+                glib::idle_add_local_once(move || {
+                    let waiting = matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == "item-menu-cap-d56");
+                    if waiting && state.borrow().guide_visual.is_none() {
+                        guide_resolve(&state);
+                    }
+                });
+            }
         }
     });
     unparent_when_closed(&popover);
@@ -10018,6 +10041,51 @@ mod tests {
         close_menu();
         no_visual("closed again");
 
+        // D-73: the item menu's one real scroller takes the arrow; the menu itself never changes.
+        put("item-menu-cap-d56", "Whole menu");
+        no_visual("pending before the item menu exists");
+        assert_eq!(pending(), known("item-menu-cap-d56", "Whole menu"));
+        open_menu();
+        let scrollers = by_name("item-menu-cap-d56");
+        assert_eq!(scrollers.len(), 1, "exactly one real scroller is named");
+        let scroller = scrollers[0].clone();
+        assert!(scroller.is::<gtk::ScrolledWindow>() && scroller.is_mapped());
+        let item_menu = popovers_of(&row).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("item menu");
+        assert!(scroller.is_ancestor(&item_menu), "it is the menu popover's own scroller");
+        assert_eq!(item_menu.child().as_ref(), Some(&scroller), "and the popover's child");
+        assert!(button_labelled(item_menu.upcast_ref(), "Open Terminal Here").is_some(), "Open Terminal Here exists");
+        let sw = scroller.downcast_ref::<gtk::ScrolledWindow>().unwrap().clone();
+        let menu_shape = || (item_menu.width(), item_menu.height(), sw.width(), sw.height(), sw.vadjustment().upper(), sw.vadjustment().page_size(), sw.vadjustment().value());
+        let shape_open = menu_shape();
+        let pops = label_pops();
+        assert_eq!(pops.len(), 1);
+        assert_eq!(label_text(&pops[0]), "Whole menu");
+        assert_eq!(pops[0].parent().as_ref(), Some(&scroller));
+        assert!(pops[0].has_css_class("wf-guide-arrow"));
+        wait_for("the arrow surface", || {
+            label_pops().first().is_some_and(|p| p.is_mapped() && p.native().and_then(|n| n.surface()).is_some())
+        });
+        arrow_check("item-menu-cap-d56", &scroller, "d73-item-menu-cap-d56.png");
+        assert_eq!(menu_shape(), shape_open, "the arrow moved or resized nothing in the menu");
+        assert!(item_menu.is_mapped(), "the menu stays open under the arrow");
+        assert!(button_labelled(item_menu.upcast_ref(), "Open Terminal Here").is_some_and(|b| b.is_mapped() && b.can_target()));
+        assert_eq!(by_name("item-menu-cap-d56").len(), 1, "no duplicate target");
+        let stale = pops[0].clone();
+        drop((pops, item_menu, sw, scrollers));
+        close_menu();
+        no_visual("closed item menu");
+        assert!(stale.parent().is_none() && guide_live_target(&state).is_none(), "no stale visual or target");
+        assert_eq!(pending(), known("item-menu-cap-d56", "Whole menu"), "still pending after close");
+        drop(scroller);
+        open_menu();
+        let again = by_name("item-menu-cap-d56");
+        assert_eq!(again.len(), 1, "reopening gives one new scroller");
+        assert_eq!(label_pops().len(), 1, "one arrow visual on the new scroller");
+        drop(again);
+        put("", "");
+        no_visual("cleared");
+        close_menu();
+
         // D-64: circles and arrows replace one another cleanly, and the row never changes.
         put("", "");
         open_menu();
@@ -10751,7 +10819,7 @@ mod tests {
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 9);
+        assert_eq!(keys.len(), 10);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -10823,7 +10891,7 @@ mod tests {
         let item_menu = popovers_of(&row).pop().expect("item menu");
         let open_with = button_labelled(item_menu.upcast_ref(), "Open With...").expect("Open With row");
         assert_eq!(open_with.widget_name(), "open-with-other-app");
-        assert_eq!(named(item_menu.upcast_ref()), vec!["open-with-other-app"]);
+        assert_eq!(named(item_menu.upcast_ref()), vec!["item-menu-cap-d56", "open-with-other-app"]);
         assert!(open_with.is_focusable() == twin.is_focusable() && open_with.can_target());
         item_menu.popdown();
 
@@ -10878,7 +10946,8 @@ mod tests {
         }
         seen.extend(named(ui.window.upcast_ref()));
         seen.insert("open-with-other-app".to_string());
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all nine keys, each on its real control");
+        seen.insert("item-menu-cap-d56".to_string());
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all ten keys, each on its real control");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
         }
