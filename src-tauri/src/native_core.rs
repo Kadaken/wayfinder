@@ -3934,6 +3934,7 @@ mod tests {
                 "drive-unmount-crucial",
                 "drive-unmount-stick",
                 "item-menu-cap-d56",
+                "item-menu-full-d60",
                 "open-with-other-app",
                 "terminal-here-folder",
                 "trash-and-restore-file",
@@ -3967,6 +3968,7 @@ mod tests {
                 "drive-unmount-crucial",
                 "drive-unmount-stick",
                 "item-menu-cap-d56",
+                "item-menu-full-d60",
                 "open-with-other-app",
             ],
             "every row entry chooses arrow"
