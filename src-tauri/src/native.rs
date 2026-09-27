@@ -4733,18 +4733,12 @@ fn navigate_to_with_message(
         ui.status.set_label(&format!("Loading {path}"));
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
     let path_for_worker = path.clone();
-    std::thread::spawn(move || {
-        let _ = tx.send(native_core::list_dir_cancellable(
-            &path_for_worker,
-            show_hidden,
-            &cancelled,
-        ));
-    });
-
     let state = state.clone();
-    glib::timeout_add_local(Duration::from_millis(40), move || match rx.try_recv() {
+    // D-82: the worker's result wakes the main loop the moment it is ready
+    // instead of waiting for a 40 ms poll tick.
+    let on_result = move |received: Result<Result<native_core::DirectoryListing, native_core::ListDirError>, ()>| -> glib::ControlFlow {
+        match received {
         Ok(Ok(listing)) => {
             // The result is only valid for the newest navigation request.
             if state.borrow().listing_generation != generation
@@ -4840,8 +4834,7 @@ fn navigate_to_with_message(
             }
             glib::ControlFlow::Break
         }
-        Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
-        Err(TryRecvError::Disconnected) => {
+        Err(()) => {
             if state.borrow().listing_generation == generation {
                 state.borrow_mut().listing_cancel = None;
                 if let Some(ui) = &ui {
@@ -4850,6 +4843,15 @@ fn navigate_to_with_message(
             }
             glib::ControlFlow::Break
         }
+        }
+    };
+    glib::spawn_future_local(async move {
+        let received = gio::spawn_blocking(move || {
+            native_core::list_dir_cancellable(&path_for_worker, show_hidden, &cancelled)
+        })
+        .await
+        .map_err(|_| ());
+        on_result(received);
     });
 }
 
@@ -5892,68 +5894,90 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, ascending: bool) {
-    entries.sort_by(|a, b| {
+    // D-82: the natural-name key is built once per entry, not re-derived on
+    // each of the O(n log n) comparisons.
+    let keys: Vec<Vec<NameToken>> = entries.iter().map(|e| natural_name_key(&e.name)).collect();
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&i, &j| {
+        let (a, b) = (&entries[i], &entries[j]);
         // Explorer parity: folders always sort ABOVE files, in every sort order.
         let dir_order = b.is_dir.cmp(&a.is_dir);
         if dir_order != std::cmp::Ordering::Equal {
             return dir_order;
         }
         let ordering = match key {
-            SortKey::Name => natural_name_cmp(&a.name, &b.name),
+            SortKey::Name => keys[i].cmp(&keys[j]),
             SortKey::Size => a.size.cmp(&b.size),
             SortKey::Kind => native_core::kind_label(a).cmp(&native_core::kind_label(b)),
             SortKey::Modified => a.modified.cmp(&b.modified),
         };
         if ascending {
-            ordering.then_with(|| natural_name_cmp(&a.name, &b.name))
+            ordering.then_with(|| keys[i].cmp(&keys[j]))
         } else {
-            ordering
-                .reverse()
-                .then_with(|| natural_name_cmp(&a.name, &b.name))
+            ordering.reverse().then_with(|| keys[i].cmp(&keys[j]))
         }
     });
+    let sorted: Vec<Entry> = order.iter().map(|&i| entries[i].clone()).collect();
+    entries.clone_from_slice(&sorted);
 }
 
-/// Explorer parity: case-insensitive compare where digit runs order numerically,
-/// so "file2" sorts before "file10".
-fn natural_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut ia = a.chars().flat_map(char::to_lowercase).peekable();
-    let mut ib = b.chars().flat_map(char::to_lowercase).peekable();
-    loop {
-        match (ia.peek().copied(), ib.peek().copied()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(ca), Some(cb)) => {
-                if ca.is_ascii_digit() && cb.is_ascii_digit() {
-                    let mut na = String::new();
-                    while let Some(c) = ia.peek().copied().filter(char::is_ascii_digit) {
-                        na.push(c);
-                        ia.next();
-                    }
-                    let mut nb = String::new();
-                    while let Some(c) = ib.peek().copied().filter(char::is_ascii_digit) {
-                        nb.push(c);
-                        ib.next();
-                    }
-                    let va: u128 = na.parse().unwrap_or(u128::MAX);
-                    let vb: u128 = nb.parse().unwrap_or(u128::MAX);
-                    match va.cmp(&vb).then(na.len().cmp(&nb.len())) {
-                        std::cmp::Ordering::Equal => {}
-                        other => return other,
-                    }
-                } else {
-                    match ca.cmp(&cb) {
-                        std::cmp::Ordering::Equal => {
-                            ia.next();
-                            ib.next();
-                        }
-                        other => return other,
-                    }
-                }
+/// Consumes one run of ASCII digits: (numeric value, or u128::MAX on overflow; length).
+fn digit_run(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) -> (u128, usize) {
+    let (mut value, mut len, mut overflow) = (0u128, 0usize, false);
+    while let Some(c) = chars.peek().copied().filter(char::is_ascii_digit) {
+        len += 1;
+        if !overflow {
+            match value.checked_mul(10).and_then(|v| v.checked_add(c as u128 - '0' as u128)) {
+                Some(v) => value = v,
+                None => overflow = true,
             }
         }
+        chars.next();
     }
+    (if overflow { u128::MAX } else { value }, len)
+}
+
+/// One piece of a name for natural ordering: a lowercase character, or a whole
+/// run of digits compared by value (then by length).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NameToken {
+    Char(char),
+    Digits(u128, usize),
+}
+
+impl Ord for NameToken {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (NameToken::Char(a), NameToken::Char(b)) => a.cmp(b),
+            (NameToken::Digits(va, la), NameToken::Digits(vb, lb)) => va.cmp(vb).then(la.cmp(lb)),
+            // A digit run against another character compares as the digit
+            // characters ('0'..='9'), exactly as natural_name_cmp does.
+            (NameToken::Char(c), NameToken::Digits(..)) => if *c < '0' { Ordering::Less } else { Ordering::Greater },
+            (NameToken::Digits(..), NameToken::Char(c)) => if *c < '0' { Ordering::Greater } else { Ordering::Less },
+        }
+    }
+}
+
+impl PartialOrd for NameToken {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn natural_name_key(name: &str) -> Vec<NameToken> {
+    let mut chars = name.chars().flat_map(char::to_lowercase).peekable();
+    let mut key = Vec::with_capacity(name.len());
+    while let Some(c) = chars.peek().copied() {
+        if c.is_ascii_digit() {
+            let (value, len) = digit_run(&mut chars);
+            key.push(NameToken::Digits(value, len));
+        } else {
+            key.push(NameToken::Char(c));
+            chars.next();
+        }
+    }
+    key
 }
 
 fn file_icon(entry: &Entry, zoom: f64) -> gtk::Box {
@@ -15095,6 +15119,97 @@ mod tests {
         assert_ne!(c.view_mode, want.view_mode);
         assert!(!include_str!("native.rs").contains(concat!("save_view", "_settings(")), "no whole-snapshot view write");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The pre-D-82 comparator, kept as the reference the cached key must match.
+    fn old_natural_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        let mut ia = a.chars().flat_map(char::to_lowercase).peekable();
+        let mut ib = b.chars().flat_map(char::to_lowercase).peekable();
+        loop {
+            match (ia.peek().copied(), ib.peek().copied()) {
+                (None, None) => return std::cmp::Ordering::Equal,
+                (None, Some(_)) => return std::cmp::Ordering::Less,
+                (Some(_), None) => return std::cmp::Ordering::Greater,
+                (Some(ca), Some(cb)) => {
+                    if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                        let mut na = String::new();
+                        while let Some(c) = ia.peek().copied().filter(char::is_ascii_digit) {
+                            na.push(c);
+                            ia.next();
+                        }
+                        let mut nb = String::new();
+                        while let Some(c) = ib.peek().copied().filter(char::is_ascii_digit) {
+                            nb.push(c);
+                            ib.next();
+                        }
+                        let va: u128 = na.parse().unwrap_or(u128::MAX);
+                        let vb: u128 = nb.parse().unwrap_or(u128::MAX);
+                        match va.cmp(&vb).then(na.len().cmp(&nb.len())) {
+                            std::cmp::Ordering::Equal => {}
+                            other => return other,
+                        }
+                    } else {
+                        match ca.cmp(&cb) {
+                            std::cmp::Ordering::Equal => {
+                                ia.next();
+                                ib.next();
+                            }
+                            other => return other,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// D-82: the cached natural-name key must order every name exactly as the
+    /// old per-comparison comparator did (same folders-first, same ties).
+    #[test]
+    fn cached_name_key_orders_like_the_old_comparator_d82() {
+        let names = [
+            "a", "A", "b", "file2", "file10", "File10", "file010", "file1", "file01", "9", "10", "007", "7", "x9y", "x10y",
+            "x9", "x-9", "x_9", "9x", "é1", "É1", "ß", "SS", "", "a b", "a  b", ".hidden", "~tilde", "z999",
+            "99999999999999999999999999999999999999999999", "99999999999999999999999999999999999999999998",
+            "1", "١", "img (1).png", "img (10).png", "img (2).png",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(
+                    natural_name_key(a).cmp(&natural_name_key(b)),
+                    old_natural_name_cmp(a, b),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sort_entries_keeps_folders_first_and_natural_names_d82() {
+        let entry = |name: &str, is_dir: bool, size: u64| Entry {
+            name: name.to_string(), path: format!("/t/{name}"), is_dir, size, modified: 0,
+            is_image: false, icon: String::new(), metadata_error: None,
+        };
+        let mut v = vec![entry("f10", false, 1), entry("F2", false, 3), entry("d2", true, 0), entry("d10", true, 0), entry("f1", false, 2)];
+        sort_entries(&mut v, SortKey::Name, true);
+        assert_eq!(v.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["d2", "d10", "f1", "F2", "f10"]);
+        sort_entries(&mut v, SortKey::Size, false);
+        assert_eq!(v.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["d2", "d10", "F2", "f1", "f10"]);
+    }
+
+    /// D-82: the listing worker must wake the main loop directly. A 40 ms poll
+    /// timer put a fixed delay on every folder open.
+    #[test]
+    fn folder_listing_result_is_not_polled_d82() {
+        let all = include_str!("native.rs");
+        let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = app.find("fn navigate_to_with_message(").unwrap();
+        let body = &app[start..app[start..].find("\nfn clear_file_views").unwrap() + start];
+        assert!(body.contains("gio::spawn_blocking"), "listing runs on a worker");
+        assert!(body.contains("glib::spawn_future_local"), "result is delivered by waking the main loop");
+        assert!(!body.contains("timeout_add_local(Duration::from_millis(40)"), "no 40 ms polling");
+        assert!(!body.contains("try_recv"), "no polling of a channel");
+        assert!(body.contains("listing_generation != generation"), "stale results still rejected");
+        assert!(body.contains("Err(native_core::ListDirError::Cancelled)"), "cancelled results still ignored");
     }
 
     /// D-20: AdwAlertDialog closes itself after `response`; closing it again in
