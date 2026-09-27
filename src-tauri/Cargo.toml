@@ -21,6 +21,8 @@ adw = { version = "0.9.1", package = "libadwaita", features = [
 ] }
 gdk-pixbuf = "0.22"
 libc = "0.2"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
 
 [features]
 default = []

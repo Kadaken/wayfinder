@@ -83,6 +83,7 @@ For a local native build, see [Build from Source](#build-from-source).
 | **Details view** | Table with Name, Size, Type, Modified — click column headers to sort |
 | **Icons / Grid view** | Large icon grid — zoom with `Ctrl+scroll` |
 | **Image thumbnails** | In grid view, the first 60 images load in the background (two at a time). A file-type icon remains visible until each thumbnail is ready. |
+| **Video pictures** | In grid view, each video shows a real frame pulled from the file (two at a time). The generic video icon remains visible until a frame is ready. |
 | **Sort** | Click any column header to sort ascending; click again for descending |
 | **Files before folders** | The current native view keeps regular files above folders, regardless of sort direction. |
 | **Search / Filter** | Type in the search box to live-filter the current folder |
