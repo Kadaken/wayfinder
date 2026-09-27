@@ -6724,7 +6724,13 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
                 .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
         }
     }
-    update_selection(state, ui);
+    // No explicit update_selection() call here: both branches above change a
+    // real GTK selection model/widget, whose own connect_selected_children_changed
+    // (Grid) or connect_selection_changed (Details/Compact) handler already runs
+    // update_selection. A second explicit call here used to run it again for the
+    // same selection, which built a second live GtkMediaFile/GStreamer pipeline
+    // for the same video and let both decode and play in parallel for the rest
+    // of the session (D-86 measurement finding).
 }
 
 fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
@@ -10218,6 +10224,7 @@ mod tests {
         thumbnail_queue_caps_concurrency_and_drains_on_cancel_d84();
         video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
+        selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
         #[cfg(feature = "guide")]
@@ -13557,6 +13564,64 @@ mod tests {
             Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
             None => std::env::remove_var("WF_GUIDE_FILE"),
         }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-86: selecting one row must build the preview media pipeline exactly
+    /// once. Grid's unselect_all()+select_child() and List's select_item()
+    /// each already run update_selection through their own selection-changed
+    /// signal; select_index used to call update_selection a second time for
+    /// the same selection, which built and played a second live
+    /// GtkMediaFile/GStreamer pipeline for the same file. The regression
+    /// counts how many times `preview_media_controls`'s media-stream
+    /// property actually changes for one selection, using a disposable file
+    /// (never an owner video) that only needs to look like a video by
+    /// extension for `set_preview_media` to run.
+    fn selecting_one_video_row_builds_the_preview_pipeline_only_once_d86() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d86-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("home");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        std::fs::write(dir.join("clip.mp4"), b"not a real video, only the extension matters here").unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d86test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+
+        let changes = Rc::new(std::cell::Cell::new(0));
+        let changes_for_signal = changes.clone();
+        ui.preview_media_controls
+            .connect_notify_local(Some("media-stream"), move |_, _| {
+                changes_for_signal.set(changes_for_signal.get() + 1);
+            });
+
+        select_entry_by_path(&state, &ui, &dir.join("clip.mp4").to_string_lossy());
+        wait_for("preview switches to media", || {
+            ui.preview_stack.visible_child_name().as_deref() == Some("media")
+        });
+        // Settle across a few more main-loop turns: a second, redundant
+        // construction (the D-86 bug) would show up here as changes == 2.
+        for _ in 0..5 {
+            pump();
+        }
+        assert_eq!(
+            changes.get(),
+            1,
+            "one row selection must build the preview media pipeline exactly once"
+        );
+
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
