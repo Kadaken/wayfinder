@@ -7555,6 +7555,14 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
     }
 }
 
+/// D-91: how often `run_job` polls its worker thread for completion (Trash,
+/// permanent delete, unmount/eject, etc.). Was 150ms; measured to add a flat
+/// ~150ms to every job-based operation regardless of directory size (Round
+/// 150). 16ms matches this file's own next-frame convention (see the
+/// post-rename scroll-restore `timeout_add_local_once(Duration::from_millis(16))`
+/// above) and is imperceptible while still cheap to poll.
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 fn run_job<F, A>(state: Rc<RefCell<AppState>>, ui: Ui, label: String, job: F, after_success: A)
 where
     F: FnOnce() -> Result<JobOutcome, String> + Send + 'static,
@@ -7567,7 +7575,7 @@ where
         let _ = tx.send(job());
     });
 
-    glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || match rx.try_recv() {
         Ok(Ok(outcome)) => {
             after_success(&state, &ui, &outcome);
             if let Some(undo) = outcome.undo.clone() {
@@ -9686,6 +9694,16 @@ fn spawn_child(ui: &Ui, launch: ChildLaunch) -> Result<(), native_core::LaunchEr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_poll_interval_is_a_frame_not_a_stall() {
+        // D-91 regression guard: run_job's completion poll must stay at a
+        // single-frame cadence. It was 150ms and added a flat ~150ms to every
+        // job-based operation (Trash, unmount, eject, ...) regardless of
+        // directory size (Round 150 measurement). Never let it drift back up.
+        assert_eq!(super::JOB_POLL_INTERVAL, std::time::Duration::from_millis(16));
+        assert!(super::JOB_POLL_INTERVAL < std::time::Duration::from_millis(50));
+    }
+
     #[test]
     fn transfer_seam_cancel_starts_nothing_and_cut_clears_only_on_success() {
         let started = std::cell::Cell::new(0);
