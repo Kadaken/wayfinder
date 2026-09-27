@@ -1548,6 +1548,19 @@ fn guide_find(root: &gtk::Widget, name: &str, out: &mut Vec<gtk::Widget>) {
     }
 }
 
+/// A tag's real widget name: itself, unless the registry gives it a narrow
+/// `"alias"` field, in which case it resolves to that other tag's name one
+/// hop -- the widget on screen is still only ever named the aliased tag, so
+/// a new tag can point at an existing tutorial's real target without
+/// renaming that widget or touching its own accepted tag.
+#[cfg(feature = "guide")]
+fn guide_alias_target(name: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(GUIDE_REGISTRY)
+        .ok()
+        .and_then(|r| r.get(name)?.get("alias")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| name.to_string())
+}
+
 /// Binds the pending request to its one real widget. Clear and unknown requests
 /// leave no target; a known one binds only when exactly one live widget carries
 /// the name (none: stays pending; several: fails closed).
@@ -1557,7 +1570,7 @@ fn guide_resolve(state: &Rc<RefCell<AppState>>) {
     let target = match request {
         GuideRequest::Known { name, .. } => ui_for_state(state).and_then(|ui| {
             let mut found = Vec::new();
-            guide_find(ui.window.upcast_ref(), &name, &mut found);
+            guide_find(ui.window.upcast_ref(), &guide_alias_target(&name), &mut found);
             (found.len() == 1).then(|| found[0].downgrade())
         }),
         _ => None,
@@ -2529,6 +2542,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     {
         guide_name(&terminal, "terminal-here-folder");
         guide_name(&trash, "trash-and-restore-file");
+        guide_name(&rename, "rename-in-place");
     }
     let details_view = gtk::ToggleButton::builder()
         .icon_name("view-list-symbolic")
@@ -10284,6 +10298,7 @@ mod tests {
         context_menu_actions_fire_once_and_leave_no_popover_d54();
         child_apps_launch_with_the_window_context_d57();
         thumbnail_queue_caps_concurrency_and_drains_on_cancel_d84();
+        corrupt_image_keeps_fallback_and_queue_drains_to_follower_d152();
         video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
@@ -10295,6 +10310,8 @@ mod tests {
         guide_target_names_are_exact_d50();
         #[cfg(feature = "guide")]
         guide_pending_targets_resolve_d51();
+        #[cfg(feature = "guide")]
+        guide_rename_target_and_delete_speed_alias_d152();
     }
 
     /// D-84: a disposable fixture of tiny real (not real-photo) PNGs proves the
@@ -10376,6 +10393,78 @@ mod tests {
         assert!(queue.borrow().pending.is_empty(), "cancellation must drop the rest of the queued work");
     }
 
+    /// Round 152: a real on-disk corrupt image (a valid PNG's encoded bytes
+    /// truncated mid-stream, not an extension-only empty placeholder) proves
+    /// `start_thumbnail_jobs`'s existing decode-error branch (no-op on `Err`,
+    /// always calls `finish_thumbnail_job`) already does the right thing: the
+    /// corrupt tile keeps its pre-set fallback icon, the job slot is
+    /// released, and a valid follower right behind it in the queue still
+    /// gets a real decoded thumbnail.
+    fn corrupt_image_keeps_fallback_and_queue_drains_to_follower_d152() {
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d152-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        // A real, CRC-correct minimal 1x1 grayscale+alpha PNG (verified
+        // against this box's real gdk-pixbuf decode path -- the codebase's
+        // older TINY_PNG fixture in the D-84 test above has a wrong IHDR
+        // CRC and silently never decodes here; that test never checks
+        // decode content so it never caught it, but this test does, so it
+        // needed a fixture whose CRC is actually right).
+        const VALID_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+            0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+            0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60,
+            0x60, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x2b, 0x09, 0x4d, 0x84, 0x00, 0x00, 0x00, 0x00,
+            0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        // Same real signature and IHDR as the valid fixture above, so the
+        // real decoder recognizes the format and begins decoding, but the
+        // IDAT/IEND tail is cut off mid-stream -- a real decode failure, not
+        // an unrecognized-format rejection.
+        let corrupt_path = root.join("corrupt.png");
+        std::fs::write(&corrupt_path, &VALID_PNG[..30]).unwrap();
+        let follower_path = root.join("follower.png");
+        std::fs::write(&follower_path, VALID_PNG).unwrap();
+
+        let corrupt_picture = gtk::Picture::new();
+        let follower_picture = gtk::Picture::new();
+        assert!(corrupt_picture.paintable().is_none(), "tile starts on the fallback icon, not a paintable");
+        let queue = Rc::new(RefCell::new(ThumbnailQueue {
+            cancelled: gio::Cancellable::new(),
+            pending: VecDeque::from(vec![
+                ThumbnailJob { path: corrupt_path.to_string_lossy().to_string(), picture: corrupt_picture.clone(), width: 32, height: 32 },
+                ThumbnailJob { path: follower_path.to_string_lossy().to_string(), picture: follower_picture.clone(), width: 32, height: 32 },
+            ]),
+            active: 0,
+        }));
+
+        start_thumbnail_jobs(queue.clone());
+        let ctx = glib::MainContext::default();
+        for _ in 0..200 {
+            while ctx.iteration(false) {}
+            if queue.borrow().active == 0 && queue.borrow().pending.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(queue.borrow().active, 0, "the job slot must be released after the corrupt decode, not left held");
+        assert!(queue.borrow().pending.is_empty(), "the queue must drain past the corrupt entry, not stall on it");
+        assert!(
+            corrupt_picture.paintable().is_none(),
+            "a corrupt file must leave the normal fallback icon in place, never blank or broken"
+        );
+        assert!(
+            follower_picture.paintable().is_some(),
+            "the valid follower right behind the corrupt entry must still receive its real decoded thumbnail"
+        );
+        // The main loop kept iterating and this function returned within the
+        // bounded loop above (not by panic or abort): the app stayed
+        // responsive through the corrupt decode, exactly as a real corrupt
+        // file dropped into a live Grid folder would.
+    }
 
     /// D-85: a disposable synthetic short H.264/mp4 clip (never an owner
     /// video) proves the poster queue actually paints a real decoded frame,
@@ -13191,11 +13280,149 @@ mod tests {
         }
     }
 
+    /// Round 152: the new Rename target and the new alias-only Delete-speed
+    /// tag. Covers registry classification, unique alias resolution to the
+    /// real Trash button, both circle marks, click-through, clearing after
+    /// use, and that the legacy `trash-and-restore-file` tag keeps working
+    /// unaliased and unrenamed.
+    #[cfg(feature = "guide")]
+    fn guide_rename_target_and_delete_speed_alias_d152() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d152-guide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let gdir = root.join("guide");
+        for d in [&home, &dir, &gdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d152guidetest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        pump();
+
+        // 1. Registry classification: both new tags are known, exactly one
+        // real widget carries "rename-in-place", and none carries the
+        // alias-only "delete-speed" (its widget stays named the legacy tag).
+        let registry: serde_json::Value = serde_json::from_str(GUIDE_REGISTRY).unwrap();
+        assert!(registry.get("rename-in-place").is_some(), "rename-in-place is a known tag");
+        assert!(registry.get("delete-speed").is_some(), "delete-speed is a known tag");
+        assert_eq!(
+            registry.get("delete-speed").and_then(|v| v.get("alias")).and_then(|v| v.as_str()),
+            Some("trash-and-restore-file"),
+            "delete-speed aliases the existing tag, not a renamed widget"
+        );
+        let by_name = |n: &str| -> Vec<gtk::Widget> {
+            all_widgets(ui.window.upcast_ref()).into_iter().filter(|w| w.widget_name() == n).collect()
+        };
+        assert_eq!(by_name("rename-in-place").len(), 1, "exactly one real Rename target");
+        assert!(by_name("delete-speed").is_empty(), "no widget is ever renamed to the alias tag itself");
+        let trash_widget = by_name("trash-and-restore-file");
+        assert_eq!(trash_widget.len(), 1, "the legacy trash tag still names its one real widget");
+
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let pending = || state.borrow().guide_pending.clone();
+        let target = || guide_live_target(&state);
+        let mut serial = 0;
+        let mut put = |name: &str| -> GuideRequest {
+            serial += 1;
+            let label = format!("L{serial}");
+            let tmp = gdir.join("wayfinder.json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, &label) };
+            wait_for("guide request", || pending() == want);
+            want
+        };
+
+        // 2. Unique target resolution: the new alias tag resolves to the
+        // SAME real widget as the legacy tag, through the one-hop alias.
+        put("delete-speed");
+        assert_eq!(target().as_ref(), Some(&trash_widget[0]), "delete-speed resolves to the real trash button");
+        put("trash-and-restore-file");
+        assert_eq!(target().as_ref(), Some(&trash_widget[0]), "the legacy tag still resolves to the same real widget (no rename, no break)");
+
+        // 3. Both circle marks: each tag's own mark comes from its own
+        // registry entry, not the aliased target's.
+        assert_eq!(guide_mark_for("rename-in-place"), Some(GuideMark::Circle), "Rename target draws a circle");
+        assert_eq!(guide_mark_for("delete-speed"), Some(GuideMark::Circle), "Delete-speed draws a circle too");
+        put("rename-in-place");
+        guide_paint(&state);
+        pump();
+        let rename_widget = by_name("rename-in-place").pop().expect("rename target");
+        let ring_on = |w: &gtk::Widget| -> bool {
+            let mut cur = w.parent();
+            while let Some(c) = cur {
+                if c.has_css_class("wf-guide-circle") {
+                    return true;
+                }
+                cur = c.parent();
+            }
+            w.has_css_class("wf-guide-circle")
+        };
+        assert!(ring_on(&rename_widget), "the Rename circle mark is actually drawn on the real button");
+
+        // 4. Pass-through activation: the marked Rename button is still a
+        // real, clickable, focusable, sensitive control -- the guide mark
+        // changes no allocation and blocks no input.
+        assert!(rename_widget.is_sensitive(), "marked target stays sensitive");
+        assert!(rename_widget.can_target(), "marked target stays click-through-able (still targetable itself; the ring never steals input)");
+        let rename_button = rename_widget.downcast_ref::<gtk::Button>().expect("Rename is a real Button");
+        let clicked = Rc::new(std::cell::Cell::new(false));
+        let handler = rename_button.connect_clicked({
+            let clicked = clicked.clone();
+            move |_| clicked.set(true)
+        });
+        rename_button.emit_clicked();
+        pump();
+        assert!(clicked.get(), "a real click still reaches the marked control");
+        rename_button.disconnect(handler);
+
+        // 5. Clearing after use: an empty highlight clears the mark and the
+        // target, leaving the widget exactly as it was.
+        put("");
+        assert!(target().is_none(), "clearing drops the target");
+        guide_unpaint(&state);
+        pump();
+        assert!(!ring_on(&rename_widget), "the circle is gone once cleared");
+        assert!(rename_widget.is_sensitive() && rename_widget.can_target(), "the widget is unchanged after clearing");
+
+        // 6. Legacy compatibility: after all of this, the old
+        // `trash-and-restore-file` tag is exactly as usable as before --
+        // same widget, same one-shot resolve, no residue from the alias.
+        put("trash-and-restore-file");
+        assert_eq!(target().as_ref(), Some(&trash_widget[0]));
+        assert_eq!(by_name("trash-and-restore-file").len(), 1, "still exactly one real widget on the legacy tag");
+        put("");
+
+        ui.window.destroy();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[cfg(feature = "guide")]
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 15);
+        assert_eq!(keys.len(), 17);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -13237,7 +13464,11 @@ mod tests {
                 .collect()
         };
         let twin = icon_button("edit-undo-symbolic", "twin");
-        for (tip, key) in [("Terminal here", "terminal-here-folder"), ("Move to Trash", "trash-and-restore-file")] {
+        for (tip, key) in [
+            ("Terminal here", "terminal-here-folder"),
+            ("Move to Trash", "trash-and-restore-file"),
+            ("Rename", "rename-in-place"),
+        ] {
             let found = toolbar_button(tip);
             assert_eq!(found.len(), 1, "one command-bar button for {tip}");
             let b = &found[0];
@@ -13246,7 +13477,7 @@ mod tests {
             assert_eq!((b.is_focusable(), b.can_target()), (twin.is_focusable(), twin.can_target()));
             assert_eq!(b.width(), toolbar_button("Copy")[0].width(), "naming moved nothing");
         }
-        assert_eq!(named(ui.window.upcast_ref()), vec!["terminal-here-folder", "trash-and-restore-file"]);
+        assert_eq!(named(ui.window.upcast_ref()), vec!["rename-in-place", "terminal-here-folder", "trash-and-restore-file"]);
 
         // Open With: the real connected opener in the item menu.
         let has_right_click = |w: &gtk::Widget| {
@@ -13344,7 +13575,12 @@ mod tests {
         seen.insert("open-file-other-app".to_string());
         seen.insert("drive-space-bars".to_string());
         seen.insert("drive-mounted-again-crucial".to_string());
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all fifteen keys, each on its real control");
+        // "delete-speed" is alias-only (Round 152): it has no widget of its
+        // own named "delete-speed" -- it resolves through the registry's
+        // "alias" field to the real "trash-and-restore-file" button, which
+        // is already covered above.
+        seen.insert("delete-speed".to_string());
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "every registry key is either on its own real control or a covered alias");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
         }

@@ -13,5 +13,7 @@
   "item-menu-cap-d56": { "kind": "item context-menu scroller", "mark": "arrow", "where": "file right-click item menu, the whole menu surface" },
   "drive-space-bars": { "kind": "sidebar heading", "mark": "arrow", "where": "the Devices heading above the drive rows in the sidebar" },
   "open-file-other-app": { "kind": "file item", "mark": "circle", "where": "Throwaways folder, the open-me.txt item in the active file view" },
-  "trash-and-restore-file": { "kind": "toolbar button", "mark": "circle", "where": "command bar, before the divider that precedes Undo" }
+  "trash-and-restore-file": { "kind": "toolbar button", "mark": "circle", "where": "command bar, before the divider that precedes Undo" },
+  "rename-in-place": { "kind": "toolbar button", "mark": "circle", "where": "command bar, the Rename control" },
+  "delete-speed": { "kind": "toolbar button", "mark": "circle", "where": "command bar, before the divider that precedes Undo", "alias": "trash-and-restore-file" }
 }
