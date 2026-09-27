@@ -1,6 +1,7 @@
 {
   "terminal-here-folder": { "kind": "toolbar button", "mark": "circle", "where": "command bar, immediately after Undo" },
   "open-with-other-app": { "kind": "context-menu side-menu opener", "mark": "arrow", "where": "file right-click menu" },
+  "drive-mounted-again-crucial": { "kind": "file view", "mark": "arrow", "where": "the active file view while browsing the Launch Box SSD 2TB mount or a folder below it" },
   "drive-open-crucial": { "kind": "drive context-menu item", "mark": "arrow", "where": "DEVICES row right-click menu" },
   "drive-open-stick": { "kind": "drive context-menu item", "mark": "arrow", "where": "DEVICES row right-click menu" },
   "drive-unmount-crucial": { "kind": "drive context-menu item", "mark": "arrow", "where": "mounted drive's DEVICES row right-click menu" },
