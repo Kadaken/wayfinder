@@ -316,9 +316,15 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo build --release --manifest-path src-tauri/Cargo.toml
 # → src-tauri/target/release/wayfinder-native
 
-# Optional user-local install
-install -Dm755 src-tauri/target/release/wayfinder-native ~/.local/bin/wayfinder
+# Optional user-local install (the only sanctioned way to replace the daily app)
+scripts/install-daily.sh <change-label> src-tauri/target/release/wayfinder-native
 ```
+
+**Hard rule: no daily replacement without a verified rollback copy first.**
+`scripts/install-daily.sh` saves the current `~/.local/bin/wayfinder` as
+`wayfinder.pre-<change-label>-<old-short-sha>`, verifies it, and only then
+swaps in the new binary atomically. Never copy over the daily by hand. Its
+fixture tests are `scripts/test-install-daily.sh`.
 
 The `--features native` flag is gone: GTK is no longer optional, because there
 is no other shell to build. The old `npm run native:build` script is gone too —
