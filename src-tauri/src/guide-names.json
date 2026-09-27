@@ -9,6 +9,7 @@
   "drive-remount-stick": { "kind": "drive context-menu item", "mark": "arrow", "where": "unmounted stick's DEVICES row right-click menu" },
   "item-menu-full-d60": { "kind": "item context-menu content", "mark": "arrow", "where": "file right-click item menu, the list of every action" },
   "item-menu-cap-d56": { "kind": "item context-menu scroller", "mark": "arrow", "where": "file right-click item menu, the whole menu surface" },
+  "drive-space-bars": { "kind": "sidebar heading", "mark": "arrow", "where": "the Devices heading above the drive rows in the sidebar" },
   "open-file-other-app": { "kind": "file item", "mark": "circle", "where": "Throwaways folder, the open-me.txt item in the active file view" },
   "trash-and-restore-file": { "kind": "toolbar button", "mark": "circle", "where": "command bar, before the divider that precedes Undo" }
 }

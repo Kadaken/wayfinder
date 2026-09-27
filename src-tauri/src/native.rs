@@ -1604,6 +1604,30 @@ fn guide_note_opened(state: &Rc<RefCell<AppState>>, entry: &Entry) {
     guide_unpaint(state);
 }
 
+/// D-76: the Devices heading, the one target for the drive space words and bars.
+#[cfg(feature = "guide")]
+const GUIDE_DRIVE_SPACE: &str = "drive-space-bars";
+
+#[cfg(feature = "guide")]
+fn guide_waits_for_drive_space(state: &Rc<RefCell<AppState>>) -> bool {
+    matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_DRIVE_SPACE)
+}
+
+/// One post-layout resolve after a sidebar rebuild: the fresh heading is allocated only after the
+/// sidebar lays out. Nothing runs when the pending request is not this one.
+#[cfg(feature = "guide")]
+fn guide_resolve_drive_space_later(state: &Rc<RefCell<AppState>>) {
+    if !guide_waits_for_drive_space(state) {
+        return;
+    }
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        if guide_waits_for_drive_space(&state) {
+            guide_resolve(&state);
+        }
+    });
+}
+
 /// Connects the one clear-on-use callback to the painted button. It clears only
 /// while the activated button is still this window's bound target, so a stale,
 /// duplicate, unresolved or other-window control can never clear the request.
@@ -1859,7 +1883,7 @@ fn guide_paint(state: &Rc<RefCell<AppState>>) {
         }
         GuideMark::Arrow => guide_arrow_popover(&target, &label),
     };
-    if target.is::<gtk::ScrolledWindow>() || name == "item-menu-full-d60" {
+    if target.is::<gtk::ScrolledWindow>() || name == "item-menu-full-d60" || name == GUIDE_DRIVE_SPACE {
         // The item menu's scroller and content are allocated only after it maps: it resolves again
         // once laid out, so this places the popover once against the real box, never an empty one.
         if target.width() <= 0 || target.height() <= 0 {
@@ -3451,6 +3475,12 @@ fn edit_path_action(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    // D-76: the old Devices heading goes away below, so only this request's own visual comes off
+    // first; another tutorial painted elsewhere is never touched.
+    #[cfg(feature = "guide")]
+    if guide_waits_for_drive_space(state) {
+        guide_unpaint(state);
+    }
     while let Some(child) = ui.sidebar.first_child() {
         ui.sidebar.remove(&child);
     }
@@ -3495,6 +3525,9 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 
     let drives = state.borrow().drives.clone();
     if !drives.is_empty() {
+        #[cfg(feature = "guide")]
+        guide_name(&append_sidebar_heading(&ui.sidebar, "Devices"), GUIDE_DRIVE_SPACE);
+        #[cfg(not(feature = "guide"))]
         append_sidebar_heading(&ui.sidebar, "Devices");
         for drive in drives {
             let view = drive.space_view();
@@ -3574,6 +3607,8 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             ui.sidebar.append(&row);
         }
     }
+    #[cfg(feature = "guide")]
+    guide_resolve_drive_space_later(state);
 }
 
 fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListBoxRow) {
@@ -3732,7 +3767,7 @@ fn update_sidebar_active_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 }
 
-fn append_sidebar_heading(sidebar: &gtk::ListBox, text: &str) {
+fn append_sidebar_heading(sidebar: &gtk::ListBox, text: &str) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::builder()
         .activatable(false)
         .selectable(false)
@@ -3748,6 +3783,7 @@ fn append_sidebar_heading(sidebar: &gtk::ListBox, text: &str) {
     label.add_css_class("wf-sidebar-heading");
     row.set_child(Some(&label));
     sidebar.append(&row);
+    row
 }
 
 fn sidebar_row(name: &str, detail: &str, icon_name: &str) -> gtk::ListBoxRow {
@@ -11261,7 +11297,7 @@ mod tests {
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 12);
+        assert_eq!(keys.len(), 13);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -11391,7 +11427,8 @@ mod tests {
         seen.insert("item-menu-cap-d56".to_string());
         seen.insert("item-menu-full-d60".to_string());
         seen.insert("open-file-other-app".to_string());
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all twelve keys, each on its real control");
+        seen.insert("drive-space-bars".to_string());
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all thirteen keys, each on its real control");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
         }
@@ -12789,6 +12826,16 @@ mod tests {
             });
             TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = Some(scan));
         }
+        #[cfg(feature = "guide")]
+        let old_guide = std::env::var("WF_GUIDE_FILE").ok();
+        #[cfg(feature = "guide")]
+        let guide_file = {
+            let gdir = root.join("guide");
+            std::fs::create_dir_all(&gdir).unwrap();
+            let file = gdir.join("wayfinder.json");
+            std::env::set_var("WF_GUIDE_FILE", &file);
+            file
+        };
         let app = adw::Application::builder()
             .application_id("com.kadaken.wayfinder.d46test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -12821,6 +12868,54 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one refresh in flight at most");
         assert!(state.borrow().drive_refresh_in_flight && state.borrow().drive_refresh_again);
         assert!(state.borrow().drives.is_empty());
+
+        // D-76: the request arrives before any scan result. It waits with no visual and no target.
+        #[cfg(feature = "guide")]
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        #[cfg(feature = "guide")]
+        let put = |name: &str, label: &str| {
+            let tmp = guide_file.with_extension("json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &guide_file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || state.borrow().guide_pending == want);
+            pump();
+        };
+        #[cfg(feature = "guide")]
+        let tree = || all_widgets(ui.window.upcast_ref());
+        #[cfg(feature = "guide")]
+        let named = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+        #[cfg(feature = "guide")]
+        let label_pops = || -> Vec<gtk::Popover> {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).collect()
+        };
+        #[cfg(feature = "guide")]
+        {
+            put("drive-space-bars", "Free space for each drive");
+            assert!(named("drive-space-bars").is_empty(), "nothing is named before the first scan");
+            assert!(guide_marked(tree()).is_empty() && label_pops().is_empty(), "a visual appeared before the scan");
+            assert_eq!(state.borrow().guide_pending, known("drive-space-bars", "Free space for each drive"));
+        }
+        #[cfg(feature = "guide")]
+        let one_arrow = |why: &str| -> gtk::Widget {
+            wait_for(why, || guide_marked(tree()).len() == 1 && label_pops().len() == 1);
+            let marked = guide_marked(tree());
+            assert_eq!(marked.len(), 1, "{why}: exactly one target");
+            let heading = named("drive-space-bars");
+            assert_eq!(heading.len(), 1, "{why}: exactly one named widget");
+            assert_eq!(heading[0], marked[0], "{why}: the named heading is the marked one");
+            let row = heading[0].downcast_ref::<gtk::ListBoxRow>().expect("the heading row");
+            assert!(row.is_mapped() && row.height() > 0);
+            let text = row.child().and_downcast::<gtk::Label>().expect("heading label");
+            assert_eq!(text.label(), "Devices", "{why}: the heading text is unchanged");
+            let pops = label_pops();
+            assert!(pops[0].has_css_class("wf-guide-arrow") && !pops[0].can_target() && !pops[0].can_focus());
+            let shown = all_widgets(pops[0].upcast_ref()).iter().find_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.label().to_string()));
+            assert_eq!(shown.as_deref(), Some("Free space for each drive"), "{why}: exact label");
+            let stray: Vec<_> = tree().into_iter().filter(|w| w.widget_name() == "drive-space-bars" && (w.is::<gtk::ProgressBar>() || w.parent().is_some_and(|p| p.is::<gtk::Box>()))).collect();
+            assert!(stray.is_empty(), "{why}: no drive row or bar is named");
+            marked[0].clone()
+        };
 
         let rows = |ui: &Ui| -> Vec<(String, String, usize, gtk::ListBoxRow)> {
             all_widgets(ui.sidebar.upcast_ref())
@@ -12860,6 +12955,8 @@ mod tests {
         });
         assert!(threads.lock().unwrap().iter().all(|t| *t != main_thread), "scan ran on the window thread");
         pump();
+        #[cfg(feature = "guide")]
+        let first_heading = one_arrow("arrow after the first scan");
 
         let (_, words, bars, row_a) = row_named(&ui, "SynA").expect("mounted drive row");
         assert_eq!((words.as_str(), bars), ("25 GB available", 1));
@@ -12892,6 +12989,68 @@ mod tests {
         assert!(["SynB", "SynC", "SynZ"].iter().all(|n| row_named(&ui, n).is_none()), "stale drive rows");
         let (_, words, bars, _) = row_named(&ui, "SynA").expect("unmounted drive row");
         assert_eq!((words.as_str(), bars), ("Space unavailable", 0));
+
+        // D-76: a refresh rebuilds the sidebar. The stale heading loses its arrow before it goes,
+        // and one fresh heading is bound after.
+        #[cfg(feature = "guide")]
+        {
+            let refresh = |list: Vec<Drive>| {
+                let n = calls.load(Ordering::SeqCst);
+                *listing.lock().unwrap() = list;
+                request_drive_refresh(&state);
+                wait_for("guide refresh scan", || calls.load(Ordering::SeqCst) == n + 1 && !state.borrow().drive_refresh_in_flight);
+                pump();
+            };
+            let stale = first_heading.downgrade();
+            drop(first_heading);
+            let second = one_arrow("arrow reacquired after the replacement refresh");
+            assert!(stale.upgrade().is_none_or(|old| old != second && !old.is_ancestor(&ui.window)), "the stale heading is gone");
+            let (_, words, bars, _) = row_named(&ui, "SynA").expect("drive row");
+            assert_eq!((words.as_str(), bars), ("Space unavailable", 0), "drive values unchanged by the arrow");
+            assert_eq!(geometry(&ui), before, "geometry moved with the arrow drawn");
+
+            let stale = second.downgrade();
+            drop(second);
+            refresh(vec![drive("SynA", Some(&mount_a), space(100, 25))]);
+            let third = one_arrow("arrow after a second refresh");
+            assert!(stale.upgrade().is_none_or(|old| old != third));
+            let (_, words, bars, _) = row_named(&ui, "SynA").expect("drive row");
+            assert_eq!((words.as_str(), bars), ("25 GB available", 1), "the 75% bar is intact under the arrow");
+            drop(third);
+
+            // The list empties: no heading, so no visual, but the request stays pending.
+            refresh(vec![]);
+            assert!(named("drive-space-bars").is_empty());
+            assert!(guide_marked(tree()).is_empty() && label_pops().is_empty(), "a visual survived an empty drive list");
+            assert_eq!(state.borrow().guide_pending, known("drive-space-bars", "Free space for each drive"));
+            assert!(state.borrow().guide_target.as_ref().is_none_or(|t| t.upgrade().is_none()));
+            // The drives return: it binds once.
+            refresh(vec![drive("SynA", Some(&mount_a), space(100, 25))]);
+            let back = one_arrow("arrow reacquired when the drives returned");
+
+            // Another tutorial painted while the sidebar rebuilds is never removed or replaced.
+            drop(back);
+            put("terminal-here-folder", "Terminal");
+            let circle = guide_marked(tree());
+            assert_eq!(circle.len(), 1);
+            assert_eq!(circle[0].widget_name(), "terminal-here-folder");
+            refresh(vec![drive("SynA", None, None)]);
+            pump();
+            let after = guide_marked(tree());
+            assert_eq!(after, circle, "a sidebar rebuild moved another tutorial's visual");
+            assert_eq!(state.borrow().guide_pending, known("terminal-here-folder", "Terminal"));
+
+            // Back to this request, then clear: nothing is left.
+            put("drive-space-bars", "Free space for each drive");
+            one_arrow("arrow after switching back");
+            put("", "");
+            assert!(guide_marked(tree()).is_empty() && label_pops().is_empty(), "clear left a visual");
+            assert!(named("drive-space-bars").len() == 1, "the heading keeps its name; only the visual clears");
+            match &old_guide {
+                Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+                None => std::env::remove_var("WF_GUIDE_FILE"),
+            }
+        }
 
         ui.window.destroy();
         TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
