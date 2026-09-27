@@ -3044,8 +3044,8 @@ fn asset_toggle_button(asset_name: &str, tooltip: &str, active: bool) -> gtk::To
     button.add_css_class("wf-icon-button");
     size_toolbar_button(&button);
 
-    if let Some(path) = wayfinder_ui_icon_path(asset_name) {
-        let icon = gtk::Picture::for_filename(path);
+    if let Some(texture) = packaged_icon_texture(UI_ICON_BYTES, asset_name) {
+        let icon = gtk::Picture::for_paintable(&texture);
         icon.set_can_shrink(true);
         icon.set_content_fit(gtk::ContentFit::Contain);
         icon.set_size_request(16, 16);
@@ -3961,8 +3961,8 @@ fn sidebar_icon(icon_name: &str) -> gtk::Box {
     slot.set_valign(gtk::Align::Center);
 
     if let Some(asset_name) = icon_name.strip_prefix("asset:") {
-        if let Some(path) = old_wayfinder_asset_icon_path(asset_name) {
-            let icon = gtk::Picture::for_filename(path);
+        if let Some(texture) = packaged_icon_texture(SIDEBAR_ICON_BYTES, asset_name) {
+            let icon = gtk::Picture::for_paintable(&texture);
             icon.set_can_shrink(true);
             icon.set_content_fit(gtk::ContentFit::Contain);
             icon.set_size_request(18, 18);
@@ -3982,53 +3982,33 @@ fn sidebar_icon(icon_name: &str) -> gtk::Box {
     slot
 }
 
-fn old_wayfinder_asset_icon_path(name: &str) -> Option<PathBuf> {
-    let filename = format!("{name}.png");
-    let mut candidates = Vec::new();
+/// Every custom sidebar PNG, compiled into the executable so an installed
+/// build never looks for icon files in a build tree, HOME or the working folder.
+const SIDEBAR_ICON_BYTES: &[(&str, &[u8])] = &[
+    ("desktop", include_bytes!("../../static/icons/sidebar/desktop.png")),
+    ("documents", include_bytes!("../../static/icons/sidebar/documents.png")),
+    ("downloads", include_bytes!("../../static/icons/sidebar/downloads.png")),
+    ("folders", include_bytes!("../../static/icons/sidebar/folders.png")),
+    ("gdrive", include_bytes!("../../static/icons/sidebar/gdrive.png")),
+    ("home", include_bytes!("../../static/icons/sidebar/home.png")),
+    ("music", include_bytes!("../../static/icons/sidebar/music.png")),
+    ("network", include_bytes!("../../static/icons/sidebar/network.png")),
+    ("pictures", include_bytes!("../../static/icons/sidebar/pictures.png")),
+    ("storage", include_bytes!("../../static/icons/sidebar/storage.png")),
+    ("trash", include_bytes!("../../static/icons/sidebar/trash.png")),
+    ("video", include_bytes!("../../static/icons/sidebar/video.png")),
+];
 
-    if let Some(project_dir) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        candidates.push(project_dir.join("static/icons/sidebar").join(&filename));
-        candidates.push(project_dir.join("static/icons").join(&filename));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(&home)
-                .join(".local/share/wayfinder/icons/sidebar")
-                .join(&filename),
-        );
-        candidates.push(
-            PathBuf::from(home)
-                .join(".local/share/wayfinder/icons")
-                .join(&filename),
-        );
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("static/icons/sidebar").join(&filename));
-        candidates.push(cwd.join("static/icons").join(&filename));
-    }
+/// Both custom toolbar PNGs, packaged the same way.
+const UI_ICON_BYTES: &[(&str, &[u8])] = &[
+    ("view-list-compact", include_bytes!("../../static/icons/ui/view-list-compact.png")),
+    ("view-grid", include_bytes!("../../static/icons/ui/view-grid.png")),
+];
 
-    candidates.into_iter().find(|path| path.exists())
-}
-
-fn wayfinder_ui_icon_path(name: &str) -> Option<PathBuf> {
-    let filename = format!("{name}.png");
-    let mut candidates = Vec::new();
-
-    if let Some(project_dir) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        candidates.push(project_dir.join("static/icons/ui").join(&filename));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join(".local/share/wayfinder/icons/ui")
-                .join(&filename),
-        );
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("static/icons/ui").join(&filename));
-    }
-
-    candidates.into_iter().find(|path| path.exists())
+/// Decodes a packaged icon; an unknown name or undecodable bytes give None.
+fn packaged_icon_texture(table: &[(&str, &'static [u8])], name: &str) -> Option<gdk::Texture> {
+    let (_, bytes) = table.iter().find(|(known, _)| *known == name)?;
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(bytes)).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9791,6 +9771,112 @@ mod tests {
         }
     }
 
+    /// The diagnostic contract: every real sidebar icon and both real toolbar
+    /// icons must hold a decoded, nonempty paintable. Returns each failure.
+    fn real_icon_widget_failures_d80(ui: &Ui) -> Vec<String> {
+        let mut failures = Vec::new();
+        let widgets = all_widgets(ui.window.upcast_ref());
+        let real_texture = |p: &gtk::Picture| {
+            p.paintable()
+                .and_then(|x| x.downcast::<gdk::Texture>().ok())
+                .map_or(false, |t| t.width() > 0 && t.height() > 0)
+        };
+        let sidebar_pictures: Vec<gtk::Picture> = widgets
+            .iter()
+            .filter_map(|w| w.clone().downcast::<gtk::Picture>().ok())
+            .filter(|p| p.width_request() == 18)
+            .collect();
+        if sidebar_pictures.len() < 3 {
+            failures.push(format!("sidebar has {} icon pictures, expected at least 3", sidebar_pictures.len()));
+        }
+        if !sidebar_pictures.iter().all(real_texture) {
+            failures.push("a sidebar icon has no decoded paintable".to_string());
+        }
+        for tip in ["Compact details", "Icons"] {
+            let picture = widgets
+                .iter()
+                .filter_map(|w| w.clone().downcast::<gtk::ToggleButton>().ok())
+                .find(|b| b.tooltip_text().as_deref() == Some(tip))
+                .and_then(|b| b.child())
+                .and_then(|c| c.downcast::<gtk::Picture>().ok());
+            if !picture.as_ref().map_or(false, real_texture) {
+                failures.push(format!("toolbar {tip} has no decoded paintable"));
+            }
+        }
+        failures
+    }
+
+    /// D-80: every custom sidebar and toolbar PNG is compiled in, decodes, and
+    /// reaches the real widgets as a nonempty texture without any icon file on disk.
+    fn packaged_icons_d80(dir: &std::path::Path) {
+        let names: Vec<&str> = SIDEBAR_ICON_BYTES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            ["desktop", "documents", "downloads", "folders", "gdrive", "home", "music", "network", "pictures", "storage", "trash", "video"]
+        );
+        let ui_names: Vec<&str> = UI_ICON_BYTES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(ui_names, ["view-list-compact", "view-grid"]);
+        // A production name cannot lack packaged bytes.
+        let place_names = ["Home", "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "Root", "Trash", "Unlisted place"];
+        let mut used: Vec<&str> = place_names.iter().map(|p| place_icon(p)).collect();
+        for kind in ["network", "gdrive", "usb"] {
+            let drive = Drive {
+                name: "d".into(),
+                path: "synthetic:d80".into(),
+                mountpoint: String::new(),
+                size: 0,
+                fstype: String::new(),
+                kind: kind.into(),
+                removable: false,
+                space: None,
+            };
+            used.push(drive_icon(&drive));
+        }
+        for icon in used {
+            let name = icon.strip_prefix("asset:").expect("custom asset name");
+            assert!(names.contains(&name), "no packaged bytes for {icon}");
+        }
+        for (table, name) in SIDEBAR_ICON_BYTES.iter().map(|(n, _)| (SIDEBAR_ICON_BYTES, *n)).chain(UI_ICON_BYTES.iter().map(|(n, _)| (UI_ICON_BYTES, *n))) {
+            let texture = packaged_icon_texture(table, name).unwrap_or_else(|| panic!("{name} does not decode"));
+            assert!(texture.width() > 0 && texture.height() > 0, "{name} is empty");
+        }
+        assert!(packaged_icon_texture(SIDEBAR_ICON_BYTES, "nonesuch").is_none());
+        assert!(packaged_icon_texture(UI_ICON_BYTES, "home").is_none());
+        assert!(packaged_icon_texture(SIDEBAR_ICON_BYTES, "view-grid").is_none());
+
+        // The real window holds real paintables, not the theme fallback.
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d80")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (_, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        let failures = real_icon_widget_failures_d80(&ui);
+        assert!(failures.is_empty(), "missing paintables: {failures:?}");
+        ui.window.destroy();
+    }
+
+    /// Fresh-install proof entry: runs alone, on a virtual display, in an empty HOME
+    /// and working folder where no Wayfinder icon directory exists.
+    #[test]
+    fn packaged_icons_fresh_install_d80() {
+        if std::env::var("WAYFINDER_D80_FRESH").as_deref() != Ok("1") {
+            return;
+        }
+        let home = std::env::var("HOME").expect("HOME");
+        assert!(!Path::new(&home).join(".local/share/wayfinder/icons").exists());
+        assert!(!Path::new("static/icons").exists());
+        gtk::init().expect("gtk init on the virtual display");
+        // The fixture folder lives outside HOME, so HOME never gains a file.
+        let dir = PathBuf::from(std::env::var("WAYFINDER_D80_FIXTURE").expect("fixture folder outside HOME"));
+        assert!(dir.is_dir() && !dir.starts_with(&home));
+        packaged_icons_d80(&dir);
+        assert!(!Path::new(&home).join(".local/share/wayfinder/icons").exists());
+    }
+
     /// Runs only under a virtual display (see the env guard), so it can never
     /// open a window on the owner's screen.
     /// All GTK tests share one thread (GTK initializes once) and run only under
@@ -9819,6 +9905,13 @@ mod tests {
         #[cfg(feature = "guide")]
         guide_crucial_back_d77();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
+        {
+            let root = crate::native_core::scratch_root().join(format!("wf-d80-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let _cleanup = ScratchCleanup(root.clone());
+            std::fs::create_dir_all(root.join("fixture")).unwrap();
+            packaged_icons_d80(&root.join("fixture"));
+        }
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
         drag_ghost_builds_compact_translucent_item();
