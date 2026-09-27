@@ -3927,6 +3927,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "drive-eject-stick",
                 "drive-mounted-again-crucial",
                 "drive-open-crucial",
                 "drive-open-stick",
@@ -3964,6 +3965,7 @@ mod tests {
         assert_eq!(
             arrows,
             [
+                "drive-eject-stick",
                 "drive-mounted-again-crucial",
                 "drive-open-crucial",
                 "drive-open-stick",
