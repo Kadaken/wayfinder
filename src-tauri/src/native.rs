@@ -1553,6 +1553,57 @@ fn guide_release_hook(hook: Option<GuideHook>) {
     }
 }
 
+/// D-75: the one fixture item the tutorial points at: the file `open-me.txt` directly inside a
+/// folder named `Throwaways`. Nothing else, and no other file name, is ever named.
+#[cfg(feature = "guide")]
+const GUIDE_OPEN_FILE: &str = "open-file-other-app";
+
+#[cfg(feature = "guide")]
+fn guide_is_open_file_fixture(entry: &Entry) -> bool {
+    let path = Path::new(&entry.path);
+    !entry.is_dir
+        && path.file_name().is_some_and(|n| n == "open-me.txt")
+        && path.parent().and_then(Path::file_name).is_some_and(|n| n == "Throwaways")
+}
+
+#[cfg(feature = "guide")]
+fn guide_waits_for_open_file(state: &Rc<RefCell<AppState>>) -> bool {
+    matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_OPEN_FILE)
+}
+
+/// One post-layout resolve after the fixture item binds or goes away: the item is allocated only
+/// after its view lays out. Nothing runs when the pending request is not this one.
+#[cfg(feature = "guide")]
+fn guide_resolve_open_file_later(state: &Rc<RefCell<AppState>>) {
+    if !guide_waits_for_open_file(state) {
+        return;
+    }
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        if guide_waits_for_open_file(&state) {
+            guide_resolve(&state);
+        }
+    });
+}
+
+/// Observes the existing activation route: opening the bound fixture item clears only this
+/// request. It never opens anything itself; any other item leaves the request alone.
+#[cfg(feature = "guide")]
+fn guide_note_opened(state: &Rc<RefCell<AppState>>, entry: &Entry) {
+    if !guide_is_open_file_fixture(entry) || !guide_waits_for_open_file(state) {
+        return;
+    }
+    if !state.borrow().guide_target.as_ref().is_some_and(|t| t.upgrade().is_some()) {
+        return;
+    }
+    {
+        let mut st = state.borrow_mut();
+        st.guide_pending = GuideRequest::Clear;
+        st.guide_target = None;
+    }
+    guide_unpaint(state);
+}
+
 /// Connects the one clear-on-use callback to the painted button. It clears only
 /// while the activated button is still this window's bound target, so a stale,
 /// duplicate, unresolved or other-window control can never clear the request.
@@ -5463,6 +5514,11 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             line.add_controller(middle);
         }
 
+        #[cfg(feature = "guide")]
+        if guide_is_open_file_fixture(&entry) {
+            guide_name(&line, GUIDE_OPEN_FILE);
+            guide_resolve_open_file_later(&state);
+        }
         item.set_child(Some(&line));
     });
     factory.connect_unbind(move |_, item| {
@@ -5501,6 +5557,14 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 ui_for_unbind.columns.modified.remove_widget(&children[4]);
             }
         }
+        #[cfg(feature = "guide")]
+        if guide_waits_for_open_file(&state_for_unbind)
+            && item.child().is_some_and(|c| c.widget_name() == GUIDE_OPEN_FILE)
+        {
+            // The visual's label is parented to this row: drop it before the row goes.
+            guide_unpaint(&state_for_unbind);
+            guide_resolve_open_file_later(&state_for_unbind);
+        }
         item.set_child(None::<&gtk::Widget>);
     });
 }
@@ -5517,6 +5581,14 @@ fn selected_indices(ui: &Ui) -> Vec<usize> {
 }
 
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    #[cfg(feature = "guide")]
+    {
+        // Rows and grid children are rebuilt: no visual may outlive its old target.
+        if guide_waits_for_open_file(state) {
+            guide_unpaint(state);
+            guide_resolve_open_file_later(state);
+        }
+    }
     let focus_was_in_files = focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid);
     ui.list_store.remove_all();
     while let Some(child) = ui.grid.first_child() {
@@ -5619,6 +5691,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         if view_mode == ViewMode::Grid {
             let grid_child = gtk::FlowBoxChild::builder().tooltip_text(&tooltip).build();
             grid_child.add_css_class("wf-grid-child");
+            #[cfg(feature = "guide")]
+            if guide_is_open_file_fixture(&entry) {
+                guide_name(&grid_child, GUIDE_OPEN_FILE);
+            }
             let grid_item = gtk::Box::new(gtk::Orientation::Vertical, 4);
             grid_item.add_css_class("wf-grid-item");
             grid_item.set_halign(gtk::Align::Center);
@@ -6283,8 +6359,13 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         ui.status.set_label(&format!("{} no longer exists", entry.name));
     } else {
         eprintln!("wf-event: open {}", entry.path);
-        if let Err(err) = native_core::open_path(&entry.path) {
-            ui.status.set_label(&format!("Open failed: {err}"));
+        match native_core::open_path(&entry.path) {
+            Err(err) => ui.status.set_label(&format!("Open failed: {err}")),
+            // D-75: only a launch that succeeded clears the tutorial.
+            #[cfg(feature = "guide")]
+            Ok(()) => guide_note_opened(state, &entry),
+            #[cfg(not(feature = "guide"))]
+            Ok(()) => {}
         }
     }
 }
@@ -9599,6 +9680,8 @@ mod tests {
         guide_ring_and_label_are_drawn_d52();
         #[cfg(feature = "guide")]
         guide_clears_on_use_d53();
+        #[cfg(feature = "guide")]
+        guide_open_file_item_d75();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
@@ -9629,6 +9712,309 @@ mod tests {
         guide_target_names_are_exact_d50();
         #[cfg(feature = "guide")]
         guide_pending_targets_resolve_d51();
+    }
+
+    /// D-75: the tutorial circle on the one real `Throwaways/open-me.txt` item, in list and grid
+    /// views, through navigation, filtering and view switches, and its clear-on-open.
+    #[cfg(feature = "guide")]
+    fn guide_open_file_item_d75() {
+        use std::os::unix::fs::PermissionsExt;
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let old_path = std::env::var("PATH").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d75-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let throwaways = root.join("Throwaways");
+        let elsewhere = root.join("Elsewhere");
+        let gdir = root.join("guide");
+        let bin = root.join("bin");
+        for d in [&home, &throwaways, &elsewhere, &gdir, &bin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(throwaways.join("open-me.txt"), "THROWAWAY OPEN ME").unwrap();
+        std::fs::write(throwaways.join("other.txt"), "other").unwrap();
+        std::fs::write(elsewhere.join("open-me.txt"), "same name, wrong parent").unwrap();
+        // A recording xdg-open: the unchanged open route runs it, and the log counts the opens.
+        let log = root.join("opens.log");
+        let fake = bin.join("xdg-open");
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$1\" >> '{}'\n", log.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path.clone().unwrap_or_default()));
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d75test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(root.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("window");
+        ui.window.set_title(Some("wf-d75-proof"));
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() >= 2);
+        pump();
+
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let pending = || state.borrow().guide_pending.clone();
+        let put = |name: &str, label: &str| {
+            let tmp = gdir.join("wayfinder.json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || pending() == want);
+            pump();
+        };
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let rings = || -> Vec<gtk::Widget> { guide_marked(tree()) };
+        let label_pops = || -> Vec<gtk::Popover> {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).collect()
+        };
+        let label_text = |p: &gtk::Popover| -> String {
+            all_widgets(p.upcast_ref()).iter().find_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.label().to_string())).expect("label text")
+        };
+        let by_name = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+        let no_visual = |why: &str| {
+            assert!(rings().is_empty(), "{why}: a circle is still drawn");
+            assert!(label_pops().is_empty(), "{why}: a label is still drawn");
+            assert!(state.borrow().guide_visual.is_none(), "{why}: visual state dropped");
+        };
+        let opens = || -> Vec<String> { std::fs::read_to_string(&log).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default() };
+        let open_me = throwaways.join("open-me.txt").to_string_lossy().to_string();
+        let other = throwaways.join("other.txt").to_string_lossy().to_string();
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let geo = xdo(&["search", "--name", "wf-d75-proof", "getwindowgeometry", "--shell"]);
+        let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+        let (wx, wy) = (num("X="), num("Y="));
+        let centre = |w: &gtk::Widget| -> (i32, i32) {
+            let b = w.compute_bounds(&ui.window).expect("bounds");
+            (wx + (b.x() + b.width() / 2.0) as i32, wy + (b.y() + b.height() / 2.0) as i32)
+        };
+        let click_at = |w: &gtk::Widget, n: u32| {
+            pump();
+            let (x, y) = centre(w);
+            xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            pump();
+            xdo(&["click", "--repeat", &n.to_string(), "--delay", "80", "1"]);
+            pump();
+            std::thread::sleep(Duration::from_millis(300));
+            pump();
+        };
+        // The item widget for a path: the list row content in list views, the FlowBoxChild in grid.
+        let item_for = |path: &str| -> gtk::Widget {
+            let mode = state.borrow().view_mode;
+            if mode == ViewMode::Grid {
+                let entry_ix = state.borrow().visible_entries.iter().position(|e| e.path == path).expect("entry");
+                ui.grid.child_at_index(entry_ix as i32).expect("grid child").upcast()
+            } else {
+                tree().into_iter().find(|w| w.has_css_class("wf-file-row") && w.tooltip_text().as_deref() == Some(path)).expect("list row")
+            }
+        };
+        let geometry = |w: &gtk::Widget| {
+            (
+                w.compute_bounds(&ui.window).map(|b| (b.x(), b.y(), b.width(), b.height())),
+                (w.width(), w.height(), w.is_focusable(), w.can_target(), w.is_sensitive()),
+                (ui.window.width(), ui.window.height()),
+                GtkWindowExt::focus(&ui.window),
+            )
+        };
+
+        // Pending before Throwaways is open: no target, no visual.
+        put(GUIDE_OPEN_FILE, "Double-click this file");
+        no_visual("pending before navigation");
+        assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Double-click this file"));
+        assert!(by_name(GUIDE_OPEN_FILE).is_empty(), "no item is named before Throwaways opens");
+
+        // Navigate: exactly one real mapped row, one circle, exact label.
+        navigate(&state, throwaways.to_string_lossy().to_string());
+        wait_for("Throwaways listing", || state.borrow().visible_entries.len() == 2 && by_name(GUIDE_OPEN_FILE).len() == 1);
+        wait_for("the circle", || rings().len() == 1 && label_pops().len() == 1);
+        let target = by_name(GUIDE_OPEN_FILE).pop().unwrap();
+        assert!(target.is_mapped() && target.has_css_class("wf-file-row"), "the real list row content");
+        assert_eq!(target.tooltip_text().as_deref(), Some(open_me.as_str()), "the exact fixture path");
+        assert_eq!(rings(), vec![target.clone()]);
+        let pops = label_pops();
+        assert_eq!(pops.len(), 1);
+        assert_eq!(label_text(&pops[0]), "Double-click this file");
+        assert_eq!(pops[0].parent().as_ref(), Some(&target));
+        assert!(!pops[0].can_target() && !pops[0].is_focusable() && !pops[0].can_focus(), "input-transparent, no focus");
+        assert!(by_name(GUIDE_OPEN_FILE).iter().all(|w| !w.is::<gtk::FlowBoxChild>()), "no hidden grid duplicate");
+        assert!(ui.grid.first_child().is_none(), "the grid holds nothing in list view");
+        let shape = geometry(&target);
+        drop(pops);
+
+        // A single click only selects: no open, no clear, nothing moved.
+        click_at(&target, 1);
+        assert_eq!(selected_paths(&state, &ui), vec![open_me.clone()], "single click selects");
+        assert!(opens().is_empty(), "single click opens nothing");
+        assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Double-click this file"));
+        assert_eq!(rings(), vec![target.clone()]);
+        assert_eq!(geometry(&target).1, shape.1, "size and focus flags unchanged");
+
+        // Opening a different item leaves the request alone.
+        let wrong = item_for(&other);
+        click_at(&wrong, 2);
+        wait_for("the other file to open", || opens() == vec![other.clone()]);
+        assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Double-click this file"), "wrong item does not clear");
+        assert_eq!(rings().len(), 1, "circle stays");
+        drop(wrong);
+
+        // The real double-click on the exact item: the unchanged route opens once, then clears.
+        let target = by_name(GUIDE_OPEN_FILE).pop().unwrap();
+        click_at(&target, 2);
+        wait_for("open-me.txt to open", || opens().len() == 2);
+        pump();
+        assert_eq!(opens(), vec![other.clone(), open_me.clone()], "exactly one open of open-me.txt");
+        assert_eq!(pending(), GuideRequest::Clear, "cleared by the open");
+        assert!(state.borrow().guide_target.is_none());
+        no_visual("after the open");
+        drop(target);
+
+        // Same request again: rebinds at once; leaving the folder removes the stale visual.
+        put(GUIDE_OPEN_FILE, "Again");
+        assert_eq!(rings().len(), 1);
+        navigate(&state, elsewhere.to_string_lossy().to_string());
+        wait_for("Elsewhere listing", || state.borrow().cwd == elsewhere.to_string_lossy());
+        wait_for("stale visual gone", || rings().is_empty() && label_pops().is_empty());
+        assert!(by_name(GUIDE_OPEN_FILE).is_empty(), "an open-me.txt outside Throwaways is never named");
+        assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Again"), "still pending");
+        assert!(state.borrow().guide_visual.is_none());
+
+        // Return: one fresh target.
+        navigate(&state, throwaways.to_string_lossy().to_string());
+        wait_for("back in Throwaways", || by_name(GUIDE_OPEN_FILE).len() == 1 && rings().len() == 1 && label_pops().len() == 1);
+
+        // Filter: the item unbinds, the visual goes; clearing the filter reacquires exactly one.
+        state.borrow_mut().filter_text = "other".to_string();
+        repopulate_rows(&state, &ui);
+        wait_for("filtered out", || by_name(GUIDE_OPEN_FILE).is_empty() && rings().is_empty() && label_pops().is_empty());
+        state.borrow_mut().filter_text = String::new();
+        repopulate_rows(&state, &ui);
+        wait_for("filter cleared", || by_name(GUIDE_OPEN_FILE).len() == 1 && rings().len() == 1 && label_pops().len() == 1);
+
+        // Grid: the FlowBoxChild is the one target, with no list duplicate.
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        wait_for("grid target", || {
+            let named = by_name(GUIDE_OPEN_FILE);
+            named.len() == 1 && named[0].is::<gtk::FlowBoxChild>() && rings().len() == 1 && label_pops().len() == 1
+        });
+        let child = by_name(GUIDE_OPEN_FILE).pop().unwrap();
+        assert_eq!(rings(), vec![child.clone()]);
+        assert!(child.is_mapped());
+        assert_eq!(label_text(&label_pops()[0]), "Again");
+        assert!(label_pops()[0].parent().as_ref() == Some(&child));
+        // Grid: drawing and a single selecting click change nothing but the selection.
+        let shape = geometry(&child);
+        click_at(&child, 1);
+        assert_eq!(selected_paths(&state, &ui), vec![open_me.clone()], "grid: single click selects");
+        let n_grid = opens().len();
+        pump();
+        assert_eq!(opens().len(), n_grid, "grid: a single click opens nothing");
+        assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Again"), "grid: a single click clears nothing");
+        assert_eq!(rings(), vec![child.clone()]);
+        assert_eq!(geometry(&child).1, shape.1, "grid: size and focus flags unchanged");
+        drop(child);
+
+        // Switching back removes the grid target and reacquires one fresh list row.
+        set_view_mode(&state, &ui, ViewMode::Details);
+        wait_for("list target again", || {
+            let named = by_name(GUIDE_OPEN_FILE);
+            named.len() == 1 && named[0].has_css_class("wf-file-row") && rings().len() == 1 && label_pops().len() == 1
+        });
+
+        // Fail closed: a second widget carrying the name binds nothing.
+        guide_name(&ui.status, GUIDE_OPEN_FILE);
+        guide_resolve(&state);
+        no_visual("duplicate name");
+        ui.status.set_widget_name("");
+        guide_resolve(&state);
+        assert_eq!(rings().len(), 1, "one target again once the duplicate is gone");
+
+        // Negatives at the external-open success boundary: none of these opens anything, so none
+        // may clear. Each calls the real open route directly.
+        let entry = state.borrow().visible_entries.iter().find(|e| e.path == open_me).cloned().expect("fixture entry");
+        let still_pending = |why: &str| {
+            assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Back"), "{why}: request kept");
+            assert_eq!(rings().len(), 1, "{why}: circle kept");
+            assert_eq!(label_pops().len(), 1, "{why}: label kept");
+        };
+        put(GUIDE_OPEN_FILE, "Back");
+        let n = opens().len();
+        // A vanished file is refused before any launch.
+        let gone = throwaways.join("open-me.txt.gone");
+        std::fs::rename(&open_me, &gone).unwrap();
+        open_entry(&state, &ui, entry.clone());
+        std::fs::rename(&gone, &open_me).unwrap();
+        pump();
+        assert_eq!(opens().len(), n, "vanished: nothing launched");
+        still_pending("vanished file");
+        // A launcher that fails (no xdg-open on PATH) reports and leaves the tutorial.
+        std::env::set_var("PATH", "");
+        open_entry(&state, &ui, entry.clone());
+        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
+        assert!(ui.status.label().contains("Open failed"), "failed launch reported: {}", ui.status.label());
+        still_pending("failed open_path");
+        // Picker mode (directory picker, so a file is refused and nothing exits).
+        state.borrow_mut().picker = Some(PickerState {
+            config: PickerConfig { multiple: false, directory: true, starting_dir: None, filter: None, window: None },
+            out_file: root.join("picker.out").to_string_lossy().to_string(),
+        });
+        open_entry(&state, &ui, entry.clone());
+        state.borrow_mut().picker = None;
+        assert_eq!(opens().len(), n, "picker: nothing launched");
+        still_pending("picker mode");
+        // A directory never clears it.
+        let dir_entry = Entry { is_dir: true, ..entry.clone() };
+        assert!(!guide_is_open_file_fixture(&dir_entry));
+        guide_note_opened(&state, &dir_entry);
+        still_pending("directory entry");
+        // The successful, unchanged open route is the only thing that clears it (proved above and here).
+        open_entry(&state, &ui, entry.clone());
+        wait_for("the successful open", || opens().len() == n + 1);
+        assert_eq!(pending(), GuideRequest::Clear, "cleared only after open_path returned Ok");
+        no_visual("after the successful open");
+
+        // Unbinding the fixture row while another tutorial's target is painted leaves that alone.
+        put("terminal-here-folder", "Other tutorial");
+        assert_eq!(rings().len(), 1, "the toolbar circle is painted");
+        assert!(by_name(GUIDE_OPEN_FILE).len() == 1, "the fixture row is still bound");
+        state.borrow_mut().filter_text = "other".to_string();
+        repopulate_rows(&state, &ui);
+        wait_for("fixture row unbound", || by_name(GUIDE_OPEN_FILE).is_empty());
+        pump();
+        assert_eq!(pending(), known("terminal-here-folder", "Other tutorial"), "other request untouched");
+        assert_eq!(rings().len(), 1, "the other tutorial's circle survives the unbind");
+        assert_eq!(label_pops().len(), 1);
+        state.borrow_mut().filter_text = String::new();
+        repopulate_rows(&state, &ui);
+        pump();
+        assert_eq!(rings().len(), 1, "and survives the rebind");
+
+        // Clearing removes it; the request never touched the file.
+        put("", "");
+        no_visual("cleared");
+        assert_eq!(std::fs::read_to_string(&throwaways.join("open-me.txt")).unwrap(), "THROWAWAY OPEN ME");
+
+        ui.window.close();
+        pump();
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
     }
 
     /// The marked targets: the ones carrying the circle class, and the parent of every
@@ -10875,7 +11261,7 @@ mod tests {
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 11);
+        assert_eq!(keys.len(), 12);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -11004,7 +11390,8 @@ mod tests {
         seen.insert("open-with-other-app".to_string());
         seen.insert("item-menu-cap-d56".to_string());
         seen.insert("item-menu-full-d60".to_string());
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all eleven keys, each on its real control");
+        seen.insert("open-file-other-app".to_string());
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all twelve keys, each on its real control");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
         }

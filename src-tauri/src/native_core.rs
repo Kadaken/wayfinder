@@ -3935,6 +3935,7 @@ mod tests {
                 "drive-unmount-stick",
                 "item-menu-cap-d56",
                 "item-menu-full-d60",
+                "open-file-other-app",
                 "open-with-other-app",
                 "terminal-here-folder",
                 "trash-and-restore-file",
@@ -3954,7 +3955,7 @@ mod tests {
         let mut circles: Vec<&str> =
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("circle")).map(|(k, _)| k.as_str()).collect();
         circles.sort_unstable();
-        assert_eq!(circles, ["terminal-here-folder", "trash-and-restore-file"], "the compact toolbar entries choose circle");
+        assert_eq!(circles, ["open-file-other-app", "terminal-here-folder", "trash-and-restore-file"], "the toolbar entries and the fixture file item choose circle");
         let mut arrows: Vec<&str> =
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("arrow")).map(|(k, _)| k.as_str()).collect();
         arrows.sort_unstable();
