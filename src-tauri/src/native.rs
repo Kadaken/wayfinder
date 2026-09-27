@@ -1628,6 +1628,94 @@ fn guide_resolve_drive_space_later(state: &Rc<RefCell<AppState>>) {
     });
 }
 
+/// D-77: the one file-view surface, named only while browsing the synthetic-or-real Launch Box SSD
+/// mount tree. Nothing else is ever named with this key.
+#[cfg(feature = "guide")]
+const GUIDE_CRUCIAL_BACK: &str = "drive-mounted-again-crucial";
+
+/// Exactly one cached, non-removable `drive` called `Launch Box SSD 2TB` with an absolute
+/// mountpoint, and the current folder is that mountpoint or below it (whole path components).
+#[cfg(feature = "guide")]
+fn guide_crucial_context(drives: &[Drive], cwd: &str) -> bool {
+    // Absolute and free of `..`: a parent-traversal path could lexically match while leaving the mount.
+    // Harmless `.` spellings are already normalized away by the path components.
+    let plain = |p: &str| {
+        let p = Path::new(p);
+        p.is_absolute() && p.components().all(|c| !matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    };
+    let mut eligible = drives.iter().filter(|d| {
+        d.kind == "drive" && !d.removable && d.name == "Launch Box SSD 2TB" && plain(&d.mountpoint)
+    });
+    match (eligible.next(), eligible.next()) {
+        (Some(d), None) => plain(cwd) && Path::new(cwd).starts_with(&d.mountpoint),
+        _ => false,
+    }
+}
+
+thread_local! {
+    static GUIDE_RETRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A target that was not yet allocated when it was painted: resolve once more right after the next
+/// frame is painted, when its size is known. One retry per unallocated paint, never a poll.
+#[cfg(feature = "guide")]
+fn guide_retry_after_paint(state: &Rc<RefCell<AppState>>, target: &gtk::Widget) {
+    if GUIDE_RETRIED.with(|r| r.replace(true)) {
+        return;
+    }
+    let Some(clock) = target.frame_clock() else {
+        GUIDE_RETRIED.with(|r| r.set(false));
+        return;
+    };
+    let state = state.clone();
+    let id = Rc::new(RefCell::new(None::<glib::SignalHandlerId>));
+    let id_in = id.clone();
+    *id.borrow_mut() = Some(clock.connect_after_paint(move |clock| {
+        if let Some(id) = id_in.borrow_mut().take() {
+            clock.disconnect(id);
+        }
+        let state = state.clone();
+        glib::idle_add_local_once(move || {
+            GUIDE_RETRIED.with(|r| r.set(false));
+            if guide_waits_for_drive_space(&state)
+                || matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_CRUCIAL_BACK)
+            {
+                guide_resolve(&state);
+            }
+        });
+    }));
+    target.queue_resize();
+}
+
+/// Keeps the guide-only name on the file view in step with navigation and the cached drive list.
+/// A change re-resolves once after layout, only when this request is the pending one, so another
+/// tutorial's visual is never torn down or replaced.
+#[cfg(feature = "guide")]
+fn guide_sync_crucial(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let eligible = {
+        let st = state.borrow();
+        guide_crucial_context(&st.drives, &st.cwd)
+    };
+    let named = ui.files_stack.widget_name() == GUIDE_CRUCIAL_BACK;
+    if eligible != named {
+        if eligible {
+            guide_name(&ui.files_stack, GUIDE_CRUCIAL_BACK);
+        } else {
+            ui.files_stack.set_widget_name("");
+        }
+    }
+    let waiting = matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_CRUCIAL_BACK);
+    if !waiting || (eligible == named && (!eligible || state.borrow().guide_visual.is_some())) {
+        return;
+    }
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        if matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_CRUCIAL_BACK) {
+            guide_resolve(&state);
+        }
+    });
+}
+
 /// Connects the one clear-on-use callback to the painted button. It clears only
 /// while the activated button is still this window's bound target, so a stale,
 /// duplicate, unresolved or other-window control can never clear the request.
@@ -1883,10 +1971,13 @@ fn guide_paint(state: &Rc<RefCell<AppState>>) {
         }
         GuideMark::Arrow => guide_arrow_popover(&target, &label),
     };
-    if target.is::<gtk::ScrolledWindow>() || name == "item-menu-full-d60" || name == GUIDE_DRIVE_SPACE {
+    if target.is::<gtk::ScrolledWindow>() || name == "item-menu-full-d60" || name == GUIDE_DRIVE_SPACE || name == GUIDE_CRUCIAL_BACK {
         // The item menu's scroller and content are allocated only after it maps: it resolves again
         // once laid out, so this places the popover once against the real box, never an empty one.
         if target.width() <= 0 || target.height() <= 0 {
+            if name == GUIDE_DRIVE_SPACE || name == GUIDE_CRUCIAL_BACK {
+                guide_retry_after_paint(state, &target);
+            }
             return;
         }
         pop.set_pointing_to(Some(&gdk::Rectangle::new(0, 0, target.width(), target.height())));
@@ -5619,6 +5710,7 @@ fn selected_indices(ui: &Ui) -> Vec<usize> {
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     #[cfg(feature = "guide")]
     {
+        guide_sync_crucial(state, ui);
         // Rows and grid children are rebuilt: no visual may outlive its old target.
         if guide_waits_for_open_file(state) {
             guide_unpaint(state);
@@ -6880,6 +6972,8 @@ fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
         if let Some(drives) = result {
             state.borrow_mut().drives = drives;
             rebuild_sidebar(&state, &ui);
+            #[cfg(feature = "guide")]
+            guide_sync_crucial(&state, &ui);
         }
         if again {
             request_drive_refresh(&state);
@@ -9718,6 +9812,8 @@ mod tests {
         guide_clears_on_use_d53();
         #[cfg(feature = "guide")]
         guide_open_file_item_d75();
+        #[cfg(feature = "guide")]
+        guide_crucial_back_d77();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         list_activation_gate_on_real_listview_opens_only_when_allowed();
         inline_editor_click_away_never_writes_and_enter_writes_once();
@@ -9748,6 +9844,218 @@ mod tests {
         guide_target_names_are_exact_d50();
         #[cfg(feature = "guide")]
         guide_pending_targets_resolve_d51();
+    }
+
+    /// D-77: the arrow on the one file-view surface while browsing the synthetic Launch Box SSD
+    /// mount tree. Synthetic drives only: the scan hook never reaches a real drive.
+    #[cfg(feature = "guide")]
+    fn guide_crucial_back_d77() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d77-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let mount = root.join("mount-crucial");
+        let evil = root.join("mount-crucial-evil");
+        let outside = root.join("outside");
+        let gdir = root.join("guide");
+        for d in [&home, &mount.join("LaunchBox"), &mount.join("ES-DE"), &evil, &outside, &gdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let fixtures = [mount.join("LaunchBox/game.txt"), mount.join("ES-DE/theme.txt"), evil.join("x.txt"), outside.join("y.txt")];
+        for f in &fixtures {
+            std::fs::write(f, "fixture").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let gb: u64 = 1024 * 1024 * 1024;
+        let drive = |name: &str, kind: &str, removable: bool, mp: &str| Drive {
+            name: name.to_string(),
+            path: "synthetic-crucial-scratch-fixture".into(),
+            mountpoint: mp.to_string(),
+            size: 100 * gb,
+            fstype: "ext4".into(),
+            kind: kind.into(),
+            removable,
+            space: None,
+        };
+        let mp = mount.to_string_lossy().to_string();
+        let good = || drive("Launch Box SSD 2TB", "drive", false, &mp);
+        let listing = Arc::new(Mutex::new(Vec::<Drive>::new()));
+        {
+            let listing = listing.clone();
+            let scan: DriveScan = Arc::new(move || listing.lock().unwrap().clone());
+            TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = Some(scan));
+        }
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d77test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        install_app_css();
+        build_ui(&app, Some(outside.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("outside listing", || state.borrow().cwd == outside.to_string_lossy() && !state.borrow().visible_entries.is_empty());
+        wait_for("laid out", || ui.files_stack.width() > 0);
+        pump();
+
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let label = "Your games are back";
+        let put = |name: &str, label: &str| {
+            let tmp = gdir.join("wayfinder.json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || state.borrow().guide_pending == want);
+            pump();
+        };
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let named = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+        let label_pops = || -> Vec<gtk::Popover> {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).collect()
+        };
+        let geometry = || (ui.window.width(), ui.window.height(), ui.sidebar.width(), ui.files_stack.width(), ui.files_stack.height(), ui.file_preview.position());
+        let before = geometry();
+        let refresh = |list: Vec<Drive>| {
+            *listing.lock().unwrap() = list;
+            request_drive_refresh(&state);
+            wait_for("synthetic scan lands", || !state.borrow().drive_refresh_in_flight);
+            pump();
+        };
+        let nav = |path: &std::path::Path| {
+            navigate(&state, path.to_string_lossy().to_string());
+            wait_for("navigated", || state.borrow().cwd == path.to_string_lossy() && !state.borrow().visible_entries.is_empty());
+            pump();
+        };
+        let none = |why: &str| {
+            pump();
+            assert!(guide_marked(tree()).is_empty() && label_pops().is_empty(), "{why}: a visual is drawn");
+            assert!(named(GUIDE_CRUCIAL_BACK).is_empty(), "{why}: the surface is named");
+            assert_eq!(state.borrow().guide_pending, known(GUIDE_CRUCIAL_BACK, label), "{why}: the request stays pending");
+        };
+        let one = |why: &str| {
+            wait_for(why, || guide_marked(tree()).len() == 1 && label_pops().len() == 1);
+            let marked = guide_marked(tree());
+            let names = named(GUIDE_CRUCIAL_BACK);
+            assert_eq!((marked.len(), names.len()), (1, 1), "{why}");
+            assert_eq!(marked[0], names[0], "{why}: the named surface is the marked one");
+            assert_eq!(marked[0], ui.files_stack.clone().upcast::<gtk::Widget>(), "{why}: the marked surface is the file view");
+            assert!(ui.files_stack.is_mapped());
+            let pops = label_pops();
+            assert!(pops[0].has_css_class("wf-guide-arrow") && !pops[0].can_target() && !pops[0].can_focus(), "{why}");
+            let shown = all_widgets(pops[0].upcast_ref()).iter().find_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.label().to_string()));
+            assert_eq!(shown.as_deref(), Some(label), "{why}: exact label");
+            assert!(tree().into_iter().all(|w| w.widget_name() != GUIDE_CRUCIAL_BACK || w == names[0]), "{why}");
+            assert_eq!(geometry(), before, "{why}: geometry moved");
+            let focus_in_label = gtk::prelude::GtkWindowExt::focus(&ui.window).is_some_and(|f| f.ancestor(gtk::Popover::static_type()).is_some_and(|p| p.has_css_class("wf-guide-label")));
+            assert!(!focus_in_label, "{why}: the arrow took focus");
+        };
+
+        // Pending before any scan result, and outside the mount tree.
+        put(GUIDE_CRUCIAL_BACK, label);
+        none("pending before the scan");
+        refresh(vec![good()]);
+        none("outside the mount tree");
+
+        // Inside: the root and both folders, through real navigation and Back.
+        nav(&mount);
+        one("mount root");
+        nav(&mount.join("LaunchBox"));
+        assert!(state.borrow().visible_entries.iter().any(|e| e.name == "game.txt"), "LaunchBox listing is nonempty");
+        one("LaunchBox");
+        history_step(&state, false);
+        wait_for("back to the root", || state.borrow().cwd == mp);
+        one("back at the root");
+        nav(&mount.join("ES-DE"));
+        assert!(state.borrow().visible_entries.iter().any(|e| e.name == "theme.txt"), "ES-DE listing is nonempty");
+        one("ES-DE");
+        history_step(&state, false);
+        wait_for("back to the root again", || state.borrow().cwd == mp);
+        one("back again");
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        one("grid view");
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        one("compact view");
+        set_view_mode(&state, &ui, ViewMode::Details);
+        one("details view");
+
+        // Leaving the tree removes only the visual; the request stays pending.
+        nav(&outside);
+        none("outside again");
+        nav(&evil);
+        none("sibling folder that only shares the name prefix");
+        nav(&mount);
+        one("returned to the mount");
+
+        // The drive goes away and returns.
+        refresh(vec![drive("Launch Box SSD 2TB", "drive", false, "")]);
+        none("unmounted");
+        refresh(vec![good()]);
+        one("mounted again");
+        refresh(vec![]);
+        none("drive removed");
+        refresh(vec![good()]);
+        one("drive back");
+
+        // Wrong or duplicate contexts fail closed.
+        for (why, list) in [
+            ("removable", vec![drive("Launch Box SSD 2TB", "drive", true, &mp)]),
+            ("wrong case", vec![drive("launch box ssd 2tb", "drive", false, &mp)]),
+            ("wrong kind", vec![drive("Launch Box SSD 2TB", "network", false, &mp)]),
+            ("relative mountpoint", vec![drive("Launch Box SSD 2TB", "drive", false, "mount-crucial")]),
+            ("duplicate eligible", vec![good(), good()]),
+        ] {
+            refresh(list);
+            none(why);
+            refresh(vec![good()]);
+            one(&format!("restored after {why}"));
+        }
+        assert!(guide_crucial_context(&[good()], &format!("{mp}/LaunchBox")) && !guide_crucial_context(&[good()], &format!("{mp}-evil")));
+        assert!(!guide_crucial_context(&[good()], &format!("{mp}/../outside")), "a parent-traversal cwd is rejected");
+        assert!(!guide_crucial_context(&[drive("Launch Box SSD 2TB", "drive", false, &format!("{mp}/../mount-crucial"))], &mp), "a non-normal mountpoint is rejected");
+
+        // Another tutorial's visual survives the same navigation and refresh paths.
+        put("terminal-here-folder", "Terminal");
+        let circle = guide_marked(tree());
+        assert_eq!(circle.len(), 1);
+        for step in 0..3 {
+            match step {
+                0 => nav(&outside),
+                1 => refresh(vec![]),
+                _ => {
+                    refresh(vec![good()]);
+                    nav(&mount);
+                }
+            }
+            assert_eq!(guide_marked(tree()), circle, "step {step} disturbed another tutorial");
+            assert_eq!(state.borrow().guide_pending, known("terminal-here-folder", "Terminal"));
+        }
+        put(GUIDE_CRUCIAL_BACK, label);
+        one("back to this request");
+        put("", "");
+        assert!(guide_marked(tree()).is_empty() && label_pops().is_empty(), "clear left a visual");
+        for f in &fixtures {
+            assert_eq!(std::fs::read_to_string(f).unwrap(), "fixture", "a fixture changed");
+        }
+
+        ui.window.destroy();
+        TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
     }
 
     /// D-75: the tutorial circle on the one real `Throwaways/open-me.txt` item, in list and grid
@@ -11297,7 +11605,7 @@ mod tests {
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 13);
+        assert_eq!(keys.len(), 14);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -11428,7 +11736,8 @@ mod tests {
         seen.insert("item-menu-full-d60".to_string());
         seen.insert("open-file-other-app".to_string());
         seen.insert("drive-space-bars".to_string());
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all thirteen keys, each on its real control");
+        seen.insert("drive-mounted-again-crucial".to_string());
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "all fourteen keys, each on its real control");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");
         }
