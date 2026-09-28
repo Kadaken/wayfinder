@@ -606,6 +606,15 @@ scrollbar slider:active {
     font-size: 14px;
 }
 
+.wf-transfer-bar {
+    min-height: 4px;
+}
+
+.wf-transfer-cancel {
+    min-height: 0;
+    padding: 0 8px;
+}
+
 .wf-status {
     background: @wf_chrome;
     color: @wf_text_dim;
@@ -1253,6 +1262,8 @@ struct AppState {
     typeahead: String,
     typeahead_at: Instant,
     clipboard: Option<FileClipboard>,
+    /// D-155: the one transfer whose progress and Cancel the strip shows.
+    active_transfer: Option<ActiveTransfer>,
     undo_stack: Vec<UndoAction>,
     picker: Option<PickerState>,
     /// Every navigation owns one cancellable folder load. A late response must
@@ -1358,6 +1369,9 @@ struct Ui {
     preview_media_controls: gtk::MediaControls,
     preview: gtk::Label,
     status: gtk::Label,
+    /// D-155: transfer-only controls beside the status text; hidden at rest.
+    transfer_bar: gtk::ProgressBar,
+    transfer_cancel: gtk::Button,
     picker_open: Option<gtk::Button>,
 }
 
@@ -2671,6 +2685,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         typeahead: String::new(),
         typeahead_at: Instant::now(),
         clipboard: None,
+        active_transfer: None,
         undo_stack: Vec::new(),
         picker: picker.clone(),
         listing_generation: 0,
@@ -2827,8 +2842,20 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     preview_stack.set_visible_child_name("text");
     // Spacing lives in CSS padding so the status bar's background runs the full
     // width of the window. With margins it stopped short on both sides.
-    let status = gtk::Label::builder().xalign(0.0).build();
-    status.add_css_class("wf-status");
+    let status = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+    // The row carries the status background so the bar and Cancel sit inside it.
+    let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    status_row.add_css_class("wf-status");
+    let transfer_bar = gtk::ProgressBar::builder().valign(gtk::Align::Center).visible(false).build();
+    transfer_bar.add_css_class("wf-transfer-bar");
+    transfer_bar.set_size_request(160, -1);
+    let transfer_cancel = gtk::Button::with_label("Cancel");
+    transfer_cancel.add_css_class("flat");
+    transfer_cancel.add_css_class("wf-transfer-cancel");
+    transfer_cancel.set_visible(false);
+    status_row.append(&status);
+    status_row.append(&transfer_bar);
+    status_row.append(&transfer_cancel);
 
     let back = icon_button("go-previous-symbolic", "Back");
     let forward = icon_button("go-next-symbolic", "Forward");
@@ -3101,7 +3128,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         None
     };
 
-    body.append(&status);
+    body.append(&status_row);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.add_css_class("wf-root");
@@ -3177,6 +3204,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         preview_media_controls,
         preview,
         status,
+        transfer_bar: transfer_bar.clone(),
+        transfer_cancel: transfer_cancel.clone(),
         picker_open: picker_open.clone(),
     };
     // GtkApplication keeps an activation-created window alive automatically,
@@ -3184,6 +3213,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     // GTK has taken that hold. Pair an explicit hold with the window lifecycle
     // so folder launches and regular launches behave identically.
     register_window(&state, &ui, app.hold());
+    wire_transfer_cancel(&state, &ui);
     {
         let state = state.clone();
         ui.window.connect_close_request(move |_| {
@@ -7308,6 +7338,10 @@ struct Transfer {
 /// straight away; a clash asks Replace / Duplicate / Cancel once for the whole
 /// operation, and Cancel starts nothing.
 fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
+    if state.borrow().active_transfer.is_some() {
+        ui.status.set_label("A transfer is already running");
+        return;
+    }
     match plan_transfer(&transfer) {
         TransferPlan::NoOp => ui.status.set_label("Already in this folder"),
         TransferPlan::Run => {
@@ -7402,6 +7436,7 @@ where
 
 /// The disk work of every transfer: one transaction for the whole batch, checked
 /// against the disk before it is committed.
+#[cfg(any(test))]
 fn perform_transfer(
     srcs: &[String],
     dest: &str,
@@ -7444,12 +7479,163 @@ fn keep_focus_on_empty_view(root: &impl IsA<gtk::Widget>, focus_was_in_view: boo
     }
 }
 
+/// D-155: the transfer whose progress and Cancel the status strip shows. The
+/// id ties every event and every click to the worker that produced it.
+#[derive(Clone)]
+struct ActiveTransfer {
+    id: u64,
+    is_copy: bool,
+    cancel: Arc<AtomicBool>,
+    cancelling: bool,
+    /// Past the verified commit point: Cancel no longer applies.
+    committed: bool,
+}
+
+/// What the strip shows for one worker event.
+#[derive(Debug, PartialEq)]
+struct StripView {
+    text: String,
+    /// None keeps the bar where it is (checking is not more bytes copied).
+    fraction: Option<f64>,
+    cancel_enabled: bool,
+}
+
+fn transfer_strip(is_copy: bool, event: native_core::TransferEvent) -> StripView {
+    use native_core::TransferEvent as E;
+    let (ing, noun) = if is_copy { ("Copying", "copy") } else { ("Moving", "move") };
+    match event {
+        E::Preparing => StripView { text: format!("Preparing {noun}"), fraction: Some(0.0), cancel_enabled: true },
+        E::Bytes { done, total } if total > 0 => {
+            let percent = (done as u128 * 100 / total as u128) as u64;
+            StripView {
+                text: format!(
+                    "{ing} {percent}% ({} of {})",
+                    native_core::fmt_size(done),
+                    native_core::fmt_size(total)
+                ),
+                fraction: Some(done as f64 / total as f64),
+                cancel_enabled: true,
+            }
+        }
+        // Nothing to copy (empty files, links): say so, with the bytes visible.
+        E::Bytes { done, total } => StripView {
+            text: format!("{ing} {} of {}", native_core::fmt_size(done), native_core::fmt_size(total)),
+            fraction: Some(0.0),
+            cancel_enabled: true,
+        },
+        E::Verifying => StripView { text: format!("Verifying {noun}"), fraction: None, cancel_enabled: true },
+        E::Committing => StripView { text: format!("Verifying {noun}"), fraction: None, cancel_enabled: false },
+    }
+}
+
+fn show_transfer_strip(ui: &Ui, view: &StripView) {
+    ui.status.set_label(&view.text);
+    if let Some(fraction) = view.fraction {
+        ui.transfer_bar.set_fraction(fraction.clamp(0.0, 1.0));
+    }
+    ui.transfer_bar.set_visible(true);
+    ui.transfer_cancel.set_visible(true);
+    ui.transfer_cancel.set_sensitive(view.cancel_enabled);
+}
+
+fn hide_transfer_strip(ui: &Ui) {
+    ui.transfer_bar.set_visible(false);
+    ui.transfer_cancel.set_visible(false);
+    ui.transfer_cancel.set_sensitive(true);
+    ui.transfer_bar.set_fraction(0.0);
+}
+
+/// Cancel targets only the live transfer and only before its commit point.
+fn request_transfer_cancel(state: &Rc<RefCell<AppState>>, ui: &Ui) -> bool {
+    let is_copy = {
+        let mut st = state.borrow_mut();
+        match st.active_transfer.as_mut() {
+            Some(active) if !active.cancelling && !active.committed => {
+                active.cancelling = true;
+                active.cancel.store(true, Ordering::SeqCst);
+                active.is_copy
+            }
+            _ => return false,
+        }
+    };
+    ui.transfer_cancel.set_sensitive(false);
+    ui.status.set_label(if is_copy { "Cancelling copy" } else { "Cancelling move" });
+    true
+}
+
+fn wire_transfer_cancel(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let (state, ui_for_click) = (state.clone(), ui.clone());
+    ui.transfer_cancel.connect_clicked(move |_| {
+        request_transfer_cancel(&state, &ui_for_click);
+    });
+}
+
+/// Applies one worker event, but only to the transfer that is still active.
+fn apply_transfer_event(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    id: u64,
+    event: native_core::TransferEvent,
+) {
+    let (is_copy, cancelling) = {
+        let mut st = state.borrow_mut();
+        let Some(active) = st.active_transfer.as_mut().filter(|a| a.id == id) else {
+            return;
+        };
+        if event == native_core::TransferEvent::Committing {
+            active.committed = true;
+        }
+        (active.is_copy, active.cancelling)
+    };
+    if cancelling {
+        return;
+    }
+    show_transfer_strip(ui, &transfer_strip(is_copy, event));
+}
+
+/// Clears the active identity only for its own terminal event.
+fn end_transfer(state: &Rc<RefCell<AppState>>, ui: &Ui, id: u64) -> bool {
+    let mut st = state.borrow_mut();
+    if st.active_transfer.as_ref().is_some_and(|a| a.id == id) {
+        st.active_transfer = None;
+        drop(st);
+        hide_transfer_strip(ui);
+        true
+    } else {
+        false
+    }
+}
+
+enum TransferMsg {
+    Event(native_core::TransferEvent),
+    Done(Result<native_core::TransferResult, native_core::TransferFail>),
+}
+
+#[cfg(any(test))]
+thread_local! {
+    /// Test seam: the program that stages a copy, so a controlled fixture can
+    /// copy slowly. Read on the GTK thread only.
+    static TRANSFER_COPY_PROGRAM: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn transfer_copy_program() -> String {
+    #[cfg(any(test))]
+    if let Some(program) = TRANSFER_COPY_PROGRAM.with(|p| p.borrow().clone()) {
+        return program;
+    }
+    "cp".to_string()
+}
+
 fn run_transfer(
     state: Rc<RefCell<AppState>>,
     ui: Ui,
     transfer: Transfer,
     on_conflict: native_core::PasteConflict,
 ) {
+    if state.borrow().active_transfer.is_some() {
+        ui.status.set_label("A transfer is already running");
+        return;
+    }
     let Transfer { srcs, dest, is_copy, clear_cut_after, style } = transfer;
     let count = srcs.len();
     let (ing, ed) = match (style, is_copy) {
@@ -7467,20 +7653,84 @@ fn run_transfer(
     if on_conflict == native_core::PasteConflict::Replace {
         label.push_str(", replacing existing");
     }
-    run_job(
-        state,
-        ui,
-        label,
-        move || {
-            // A failed MOVE is reported as a failure and never retried as COPY.
-            transfer_outcome(ed, is_copy, perform_transfer(&srcs, &dest, is_copy, on_conflict))
-        },
-        move |state, _, _| {
-            // after_success only runs when the job succeeded.
-            let mut st = state.borrow_mut();
-            st.clipboard = clipboard_after_job(clear_cut_after, true, st.clipboard.take());
-        },
-    );
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.borrow_mut().active_transfer = Some(ActiveTransfer {
+        id,
+        is_copy,
+        cancel: cancel.clone(),
+        cancelling: false,
+        committed: false,
+    });
+    let refresh_path = state.borrow().cwd.clone();
+    ui.status.set_label(&label);
+    show_transfer_strip(&ui, &transfer_strip(is_copy, native_core::TransferEvent::Preparing));
+
+    let program = transfer_copy_program();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let events = tx.clone();
+        let on_event = move |event| {
+            let _ = events.send(TransferMsg::Event(event));
+        };
+        let ctl = native_core::TransferCtl { cancel: &cancel, on_event: &on_event, copy_program: &program };
+        // A failed MOVE is reported as a failure and never retried as COPY.
+        let result = native_core::transfer_batch_ctl(
+            &srcs,
+            &dest,
+            is_copy,
+            on_conflict,
+            &|_| Ok(()),
+            false,
+            &ctl,
+        );
+        let _ = tx.send(TransferMsg::Done(result));
+    });
+
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || {
+        let mut latest = None;
+        loop {
+            match rx.try_recv() {
+                Ok(TransferMsg::Event(event)) => latest = Some(event),
+                Ok(TransferMsg::Done(result)) => {
+                    end_transfer(&state, &ui, id);
+                    match result {
+                        Ok(result) => {
+                            if let Ok(outcome) = transfer_outcome(ed, is_copy, Ok(result)) {
+                                // A cut clipboard is emptied only on success.
+                                complete_job(&state, &ui, outcome, &refresh_path, &|state, _, _| {
+                                    let mut st = state.borrow_mut();
+                                    st.clipboard =
+                                        clipboard_after_job(clear_cut_after, true, st.clipboard.take());
+                                });
+                            }
+                        }
+                        Err(native_core::TransferFail::Cancelled) => {
+                            // The staging folder's coming and going reloads the listing;
+                            // carry the message through that reload so it stays visible.
+                            let message = if is_copy { "Copy cancelled" } else { "Move cancelled" };
+                            complete_job(&state, &ui, JobOutcome::message(message), &refresh_path, &|_, _, _| {});
+                        }
+                        Err(native_core::TransferFail::Failed(err)) => {
+                            ui.status.set_label(&format!("Operation failed: {err}"));
+                        }
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    end_transfer(&state, &ui, id);
+                    ui.status.set_label("Operation failed");
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+        if let Some(event) = latest {
+            apply_transfer_event(&state, &ui, id, event);
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -7946,20 +8196,7 @@ where
 
     glib::timeout_add_local(JOB_POLL_INTERVAL, move || match rx.try_recv() {
         Ok(Ok(outcome)) => {
-            after_success(&state, &ui, &outcome);
-            if let Some(undo) = outcome.undo.clone() {
-                push_undo(&state, undo);
-            }
-            let target = outcome
-                .refresh_to
-                .clone()
-                .unwrap_or_else(|| refresh_path.clone());
-            navigate_to_with_message(
-                &state,
-                target,
-                NavMode::Record,
-                Some(outcome.message.clone()),
-            );
+            complete_job(&state, &ui, outcome, &refresh_path, &after_success);
             glib::ControlFlow::Break
         }
         Ok(Err(err)) => {
@@ -7972,6 +8209,23 @@ where
             glib::ControlFlow::Break
         }
     });
+}
+
+/// A successful job's shared ending: after-success work, Undo, then the refresh
+/// that carries the outcome message.
+fn complete_job(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    outcome: JobOutcome,
+    refresh_path: &str,
+    after_success: &dyn Fn(&Rc<RefCell<AppState>>, &Ui, &JobOutcome),
+) {
+    after_success(state, ui, &outcome);
+    if let Some(undo) = outcome.undo.clone() {
+        push_undo(state, undo);
+    }
+    let target = outcome.refresh_to.clone().unwrap_or_else(|| refresh_path.to_string());
+    navigate_to_with_message(state, target, NavMode::Record, Some(outcome.message.clone()));
 }
 
 /// Inline (in-row) rename state. Keyed by the ORIGINAL full path, never a row
@@ -11084,6 +11338,7 @@ Broken: error.\n";
         guide_rename_target_and_delete_speed_alias_d152();
         #[cfg(feature = "guide")]
         guide_sitting_attached_card_d154();
+        transfer_progress_and_cancel_d155();
     }
 
     /// D-84: a disposable fixture of tiny real (not real-photo) PNGs proves the
@@ -17489,6 +17744,185 @@ Broken: error.\n";
         list.emit_by_name::<()>("activate", &[&2u32]);
         assert_eq!(opened.borrow().len(), 1, "a click on one file never opens another");
         assert!(started.elapsed() < Duration::from_millis(500), "activation returns promptly");
+    }
+
+    /// D-155 alone on a virtual display: the focused GTK gate for transfers.
+    #[test]
+    fn transfer_progress_and_cancel_d155_alone() {
+        if std::env::var("WAYFINDER_D155_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        transfer_progress_and_cancel_d155();
+    }
+
+    /// D-155: real window, real worker, slow stand-in copy. Bar and Cancel are
+    /// hidden at rest; percent and bytes follow worker events; a second transfer
+    /// cannot steal the controls; Cancel targets only the live transfer, leaves
+    /// the cut clipboard and Undo alone and leaves the disk exactly as before;
+    /// success restores the ordinary status path.
+    fn transfer_progress_and_cancel_d155() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d155-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, src, dest) = (root.join("home"), root.join("src"), root.join("dest"));
+        for d in [&home, &src, &dest] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let bytes: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        std::fs::write(src.join("big.bin"), &bytes).unwrap();
+        std::fs::write(src.join("other.txt"), "other").unwrap();
+        let slow = root.join("slowcp.sh");
+        std::fs::write(
+            &slow,
+            "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
+             while [ $i -lt 6 ]; do\n\
+             dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
+             i=$((i+1)); sleep 0.15; done\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d155test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dest.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().cwd == dest.to_string_lossy());
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
+        let transfer = |name: &str, is_copy: bool, clear_cut: bool| Transfer {
+            srcs: vec![src.join(name).to_string_lossy().to_string()],
+            dest: dest.to_string_lossy().to_string(),
+            is_copy,
+            clear_cut_after: clear_cut,
+            style: TransferStyle::Paste,
+        };
+        let until = |what: &str, cond: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(20);
+            while !cond() {
+                assert!(Instant::now() < end, "timed out waiting for {what}");
+                pump();
+            }
+        };
+        let at_rest = || !ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible();
+        assert!(at_rest(), "bar and Cancel are hidden at rest");
+        assert!(!request_transfer_cancel(&state, &ui), "Cancel with nothing running does nothing");
+
+        // 1. A successful copy: percent and byte text follow the worker.
+        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, false), native_core::PasteConflict::KeepBoth);
+        assert!(ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
+        until("copy done", &|| state.borrow().active_transfer.is_none());
+        assert!(at_rest(), "controls hide when the transfer ends");
+        assert!(ui.status.label().starts_with("Pasted 1 item"), "ordinary success status: {}", ui.status.label());
+        assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), bytes);
+        std::fs::remove_file(dest.join("big.bin")).unwrap();
+
+        // 2. Live labels while a transfer runs.
+        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, false), native_core::PasteConflict::KeepBoth);
+        let mut seen: Vec<String> = Vec::new();
+        let end = Instant::now() + Duration::from_secs(20);
+        while state.borrow().active_transfer.is_some() {
+            assert!(Instant::now() < end, "copy never finished");
+            let label = ui.status.label().to_string();
+            if seen.last() != Some(&label) {
+                seen.push(label);
+            }
+            pump();
+        }
+        let shown: Vec<u64> = seen
+            .iter()
+            .filter_map(|l| l.strip_prefix("Copying ")?.split('%').next()?.parse().ok())
+            .collect();
+        assert!(shown.len() >= 2, "percent text followed the worker: {seen:?}");
+        assert!(shown.windows(2).all(|w| w[1] >= w[0]), "percent never goes back: {shown:?}");
+        assert!(seen.iter().any(|l| l.contains("MB of 6 MB")), "bytes done of total shown: {seen:?}");
+        std::fs::remove_dir_all(dest.join("big.bin")).ok();
+        std::fs::remove_file(dest.join("big.bin")).ok();
+
+        // 3. A second transfer cannot steal the controls; Cancel hits the live one.
+        state.borrow_mut().clipboard = Some(FileClipboard {
+            mode: ClipboardMode::Cut,
+            paths: vec![src.join("big.bin").to_string_lossy().to_string()],
+        });
+        let undo_before = state.borrow().undo_stack.len();
+        let before = crate::native_core::fingerprint(root.to_str().unwrap()).unwrap();
+        // Same-filesystem MOVE is a rename with no bytes, so the live transfer is a copy
+        // that also carries the cut clipboard's clear-on-success flag.
+        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, true), native_core::PasteConflict::KeepBoth);
+        let live_id = state.borrow().active_transfer.as_ref().map(|a| a.id).expect("transfer is live");
+        // wait until a real byte update is on screen
+        until("first bytes", &|| ui.status.label().contains('%') && ui.status.label().starts_with("Copying "));
+        run_transfer(state.clone(), ui.clone(), transfer("other.txt", true, false), native_core::PasteConflict::KeepBoth);
+        assert_eq!(state.borrow().active_transfer.as_ref().map(|a| a.id), Some(live_id), "second transfer refused");
+        assert!(ui.status.label().contains("already running"));
+        // a stale event for another id changes nothing
+        let shown_now = ui.status.label().to_string();
+        apply_transfer_event(&state, &ui, live_id + 99, native_core::TransferEvent::Verifying);
+        assert_eq!(ui.status.label(), shown_now, "stale event ignored");
+        pump();
+        assert!(ui.transfer_cancel.is_sensitive());
+        let clicked = std::time::Instant::now();
+        ui.transfer_cancel.emit_clicked();
+        assert!(!ui.transfer_cancel.is_sensitive(), "Cancel is spent after one click");
+        assert_eq!(ui.status.label(), "Cancelling copy");
+        // Fine-grained wait: drain the main loop, sleeping only 1 ms between checks.
+        let ctx = glib::MainContext::default();
+        let terminal_ui = loop {
+            while ctx.iteration(false) {}
+            if state.borrow().active_transfer.is_none() && ui.status.label() == "Copy cancelled" {
+                break clicked.elapsed();
+            }
+            assert!(clicked.elapsed() < std::time::Duration::from_secs(5), "cancel never reached the UI");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        println!("D155 MEASURE click-to-terminal-UI: {} ms", terminal_ui.as_millis());
+        assert!(terminal_ui < std::time::Duration::from_millis(250), "terminal UI in {terminal_ui:?}");
+        assert!(at_rest());
+        assert_eq!(crate::native_core::fingerprint(root.to_str().unwrap()).unwrap(), before, "disk exactly as before");
+        assert!(std::fs::read_dir(&dest).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".wf-replace-")));
+        assert!(state.borrow().clipboard.is_some(), "cut clipboard survives a cancel");
+        assert_eq!(state.borrow().undo_stack.len(), undo_before, "no Undo entry for a cancel");
+        assert!(!request_transfer_cancel(&state, &ui), "a finished transfer cannot be cancelled again");
+
+        // 4. The ordinary path still works after a cancel; a cut clipboard clears on success.
+        run_transfer(state.clone(), ui.clone(), transfer("other.txt", false, true), native_core::PasteConflict::KeepBoth);
+        until("move done", &|| state.borrow().active_transfer.is_none());
+        pump();
+        assert!(dest.join("other.txt").exists() && !src.join("other.txt").exists());
+        assert!(state.borrow().clipboard.is_none(), "cut clipboard clears only on success");
+        assert_eq!(state.borrow().undo_stack.len(), undo_before + 1);
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn transfer_strip_text_is_honest_d155() {
+        use native_core::TransferEvent as E;
+        assert_eq!(transfer_strip(true, E::Preparing).text, "Preparing copy");
+        assert_eq!(transfer_strip(false, E::Preparing).text, "Preparing move");
+        let v = transfer_strip(true, E::Bytes { done: 23 << 20, total: 64 << 20 });
+        assert_eq!(v.text, "Copying 35% (23 MB of 64 MB)");
+        assert!(v.cancel_enabled);
+        assert_eq!(transfer_strip(false, E::Bytes { done: 63, total: 64 }).text, "Moving 98% (63 B of 64 B)");
+        assert_eq!(transfer_strip(true, E::Bytes { done: 64, total: 64 }).text, "Copying 100% (64 B of 64 B)");
+        assert_eq!(transfer_strip(true, E::Bytes { done: 0, total: 0 }).text, "Copying 0 B of 0 B");
+        assert_eq!(transfer_strip(true, E::Verifying).text, "Verifying copy");
+        assert_eq!(transfer_strip(true, E::Verifying).fraction, None);
+        assert!(!transfer_strip(false, E::Committing).cancel_enabled);
     }
 
     fn pump() {

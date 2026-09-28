@@ -1367,10 +1367,26 @@ pub enum Fingerprint {
     Link(String),
 }
 
+/// The message a cancelled walk or hash returns; `Stop::from` turns it back
+/// into `Stop::Cancelled` so a cancel is never mistaken for a disk failure.
+const CANCELLED_MSG: &str = "transfer cancelled";
+
+#[cfg(any(test))]
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        Err(CANCELLED_MSG.to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn hash_file_bytes(
     hasher: &mut std::collections::hash_map::DefaultHasher,
     path: &Path,
     len: u64,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     use std::hash::Hasher;
     use std::io::Read;
@@ -1378,6 +1394,7 @@ fn hash_file_bytes(
     let mut buf = vec![0u8; 256 * 1024];
     let mut seen = 0u64;
     loop {
+        check_cancel(cancel)?;
         let got = file.read(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
         if got == 0 {
             break;
@@ -1395,6 +1412,7 @@ fn hash_tree(
     hasher: &mut std::collections::hash_map::DefaultHasher,
     dir: &Path,
     entries: &mut u64,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     use std::hash::Hasher;
     let mut names = fs::read_dir(dir)
@@ -1403,6 +1421,7 @@ fn hash_tree(
         .collect::<Result<Vec<_>, _>>()?;
     names.sort();
     for name in names {
+        check_cancel(cancel)?;
         let path = dir.join(&name);
         let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         *entries += 1;
@@ -1414,18 +1433,23 @@ fn hash_tree(
             hasher.write(target.to_string_lossy().as_bytes());
         } else if meta.is_dir() {
             hasher.write_u8(b'D');
-            hash_tree(hasher, &path, entries)?;
+            hash_tree(hasher, &path, entries, cancel)?;
             hasher.write_u8(b'/');
         } else {
             hasher.write_u8(b'F');
             hasher.write_u64(meta.len());
-            hash_file_bytes(hasher, &path, meta.len())?;
+            hash_file_bytes(hasher, &path, meta.len(), cancel)?;
         }
     }
     Ok(())
 }
 
+#[cfg(any(test))]
 pub fn fingerprint(path: &str) -> Result<Fingerprint, String> {
+    fingerprint_c(path, &NEVER_CANCELLED)
+}
+
+fn fingerprint_c(path: &str, cancel: &AtomicBool) -> Result<Fingerprint, String> {
     use std::hash::Hasher;
     let p = Path::new(path);
     let meta = fs::symlink_metadata(p).map_err(|e| format!("{path}: {e}"))?;
@@ -1435,21 +1459,26 @@ pub fn fingerprint(path: &str) -> Result<Fingerprint, String> {
         Ok(Fingerprint::Link(target.to_string_lossy().to_string()))
     } else if meta.is_dir() {
         let mut entries = 0;
-        hash_tree(&mut hasher, p, &mut entries)?;
+        hash_tree(&mut hasher, p, &mut entries, cancel)?;
         Ok(Fingerprint::Tree { entries, digest: hasher.finish() })
     } else {
-        hash_file_bytes(&mut hasher, p, meta.len())?;
+        hash_file_bytes(&mut hasher, p, meta.len(), cancel)?;
         Ok(Fingerprint::File { len: meta.len(), digest: hasher.finish() })
     }
 }
 
 /// Fails if any requested source cannot be recorded.
+#[cfg(any(test))]
 pub fn snapshot_sources(srcs: &[String]) -> Result<Vec<SourceSnapshot>, String> {
+    snapshot_sources_c(srcs, &NEVER_CANCELLED)
+}
+
+fn snapshot_sources_c(srcs: &[String], cancel: &AtomicBool) -> Result<Vec<SourceSnapshot>, String> {
     use std::os::unix::fs::MetadataExt;
     srcs.iter()
         .map(|p| {
             let meta = fs::symlink_metadata(p).map_err(|e| format!("cannot read {p}: {e}"))?;
-            Ok(SourceSnapshot { path: p.clone(), ino: meta.ino(), fp: fingerprint(p)? })
+            Ok(SourceSnapshot { path: p.clone(), ino: meta.ino(), fp: fingerprint_c(p, cancel)? })
         })
         .collect()
 }
@@ -1457,18 +1486,32 @@ pub fn snapshot_sources(srcs: &[String]) -> Result<Vec<SourceSnapshot>, String> 
 /// Fail-closed postcondition. COPY: every source still present with the same
 /// identity and content, every destination present with matching content. MOVE:
 /// every moved source gone and every destination present with matching content.
+#[cfg(any(test))]
 pub fn verify_transfer(
     before: &[SourceSnapshot],
     items: &[ResolvedItem],
     is_copy: bool,
+) -> Result<(), String> {
+    verify_transfer_c(before, items, is_copy, &NEVER_CANCELLED)
+}
+
+fn verify_transfer_c(
+    before: &[SourceSnapshot],
+    items: &[ResolvedItem],
+    is_copy: bool,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     for item in items {
         let Some(src) = before.iter().find(|s| s.path == item.from) else {
             return Err(format!("transfer check: no record of {}", item.from));
         };
-        let dest = fingerprint(&item.to).map_err(|_| {
-            format!("transfer check: {} is missing after the transfer", item.to)
+        let dest = fingerprint_c(&item.to, cancel).map_err(|e| {
+            if e == CANCELLED_MSG {
+                e
+            } else {
+                format!("transfer check: {} is missing after the transfer", item.to)
+            }
         })?;
         if dest != src.fp {
             return Err(format!("transfer check: {} does not match its source", item.to));
@@ -1477,7 +1520,7 @@ pub fn verify_transfer(
         if is_copy {
             let now = now
                 .map_err(|_| format!("transfer check: copy removed the source {}", item.from))?;
-            if now.ino() != src.ino || fingerprint(&item.from)? != src.fp {
+            if now.ino() != src.ino || fingerprint_c(&item.from, cancel)? != src.fp {
                 return Err(format!("transfer check: copy changed the source {}", item.from));
             }
         } else if now.is_ok() {
@@ -1597,6 +1640,183 @@ fn roll_back(journal: &[JournalOp], stages: &[PathBuf]) -> Vec<String> {
     failures
 }
 
+/// What a running transfer reports. `Bytes` is logical regular-file bytes for
+/// the whole batch: `done <= total`, and `done` never goes back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransferEvent {
+    Preparing,
+    Bytes { done: u64, total: u64 },
+    Verifying,
+    /// The verified commit point: Cancel no longer applies.
+    Committing,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TransferFail {
+    /// Stopped on request and rolled back exactly.
+    Cancelled,
+    Failed(String),
+}
+
+/// Inside a transfer a cancel and a disk failure are different outcomes.
+enum Stop {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for Stop {
+    fn from(message: String) -> Self {
+        if message == CANCELLED_MSG {
+            Stop::Cancelled
+        } else {
+            Stop::Failed(message)
+        }
+    }
+}
+
+impl From<&str> for Stop {
+    fn from(message: &str) -> Self {
+        Stop::from(message.to_string())
+    }
+}
+
+/// The worker's handle: the cancel token, the progress sink, and the program
+/// that stages a copy (`cp`; a test may name a slower stand-in).
+pub struct TransferCtl<'a> {
+    pub cancel: &'a AtomicBool,
+    pub on_event: &'a dyn Fn(TransferEvent),
+    pub copy_program: &'a str,
+}
+
+/// Batch byte totals never wrap: too large is a specific failure.
+fn add_bytes(total: u64, more: u64) -> Result<u64, String> {
+    total
+        .checked_add(more)
+        .ok_or_else(|| "the items are too large to count".to_string())
+}
+
+/// Logical regular-file bytes under `path`: symlinks are not followed and
+/// directory entries carry no bytes.
+fn count_bytes(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
+    check_cancel(cancel)?;
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        Ok(0)
+    } else if meta.is_dir() {
+        let mut sum = 0;
+        for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            sum = add_bytes(sum, count_bytes(&entry.path(), cancel)?)?;
+        }
+        Ok(sum)
+    } else {
+        Ok(meta.len())
+    }
+}
+
+/// Best-effort bytes already written under a growing stage (same measure as
+/// `count_bytes`; a read error just counts as nothing yet).
+fn staged_bytes(path: &Path) -> u64 {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => 0,
+        Ok(meta) if meta.is_dir() => fs::read_dir(path)
+            .map(|rd| rd.flatten().map(|e| staged_bytes(&e.path())).sum())
+            .unwrap_or(0),
+        Ok(meta) => meta.len(),
+        Err(_) => 0,
+    }
+}
+
+/// Monotonic byte reporting: emits only a strictly larger `done`, never above
+/// `total`.
+struct Progress<'a> {
+    total: u64,
+    last: Option<u64>,
+    on_event: &'a dyn Fn(TransferEvent),
+}
+
+impl Progress<'_> {
+    fn advance(&mut self, done: u64) {
+        let done = done.min(self.total);
+        if self.last.is_none_or(|last| done > last) {
+            self.last = Some(done);
+            (self.on_event)(TransferEvent::Bytes { done, total: self.total });
+        }
+    }
+}
+
+/// Stages one item with the exact `cp -a -T` child, which is polled: a cancel
+/// kills and reaps that child only, and bytes come from what it has written.
+fn copy_item(
+    ctl: &TransferCtl,
+    src: &str,
+    stage: &Path,
+    base: u64,
+    item_bytes: u64,
+    progress: &mut Progress,
+) -> Result<(), Stop> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(ctl.copy_program)
+        .args(["-a", "-T", "--", src])
+        .arg(stage)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", ctl.copy_program))?;
+    let mut stderr = child.stderr.take();
+    let drain = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(pipe) = stderr.as_mut() {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
+    let mut next_measure = Instant::now();
+    loop {
+        if ctl.cancel.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Not joined: a grandchild could hold the pipe open past the kill.
+            drop(drain);
+            return Err(Stop::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = drain.join().unwrap_or_default();
+                if status.success() {
+                    progress.advance(base + item_bytes);
+                    return Ok(());
+                }
+                let text = text.trim();
+                return Err(Stop::Failed(if text.is_empty() {
+                    format!("{} failed", ctl.copy_program)
+                } else {
+                    text.to_string()
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(drain);
+                return Err(Stop::Failed(e.to_string()));
+            }
+        }
+        if Instant::now() >= next_measure {
+            let started = Instant::now();
+            // Only a successful exit completes the item: while the child lives,
+            // even a pre-sized stage stays below its full length.
+            progress.advance(base + staged_bytes(stage).min(item_bytes.saturating_sub(1)));
+            // A walk over a big tree is throttled so measuring stays cheap.
+            next_measure = Instant::now() + (started.elapsed() * 4).max(Duration::from_millis(40));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Transfers a whole batch as one transaction. The batch is planned and every
 /// incoming object is prepared and fingerprint-checked before any live path
 /// changes. Old destinations and moved sources are then kept in reversible
@@ -1608,22 +1828,13 @@ fn roll_back(journal: &[JournalOp], stages: &[PathBuf]) -> Vec<String> {
 /// `step` is a test seam called at "prepare", "backup", "hold", "place",
 /// "verify" and "cleanup"; `force_cross_device` makes MOVE use the cross-device
 /// strategy (staged copy plus source hold) even on one filesystem.
-pub fn transfer_batch(
+/// Plans the batch with no live mutation.
+fn plan_transfer_items(
     srcs: &[String],
     dest_dir: &str,
     is_copy: bool,
     on_conflict: PasteConflict,
-    step: &dyn Fn(&str) -> Result<(), String>,
-    force_cross_device: bool,
-) -> Result<TransferResult, String> {
-    use std::os::unix::fs::MetadataExt;
-    if !Path::new(dest_dir).is_dir() {
-        return Err(format!("not a folder: {dest_dir}"));
-    }
-    let dest_dev = fs::metadata(dest_dir).map_err(|e| e.to_string())?.dev();
-    let before = snapshot_sources(srcs)?;
-
-    // Plan: no live mutation.
+) -> Result<Vec<PlanItem>, String> {
     let mut plan: Vec<PlanItem> = Vec::new();
     for src in srcs {
         let name = Path::new(src)
@@ -1676,17 +1887,101 @@ pub fn transfer_batch(
         plan.push(PlanItem { src: src.clone(), dest, kind, stage: None });
     }
 
+    Ok(plan)
+}
+
+#[cfg(any(test))]
+pub fn transfer_batch(
+    srcs: &[String],
+    dest_dir: &str,
+    is_copy: bool,
+    on_conflict: PasteConflict,
+    step: &dyn Fn(&str) -> Result<(), String>,
+    force_cross_device: bool,
+) -> Result<TransferResult, String> {
+    let ctl = TransferCtl { cancel: &NEVER_CANCELLED, on_event: &|_| {}, copy_program: "cp" };
+    transfer_batch_ctl(srcs, dest_dir, is_copy, on_conflict, step, force_cross_device, &ctl)
+        .map_err(|fail| match fail {
+            TransferFail::Cancelled => CANCELLED_MSG.to_string(),
+            TransferFail::Failed(message) => message,
+        })
+}
+
+/// `transfer_batch` with a cancel token and progress. Cancel is observed while
+/// sources are walked and hashed, while each staged item is copied, and around
+/// every phase up to the verified commit point. A cancel takes the same
+/// rollback as a failure and reports `Cancelled` only when that rollback was
+/// complete.
+pub fn transfer_batch_ctl(
+    srcs: &[String],
+    dest_dir: &str,
+    is_copy: bool,
+    on_conflict: PasteConflict,
+    step: &dyn Fn(&str) -> Result<(), String>,
+    force_cross_device: bool,
+    ctl: &TransferCtl,
+) -> Result<TransferResult, TransferFail> {
+    use std::os::unix::fs::MetadataExt;
+    let cancel = ctl.cancel;
+    let fail_of = |stop: Stop| match stop {
+        Stop::Cancelled => TransferFail::Cancelled,
+        Stop::Failed(message) => TransferFail::Failed(message),
+    };
+    (ctl.on_event)(TransferEvent::Preparing);
+    if !Path::new(dest_dir).is_dir() {
+        return Err(TransferFail::Failed(format!("not a folder: {dest_dir}")));
+    }
+    let dest_dev = fs::metadata(dest_dir)
+        .map_err(|e| TransferFail::Failed(e.to_string()))?
+        .dev();
+    let before = snapshot_sources_c(srcs, cancel).map_err(|e| fail_of(e.into()))?;
+    let mut plan = plan_transfer_items(srcs, dest_dir, is_copy, on_conflict)
+        .map_err(TransferFail::Failed)?;
+
     let cross = |item: &PlanItem| -> Result<bool, String> {
         Ok(force_cross_device
             || fs::symlink_metadata(&item.src).map_err(|e| e.to_string())?.dev() != dest_dev)
     };
+    // Bytes to stage for the whole batch, known before any copy starts.
+    let mut total = 0u64;
+    let mut staging = false;
+    let mut sizes: Vec<u64> = Vec::new();
+    for item in &plan {
+        let mut bytes = 0;
+        if is_copy || cross(item).map_err(TransferFail::Failed)? {
+            staging = true;
+            bytes = count_bytes(Path::new(&item.src), cancel).map_err(|e| fail_of(e.into()))?;
+            total = add_bytes(total, bytes).map_err(TransferFail::Failed)?;
+        }
+        sizes.push(bytes);
+    }
+    let mut progress = Progress { total, last: None, on_event: ctl.on_event };
+    if staging {
+        progress.advance(0);
+    }
 
     let mut stages: Vec<PathBuf> = Vec::new();
     let mut journal: Vec<JournalOp> = Vec::new();
     let mut retire: Vec<PathBuf> = Vec::new();
-    let mut run = || -> Result<(), String> {
+    // Cancel is checked before and after every phase.
+    let phase = |name: &str| -> Result<(), Stop> {
+        check_cancel(cancel)?;
+        step(name)?;
+        check_cancel(cancel)?;
+        Ok(())
+    };
+    // Called once a live change is journalled: the seam for cancelling after a
+    // real mutation (`backed-up`, `held`, `placed`), then the cancel check.
+    let mutated = |name: &str| -> Result<(), Stop> {
+        step(name)?;
+        check_cancel(cancel)?;
+        Ok(())
+    };
+    let mut run = || -> Result<(), Stop> {
         // Prepare every incoming object beside its destination.
-        for item in plan.iter_mut() {
+        let mut base = 0u64;
+        for (index, item) in plan.iter_mut().enumerate() {
+            check_cancel(cancel)?;
             let src_fp = &before
                 .iter()
                 .find(|s| s.path == item.src)
@@ -1697,66 +1992,84 @@ pub fn transfer_batch(
                 let stage = internal_sibling(dir, "new");
                 stages.push(stage.clone());
                 let stage_str = stage.to_string_lossy().to_string();
-                run_cmd_capture("cp", &["-a", "-T", "--", &item.src, &stage_str])?;
-                if fingerprint(&stage_str)? != *src_fp {
-                    return Err("the prepared copy does not match its source".to_string());
+                let item_bytes = sizes[index];
+                copy_item(ctl, &item.src, &stage, base, item_bytes, &mut progress)?;
+                base += item_bytes;
+                (ctl.on_event)(TransferEvent::Verifying);
+                if fingerprint_c(&stage_str, cancel)? != *src_fp {
+                    return Err(Stop::Failed("the prepared copy does not match its source".to_string()));
                 }
                 item.stage = Some(stage);
             }
-            step("prepare")?;
+            phase("prepare")?;
         }
         // Commit in order, journaling every live change.
         for item in plan.iter() {
             if matches!(item.kind, PlanKind::Replace) {
-                step("backup")?;
+                phase("backup")?;
                 let dir = item.dest.parent().ok_or("bad target")?;
                 let backup = internal_sibling(dir, "old");
                 fs::rename(&item.dest, &backup).map_err(|e| e.to_string())?;
                 journal.push(JournalOp::Backup { target: item.dest.clone(), backup: backup.clone() });
                 retire.push(backup);
+                mutated("backed-up")?;
             }
             match (&item.stage, is_copy) {
                 (Some(stage), true) => {
-                    step("place")?;
+                    phase("place")?;
                     fs::rename(stage, &item.dest).map_err(|e| e.to_string())?;
                     journal.push(JournalOp::Placed { dest: item.dest.clone() });
+                    mutated("placed")?;
                 }
                 (Some(stage), false) => {
-                    step("hold")?;
+                    phase("hold")?;
                     let src = Path::new(&item.src);
                     let hold = internal_sibling(src.parent().ok_or("bad source")?, "hold");
                     fs::rename(src, &hold).map_err(|e| e.to_string())?;
                     journal.push(JournalOp::Hold { src: src.to_path_buf(), hold: hold.clone() });
                     retire.push(hold);
-                    step("place")?;
+                    mutated("held")?;
+                    phase("place")?;
                     fs::rename(stage, &item.dest).map_err(|e| e.to_string())?;
                     journal.push(JournalOp::Placed { dest: item.dest.clone() });
+                    mutated("placed")?;
                 }
                 (None, _) => {
-                    step("place")?;
+                    phase("place")?;
                     fs::rename(&item.src, &item.dest).map_err(|e| e.to_string())?;
                     journal.push(JournalOp::Moved {
                         src: PathBuf::from(&item.src),
                         dest: item.dest.clone(),
                     });
+                    mutated("placed")?;
                 }
             }
         }
-        step("verify")?;
+        (ctl.on_event)(TransferEvent::Verifying);
+        phase("verify")?;
         let items: Vec<ResolvedItem> = plan
             .iter()
             .map(|i| ResolvedItem { from: i.src.clone(), to: i.dest.to_string_lossy().to_string() })
             .collect();
-        verify_transfer(&before, &items, is_copy)
+        verify_transfer_c(&before, &items, is_copy, cancel)?;
+        Ok(())
     };
-    if let Err(err) = run() {
+    if let Err(stop) = run() {
         let failures = roll_back(&journal, &stages);
-        return Err(if failures.is_empty() {
-            err
-        } else {
-            format!("{err}; rollback incomplete: {}", failures.join("; "))
+        return Err(match (stop, failures.is_empty()) {
+            (Stop::Cancelled, true) => TransferFail::Cancelled,
+            (Stop::Cancelled, false) => TransferFail::Failed(format!(
+                "cancelled, but rollback incomplete: {}",
+                failures.join("; ")
+            )),
+            (Stop::Failed(err), true) => TransferFail::Failed(err),
+            (Stop::Failed(err), false) => TransferFail::Failed(format!(
+                "{err}; rollback incomplete: {}",
+                failures.join("; ")
+            )),
         });
     }
+    (ctl.on_event)(TransferEvent::Committing);
 
     // Committed and verified: retire owned backups and holds; problems are warnings.
     let mut warnings = Vec::new();
@@ -2609,6 +2922,401 @@ mod tests {
     }
 
     /// Fixture for D-24: `src/{a.txt, b/, c.txt}` incoming, `dest/{a.txt, b/}` existing.
+    // ---- D-155: progress and cancellation -------------------------------
+
+    /// Stand-in for `cp -a -T -- SRC STAGE` that writes one 1 MiB chunk per
+    /// 150 ms, so a controlled fixture is always still copying when cancelled.
+    fn slow_copy_program(root: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("slowcp.sh");
+        fs::write(
+            &path,
+            "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
+             while [ $i -lt 6 ]; do\n\
+             dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
+             i=$((i+1)); sleep 0.15; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn big_file_fixture(root: &Path) -> (Vec<String>, String) {
+        let (src, dest) = (root.join("src"), root.join("dest"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let bytes: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        fs::write(src.join("big.bin"), bytes).unwrap();
+        (vec![src.join("big.bin").to_string_lossy().to_string()], dest.to_string_lossy().to_string())
+    }
+
+    type Events = std::cell::RefCell<Vec<(std::time::Instant, TransferEvent)>>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_ctl(
+        srcs: &[String],
+        dest: &str,
+        is_copy: bool,
+        conflict: PasteConflict,
+        step: &dyn Fn(&str) -> Result<(), String>,
+        cross: bool,
+        cancel: &AtomicBool,
+        program: &str,
+        events: &Events,
+        react: &dyn Fn(TransferEvent),
+    ) -> Result<TransferResult, TransferFail> {
+        let on_event = |e: TransferEvent| {
+            events.borrow_mut().push((std::time::Instant::now(), e));
+            react(e);
+        };
+        let ctl = TransferCtl { cancel, on_event: &on_event, copy_program: program };
+        transfer_batch_ctl(srcs, dest, is_copy, conflict, step, cross, &ctl)
+    }
+
+    fn bytes_of(events: &Events) -> Vec<(u64, u64)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|(_, e)| if let TransferEvent::Bytes { done, total } = e { Some((*done, *total)) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn byte_total_counts_regular_file_bytes_only_d155() {
+        use std::os::unix::fs::symlink;
+        let root = scratch_case("wf-d155-count");
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("empty")).unwrap();
+        fs::create_dir_all(tree.join("d/e")).unwrap();
+        fs::write(tree.join("one"), vec![1u8; 10]).unwrap();
+        fs::write(tree.join("d/e/two"), vec![2u8; 20]).unwrap();
+        let outside = root.join("outside.bin");
+        fs::write(&outside, vec![3u8; 5000]).unwrap();
+        symlink(&outside, tree.join("link-to-big")).unwrap();
+        symlink("missing", tree.join("dangling")).unwrap();
+        let never = AtomicBool::new(false);
+        assert_eq!(count_bytes(&tree, &never).unwrap(), 30, "symlinks and directories carry no bytes");
+        assert_eq!(count_bytes(&tree.join("link-to-big"), &never).unwrap(), 0);
+        assert_eq!(count_bytes(&tree.join("one"), &never).unwrap(), 10);
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let events = Events::default();
+        run_ctl(&[tree.to_string_lossy().to_string()], dest.to_str().unwrap(), true, PasteConflict::KeepBoth,
+            &|_| Ok(()), false, &never, "cp", &events, &|_| {}).unwrap();
+        let bytes = bytes_of(&events);
+        assert_eq!(bytes.first(), Some(&(0, 30)));
+        assert_eq!(bytes.last(), Some(&(30, 30)));
+    }
+
+    #[test]
+    fn progress_is_monotonic_bounded_and_ends_at_total_d155() {
+        let root = scratch_case("wf-d155-progress");
+        let (srcs, dest) = big_file_fixture(&root);
+        let program = slow_copy_program(&root);
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let result = run_ctl(&srcs, &dest, true, PasteConflict::KeepBoth, &|_| Ok(()), false, &never, &program, &events, &|_| {});
+        assert!(result.is_ok(), "{result:?}");
+        let all: Vec<TransferEvent> = events.borrow().iter().map(|(_, e)| *e).collect();
+        assert_eq!(all.first(), Some(&TransferEvent::Preparing));
+        assert_eq!(all.last(), Some(&TransferEvent::Committing));
+        let bytes = bytes_of(&events);
+        assert!(bytes.len() >= 4, "several advancing updates, got {bytes:?}");
+        let total = 6 * 1024 * 1024;
+        assert!(bytes.iter().all(|(d, t)| *t == total && d <= t));
+        assert!(bytes.windows(2).all(|w| w[1].0 > w[0].0), "strictly advancing: {bytes:?}");
+        assert_eq!(bytes.last(), Some(&(total, total)), "100% only when everything is staged");
+        let last_bytes = all.iter().rposition(|e| matches!(e, TransferEvent::Bytes { .. })).unwrap();
+        assert!(all[last_bytes + 1..].contains(&TransferEvent::Verifying), "checking is not counted as bytes");
+        let first_bytes = events.borrow().iter().find(|(_, e)| matches!(e, TransferEvent::Bytes { done, .. } if *done > 0)).unwrap().0;
+        eprintln!("D155 MEASURE first byte event {} ms; updates {}; last {:?}; whole copy {} ms",
+            first_bytes.duration_since(started).as_millis(), bytes.len(), bytes.last().unwrap(), started.elapsed().as_millis());
+        assert_eq!(fingerprint(&srcs[0]).unwrap(), fingerprint(&format!("{dest}/big.bin")).unwrap());
+        assert!(no_owned_names(&root));
+    }
+
+    #[test]
+    fn cancel_mid_file_stops_the_child_and_restores_everything_d155() {
+        for is_copy in [true, false] {
+            let root = scratch_case("wf-d155-midfile");
+            let (srcs, dest) = big_file_fixture(&root);
+            let program = slow_copy_program(&root);
+            let before = fingerprint(root.to_str().unwrap()).unwrap();
+            let events = Events::default();
+            let cancel = AtomicBool::new(false);
+            let clicked = std::cell::Cell::new(None);
+            let react = |e: TransferEvent| {
+                if matches!(e, TransferEvent::Bytes { done, .. } if done > 0) && clicked.get().is_none() {
+                    clicked.set(Some(std::time::Instant::now()));
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            };
+            let result = run_ctl(&srcs, &dest, is_copy, PasteConflict::KeepBoth, &|_| Ok(()), true, &cancel, &program, &events, &react);
+            let done_at = std::time::Instant::now();
+            assert_eq!(result.unwrap_err(), TransferFail::Cancelled, "copy={is_copy}");
+            let latency = done_at.duration_since(clicked.get().unwrap());
+            eprintln!("D155 MEASURE cancel click to terminal (copy={is_copy}) {} ms", latency.as_millis());
+            assert!(latency < std::time::Duration::from_millis(250), "{latency:?}");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "sources and destination exact");
+            assert!(no_owned_names(&root), "no stage left");
+            assert!(bytes_of(&events).iter().all(|(d, t)| d < t), "never reached 100 percent");
+        }
+    }
+
+    #[test]
+    fn cancel_during_source_scan_and_verify_hashing_d155() {
+        let root = scratch_case("wf-d155-scan");
+        let (srcs, dest) = batch_fixture(&root);
+        let before = fingerprint(root.to_str().unwrap()).unwrap();
+        let cancel = AtomicBool::new(true);
+        let events = Events::default();
+        let r = run_ctl(&srcs, &dest, true, PasteConflict::KeepBoth, &|_| Ok(()), false, &cancel, "cp", &events, &|_| {});
+        assert_eq!(r.unwrap_err(), TransferFail::Cancelled);
+        assert!(bytes_of(&events).is_empty(), "stopped before any total was known");
+        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+        // Cancel arriving while the staged copy is being checked.
+        for is_copy in [true, false] {
+            let cancel = AtomicBool::new(false);
+            let react = |e: TransferEvent| {
+                if e == TransferEvent::Verifying {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            };
+            let r = run_ctl(&srcs, &dest, is_copy, PasteConflict::Replace, &|_| Ok(()), true, &cancel, "cp", &Events::default(), &react);
+            assert_eq!(r.unwrap_err(), TransferFail::Cancelled, "copy={is_copy}");
+            assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before);
+            assert!(no_owned_names(&root));
+        }
+    }
+
+    #[test]
+    fn cancel_at_every_phase_restores_exactly_d155() {
+        let cases: [(&str, usize); 6] =
+            [("prepare", 1), ("prepare", 2), ("backup", 1), ("hold", 2), ("place", 2), ("verify", 1)];
+        for conflict in [PasteConflict::KeepBoth, PasteConflict::Replace] {
+            for is_copy in [true, false] {
+                for force_cross in [false, true] {
+                    for (phase, nth) in cases {
+                        if (phase == "backup" && conflict == PasteConflict::KeepBoth)
+                            || (phase == "hold" && (is_copy || !force_cross))
+                        {
+                            continue;
+                        }
+                        let root = scratch_case("wf-d155-phase");
+                        let (srcs, dest) = batch_fixture(&root);
+                        let before = fingerprint(root.to_str().unwrap()).unwrap();
+                        let cancel = AtomicBool::new(false);
+                        let seen = std::cell::Cell::new(0);
+                        let step = |name: &str| {
+                            if name == phase {
+                                seen.set(seen.get() + 1);
+                                if seen.get() == nth {
+                                    cancel.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            Ok(())
+                        };
+                        let r = run_ctl(&srcs, &dest, is_copy, conflict, &step, force_cross, &cancel, "cp", &Events::default(), &|_| {});
+                        let label = format!("{conflict:?} copy={is_copy} cross={force_cross} {phase}#{nth}");
+                        assert_eq!(r.unwrap_err(), TransferFail::Cancelled, "{label}");
+                        assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "exact: {label}");
+                        assert!(no_owned_names(&root), "no residue: {label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rollback_that_fails_is_never_called_cancelled_d155() {
+        let root = scratch_case("wf-d155-rollback");
+        let (srcs, dest) = batch_fixture(&root);
+        let cancel = AtomicBool::new(false);
+        let dest_path = dest.clone();
+        // After the old destination was moved to its backup, destroy the backup
+        // so it cannot be restored, then cancel.
+        let step = |name: &str| {
+            if name == "place" {
+                for e in fs::read_dir(&dest_path).unwrap().flatten() {
+                    if e.file_name().to_string_lossy().starts_with(".wf-replace-old-") {
+                        remove_any(&e.path()).unwrap();
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            Ok(())
+        };
+        let r = run_ctl(&srcs, &dest, true, PasteConflict::Replace, &step, false, &cancel, "cp", &Events::default(), &|_| {});
+        match r {
+            Err(TransferFail::Failed(message)) => assert!(message.contains("rollback incomplete"), "{message}"),
+            other => panic!("must be a failure with the residue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_after_the_commit_point_is_ignored_d155() {
+        for is_copy in [true, false] {
+            let root = scratch_case("wf-d155-late");
+            let (srcs, dest) = batch_fixture(&root);
+            let cancel = AtomicBool::new(false);
+            let react = |e: TransferEvent| {
+                if e == TransferEvent::Committing {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            };
+            let r = run_ctl(&srcs, &dest, is_copy, PasteConflict::Replace, &|_| Ok(()), true, &cancel, "cp", &Events::default(), &react);
+            assert!(r.is_ok(), "committed work stays committed: {r:?}");
+            assert!(no_owned_names(&root));
+        }
+    }
+
+    #[test]
+    fn same_filesystem_move_has_no_byte_progress_but_the_same_terminal_state_d155() {
+        let root = scratch_case("wf-d155-rename");
+        let (srcs, dest) = batch_fixture(&root);
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        run_ctl(&srcs, &dest, false, PasteConflict::KeepBoth, &|_| Ok(()), false, &never, "cp", &events, &|_| {}).unwrap();
+        assert!(bytes_of(&events).is_empty());
+        let cancel = AtomicBool::new(false);
+        let root2 = scratch_case("wf-d155-rename2");
+        let (srcs2, dest2) = batch_fixture(&root2);
+        let before = fingerprint(root2.to_str().unwrap()).unwrap();
+        let step = |n: &str| { if n == "place" { cancel.store(true, Ordering::SeqCst); } Ok(()) };
+        let r = run_ctl(&srcs2, &dest2, false, PasteConflict::KeepBoth, &step, false, &cancel, "cp", &Events::default(), &|_| {});
+        assert_eq!(r.unwrap_err(), TransferFail::Cancelled);
+        assert_eq!(fingerprint(root2.to_str().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn staged_copies_keep_modes_times_and_symlinks_d155() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let root = scratch_case("wf-d155-meta");
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("run.sh"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(tree.join("run.sh"), fs::Permissions::from_mode(0o751)).unwrap();
+        symlink("run.sh", tree.join("rel-link")).unwrap();
+        symlink("/nowhere/at/all", tree.join("dangling")).unwrap();
+        assert!(Command::new("touch").args(["-d", "2001-02-03 04:05:06"]).arg(tree.join("run.sh")).status().unwrap().success());
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let never = AtomicBool::new(false);
+        run_ctl(&[tree.to_string_lossy().to_string()], dest.to_str().unwrap(), true, PasteConflict::KeepBoth,
+            &|_| Ok(()), false, &never, "cp", &Events::default(), &|_| {}).unwrap();
+        let copy = dest.join("tree");
+        let (a, b) = (fs::metadata(tree.join("run.sh")).unwrap(), fs::metadata(copy.join("run.sh")).unwrap());
+        assert_eq!(b.permissions().mode() & 0o7777, 0o751);
+        assert_eq!(a.mtime(), b.mtime());
+        assert_eq!(fs::read_link(copy.join("rel-link")).unwrap(), Path::new("run.sh"));
+        assert_eq!(fs::read_link(copy.join("dangling")).unwrap(), Path::new("/nowhere/at/all"));
+    }
+
+    #[test]
+    fn cancel_after_each_real_mutation_restores_the_populated_journal_d155() {
+        let cases = ["backed-up", "held", "placed"];
+        for conflict in [PasteConflict::KeepBoth, PasteConflict::Replace] {
+            for is_copy in [true, false] {
+                for force_cross in [false, true] {
+                    for name in cases {
+                        for nth in [1usize, 3] {
+                            let hits = std::cell::Cell::new(0);
+                            let root = scratch_case("wf-d155-after");
+                            let (srcs, dest) = batch_fixture(&root);
+                            let before = fingerprint(root.to_str().unwrap()).unwrap();
+                            let cancel = AtomicBool::new(false);
+                            let journal_seen = std::cell::Cell::new(false);
+                            let step = |n: &str| {
+                                if n == name {
+                                    hits.set(hits.get() + 1);
+                                    if hits.get() == nth {
+                                        // The mutation has really happened by now.
+                                        let changed = fingerprint(root.to_str().unwrap()).unwrap() != before;
+                                        journal_seen.set(changed);
+                                        cancel.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                Ok(())
+                            };
+                            let r = run_ctl(&srcs, &dest, is_copy, conflict, &step, force_cross, &cancel, "cp", &Events::default(), &|_| {});
+                            if hits.get() < nth {
+                                assert!(r.is_ok(), "seam not reached, so the run committed");
+                                continue;
+                            }
+                            let label = format!("{conflict:?} copy={is_copy} cross={force_cross} {name}#{nth}");
+                            assert!(journal_seen.get(), "live tree already changed: {label}");
+                            assert_eq!(r.unwrap_err(), TransferFail::Cancelled, "{label}");
+                            assert_eq!(fingerprint(root.to_str().unwrap()).unwrap(), before, "exact: {label}");
+                            assert!(no_owned_names(&root), "no residue: {label}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A copier that pre-sizes the stage to its full length, then finishes late.
+    fn presizing_copy_program(root: &Path) -> (String, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("presize.sh");
+        let marker = root.join("copier-finished");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nsrc=$4; stage=$5\nsize=$(stat -c %s \"$src\")\ntruncate -s \"$size\" \"$stage\"\nsleep 0.5\n\
+                 dd if=\"$src\" of=\"$stage\" bs=1048576 conv=notrunc 2>/dev/null\ntouch '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        (path.to_string_lossy().to_string(), marker)
+    }
+
+    #[test]
+    fn full_progress_waits_for_the_copier_to_exit_d155() {
+        let root = scratch_case("wf-d155-presize");
+        let (srcs, dest) = big_file_fixture(&root);
+        let (program, marker) = presizing_copy_program(&root);
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        let early = std::cell::Cell::new(0);
+        let react = |e: TransferEvent| {
+            if matches!(e, TransferEvent::Bytes { done, total } if done == total) && !marker.exists() {
+                early.set(early.get() + 1);
+            }
+        };
+        let r = run_ctl(&srcs, &dest, true, PasteConflict::KeepBoth, &|_| Ok(()), false, &never, &program, &events, &react);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(early.get(), 0, "no 100% before the child exited");
+        let bytes = bytes_of(&events);
+        assert_eq!(bytes.last(), Some(&(6 * 1024 * 1024, 6 * 1024 * 1024)));
+        assert!(bytes.iter().filter(|(d, t)| d == t).count() == 1, "one 100% event: {bytes:?}");
+        assert_eq!(fingerprint(&srcs[0]).unwrap(), fingerprint(&format!("{dest}/big.bin")).unwrap());
+    }
+
+    #[test]
+    fn zero_byte_batches_have_a_defined_terminal_state_and_totals_never_wrap_d155() {
+        use std::os::unix::fs::symlink;
+        let root = scratch_case("wf-d155-zero");
+        let (src, dest) = (root.join("src"), root.join("dest"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("empty"), "").unwrap();
+        symlink("empty", src.join("link")).unwrap();
+        let srcs: Vec<String> = ["empty", "link"].iter().map(|n| src.join(n).to_string_lossy().to_string()).collect();
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        let r = run_ctl(&srcs, dest.to_str().unwrap(), true, PasteConflict::KeepBoth, &|_| Ok(()), false, &never, "cp", &events, &|_| {});
+        assert_eq!(r.unwrap().items.len(), 2);
+        assert_eq!(bytes_of(&events), vec![(0, 0)], "one honest 0 of 0 event");
+        assert!(dest.join("empty").exists() && fs::read_link(dest.join("link")).is_ok());
+        assert_eq!(add_bytes(u64::MAX - 1, 1), Ok(u64::MAX));
+        assert!(add_bytes(u64::MAX, 1).unwrap_err().contains("too large"));
+    }
+
     fn batch_fixture(root: &Path) -> (Vec<String>, String) {
         let (src, dest) = (root.join("src"), root.join("dest"));
         for (base, tag) in [(&src, "new"), (&dest, "old")] {
