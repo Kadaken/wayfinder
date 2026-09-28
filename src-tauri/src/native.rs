@@ -793,8 +793,78 @@ enum SortKey {
     Modified,
 }
 
+fn column_shown_by_default() -> bool {
+    true
+}
+
+/// Which of the three metadata columns Details and Compact show. Name is
+/// always shown, so it has no field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+struct ColumnVisibility {
+    #[serde(default = "column_shown_by_default")]
+    size: bool,
+    #[serde(default = "column_shown_by_default")]
+    kind: bool,
+    #[serde(default = "column_shown_by_default")]
+    modified: bool,
+}
+
+impl Default for ColumnVisibility {
+    fn default() -> Self {
+        Self { size: true, kind: true, modified: true }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaColumn {
+    Size,
+    Kind,
+    Modified,
+}
+
+impl ColumnVisibility {
+    fn shown(&self, column: MetaColumn) -> bool {
+        match column {
+            MetaColumn::Size => self.size,
+            MetaColumn::Kind => self.kind,
+            MetaColumn::Modified => self.modified,
+        }
+    }
+
+    fn set(&mut self, column: MetaColumn, shown: bool) {
+        match column {
+            MetaColumn::Size => self.size = shown,
+            MetaColumn::Kind => self.kind = shown,
+            MetaColumn::Modified => self.modified = shown,
+        }
+    }
+}
+
+impl MetaColumn {
+    fn sort_key(self) -> SortKey {
+        match self {
+            MetaColumn::Size => SortKey::Size,
+            MetaColumn::Kind => SortKey::Kind,
+            MetaColumn::Modified => SortKey::Modified,
+        }
+    }
+}
+
+/// A sort on a hidden column would show no indicator, so it falls back to Name.
+fn visible_sort(key: SortKey, ascending: bool, columns: ColumnVisibility) -> (SortKey, bool) {
+    let hidden = match key {
+        SortKey::Name => false,
+        SortKey::Size => !columns.size,
+        SortKey::Kind => !columns.kind,
+        SortKey::Modified => !columns.modified,
+    };
+    if hidden { (SortKey::Name, true) } else { (key, ascending) }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AppConfig {
+    #[serde(default)]
+    columns: ColumnVisibility,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
     show_hidden: bool,
@@ -947,6 +1017,7 @@ impl Default for AppConfig {
             search_in_files: false,
             sort_key: SortKey::Name,
             sort_ascending: true,
+            columns: ColumnVisibility::default(),
         }
     }
 }
@@ -1008,6 +1079,10 @@ fn config_search_in_files(config: &mut AppConfig, value: bool) {
 
 fn config_view_mode(config: &mut AppConfig, mode: ViewMode) {
     config.view_mode = view_mode_id(mode).to_string();
+}
+
+fn config_column(config: &mut AppConfig, column: MetaColumn, shown: bool) {
+    config.columns.set(column, shown);
 }
 
 fn config_sort(config: &mut AppConfig, key: SortKey, ascending: bool) {
@@ -1254,6 +1329,7 @@ struct AppState {
     preview_zoom: f64,
     sort_key: SortKey,
     sort_ascending: bool,
+    columns_visible: ColumnVisibility,
     sidebar_active_key: Option<String>,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
@@ -2675,8 +2751,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         view_mode: view_mode_from_id(&config.view_mode),
         icon_zoom: 1.0,
         preview_zoom: 1.0,
-        sort_key: config.sort_key,
-        sort_ascending: config.sort_ascending,
+        sort_key: visible_sort(config.sort_key, config.sort_ascending, config.columns).0,
+        sort_ascending: visible_sort(config.sort_key, config.sort_ascending, config.columns).1,
+        columns_visible: config.columns,
         sidebar_active_key: None,
         favorites: config.favorites,
         recents: config.recents,
@@ -3282,6 +3359,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         options,
     );
     connect_sort_headers(&state, &ui);
+    connect_column_chooser(&state, &ui);
+    apply_column_visibility(&state, &ui);
     update_sort_header_labels(&state, &ui);
     connect_shortcuts(state.clone(), ui.clone());
     connect_picker_actions(&state, &ui);
@@ -3733,16 +3812,42 @@ struct ColumnSizing {
     size: gtk::SizeGroup,
     kind: gtk::SizeGroup,
     modified: gtk::SizeGroup,
+    /// The header's left-hand resizer of Size, Type and Modified.
+    resizers: [gtk::DrawingArea; 3],
 }
 
 impl ColumnSizing {
-    fn new() -> Self {
+    fn new(resizers: [gtk::DrawingArea; 3]) -> Self {
         let group = || gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
         Self {
             size: group(),
             kind: group(),
             modified: group(),
+            resizers,
         }
+    }
+
+    fn group(&self, column: MetaColumn) -> &gtk::SizeGroup {
+        match column {
+            MetaColumn::Size => &self.size,
+            MetaColumn::Kind => &self.kind,
+            MetaColumn::Modified => &self.modified,
+        }
+    }
+
+    /// Shows or hides one metadata column everywhere at once: its header, its
+    /// resizer and the value in every bound row (each is in the column's group).
+    /// Hidden widgets take no width and no box spacing.
+    fn set_shown(&self, column: MetaColumn, shown: bool) {
+        for widget in self.group(column).widgets() {
+            widget.set_visible(shown);
+        }
+        let index = match column {
+            MetaColumn::Size => 0,
+            MetaColumn::Kind => 1,
+            MetaColumn::Modified => 2,
+        };
+        self.resizers[index].set_visible(shown);
     }
 }
 
@@ -3806,18 +3911,19 @@ fn details_header() -> (gtk::Box, ColumnSizing) {
     kind.set_size_request(COL_KIND_W, -1);
     modified.set_size_request(COL_MODIFIED_W, -1);
 
-    let sizing = ColumnSizing::new();
+    let resizers = [column_resizer(&size), column_resizer(&kind), column_resizer(&modified)];
+    let sizing = ColumnSizing::new(resizers.clone());
     sizing.size.add_widget(&size);
     sizing.kind.add_widget(&kind);
     sizing.modified.add_widget(&modified);
 
     header.append(&lead);
     header.append(&name);
-    header.append(&column_resizer(&size));
+    header.append(&resizers[0]);
     header.append(&size);
-    header.append(&column_resizer(&kind));
+    header.append(&resizers[1]);
     header.append(&kind);
-    header.append(&column_resizer(&modified));
+    header.append(&resizers[2]);
     header.append(&modified);
     (header, sizing)
 }
@@ -4717,6 +4823,103 @@ fn connect_sort_headers(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         };
         child = next;
     }
+}
+
+/// Applies the remembered column choice to the header and every bound row.
+fn apply_column_visibility(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let columns = state.borrow().columns_visible;
+    for column in [MetaColumn::Size, MetaColumn::Kind, MetaColumn::Modified] {
+        ui.columns.set_shown(column, columns.shown(column));
+    }
+}
+
+/// Shows or hides one metadata column. Nothing is re-read from disk; only when
+/// the active sort column goes away do the rows reorder, under Name ascending.
+fn toggle_column(state: &Rc<RefCell<AppState>>, ui: &Ui, column: MetaColumn) {
+    let (shown, fallback) = {
+        let mut state_ref = state.borrow_mut();
+        let shown = !state_ref.columns_visible.shown(column);
+        state_ref.columns_visible.set(column, shown);
+        let fallback = !shown && state_ref.sort_key == column.sort_key();
+        if fallback {
+            state_ref.sort_key = SortKey::Name;
+            state_ref.sort_ascending = true;
+        }
+        (shown, fallback)
+    };
+    update_config(|config| {
+        config_column(config, column, shown);
+        if fallback {
+            config_sort(config, SortKey::Name, true);
+        }
+    });
+    apply_column_visibility(state, ui);
+    if fallback {
+        update_sort_header_labels(state, ui);
+        repopulate_rows(state, ui);
+        update_selection(state, ui);
+    }
+}
+
+/// A secondary click anywhere on the Details/Compact header opens one chooser.
+fn connect_column_chooser(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_SECONDARY);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let (state, ui_for_click) = (state.clone(), ui.clone());
+    click.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        show_column_chooser(&state, &ui_for_click, x, y);
+    });
+    ui.column_header.add_controller(click);
+}
+
+fn show_column_chooser(state: &Rc<RefCell<AppState>>, ui: &Ui, x: f64, y: f64) {
+    let mut child = ui.column_header.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(old) = widget.downcast::<gtk::Popover>() {
+            old.popdown();
+            old.unparent();
+        }
+    }
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(&ui.column_header);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.set_margin_top(4);
+    menu.set_margin_end(4);
+    menu.set_margin_bottom(4);
+    menu.set_margin_start(4);
+    let columns = state.borrow().columns_visible;
+    let name = context_item("object-select-symbolic", "Name", "", &popover, || {});
+    name.set_widget_name("wf-column-option-name");
+    name.set_sensitive(false);
+    menu.append(&name);
+    for (column, label, id) in [
+        (MetaColumn::Size, "Size", "wf-column-option-size"),
+        (MetaColumn::Kind, "Type", "wf-column-option-kind"),
+        (MetaColumn::Modified, "Modified", "wf-column-option-modified"),
+    ] {
+        let checked = columns.shown(column);
+        let (state, ui) = (state.clone(), ui.clone());
+        let row = context_item(
+            if checked { "object-select-symbolic" } else { "" },
+            label,
+            "",
+            &popover,
+            move || toggle_column(&state, &ui, column),
+        );
+        row.set_widget_name(id);
+        if checked {
+            row.add_css_class("wf-checked");
+        }
+        menu.append(&row);
+    }
+    popover.set_child(Some(&menu));
+    unparent_when_closed(&popover);
+    popover.popup();
 }
 
 /// Show which column is active and its direction, so sorting is discoverable.
@@ -5981,6 +6184,10 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .build();
         modified.add_css_class("wf-file-meta");
         ui.columns.modified.add_widget(&modified);
+        let columns_visible = state.borrow().columns_visible;
+        size.set_visible(columns_visible.size);
+        kind.set_visible(columns_visible.kind);
+        modified.set_visible(columns_visible.modified);
         state
             .borrow_mut()
             .meta_labels
@@ -9848,10 +10055,24 @@ fn connect_file_drag_with<W: IsA<gtk::Widget>>(
         let Some(edge) = edge.as_ref() else {
             return false;
         };
-        let Some(bounds) = edge.compute_bounds(&row) else {
+        // The strip ends at the first shown metadata label from Size onward, so a
+        // hidden Size leaves no dead space; with every metadata column hidden it
+        // ends at the right edge of Name.
+        let mut target: Option<gtk::Widget> = Some(edge.clone().upcast());
+        while let Some(widget) = target.as_ref().filter(|w| !w.is_visible()) {
+            target = widget.next_sibling();
+        }
+        let Some(target) = target else {
+            let Some(bounds) = edge.prev_sibling().and_then(|name| name.compute_bounds(&row)) else {
+                return false;
+            };
+            let right = (bounds.x() + bounds.width()) as f64;
+            return x >= right - ROW_GAP as f64 - BOX_SELECT_STRIP_W && x < right;
+        };
+        let Some(bounds) = target.compute_bounds(&row) else {
             return false;
         };
-        // The box spacing before the Size label is the column separator.
+        // The box spacing before the label is the column separator.
         let separator = bounds.x() as f64 - ROW_GAP as f64;
         x >= separator - BOX_SELECT_STRIP_W && x < bounds.x() as f64
     });
@@ -17923,6 +18144,336 @@ Broken: error.\n";
         assert_eq!(transfer_strip(true, E::Verifying).text, "Verifying copy");
         assert_eq!(transfer_strip(true, E::Verifying).fraction, None);
         assert!(!transfer_strip(false, E::Committing).cancel_enabled);
+    }
+
+    /// D-157 pure config: an old file with no `columns` field keeps everything
+    /// and shows all three columns; one toggle writes only its own field.
+    #[test]
+    fn legacy_config_defaults_all_columns_and_toggle_writes_one_field_d157() {
+        let dir = crate::native_core::scratch_root().join(format!("wf-d157-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _cleanup = ScratchCleanup(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("native-config.json");
+        let legacy = r#"{"favorites":[{"name":"P","path":"/p"}],"recents":[{"name":"R","path":"/r"}],"show_hidden":true,"view_mode":"compact","search_in_files":true,"sort_key":"Size","sort_ascending":false}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let c = read_config_at(&path);
+        assert_eq!(c.columns, ColumnVisibility { size: true, kind: true, modified: true });
+        assert_eq!((c.favorites.len(), c.recents.len(), c.show_hidden, c.view_mode.as_str(), c.search_in_files), (1, 1, true, "compact", true));
+        assert_eq!((c.sort_key, c.sort_ascending), (SortKey::Size, false));
+        // partial field: only what is written changes
+        std::fs::write(&path, legacy.replace("\"sort_ascending\":false", "\"sort_ascending\":false,\"columns\":{\"kind\":false}")).unwrap();
+        assert_eq!(read_config_at(&path).columns, ColumnVisibility { size: true, kind: false, modified: true });
+        // one toggle through the read-current path leaves every other field alone
+        std::fs::write(&path, legacy).unwrap();
+        update_config_at(&path, |c| config_column(c, MetaColumn::Modified, false));
+        let c = read_config_at(&path);
+        assert_eq!(c.columns, ColumnVisibility { size: true, kind: true, modified: false });
+        assert_eq!((c.favorites.len(), c.recents.len(), c.show_hidden, c.search_in_files), (1, 1, true, true));
+        assert_eq!((c.sort_key, c.sort_ascending, c.view_mode.as_str()), (SortKey::Size, false, "compact"));
+        // a stale window's change to another field keeps the choice
+        update_config_at(&path, |c| config_show_hidden(c, false));
+        assert!(!read_config_at(&path).columns.modified);
+        // the hidden sort column falls back to Name ascending, others are kept
+        let none = ColumnVisibility { size: false, kind: true, modified: false };
+        assert_eq!(visible_sort(SortKey::Size, false, none), (SortKey::Name, true));
+        assert_eq!(visible_sort(SortKey::Modified, false, none), (SortKey::Name, true));
+        assert_eq!(visible_sort(SortKey::Kind, false, none), (SortKey::Kind, false));
+        assert_eq!(visible_sort(SortKey::Name, false, none), (SortKey::Name, false));
+    }
+
+    /// D-157 alone on a virtual display.
+    #[test]
+    fn column_chooser_d157_alone() {
+        if std::env::var("WAYFINDER_D157_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        column_chooser_d157();
+        row_strip_follows_visible_columns_d157();
+    }
+
+    /// D-157: real window, real secondary click, real rows.
+    fn column_chooser_d157() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d157-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("files"));
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..80 {
+            std::fs::write(dir.join(format!("file{i:02}.txt")), vec![b'x'; 100 + i * 37]).unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d157test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d157-window"));
+        wait_for("listing", || state.borrow().cwd == dir.to_string_lossy() && !rows_of(&ui).is_empty());
+        pump();
+
+        let header_button = |name: &str| -> gtk::Button {
+            let mut child = ui.column_header.first_child();
+            while let Some(w) = child {
+                if w.widget_name() == name {
+                    return w.downcast().unwrap();
+                }
+                child = w.next_sibling();
+            }
+            panic!("no header button {name}");
+        };
+        let x_of = |w: &gtk::Widget| w.compute_bounds(&ui.window).expect("bounds").x() as f64;
+        let w_of = |w: &gtk::Widget| w.width();
+        let meta_at = |row: &gtk::Widget, index: usize| -> gtk::Widget {
+            let mut child = row.first_child();
+            for _ in 0..index {
+                child = child.and_then(|c| c.next_sibling());
+            }
+            child.expect("row child")
+        };
+        let chooser_popovers = || -> Vec<gtk::Popover> {
+            all_widgets(ui.column_header.upcast_ref()).into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.is_visible()).collect()
+        };
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let secondary_click_on_header = |over: &str| {
+            let geo = xdo(&["search", "--name", "wf-d157-window", "getwindowgeometry", "--shell"]);
+            let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+            let target: gtk::Widget = header_button(over).upcast();
+            let b = target.compute_bounds(&ui.window).unwrap();
+            let (x, y) = (num("X=") + b.x() as i32 + b.width() as i32 / 2, num("Y=") + b.y() as i32 + b.height() as i32 / 2);
+            xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            pump();
+            xdo(&["click", "3"]);
+            wait_for("chooser open", || !chooser_popovers().is_empty());
+        };
+        let option = |id: &str| -> gtk::Button {
+            all_widgets(ui.column_header.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == id)
+                .and_then(|w| w.downcast::<gtk::Button>().ok())
+                .unwrap_or_else(|| panic!("no chooser row {id}"))
+        };
+        let settle = || {
+            wait_for("chooser gone", || chooser_popovers().is_empty());
+            pump();
+        };
+        let shown = |w: &gtk::Widget| w.is_visible();
+        let fixture_config = || read_config_at(&home.join(".config").join("wayfinder").join("native-config.json"));
+
+        // BEFORE: default layout.
+        let names = ["sort-name", "sort-size", "sort-kind", "sort-modified"];
+        assert!(names.iter().all(|n| shown(header_button(n).upcast_ref())), "four headings by default");
+        let rows = rows_of(&ui);
+        assert!(rows.len() >= 5);
+        assert!(rows.iter().all(|r| (2..5).all(|i| shown(&meta_at(r, i)))));
+        let (kind_w0, name_w0) = (w_of(header_button("sort-kind").upcast_ref()), w_of(header_button("sort-name").upcast_ref()));
+        let (size_x0, mod_x0) = (x_of(header_button("sort-size").upcast_ref()), x_of(header_button("sort-modified").upcast_ref()));
+        let win_size0 = (ui.window.width(), ui.window.height());
+        // Header buttons and row labels differ by a fixed inset; alignment means that inset never changes.
+        let inset = |r: &gtk::Widget, i: usize, n: &str| (x_of(&meta_at(r, i)) - x_of(header_button(n).upcast_ref())).round();
+        let (size_inset0, kind_inset0, mod_inset0) = {
+            let r0 = &rows_of(&ui)[0];
+            (inset(r0, 2, "sort-size"), inset(r0, 3, "sort-kind"), inset(r0, 4, "sort-modified"))
+        };
+        // a real selection to keep, and a scroll position
+        ui.list_selection.select_item(3, true);
+        let selected_before = selected_indices(&ui);
+        let scroll_before = ui.list_scroll.vadjustment().value();
+        println!("D157 MEASURE before: selectable metadata columns 0, headings 4, name {name_w0}px, kind {kind_w0}px, size x {size_x0}, modified x {mod_x0}");
+
+        // Secondary click opens one chooser and does not sort.
+        let sort_before = (state.borrow().sort_key, state.borrow().sort_ascending);
+        secondary_click_on_header("sort-size");
+        assert_eq!(chooser_popovers().len(), 1, "exactly one chooser");
+        assert_eq!((state.borrow().sort_key, state.borrow().sort_ascending), sort_before, "secondary click does not sort");
+        let name_row = option("wf-column-option-name");
+        assert!(!name_row.is_sensitive(), "Name is fixed");
+        for id in ["wf-column-option-size", "wf-column-option-kind", "wf-column-option-modified"] {
+            assert!(option(id).is_sensitive() && option(id).has_css_class("wf-checked"), "{id} checked");
+        }
+        // 1. hide Type
+        option("wf-column-option-kind").emit_clicked();
+        settle();
+        assert!(!shown(header_button("sort-kind").upcast_ref()));
+        assert!(!shown(ui.columns.resizers[1].upcast_ref()));
+        let rows = rows_of(&ui);
+        assert!(rows.iter().all(|r| !shown(&meta_at(r, 3)) && shown(&meta_at(r, 2)) && shown(&meta_at(r, 4))), "Type gone from every row");
+        assert_eq!(selected_indices(&ui), selected_before, "selection kept");
+        assert_eq!((ui.window.width(), ui.window.height()), win_size0, "window size kept");
+        assert!((ui.list_scroll.vadjustment().value() - scroll_before).abs() < 1.0, "scroll kept");
+        let name_w1 = w_of(header_button("sort-name").upcast_ref());
+        assert!(name_w1 >= name_w0 + kind_w0 + ROW_GAP - 1, "Name takes the freed width and gap: {name_w0} -> {name_w1}");
+        assert_eq!(x_of(header_button("sort-modified").upcast_ref()), mod_x0, "Modified stays anchored");
+        for r in &rows {
+            assert_eq!(inset(r, 2, "sort-size"), size_inset0, "Size values align with heading");
+            assert_eq!(inset(r, 4, "sort-modified"), mod_inset0, "Modified values align");
+        }
+        println!("D157 MEASURE Type off: name {name_w0}->{name_w1}px (freed {} incl. {ROW_GAP} gap), modified x {mod_x0} unchanged, values aligned", name_w1 - name_w0);
+        assert!(!fixture_config().columns.kind && fixture_config().columns.size, "persisted");
+
+        // 2. Size hidden with Type back: Size-off layout
+        secondary_click_on_header("sort-name");
+        option("wf-column-option-kind").emit_clicked();
+        settle();
+        secondary_click_on_header("sort-name");
+        option("wf-column-option-size").emit_clicked();
+        settle();
+        let rows = rows_of(&ui);
+        assert!(!shown(header_button("sort-size").upcast_ref()) && shown(header_button("sort-kind").upcast_ref()));
+        assert!(rows.iter().all(|r| !shown(&meta_at(r, 2)) && shown(&meta_at(r, 3)) && shown(&meta_at(r, 4))));
+        for r in &rows {
+            assert_eq!(inset(r, 3, "sort-kind"), kind_inset0, "Type aligned with Size off");
+        }
+        println!("D157 MEASURE Size off: kind x {} modified x {}", x_of(header_button("sort-kind").upcast_ref()), x_of(header_button("sort-modified").upcast_ref()));
+        // recycled rows honor the choice
+        ui.list.scroll_to(79, gtk::ListScrollFlags::NONE, None);
+        pump();
+        let rows = rows_of(&ui);
+        assert!(rows.iter().all(|r| !shown(&meta_at(r, 2))), "recycled/new rows hide Size");
+        ui.list.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+        pump();
+
+        // 3. Compact shares the choice
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        pump();
+        assert!(!shown(header_button("sort-size").upcast_ref()) && rows_of(&ui).iter().all(|r| !shown(&meta_at(r, 2))), "Compact shares it");
+        secondary_click_on_header("sort-name");
+        option("wf-column-option-modified").emit_clicked();
+        settle();
+        secondary_click_on_header("sort-name");
+        option("wf-column-option-kind").emit_clicked();
+        settle();
+        // Name-only
+        let (hw, nw) = (ui.column_header.width(), w_of(header_button("sort-name").upcast_ref()));
+        assert!(["sort-size", "sort-kind", "sort-modified"].iter().all(|n| !shown(header_button(n).upcast_ref())));
+        assert!(ui.columns.resizers.iter().all(|r| !shown(r.upcast_ref())));
+        assert!(rows_of(&ui).iter().all(|r| (2..5).all(|i| !shown(&meta_at(r, i)))));
+        assert!(nw > name_w0 + kind_w0, "Name-only: Name spans the freed width ({nw}px of {hw}px)");
+        println!("D157 MEASURE Name only: name {nw}px of header {hw}px; no blank metadata width");
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+        assert!(["sort-size", "sort-kind", "sort-modified"].iter().all(|n| !shown(header_button(n).upcast_ref())), "Details shares it");
+
+        // 4. Hidden active sort falls back to Name ascending, visibly
+        for id in ["wf-column-option-size", "wf-column-option-kind", "wf-column-option-modified"] {
+            secondary_click_on_header("sort-name");
+            option(id).emit_clicked();
+            settle();
+        }
+        header_button("sort-size").emit_clicked();
+        pump();
+        assert_eq!(state.borrow().sort_key, SortKey::Size);
+        assert!(header_button("sort-size").child().and_downcast::<gtk::Label>().unwrap().label().contains('▲'));
+        secondary_click_on_header("sort-name");
+        option("wf-column-option-size").emit_clicked();
+        settle();
+        assert_eq!((state.borrow().sort_key, state.borrow().sort_ascending), (SortKey::Name, true));
+        assert!(header_button("sort-name").child().and_downcast::<gtk::Label>().unwrap().label().contains('▲'), "Name indicator visible");
+        assert_eq!((fixture_config().sort_key, fixture_config().sort_ascending), (SortKey::Name, true));
+        assert!(chooser_popovers().is_empty());
+        // popovers do not accumulate after closing
+        let leftover = all_widgets(ui.column_header.upcast_ref()).into_iter().filter(|w| w.is::<gtk::Popover>()).count();
+        assert!(leftover <= 1, "closed choosers are unparented, found {leftover}");
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn rows_of(ui: &Ui) -> Vec<gtk::Widget> {
+        all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .filter(|w| w.has_css_class("wf-file-row") && w.is_mapped())
+            .collect()
+    }
+
+    /// D-157 locked-drag boundary with real pointer events: the strip refuses a
+    /// drag, a press outside it drags, for default, Size-off and Name-only rows.
+    fn row_strip_follows_visible_columns_d157() {
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        for (label, hide) in [("default", [false, false, false]), ("Size off, Type on", [true, false, false]), ("Name only", [true, true, true])] {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+            row.set_height_request(40);
+            let icon = gtk::Label::new(Some("i"));
+            let name = gtk::Label::builder().label("name").hexpand(true).xalign(0.0).build();
+            let metas: Vec<gtk::Label> = (0..3)
+                .map(|i| {
+                    let l = gtk::Label::new(Some("m"));
+                    l.set_size_request(80, -1);
+                    l.set_visible(!hide[i]);
+                    l
+                })
+                .collect();
+            row.append(&icon);
+            row.append(&name);
+            for m in &metas {
+                row.append(m);
+            }
+            let began = Rc::new(std::cell::Cell::new(false));
+            let selected: Rc<dyn Fn() -> Vec<String>> = Rc::new(|| vec!["/d/a".to_string()]);
+            let drag = connect_file_drag_with(&row, selected, "/d/a".to_string(), Some(&metas[0]));
+            {
+                let began = began.clone();
+                drag.connect_drag_begin(move |_, _| began.set(true));
+            }
+            let win = gtk::Window::new();
+            win.set_title(Some("wf-d157-strip"));
+            win.set_default_size(500, 80);
+            win.set_child(Some(&row));
+            win.present();
+            pump();
+            let geo = xdo(&["search", "--name", "wf-d157-strip", "getwindowgeometry", "--shell"]);
+            let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+            let (wx, wy) = (num("X="), num("Y="));
+            let end = if let Some(first) = metas.iter().find(|m| m.is_visible()) {
+                first.compute_bounds(&row).unwrap().x() as i32
+            } else {
+                let b = name.compute_bounds(&row).unwrap();
+                (b.x() + b.width()) as i32
+            };
+            let try_drag = |press_x: i32| -> bool {
+                began.set(false);
+                let (px, py) = (wx + press_x, wy + 20);
+                xdo(&["mousemove", &px.to_string(), &py.to_string()]);
+                pump();
+                xdo(&["mousedown", "1"]);
+                pump();
+                for step in [5, 40, 60, 80] {
+                    xdo(&["mousemove", &(px + step).to_string(), &(py + step / 6).to_string()]);
+                    pump();
+                }
+                let out = began.get();
+                xdo(&["mouseup", "1"]);
+                pump();
+                out
+            };
+            let inside = end - 12;
+            let outside = 40;
+            assert!(!try_drag(inside), "{label}: a press in the strip (x={inside}) must not start a file drag");
+            assert!(try_drag(outside), "{label}: a press outside the strip (x={outside}) starts the drag");
+            println!("D157 MEASURE strip {label}: strip ends at x={end}, press in strip refused, press at x={outside} dragged");
+            win.destroy();
+            pump();
+        }
     }
 
     fn pump() {
