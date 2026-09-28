@@ -4888,6 +4888,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "delete-speed",
                 "drive-eject-stick",
                 "drive-mounted-again-crucial",
                 "drive-open-crucial",
@@ -4901,6 +4902,7 @@ mod tests {
                 "item-menu-full-d60",
                 "open-file-other-app",
                 "open-with-other-app",
+                "rename-in-place",
                 "terminal-here-folder",
                 "trash-and-restore-file",
             ]
@@ -4910,7 +4912,16 @@ mod tests {
             let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
             names.sort_unstable();
             // D-64: every entry carries `mark`, exactly `circle` or `arrow`; none is optional.
-            assert_eq!(names, ["kind", "mark", "where"], "{name}");
+            // D-152: an alias-only entry adds exactly one `alias` field.
+            if fields.contains_key("alias") {
+                assert_eq!(names, ["alias", "kind", "mark", "where"], "{name}");
+                let target = fields["alias"].as_str().expect("alias is a string");
+                assert!(!target.is_empty() && target != name, "{name}: alias names a different key");
+                let hop = obj.get(target).unwrap_or_else(|| panic!("{name}: alias target {target} exists"));
+                assert!(hop.get("alias").is_none(), "{name}: alias is one hop");
+            } else {
+                assert_eq!(names, ["kind", "mark", "where"], "{name}");
+            }
             assert!(matches!(fields["mark"].as_str(), Some("circle" | "arrow")), "{name}: mark is circle or arrow");
             for f in fields.values() {
                 assert!(f.as_str().is_some_and(|x| !x.is_empty()), "{name}");
@@ -4919,7 +4930,7 @@ mod tests {
         let mut circles: Vec<&str> =
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("circle")).map(|(k, _)| k.as_str()).collect();
         circles.sort_unstable();
-        assert_eq!(circles, ["open-file-other-app", "terminal-here-folder", "trash-and-restore-file"], "the toolbar entries and the fixture file item choose circle");
+        assert_eq!(circles, ["delete-speed", "open-file-other-app", "rename-in-place", "terminal-here-folder", "trash-and-restore-file"], "the toolbar entries and the fixture file item choose circle");
         let mut arrows: Vec<&str> =
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("arrow")).map(|(k, _)| k.as_str()).collect();
         arrows.sort_unstable();
