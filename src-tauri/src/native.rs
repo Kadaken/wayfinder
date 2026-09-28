@@ -1,4 +1,6 @@
 mod native_core;
+#[cfg(feature = "guide")]
+mod guide_sitting;
 
 use adw::gtk;
 use adw::gtk::gdk::prelude::ToplevelExt;
@@ -1469,8 +1471,18 @@ enum GuideRequest {
 #[cfg(feature = "guide")]
 const GUIDE_REGISTRY: &str = include_str!("guide-names.json");
 
+/// The one file this process watches, taken from its own `WF_GUIDE_DESCRIPTOR`
+/// when one is set (D-153 phase 2), or the plain `WF_GUIDE_FILE` env var, or the
+/// shared default. Never inferred from another process's launcher script.
 #[cfg(feature = "guide")]
 fn guide_file_path() -> PathBuf {
+    if let Some(desc) = guide_descriptor_path() {
+        if let Some(request_path) = guide_read_descriptor(&desc).and_then(|v| {
+            v.get("request_path").and_then(|x| x.as_str()).map(str::to_owned)
+        }) {
+            return PathBuf::from(request_path);
+        }
+    }
     match std::env::var("WF_GUIDE_FILE") {
         Ok(path) if !path.is_empty() => PathBuf::from(path),
         _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
@@ -1478,11 +1490,138 @@ fn guide_file_path() -> PathBuf {
     }
 }
 
+/// This process's own `WF_GUIDE_DESCRIPTOR`, handed to it directly by its
+/// launcher (never inherited or inferred from another process's script).
 #[cfg(feature = "guide")]
-fn guide_parse(text: &str) -> GuideRequest {
+fn guide_descriptor_path() -> Option<PathBuf> {
+    std::env::var("WF_GUIDE_DESCRIPTOR").ok().filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
+#[cfg(feature = "guide")]
+fn guide_read_descriptor(path: &Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()
+}
+
+/// This process's claimed token AND the one window that claimed it, set once
+/// at startup by `guide_claim_descriptor()`. D-153 phase 3, 27 September 2026:
+/// phase 2 kept this process-global, so a second top-level window in the same
+/// process (a decoy — e.g. a folder window opened from within the app) rode
+/// on the first window's claim and could be shown paints meant for it. The
+/// token is now owned by the SPECIFIC window (its `Rc<RefCell<AppState>>`
+/// pointer, stable for that window's whole life) that claimed it first; a
+/// second window's own claim attempt finds this already `Some` and leaves it
+/// alone, but its own requests are never matched against a token it does not
+/// own. `None` (the cell never set) means no window has attempted a claim yet;
+/// `Some((None, _))` means one did and found no valid descriptor to claim.
+#[cfg(feature = "guide")]
+static GUIDE_CLAIMED: std::sync::Mutex<Option<(Option<String>, usize)>> = std::sync::Mutex::new(None);
+
+/// Test-only seam: forget any claim so a test can start a fresh one. Real
+/// runs never call this — one process claims once, for its own lifetime.
+#[cfg(all(feature = "guide", test))]
+fn guide_forget_claim() {
+    *GUIDE_CLAIMED.lock().unwrap() = None;
+}
+
+/// True when `window_key` is the specific window that owns the claimed token
+/// (or when nothing has claimed a token at all, which callers must still
+/// treat as "not bound" — see `guide_token_ok`).
+#[cfg(feature = "guide")]
+fn guide_claimed_by(window_key: usize) -> Option<String> {
+    match GUIDE_CLAIMED.lock().unwrap().as_ref() {
+        Some((Some(token), key)) if *key == window_key => Some(token.clone()),
+        _ => None,
+    }
+}
+
+/// Reads this process's own `WF_GUIDE_DESCRIPTOR` once, claims the token it
+/// names FOR `window_key` (stable per window — see `GUIDE_CLAIMED`), and
+/// writes the sibling `<descriptor>.ack` file checkrun's preflight waits on.
+/// A process started with no descriptor (a decoy window in the D-153 phase 2
+/// repro) claims no token and acks nothing. A second window in the same
+/// process that calls this after the first already claimed finds the cell
+/// `Some` and returns without disturbing the first window's ownership.
+#[cfg(feature = "guide")]
+fn guide_claim_descriptor(window_key: usize) {
+    if GUIDE_CLAIMED.lock().unwrap().is_some() {
+        return; // already claimed (or already found nothing) this run
+    }
+    let Some(desc_path) = guide_descriptor_path() else {
+        *GUIDE_CLAIMED.lock().unwrap() = Some((None, 0));
+        return;
+    };
+    let Some(value) = guide_read_descriptor(&desc_path) else {
+        *GUIDE_CLAIMED.lock().unwrap() = Some((None, 0));
+        return;
+    };
+    let (Some(token), Some(request_path)) = (
+        value.get("token").and_then(|v| v.as_str()).map(str::to_owned),
+        value.get("request_path").and_then(|v| v.as_str()).map(str::to_owned),
+    ) else {
+        *GUIDE_CLAIMED.lock().unwrap() = Some((None, 0));
+        return;
+    };
+    *GUIDE_CLAIMED.lock().unwrap() = Some((Some(token.clone()), window_key));
+
+    let pid = std::process::id();
+    let exe = std::env::current_exe().ok();
+    let exe_str = exe.as_deref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let exe_sha256 = exe.as_deref().and_then(|p| fs::read(p).ok()).map(|bytes| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+    }).unwrap_or_default();
+    // Field 22 of /proc/<pid>/stat (index 19 after the ")" that closes comm,
+    // since comm itself may contain spaces or parens): starttime in clock
+    // ticks since boot. Re-checked against live /proc at preflight time to
+    // rule out PID reuse between the ack and the check.
+    let start_time = fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| {
+        s.rsplit_once(')').map(|(_, rest)| rest.to_string())
+    }).and_then(|rest| rest.split_whitespace().nth(19).map(str::to_owned)).unwrap_or_default();
+
+    let ack = serde_json::json!({
+        "token": token,
+        "request_path": request_path,
+        "pid": pid,
+        "start_time": start_time,
+        "exe": exe_str,
+        "exe_sha256": exe_sha256,
+        "guide_marker": true,
+    });
+    let ack_path = PathBuf::from(format!("{}.ack", desc_path.to_string_lossy()));
+    let temp = ack_path.with_extension("ack.new");
+    if fs::write(&temp, ack.to_string()).is_ok() {
+        let _ = fs::rename(&temp, &ack_path);
+    }
+}
+
+/// True when a request's own token (if it has one) matches the token owned
+/// by THIS specific window (`window_key`), never merely "some window in this
+/// process claimed it". A request with no `token` field at all is
+/// legacy/ungated (D-153 phase 1 tests and any direct WF_GUIDE_FILE use keep
+/// working). A request that DOES carry a token is honoured only by the one
+/// window that claimed that exact token — this is what makes a decoy window
+/// (no descriptor, a different token, OR a second window in the SAME process
+/// that never claimed anything) ignore a request meant for the bound window
+/// even if it happens to read the file.
+#[cfg(feature = "guide")]
+fn guide_token_ok(window_key: usize, value: &serde_json::Value) -> bool {
+    match value.get("token").and_then(|v| v.as_str()) {
+        None => true,
+        Some(t) => guide_claimed_by(window_key).as_deref() == Some(t),
+    }
+}
+
+#[cfg(feature = "guide")]
+fn guide_parse(window_key: usize, text: &str) -> GuideRequest {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return GuideRequest::Clear;
     };
+    if !guide_token_ok(window_key, &value) {
+        return GuideRequest::Clear;
+    }
     let name = value.get("highlight").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return GuideRequest::Clear;
@@ -1497,6 +1636,178 @@ fn guide_parse(text: &str) -> GuideRequest {
         GuideRequest::Known { name, label }
     } else {
         GuideRequest::Unknown { name, label }
+    }
+}
+
+/// D-153 phase 2: descriptor claim, ack write, and token-gated request
+/// handling — the guide app's half of "a decoy window ignores a request
+/// meant for the bound window even if it happens to see it". No GTK/UI
+/// harness needed; this is all file and pure-logic seams.
+#[cfg(all(feature = "guide", test))]
+mod guide_descriptor_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    // These tests share process-global env vars and GUIDE_CLAIMED_TOKEN, so
+    // they run one at a time even under a parallel test binary.
+    static SERIAL: StdMutex<()> = StdMutex::new(());
+
+    fn with_descriptor(root: &Path, token: &str, request_path: &Path) -> PathBuf {
+        let desc = root.join("descriptor.json");
+        fs::write(
+            &desc,
+            serde_json::json!({"token": token, "request_path": request_path.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&desc, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        desc
+    }
+
+    #[test]
+    fn claims_token_and_writes_a_live_ack() {
+        let _guard = SERIAL.lock().unwrap();
+        guide_forget_claim();
+        let old = std::env::var("WF_GUIDE_DESCRIPTOR").ok();
+        let root = std::env::temp_dir().join(format!("wf-guide-desc-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let request_path = root.join("request.json");
+        let desc = with_descriptor(&root, "tok-abc123", &request_path);
+        std::env::set_var("WF_GUIDE_DESCRIPTOR", &desc);
+
+        const WIN: usize = 1;
+        guide_claim_descriptor(WIN);
+
+        assert_eq!(guide_file_path(), request_path, "guide_file_path takes the path FROM the descriptor, never inventing one");
+        let ack_path = PathBuf::from(format!("{}.ack", desc.to_string_lossy()));
+        let ack: serde_json::Value = serde_json::from_str(&fs::read_to_string(&ack_path).unwrap()).unwrap();
+        assert_eq!(ack["token"], "tok-abc123");
+        assert_eq!(ack["guide_marker"], true);
+        assert_eq!(ack["pid"], std::process::id());
+        assert!(ack["exe"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(ack["exe_sha256"].as_str().is_some_and(|s| s.len() == 64), "sha256 hex digest");
+        assert!(ack["start_time"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // A request carrying the claimed token is honoured — by the window that claimed it.
+        assert_eq!(guide_parse(WIN, r#"{"highlight":"delete-speed","label":"x","token":"tok-abc123"}"#),
+            GuideRequest::Known { name: "delete-speed".into(), label: "x".into() });
+
+        match old {
+            Some(v) => std::env::set_var("WF_GUIDE_DESCRIPTOR", v),
+            None => std::env::remove_var("WF_GUIDE_DESCRIPTOR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+        guide_forget_claim();
+    }
+
+    /// D-153 phase 3, same-process decoy: a SECOND top-level window in the
+    /// same process (e.g. a folder window opened from within the app) never
+    /// claimed the token itself — the first window already had — so its own
+    /// key does not own it, and the bound window's requests must NOT resolve
+    /// for it even though both windows are in the one process that wrote the
+    /// live ack.
+    #[test]
+    fn second_window_in_same_process_does_not_own_the_first_windows_token() {
+        let _guard = SERIAL.lock().unwrap();
+        guide_forget_claim();
+        let old = std::env::var("WF_GUIDE_DESCRIPTOR").ok();
+        let root = std::env::temp_dir().join(format!("wf-guide-desc-2win-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let request_path = root.join("request.json");
+        let desc = with_descriptor(&root, "tok-first-window", &request_path);
+        std::env::set_var("WF_GUIDE_DESCRIPTOR", &desc);
+
+        const FIRST_WINDOW: usize = 111;
+        const SECOND_WINDOW: usize = 222;
+        guide_claim_descriptor(FIRST_WINDOW);
+        // The second window in this process also calls claim (as every window
+        // does on its own guide-watch startup); it finds the cell already
+        // claimed and leaves the first window's ownership untouched.
+        guide_claim_descriptor(SECOND_WINDOW);
+
+        assert_eq!(guide_claimed_by(FIRST_WINDOW), Some("tok-first-window".to_string()));
+        assert_eq!(guide_claimed_by(SECOND_WINDOW), None, "the second window owns nothing");
+
+        let body = r#"{"highlight":"delete-speed","label":"x","token":"tok-first-window"}"#;
+        assert_eq!(
+            guide_parse(FIRST_WINDOW, body),
+            GuideRequest::Known { name: "delete-speed".into(), label: "x".into() },
+            "the window that claimed the token resolves its own request"
+        );
+        assert_eq!(
+            guide_parse(SECOND_WINDOW, body),
+            GuideRequest::Clear,
+            "the decoy second window in the SAME process must not resolve the first window's request"
+        );
+
+        match old {
+            Some(v) => std::env::set_var("WF_GUIDE_DESCRIPTOR", v),
+            None => std::env::remove_var("WF_GUIDE_DESCRIPTOR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+        guide_forget_claim();
+    }
+
+    #[test]
+    fn decoy_with_no_descriptor_ignores_a_tokened_request() {
+        let _guard = SERIAL.lock().unwrap();
+        guide_forget_claim();
+        let old = std::env::var("WF_GUIDE_DESCRIPTOR").ok();
+        std::env::remove_var("WF_GUIDE_DESCRIPTOR");
+
+        guide_claim_descriptor(1); // claims nothing: no descriptor
+
+        // The bound window's exact request, if this decoy happened to read it.
+        assert_eq!(
+            guide_parse(1, r#"{"highlight":"delete-speed","label":"x","token":"tok-abc123"}"#),
+            GuideRequest::Clear,
+            "no descriptor claimed => no token-carrying request is ever honoured"
+        );
+        // A legacy, tokenless request (old direct WF_GUIDE_FILE use, or the
+        // D-153 phase 1 tests) is unaffected.
+        assert_eq!(
+            guide_parse(1, r#"{"highlight":"delete-speed","label":"x"}"#),
+            GuideRequest::Known { name: "delete-speed".into(), label: "x".into() }
+        );
+
+        match old {
+            Some(v) => std::env::set_var("WF_GUIDE_DESCRIPTOR", v),
+            None => std::env::remove_var("WF_GUIDE_DESCRIPTOR"),
+        }
+        guide_forget_claim();
+    }
+
+    #[test]
+    fn decoy_with_a_different_token_ignores_the_bound_requests() {
+        let _guard = SERIAL.lock().unwrap();
+        guide_forget_claim();
+        let old = std::env::var("WF_GUIDE_DESCRIPTOR").ok();
+        let root = std::env::temp_dir().join(format!("wf-guide-desc-decoy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let request_path = root.join("request.json");
+        let desc = with_descriptor(&root, "tok-decoy-999", &request_path);
+        std::env::set_var("WF_GUIDE_DESCRIPTOR", &desc);
+
+        guide_claim_descriptor(1);
+
+        assert_eq!(
+            guide_parse(1, r#"{"highlight":"delete-speed","label":"x","token":"tok-abc123"}"#),
+            GuideRequest::Clear,
+            "a different claimed token still ignores the bound window's request"
+        );
+
+        match old {
+            Some(v) => std::env::set_var("WF_GUIDE_DESCRIPTOR", v),
+            None => std::env::remove_var("WF_GUIDE_DESCRIPTOR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+        guide_forget_claim();
     }
 }
 
@@ -1531,8 +1842,8 @@ fn guide_name_drive(widget: &impl IsA<gtk::Widget>, action: &str, drive: &Drive)
 
 /// A missing or unreadable file clears, like malformed JSON.
 #[cfg(feature = "guide")]
-fn guide_read(path: &Path) -> GuideRequest {
-    fs::read_to_string(path).map(|t| guide_parse(&t)).unwrap_or(GuideRequest::Clear)
+fn guide_read(window_key: usize, path: &Path) -> GuideRequest {
+    fs::read_to_string(path).map(|t| guide_parse(window_key, &t)).unwrap_or(GuideRequest::Clear)
 }
 
 /// Every live widget under `root` (popovers included) named exactly `name`.
@@ -2125,6 +2436,9 @@ fn guide_write_unknown(path: &Path, name: &str) {
 /// file written right after a directory appears is never missed.
 #[cfg(feature = "guide")]
 fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
+    let window_key = Rc::as_ptr(state) as usize;
+    guide_claim_descriptor(window_key);
+    guide_sitting::start(state, window_key);
     let path = guide_file_path();
     if let Some(old) = state.borrow_mut().guide_monitor.take() {
         old.cancel();
@@ -2155,7 +2469,7 @@ fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
             }
             let Some(state) = weak.upgrade() else { return };
             if is_final {
-                let request = guide_read(&file_path);
+                let request = guide_read(Rc::as_ptr(&state) as usize, &file_path);
                 guide_apply(&state, request);
             } else {
                 start_guide_watch(&state);
@@ -2165,7 +2479,7 @@ fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
         st.guide_monitor = Some(monitor);
         st.guide_watch_dir = Some(dir);
     }
-    let request = guide_read(&path);
+    let request = guide_read(window_key, &path);
     guide_apply(state, request);
 }
 
@@ -10237,6 +10551,462 @@ mod tests {
         assert!(!Path::new(&home).join(".local/share/wayfinder/icons").exists());
     }
 
+
+    /// D-154: the real Wayfinder window owns a real app-owned card that
+    /// `checkrun --attached` (headless, real, run as a child process) fed with
+    /// a current-format checklist. Three sittings: closing the card abandons
+    /// (checkrun exit 4); Save for later writes the canonical progress file;
+    /// the full sitting restores it and proves render, the real Show me where
+    /// button, ring advance, copy, screenshot, left placement and follow,
+    /// one-shot Detach, refusals (stale ack, edited checklist, unwritable
+    /// answers folder), canonical Submit, exact-PID cleanup and the decoy.
+    #[cfg(feature = "guide")]
+    fn guide_sitting_attached_card_d154() {
+        use crate::guide_sitting::{backend_is_x11, live_sittings, window_geometry, x11_move};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let old_home = std::env::var("HOME").unwrap();
+        // Earlier suite tests may leave HOME pointing at a scratch dir: find the
+        // crew tools from the account, not from whatever HOME is now.
+        let bin = ["/home/".to_string() + &std::env::var("USER").unwrap_or_default(), old_home.clone()]
+            .iter()
+            .map(|h| PathBuf::from(h).join("bin"))
+            .find(|b| b.join("checkrun").is_file())
+            .expect("crew tools (~/bin/checkrun) not found");
+        let root = crate::native_core::scratch_root().join(format!("wf-d154-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir, sit, cl) = (root.join("home"), root.join("dir"), root.join("sit"), root.join("cl"));
+        for d in [&home, &dir, &sit, &cl] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let script = |name: &str, body: &str| -> PathBuf {
+            let p = root.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let copied = root.join("copied");
+        let copycmd = script("copycmd.sh", &format!("#!/bin/sh\ncat > '{}'\n", copied.display()));
+        let shotcmd = script("shotcmd.sh", "#!/bin/sh\nprintf png > \"$1\"\n");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("WF_GUIDE_VERIFIER", bin.join("guide_sitting.py"));
+        std::env::set_var("CHECKRUN_NO_HANDOFF", "1");
+        std::env::set_var("CHECKRUN_WAIT_APP", "30");
+        std::env::set_var("CHECKRUN_COPY_CMD", &copycmd);
+        std::env::set_var("CHECKRUN_SHOT_CMD", format!("{} {{out}}", shotcmd.display()));
+        let checklist_text = "About 3 minutes.\n\
+1. The terminal opens in this folder. [#terminal-here-folder]\n\
+- Right-click: an empty spot in the file list\n\
+- Click: Terminal Here\n\
+Works: a terminal window opens.\n\
+Broken: nothing opens.\n\
+2. Open the file with another app. [#open-with-other-app]\n\
+- Right-click: a.txt\n\
+Works: a side menu opens.\n\
+Broken: no menu.\n\
+3. Type \"ls -la\" and it lists files.\n\
+- Type: \"ls -la\"\n\
+- Press: Enter\n\
+Works: files listed.\n\
+Broken: error.\n";
+
+        assert!(backend_is_x11("GdkX11Display"));
+        assert!(!backend_is_x11("GdkWaylandDisplay") && !backend_is_x11("GdkBroadwayDisplay"));
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d154test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        // The same-process decoy: built with no descriptor, so it never claims.
+        std::env::remove_var("WF_GUIDE_DESCRIPTOR");
+        guide_forget_claim();
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (dstate, dui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("decoy window");
+        dui.window.present();
+        pump();
+        assert!(guide_claimed_by(Rc::as_ptr(&dstate) as usize).is_none());
+
+        let cards = || -> Vec<gtk::Window> {
+            gtk::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Window>().ok())
+                .filter(|w| w.widget_name() == "guide-card")
+                .collect()
+        };
+        fn find(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+            if root.widget_name() == name {
+                return Some(root.clone());
+            }
+            let mut c = root.first_child();
+            while let Some(ch) = c {
+                if let Some(w) = find(&ch, name) {
+                    return Some(w);
+                }
+                c = ch.next_sibling();
+            }
+            None
+        }
+        let button = |card: &gtk::Window, name: &str| -> gtk::Button {
+            find(card.upcast_ref(), name)
+                .unwrap_or_else(|| panic!("no widget {name}"))
+                .downcast::<gtk::Button>()
+                .unwrap_or_else(|_| panic!("{name} is not a button"))
+        };
+        let toggle = |card: &gtk::Window, name: &str| -> gtk::ToggleButton {
+            find(card.upcast_ref(), name).unwrap().downcast::<gtk::ToggleButton>().unwrap()
+        };
+        let label_text = |card: &gtk::Window, name: &str| -> String {
+            find(card.upcast_ref(), name).unwrap().downcast::<gtk::Label>().unwrap().text().to_string()
+        };
+        let set_notes = |card: &gtk::Window, n: u32, text: &str| {
+            find(card.upcast_ref(), &format!("guide-card-notes-{n}"))
+                .unwrap()
+                .downcast::<gtk::TextView>()
+                .unwrap()
+                .buffer()
+                .set_text(text);
+        };
+        let read_json = |p: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let pid_start = |pid: u32| -> Option<String> {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit(')').next().map(|t| t.split_whitespace().nth(19).unwrap_or("").to_string()))
+        };
+        let no_temp = |d: &std::path::Path| {
+            std::fs::read_dir(d).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp"))
+        };
+
+        // One sitting: a fresh bound window plus a real headless checkrun.
+        struct Sitting154 {
+            state: Rc<RefCell<AppState>>,
+            ui: Ui,
+            child: std::process::Child,
+            child_start: String,
+            desc: PathBuf,
+            checklist: PathBuf,
+        }
+        let open_sitting = |name: &str, text: &str| -> Sitting154 {
+            let checklist = cl.join(format!("{name}.md"));
+            std::fs::write(&checklist, text).unwrap();
+            let back = cl.join(format!("{name}_START.sh"));
+            std::fs::write(&back, format!("# Back to: the start.\ntouch '{}'\n", root.join(format!("back-{name}")).display())).unwrap();
+            std::fs::set_permissions(&back, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let desc = sit.join(format!("{name}.json"));
+            let request = sit.join(format!("{name}.request-path"));
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&desc).unwrap();
+                f.write_all(serde_json::json!({"token": format!("tok-{name}"), "request_path": request.to_string_lossy()}).to_string().as_bytes()).unwrap();
+            }
+            std::env::set_var("WF_GUIDE_DESCRIPTOR", &desc);
+            guide_forget_claim();
+            build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+            let (state, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("bound window");
+            assert!(!Rc::ptr_eq(&state, &dstate));
+            ui.window.set_default_size(700, 500);
+            ui.window.present();
+            let child = std::process::Command::new("python3")
+                .arg(bin.join("checkrun"))
+                .arg(&checklist)
+                .arg("--attached")
+                .stdout(std::fs::File::create(root.join(format!("{name}.out"))).unwrap())
+                .stderr(std::fs::File::create(root.join(format!("{name}.err"))).unwrap())
+                .spawn()
+                .expect("headless checkrun");
+            let child_start = pid_start(child.id()).expect("child alive");
+            Sitting154 { state, ui, child, child_start, desc, checklist }
+        };
+        let finish_child = |mut s: Sitting154, code: i32| {
+            let pid = s.child.id();
+            let status = {
+                let mut got = None;
+                for _ in 0..100 {
+                    if let Some(st) = s.child.try_wait().unwrap() {
+                        got = Some(st);
+                        break;
+                    }
+                    pump();
+                }
+                got.expect("checkrun exits")
+            };
+            assert_eq!(status.code(), Some(code), "checkrun exit code");
+            assert_ne!(pid_start(pid), Some(s.child_start.clone()), "exact checkrun process is gone");
+            for ext in ["session", "request", "reply"] {
+                assert!(!crate::guide_sitting::side_path(&s.desc, ext).exists(), "{ext} left behind");
+            }
+        };
+        let wait_card = || {
+            for _ in 0..200 {
+                if cards().len() == 1 {
+                    return cards().pop().unwrap();
+                }
+                pump();
+            }
+            let mut diag = String::new();
+            for d in [&root, &sit] {
+                for e in std::fs::read_dir(d).unwrap().flatten() {
+                    let p = e.path();
+                    if p.is_file() {
+                        diag.push_str(&format!("{}: {}\n", p.display(), std::fs::read_to_string(&p).unwrap_or_default().chars().take(300).collect::<String>()));
+                    }
+                }
+            }
+            panic!("timed out waiting for card; files:\n{diag}");
+        };
+
+        // ---- Sitting 1: closing the card abandons; checkrun exits 4. ----
+        let s1 = open_sitting("one", checklist_text);
+        let card = wait_card();
+        assert_eq!(cards().len(), 1);
+        card.close();
+        wait_for("abandon closed both", || cards().is_empty() && !s1.ui.window.is_visible());
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s1.desc))["lifecycle"], "abandoned");
+        assert!(dui.window.is_visible(), "decoy untouched");
+        finish_child(s1, 4);
+
+        // ---- Sitting 2: Save for later writes the canonical progress file. ----
+        let s2 = open_sitting("two", checklist_text);
+        let card = wait_card();
+        toggle(&card, "guide-card-broken-1").emit_clicked();
+        set_notes(&card, 1, "menu was empty");
+        button(&card, "guide-card-save").emit_clicked();
+        wait_for("save closed both", || cards().is_empty() && !s2.ui.window.is_visible());
+        let progress = std::fs::read_to_string(cl.join("two_PROGRESS.md")).unwrap();
+        assert!(progress.contains("1. BROKEN"), "{progress}");
+        assert!(progress.contains("menu was empty"));
+        assert!(!cl.join("two_ANSWERS.md").exists());
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s2.desc))["lifecycle"], "saved");
+        let saved_progress = progress.clone();
+        finish_child(s2, 0);
+
+        // ---- Sitting 3: the full card, on a checklist that has saved progress. ----
+        std::fs::write(cl.join("three_PROGRESS.md"), &saved_progress).unwrap();
+        let s3 = open_sitting("three", checklist_text);
+        let card = wait_card();
+        let wcount = gtk::Window::list_toplevels().len();
+        let windows: Vec<String> = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .filter(|w| w.is_visible())
+            .map(|w| w.title().map(|t| t.to_string()).unwrap_or_default())
+            .collect();
+        println!("D154 visible windows: {windows:?} (toplevels {wcount})");
+        assert_eq!(windows.iter().filter(|t| t.starts_with("CHECKRUN")).count(), 1, "exactly one card");
+        assert_eq!(cards().len(), 1);
+        // No Qt in the launcher: the headless checkrun never mapped a toolkit.
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", s3.child.id())).unwrap_or_default();
+        assert!(!maps.contains("libQt"), "checkrun mapped Qt");
+        assert_eq!(card.title().as_deref(), Some("CHECKRUN three"));
+        // Every step, hop, Works/Broken and the duration are on the card.
+        assert_eq!(label_text(&card, "guide-card-duration"), "About 3 minutes.");
+        for n in 1..=3 {
+            assert!(find(card.upcast_ref(), &format!("guide-card-step-{n}")).is_some(), "step {n}");
+            assert!(find(card.upcast_ref(), &format!("guide-card-says-works-{n}")).is_some());
+            assert!(find(card.upcast_ref(), &format!("guide-card-says-broken-{n}")).is_some());
+        }
+        assert!(find(card.upcast_ref(), "guide-card-step-4").is_none());
+        assert!(find(card.upcast_ref(), "guide-card-show-1").is_some());
+        assert!(find(card.upcast_ref(), "guide-card-show-2").is_some());
+        assert!(find(card.upcast_ref(), "guide-card-show-3").is_none(), "untagged step has no Show me where");
+        let all_text: String = {
+            fn texts(w: &gtk::Widget, out: &mut String) {
+                if let Ok(l) = w.clone().downcast::<gtk::Label>() {
+                    out.push_str(&l.text());
+                    out.push('\n');
+                }
+                if let Ok(b) = w.clone().downcast::<gtk::Button>() {
+                    if let Some(l) = b.label() {
+                        out.push_str(&l);
+                        out.push('\n');
+                    }
+                }
+                let mut c = w.first_child();
+                while let Some(ch) = c {
+                    texts(&ch, out);
+                    c = ch.next_sibling();
+                }
+            }
+            let mut s = String::new();
+            texts(card.upcast_ref(), &mut s);
+            s
+        };
+        for want in ["RIGHT-CLICK", "an empty spot in the file list", "CLICK", "Terminal Here", "TYPE", "\"ls -la\"", "PRESS", "Enter", "a terminal window opens.", "nothing opens."] {
+            assert!(all_text.contains(want), "card lacks {want:?}:\n{all_text}");
+        }
+        assert!(find(card.upcast_ref(), "guide-card-copy-3-0").is_some(), "copy helper for the quoted phrase");
+        assert!(button(&card, "guide-card-back").is_sensitive(), "way-back available");
+        // Saved progress came back: step 1 Broken with its note; nothing else chosen.
+        assert!(toggle(&card, "guide-card-broken-1").is_active());
+        let notes1 = find(card.upcast_ref(), "guide-card-notes-1").unwrap().downcast::<gtk::TextView>().unwrap();
+        let b = notes1.buffer();
+        assert_eq!(b.text(&b.start_iter(), &b.end_iter(), false), "menu was empty");
+        for n in 2..=3 {
+            for v in ["worked", "broken", "skipped"] {
+                assert!(!toggle(&card, &format!("guide-card-{v}-{n}")).is_active(), "no default on step {n}");
+            }
+        }
+        // Left placement, measured; follow a move and a resize.
+        let adjacent = |parent: &adw::ApplicationWindow, card: &gtk::Window| -> bool {
+            let (p, c) = (window_geometry(parent).unwrap(), window_geometry(card).unwrap());
+            c.0 + c.2 == p.0 && c.1 == p.1
+        };
+        wait_for("card on the left edge", || adjacent(&s3.ui.window, &card));
+        assert_eq!(card.transient_for().as_ref(), Some(s3.ui.window.upcast_ref::<gtk::Window>()));
+        println!("D154 start parent={:?} card={:?}", window_geometry(&s3.ui.window), window_geometry(&card));
+        // Show me where: the REAL button, the exact bound state, no other window.
+        button(&card, "guide-card-show-1").emit_clicked();
+        pump();
+        assert!(matches!(&s3.state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == "terminal-here-folder"));
+        assert!(s3.state.borrow().guide_target.as_ref().is_some_and(|t| t.upgrade().is_some()), "the bound window rings its control");
+        assert!(matches!(dstate.borrow().guide_pending, GuideRequest::Clear), "decoy request untouched");
+        assert!(dstate.borrow().guide_target.is_none(), "decoy rings nothing");
+        assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
+        // Answering step 1 moves the ring to step 2's control.
+        toggle(&card, "guide-card-worked-1").emit_clicked();
+        pump();
+        assert!(toggle(&card, "guide-card-worked-1").is_active() && !toggle(&card, "guide-card-broken-1").is_active(), "one answer per step");
+        assert!(matches!(&s3.state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == "open-with-other-app"));
+        assert!(matches!(dstate.borrow().guide_pending, GuideRequest::Clear));
+        // Choosing the same answer again takes it back off.
+        toggle(&card, "guide-card-worked-1").emit_clicked();
+        assert!(!toggle(&card, "guide-card-worked-1").is_active());
+        toggle(&card, "guide-card-worked-1").emit_clicked();
+        // Step 2 answered: the last tagged step, so the ring clears.
+        toggle(&card, "guide-card-broken-2").emit_clicked();
+        pump();
+        assert!(matches!(s3.state.borrow().guide_pending, GuideRequest::Clear));
+        // Copy helpers and notes.
+        button(&card, "guide-card-copy-3-0").emit_clicked();
+        wait_for("copied phrase", || std::fs::read_to_string(&copied).map_or(false, |t| t == "ls -la"));
+        set_notes(&card, 2, "no side menu");
+        button(&card, "guide-card-copy-notes-2").emit_clicked();
+        wait_for("copied notes", || std::fs::read_to_string(&copied).map_or(false, |t| t == "no side menu"));
+        // Screenshot: card hides, command runs, row appears, card comes back on the left edge.
+        button(&card, "guide-card-grab-2").emit_clicked();
+        let shot = cl.join("three_SHOTS").join("step2-1.png");
+        wait_for("screenshot", || shot.exists() && card.is_visible());
+        wait_for("screenshot row", || find(card.upcast_ref(), "guide-card-remove-shot-2-0").is_some());
+        wait_for("card back on the left edge", || adjacent(&s3.ui.window, &card));
+        // Every step answered, so Submit really goes to checkrun from here on.
+        toggle(&card, "guide-card-skipped-3").emit_clicked();
+        // Refusal: an unwritable answers folder: canonical writer fails, no file, no temp, no false success.
+        std::fs::set_permissions(&cl, std::fs::Permissions::from_mode(0o555)).unwrap();
+        button(&card, "guide-card-submit").emit_clicked();
+        wait_for("failure shown", || button(&card, "guide-card-submit").is_sensitive() && !label_text(&card, "guide-card-notice").contains("changed"));
+        std::fs::set_permissions(&cl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!cl.join("three_ANSWERS.md").exists());
+        assert!(no_temp(&cl));
+        assert!(card.is_visible() && s3.ui.window.is_visible(), "no false success, no closed window");
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["lifecycle"], "open");
+        // Parent move and resize keep the card attached.
+        let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
+        x11_move(&s3.ui.window, px + 137, py + 61);
+        wait_for("card follows the move", || adjacent(&s3.ui.window, &card));
+        let moved = (window_geometry(&s3.ui.window).unwrap(), window_geometry(&card).unwrap());
+        println!("D154 after move parent={:?} card={:?}", moved.0, moved.1);
+        assert_eq!(moved.0 .0, px + 137);
+        let (_, _, w0, h0) = window_geometry(&s3.ui.window).unwrap();
+        crate::guide_sitting::x11_resize(&s3.ui.window, (w0 + 180) as u32, (h0 + 90) as u32);
+        wait_for("resized", || window_geometry(&s3.ui.window).map_or(false, |g| g.2 > w0 && g.3 > h0));
+        let (_, _, w1, h1) = window_geometry(&s3.ui.window).unwrap();
+        println!("D154 resize parent {w0}x{h0} -> {w1}x{h1}");
+        wait_for("card still attached after resize", || adjacent(&s3.ui.window, &card));
+        // Detach: once, stops coupling, both windows stay.
+        button(&card, "guide-card-detach").emit_clicked();
+        pump();
+        assert!(card.transient_for().is_none());
+        let before = window_geometry(&card).unwrap();
+        let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
+        x11_move(&s3.ui.window, px + 90, py + 40);
+        wait_for("parent moved", || window_geometry(&s3.ui.window).unwrap().0 == px + 90);
+        std::thread::sleep(Duration::from_millis(300));
+        pump();
+        assert_eq!(window_geometry(&card).unwrap(), before, "detached card must not follow");
+        button(&card, "guide-card-detach").emit_clicked();
+        pump();
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["state"], "detached");
+        // Submit: canonical answers, then exactly the card and the bound window close.
+        button(&card, "guide-card-submit").emit_clicked();
+        wait_for("submit closed both", || cards().is_empty() && !s3.ui.window.is_visible());
+        pump();
+        let answers = std::fs::read_to_string(cl.join("three_ANSWERS.md")).unwrap();
+        let lines: Vec<&str> = answers.lines().collect();
+        assert_eq!(lines[0], "Answers — three", "{answers}");
+        assert!(answers.contains("1. WORKED — "), "{answers}");
+        assert!(answers.contains("2. BROKEN — ") && answers.contains("no side menu"), "{answers}");
+        assert!(answers.contains("3. SKIPPED — "), "{answers}");
+        assert!(answers.contains("step2-1.png"), "shot listed: {answers}");
+        assert!(no_temp(&cl));
+        assert!(dui.window.is_visible(), "decoy window untouched");
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["lifecycle"], "submitted");
+        let answers_log = std::fs::read_to_string(home.join(".local/share/checkrun/answers.log")).unwrap_or_default();
+        let _ = answers_log;
+        finish_child(s3, 0);
+        assert_eq!(live_sittings().iter().filter(|s| s.borrow().is_open()).count(), 0, "no sitting left open");
+
+        // ---- Sitting 4: a stale ack refuses Show me where and Save; checkrun fails closed. ----
+        let s4 = open_sitting("four", checklist_text);
+        let card = wait_card();
+        wait_for("card on the left edge", || adjacent(&s4.ui.window, &card));
+        let ack = crate::guide_sitting::side_path(&s4.desc, "ack");
+        let mut bad = read_json(&ack);
+        bad["pid"] = serde_json::json!(1);
+        std::fs::write(&ack, bad.to_string()).unwrap();
+        button(&card, "guide-card-show-1").emit_clicked();
+        pump();
+        assert!(matches!(s4.state.borrow().guide_pending, GuideRequest::Clear), "stale ack: nothing rung");
+        assert!(s4.state.borrow().guide_target.is_none());
+        toggle(&card, "guide-card-worked-1").emit_clicked();
+        button(&card, "guide-card-save").emit_clicked();
+        pump();
+        assert!(!cl.join("four_PROGRESS.md").exists(), "stale ack: nothing written");
+        assert!(!label_text(&card, "guide-card-notice").is_empty());
+        assert!(card.is_visible() && s4.ui.window.is_visible());
+        card.close();
+        wait_for("abandon closed both", || cards().is_empty() && !s4.ui.window.is_visible());
+        finish_child(s4, 3);
+
+        // ---- Sitting 5: an edited checklist refuses Save; checkrun fails closed. ----
+        let s5 = open_sitting("five", checklist_text);
+        let card = wait_card();
+        wait_for("card on the left edge", || adjacent(&s5.ui.window, &card));
+        std::fs::write(&s5.checklist, format!("{checklist_text}4. Extra.\n- Click: x\n")).unwrap();
+        toggle(&card, "guide-card-worked-1").emit_clicked();
+        button(&card, "guide-card-save").emit_clicked();
+        pump();
+        assert!(!cl.join("five_PROGRESS.md").exists(), "edited checklist: nothing written");
+        assert!(!label_text(&card, "guide-card-notice").is_empty());
+        assert!(card.is_visible() && s5.ui.window.is_visible());
+        card.close();
+        wait_for("abandon closed both", || cards().is_empty() && !s5.ui.window.is_visible());
+        finish_child(s5, 3);
+
+        dui.window.destroy();
+        for k in ["WF_GUIDE_DESCRIPTOR", "WF_GUIDE_VERIFIER", "CHECKRUN_NO_HANDOFF", "CHECKRUN_WAIT_APP", "CHECKRUN_COPY_CMD", "CHECKRUN_SHOT_CMD"] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("HOME", old_home);
+        guide_forget_claim();
+    }
+
+    /// Runs the D-154 sitting proof alone on a virtual display.
+    #[cfg(feature = "guide")]
+    #[test]
+    fn guide_sitting_attached_card_d154_alone() {
+        if std::env::var("WAYFINDER_D154_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        gst::init().expect("gstreamer init");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        guide_sitting_attached_card_d154();
+    }
+
     /// Runs only under a virtual display (see the env guard), so it can never
     /// open a window on the owner's screen.
     /// All GTK tests share one thread (GTK initializes once) and run only under
@@ -10312,6 +11082,8 @@ mod tests {
         guide_pending_targets_resolve_d51();
         #[cfg(feature = "guide")]
         guide_rename_target_and_delete_speed_alias_d152();
+        #[cfg(feature = "guide")]
+        guide_sitting_attached_card_d154();
     }
 
     /// D-84: a disposable fixture of tiny real (not real-photo) PNGs proves the

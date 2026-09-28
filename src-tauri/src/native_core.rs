@@ -2437,7 +2437,13 @@ pub fn scratch_root() -> PathBuf {
         .ancestors()
         .find(|p| p.file_name().is_some_and(|n| n == "Projects"))
         .expect("the repository lives under ~/Projects");
-    let root = projects.join("Scratch").join("wf-unit-tests");
+    let scratch = projects.join("Scratch");
+    // scripts/headless-gtk-test.sh owns a per-run root and removes it itself,
+    // even after an abort or timeout; honour it only inside the Scratch tree.
+    let root = match std::env::var_os("WF_TEST_SCRATCH_ROOT").map(PathBuf::from) {
+        Some(p) if p.starts_with(&scratch) && p != scratch => p,
+        _ => scratch.join("wf-unit-tests"),
+    };
     fs::create_dir_all(&root).expect("create the scratch test root");
     root
 }
