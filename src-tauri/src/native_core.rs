@@ -537,6 +537,73 @@ fn label_from_gvfs_child(name: &str) -> String {
     })
 }
 
+/// Backend identity `(host, share)` of a GVfs child named
+/// `smb-share:server=nas,share=media[,user=..]`, percent-decoded. Only those
+/// two keys are read; any other scheme gives `None`.
+pub fn gvfs_smb_identity(name: &str) -> Option<(String, String)> {
+    let (scheme, params) = name.split_once(':')?;
+    if scheme != "smb-share" {
+        return None;
+    }
+    let get = |key: &str| {
+        params
+            .split(',')
+            .filter_map(|part| part.split_once('='))
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| percent_decode_lossless(v))
+            .filter(|v| !v.is_empty())
+    };
+    Some((get("server")?, get("share")?))
+}
+
+fn percent_decode_lossless(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Every SMB share under every GVfs runtime root in `/proc/mounts` text, as
+/// `(host, share, local path)`. Local reads only; nothing remote is opened.
+pub fn gvfs_smb_shares(mounts: &str, children: &dyn Fn(&str) -> Option<Vec<String>>) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for line in mounts.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[2] != GVFS_FSTYPE {
+            continue;
+        }
+        let root = decode_mount_field(fields[1]);
+        if !root.starts_with('/') {
+            continue;
+        }
+        for name in children(&root).unwrap_or_default() {
+            if name.contains('/') {
+                continue;
+            }
+            if let Some((host, share)) = gvfs_smb_identity(&name) {
+                out.push((host, share, format!("{}/{name}", root.trim_end_matches('/'))));
+            }
+        }
+    }
+    out
+}
+
+/// The same, read from this machine right now.
+pub fn gvfs_smb_shares_now() -> Vec<(String, String, String)> {
+    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+    gvfs_smb_shares(&mounts, &gvfs_children)
+}
+
 /// Immediate child directories of a GVfs runtime root; a missing or unreadable
 /// root is `None`, and an entry that vanishes mid-scan is skipped alone.
 fn gvfs_children(root: &str) -> Option<Vec<String>> {
@@ -5198,5 +5265,35 @@ rclone: /home/zito/GoogleDrive fuse.rclone rw 0 0
         }
         let failed = list_drives_with(&|_| None);
         assert!(failed.iter().all(|d| d.space.is_none()), "a failed probe leaves no space");
+    }
+}
+
+#[cfg(test)]
+mod gvfs_smb_identity_tests_d156_connect {
+    use super::*;
+
+    #[test]
+    fn gvfs_child_identity_is_decoded_credential_free_and_exact_d156_connect() {
+        assert_eq!(gvfs_smb_identity("smb-share:server=nas,share=media"), Some(("nas".into(), "media".into())));
+        assert_eq!(
+            gvfs_smb_identity("smb-share:domain=W,server=NAS,share=My%20Share,user=bob"),
+            Some(("NAS".into(), "My Share".into()))
+        );
+        assert_eq!(gvfs_smb_identity("sftp:host=nas,share=media"), None);
+        assert_eq!(gvfs_smb_identity("smb-share:server=nas"), None);
+        assert_eq!(gvfs_smb_identity("smb-share:server=nas,share=bad%zz"), None);
+    }
+
+    #[test]
+    fn gvfs_smb_shares_reads_only_gvfs_roots_d156_connect() {
+        let mounts = "gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\nnas:/x /mnt/x nfs rw 0 0\n";
+        let children = |root: &str| {
+            assert_eq!(root, "/run/user/1000/gvfs", "only the gvfs root is listed");
+            Some(vec!["smb-share:server=nas,share=media".to_string(), "sftp:host=h".to_string()])
+        };
+        assert_eq!(
+            gvfs_smb_shares(mounts, &children),
+            vec![("nas".to_string(), "media".to_string(), "/run/user/1000/gvfs/smb-share:server=nas,share=media".to_string())]
+        );
     }
 }

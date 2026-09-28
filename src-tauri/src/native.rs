@@ -1,4 +1,5 @@
 mod native_core;
+mod native_smb;
 #[cfg(feature = "guide")]
 mod guide_sitting;
 
@@ -865,6 +866,9 @@ fn visible_sort(key: SortKey, ascending: bool, columns: ColumnVisibility) -> (So
 struct AppConfig {
     #[serde(default)]
     columns: ColumnVisibility,
+    /// D-156: shares connected successfully; canonical URI and label only.
+    #[serde(default)]
+    remembered_networks: Vec<native_smb::RememberedNetwork>,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
     show_hidden: bool,
@@ -1018,6 +1022,7 @@ impl Default for AppConfig {
             sort_key: SortKey::Name,
             sort_ascending: true,
             columns: ColumnVisibility::default(),
+            remembered_networks: Vec::new(),
         }
     }
 }
@@ -1333,6 +1338,11 @@ struct AppState {
     sidebar_active_key: Option<String>,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
+    /// D-156 connect: saved shares, the one flow of this window and its dialog.
+    remembered_networks: Vec<native_smb::RememberedNetwork>,
+    smb_backend: Option<Rc<dyn native_smb::SmbBackend>>,
+    smb_flow: Option<Rc<native_smb::SmbFlow>>,
+    smb_dialog: Option<SmbDialog>,
     tree_expanded: HashSet<String>,
     tree_children: HashMap<String, Vec<(String, String, bool)>>,
     typeahead: String,
@@ -2757,6 +2767,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         sidebar_active_key: None,
         favorites: config.favorites,
         recents: config.recents,
+        remembered_networks: config.remembered_networks,
+        smb_backend: None,
+        smb_flow: None,
+        smb_dialog: None,
         tree_expanded: HashSet::new(),
         tree_children: HashMap::new(),
         typeahead: String::new(),
@@ -3387,7 +3401,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         entry.connect_activate(move |entry| {
             let path = entry.text().trim().to_string();
             ui.path_stack.set_visible_child_name("label");
-            if !path.is_empty() {
+            if native_smb::looks_like_smb(&path) {
+                smb_flow(&state, &ui).connect(&path);
+            } else if !path.is_empty() {
                 navigate(&state, path);
             }
         });
@@ -4149,6 +4165,23 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         }
     }
 
+    append_sidebar_heading(&ui.sidebar, "Network");
+    let connect_row = sidebar_row("Connect to Server\u{2026}", "", "asset:network");
+    connect_row.set_tooltip_text(Some(SMB_CONNECT_ROW));
+    connect_row.set_widget_name("wf-connect-server-row");
+    ui.sidebar.append(&connect_row);
+    for saved in state.borrow().remembered_networks.clone() {
+        if native_smb::remembered_location(&saved).is_none() {
+            continue;
+        }
+        let label = native_smb::remembered_label(&saved).unwrap_or_default();
+        let row = sidebar_row(&label, "", "asset:network");
+        row.set_tooltip_text(Some(&saved.uri));
+        row.set_widget_name("wf-remembered-network-row");
+        connect_remembered_context(&row, state.clone(), ui.clone(), saved.uri.clone());
+        ui.sidebar.append(&row);
+    }
+
     let folders = folder_tree_roots();
     if !folders.is_empty() {
         append_sidebar_heading(&ui.sidebar, "Folders");
@@ -4215,6 +4248,19 @@ fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListB
     if path.is_empty() {
         return;
     }
+    if path == SMB_CONNECT_ROW {
+        open_connect_dialog(state, ui, None);
+        return;
+    }
+    if native_smb::remembered_location(&native_smb::RememberedNetwork {
+        uri: path.clone(),
+        label: String::new(),
+    })
+    .is_some()
+    {
+        smb_flow(state, ui).connect(&path);
+        return;
+    }
     let Some(label) = sidebar_row_label(row) else {
         return;
     };
@@ -4235,6 +4281,446 @@ fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListB
         open_drive_action(state.clone(), ui.clone(), drive);
     } else {
         navigate(state, path);
+    }
+}
+
+// ---- D-156 connect: sidebar row, dialog, sink and the GIO backend ----------------
+
+/// The tooltip of the "Connect to Server…" row. Not an address, so it can never
+/// be mistaken for a remembered share.
+const SMB_CONNECT_ROW: &str = "wf:connect-to-server";
+
+#[derive(Clone)]
+struct SmbDialog {
+    window: gtk::Window,
+    entry: gtk::Entry,
+    status: gtk::Label,
+    list: gtk::ListBox,
+    list_scroll: gtk::ScrolledWindow,
+    connect: gtk::Button,
+}
+
+/// The one connect flow of a window; created on first use, never at startup.
+fn smb_flow(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Rc<native_smb::SmbFlow> {
+    if let Some(flow) = state.borrow().smb_flow.clone() {
+        return flow;
+    }
+    let backend = state
+        .borrow()
+        .smb_backend
+        .clone()
+        .unwrap_or_else(|| Rc::new(GioSmbBackend::new(ui.window.upcast_ref())));
+    let sink = Rc::new(GtkSmbSink { state: Rc::downgrade(state) });
+    let flow = native_smb::SmbFlow::new(backend, sink);
+    state.borrow_mut().smb_flow = Some(flow.clone());
+    flow
+}
+
+struct GtkSmbSink {
+    state: std::rc::Weak<RefCell<AppState>>,
+}
+
+impl native_smb::SmbSink for GtkSmbSink {
+    fn busy(&self, on: bool) {
+        let Some(state) = self.state.upgrade() else { return };
+        let dialog = state.borrow().smb_dialog.clone();
+        if let Some(dialog) = dialog {
+            dialog.connect.set_sensitive(!on);
+            dialog.entry.set_sensitive(!on);
+            dialog.list.set_sensitive(!on);
+        }
+        if on {
+            if let Some(ui) = ui_for_state(&state) {
+                ui.status.set_label("Connecting\u{2026}");
+            }
+        }
+    }
+
+    fn status(&self, text: &str) {
+        let Some(state) = self.state.upgrade() else { return };
+        if let Some(ui) = ui_for_state(&state) {
+            ui.status.set_label(text);
+        }
+        let dialog = state.borrow().smb_dialog.clone();
+        if let Some(dialog) = dialog {
+            dialog.status.set_label(text);
+        }
+    }
+
+    fn shares(&self, server: &str, choices: Vec<native_smb::ShareChoice>) {
+        let Some(state) = self.state.upgrade() else { return };
+        let Some(ui) = ui_for_state(&state) else { return };
+        let existing = state.borrow().smb_dialog.clone();
+        let dialog = match existing {
+            Some(dialog) => dialog,
+            None => open_connect_dialog(&state, &ui, Some(&format!("smb://{server}"))),
+        };
+        while let Some(child) = dialog.list.first_child() {
+            dialog.list.remove(&child);
+        }
+        for choice in &choices {
+            let row = gtk::ListBoxRow::new();
+            let label = gtk::Label::builder()
+                .label(&choice.name)
+                .xalign(0.0)
+                .margin_top(6)
+                .margin_bottom(6)
+                .margin_start(10)
+                .margin_end(10)
+                .build();
+            row.set_child(Some(&label));
+            row.set_tooltip_text(Some(&choice.uri));
+            row.set_widget_name("wf-connect-share-row");
+            dialog.list.append(&row);
+        }
+        dialog.list_scroll.set_visible(true);
+        dialog.status.set_label(&if choices.is_empty() {
+            format!("No shares are available on {server}.")
+        } else {
+            format!("Choose a share on {server}.")
+        });
+    }
+
+    fn opened(&self, local: &Path, share: &native_smb::SmbLocation) {
+        let Some(state) = self.state.upgrade() else { return };
+        let Some(ui) = ui_for_state(&state) else { return };
+        let saved = update_config(|config| {
+            native_smb::remember(&mut config.remembered_networks, share);
+        });
+        if let Some(saved) = saved {
+            state.borrow_mut().remembered_networks = saved.remembered_networks;
+        }
+        if let Some(dialog) = state.borrow_mut().smb_dialog.take() {
+            dialog.window.destroy();
+        }
+        request_drive_refresh(&state);
+        rebuild_sidebar(&state, &ui);
+        navigate(&state, local.to_string_lossy().to_string());
+    }
+}
+
+/// The modal: one address field, Connect, Cancel, and (after a server-only
+/// address) a bounded list of that server's immediate shares.
+fn open_connect_dialog(state: &Rc<RefCell<AppState>>, ui: &Ui, prefill: Option<&str>) -> SmbDialog {
+    if let Some(dialog) = state.borrow().smb_dialog.clone() {
+        dialog.window.present();
+        return dialog;
+    }
+    let window = gtk::Window::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .title("Connect to Server")
+        .default_width(420)
+        .resizable(false)
+        .build();
+    window.set_widget_name("wf-connect-dialog");
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    for setter in [
+        gtk::Widget::set_margin_top,
+        gtk::Widget::set_margin_bottom,
+        gtk::Widget::set_margin_start,
+        gtk::Widget::set_margin_end,
+    ] {
+        setter(body.upcast_ref(), 14);
+    }
+    let prompt = gtk::Label::builder().label("Server address").xalign(0.0).build();
+    let entry = gtk::Entry::builder()
+        .placeholder_text("smb://server/share  or  \\\\server\\share")
+        .activates_default(false)
+        .build();
+    entry.set_widget_name("wf-connect-address");
+    if let Some(text) = prefill {
+        entry.set_text(text);
+    }
+    let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    status.set_widget_name("wf-connect-status");
+    status.add_css_class("dim-label");
+    let list = gtk::ListBox::new();
+    list.set_widget_name("wf-connect-shares");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    let list_scroll = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .min_content_height(60)
+        .max_content_height(200)
+        .propagate_natural_height(true)
+        .visible(false)
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.set_widget_name("wf-connect-cancel");
+    let connect = gtk::Button::with_label("Connect");
+    connect.set_widget_name("wf-connect-go");
+    connect.add_css_class("suggested-action");
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.append(&cancel);
+    buttons.append(&connect);
+    body.append(&prompt);
+    body.append(&entry);
+    body.append(&status);
+    body.append(&list_scroll);
+    body.append(&buttons);
+    window.set_child(Some(&body));
+
+    let dialog = SmbDialog { window: window.clone(), entry: entry.clone(), status, list: list.clone(), list_scroll, connect: connect.clone() };
+    state.borrow_mut().smb_dialog = Some(dialog.clone());
+
+    let close = {
+        let weak = Rc::downgrade(state);
+        move || {
+            let Some(state) = weak.upgrade() else { return };
+            let flow = state.borrow().smb_flow.clone();
+            if let Some(flow) = flow {
+                flow.cancel();
+            }
+            let taken = state.borrow_mut().smb_dialog.take();
+            if let Some(dialog) = taken {
+                dialog.window.destroy();
+            }
+        }
+    };
+    {
+        let close = close.clone();
+        cancel.connect_clicked(move |_| close());
+    }
+    {
+        let close = close.clone();
+        window.connect_close_request(move |_| {
+            close();
+            glib::Propagation::Stop
+        });
+    }
+    let go = {
+        let weak = Rc::downgrade(state);
+        let ui = ui.clone();
+        let entry = entry.clone();
+        move || {
+            if let Some(state) = weak.upgrade() {
+                smb_flow(&state, &ui).connect(entry.text().as_str());
+            }
+        }
+    };
+    {
+        let go = go.clone();
+        connect.connect_clicked(move |_| go());
+    }
+    entry.connect_activate(move |_| go());
+    {
+        let weak = Rc::downgrade(state);
+        let ui = ui.clone();
+        list.connect_row_activated(move |_, row| {
+            let (Some(state), Some(uri)) = (weak.upgrade(), row.tooltip_text()) else { return };
+            smb_flow(&state, &ui).choose(uri.as_str());
+        });
+    }
+    window.present();
+    dialog
+}
+
+/// Right-click on a remembered share: Forget removes only that saved entry.
+fn connect_remembered_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui: Ui, uri: String) {
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let row_for_click = row.clone();
+    click.connect_pressed(move |_, _, x, y| {
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
+        popover.set_parent(&row_for_click);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.set_margin_top(4);
+        menu.set_margin_end(4);
+        menu.set_margin_bottom(4);
+        menu.set_margin_start(4);
+        let button = context_button("Forget", &popover, {
+            let (state, ui, uri) = (state.clone(), ui.clone(), uri.clone());
+            move || forget_remembered_network(&state, &ui, &uri)
+        });
+        button.set_widget_name("wf-forget-network");
+        menu.append(&button);
+        popover.set_child(Some(&menu));
+        unparent_when_closed(&popover);
+        popover.popup();
+    });
+    row.add_controller(click);
+}
+
+fn forget_remembered_network(state: &Rc<RefCell<AppState>>, ui: &Ui, uri: &str) {
+    if let Some(saved) = update_config(|config| {
+        native_smb::forget(&mut config.remembered_networks, uri);
+    }) {
+        state.borrow_mut().remembered_networks = saved.remembered_networks;
+    }
+    rebuild_sidebar(state, ui);
+}
+
+/// GIO on the GTK main context: asynchronous, cancellable, and the desktop's
+/// own authentication prompt through a `MountOperation` parented to the window.
+struct GioSmbBackend {
+    window: glib::WeakRef<gtk::Window>,
+    cancel: RefCell<gio::Cancellable>,
+}
+
+fn smb_fail(error: &glib::Error) -> native_smb::SmbFail {
+    use native_smb::SmbFail;
+    if error.matches(gio::IOErrorEnum::Cancelled) || error.matches(gio::IOErrorEnum::FailedHandled) {
+        SmbFail::Cancelled
+    } else if error.matches(gio::IOErrorEnum::PermissionDenied) {
+        SmbFail::Denied
+    } else if error.matches(gio::IOErrorEnum::HostNotFound)
+        || error.matches(gio::IOErrorEnum::HostUnreachable)
+        || error.matches(gio::IOErrorEnum::NetworkUnreachable)
+        || error.matches(gio::IOErrorEnum::ConnectionRefused)
+        || error.matches(gio::IOErrorEnum::TimedOut)
+    {
+        SmbFail::Unreachable
+    } else {
+        SmbFail::Other
+    }
+}
+
+impl GioSmbBackend {
+    fn new(window: &gtk::Window) -> Self {
+        Self { window: window.downgrade(), cancel: RefCell::new(gio::Cancellable::new()) }
+    }
+
+    fn fresh(&self) -> gio::Cancellable {
+        let cancel = gio::Cancellable::new();
+        *self.cancel.borrow_mut() = cancel.clone();
+        cancel
+    }
+
+    fn operation(&self) -> gtk::MountOperation {
+        gtk::MountOperation::new(self.window.upgrade().as_ref())
+    }
+
+    fn mount(&self, uri: &str, done: Box<dyn FnOnce(Result<(), native_smb::SmbFail>)>) {
+        let cancel = self.fresh();
+        let operation = self.operation();
+        let file = gio::File::for_uri(uri);
+        file.mount_enclosing_volume(
+            gio::MountMountFlags::NONE,
+            Some(&operation),
+            Some(&cancel.clone()),
+            move |result| match result {
+                Ok(()) => done(Ok(())),
+                Err(error) if error.matches(gio::IOErrorEnum::AlreadyMounted) => done(Ok(())),
+                Err(error) => done(Err(smb_fail(&error))),
+            },
+        );
+    }
+}
+
+/// Reads one server root's immediate children, batch by batch, keeping what
+/// arrived if a later batch fails.
+fn collect_shares(
+    enumerator: gio::FileEnumerator,
+    cancel: gio::Cancellable,
+    mut names: Vec<native_smb::ShareEntry>,
+    done: Box<dyn FnOnce(Result<Vec<native_smb::ShareEntry>, native_smb::SmbFail>)>,
+) {
+    let next = enumerator.clone();
+    let again = cancel.clone();
+    next.next_files_async(64, glib::Priority::DEFAULT, Some(&cancel), move |result| match result {
+        Ok(batch) if batch.is_empty() => done(Ok(names)),
+        Ok(batch) => {
+            for info in batch {
+                names.push(native_smb::ShareEntry {
+                    name: info.name().to_string_lossy().into_owned(),
+                    display: info.display_name().to_string(),
+                });
+            }
+            // memory guard on raw entries only; the chooser cut happens after sorting
+            if names.len() >= 5000 {
+                done(Ok(names));
+            } else {
+                collect_shares(enumerator, again, names, done);
+            }
+        }
+        Err(error) if !names.is_empty() => {
+            let _ = error;
+            done(Ok(names));
+        }
+        Err(error) => done(Err(smb_fail(&error))),
+    });
+}
+
+/// A GIO worker thread for lookups and a GLib timer for retries.
+struct GioSched;
+
+impl native_smb::Sched for GioSched {
+    fn work(&self, job: Box<dyn FnOnce() -> native_smb::Lookup + Send>, then: Box<dyn FnOnce(native_smb::Lookup)>) {
+        glib::spawn_future_local(async move {
+            let found = gio::spawn_blocking(job).await.unwrap_or(native_smb::Lookup::Fail);
+            then(found);
+        });
+    }
+
+    fn after(&self, millis: u32, then: Box<dyn FnOnce()>) {
+        glib::timeout_add_local_once(Duration::from_millis(millis as u64), then);
+    }
+}
+
+impl native_smb::SmbBackend for GioSmbBackend {
+    fn list_shares(&self, server_uri: &str, done: Box<dyn FnOnce(Result<Vec<native_smb::ShareEntry>, native_smb::SmbFail>)>) {
+        let cancel = self.fresh();
+        let operation = self.operation();
+        let file = gio::File::for_uri(server_uri);
+        let listing = file.clone();
+        let token = cancel.clone();
+        file.mount_enclosing_volume(
+            gio::MountMountFlags::NONE,
+            Some(&operation),
+            Some(&token),
+            move |result| {
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.matches(gio::IOErrorEnum::AlreadyMounted) => {}
+                    Err(error) => return done(Err(smb_fail(&error))),
+                }
+                let again = cancel.clone();
+                listing.enumerate_children_async(
+                    "standard::name,standard::display-name",
+                    gio::FileQueryInfoFlags::NONE,
+                    glib::Priority::DEFAULT,
+                    Some(&cancel),
+                    move |result| match result {
+                        Ok(enumerator) => collect_shares(enumerator, again, Vec::new(), done),
+                        Err(error) => done(Err(smb_fail(&error))),
+                    },
+                );
+            },
+        );
+    }
+
+    fn mount_share(&self, share_uri: &str, done: Box<dyn FnOnce(Result<(), native_smb::SmbFail>)>) {
+        self.mount(share_uri, done);
+    }
+
+    fn resolve(&self, share_uri: &str, subpath: &[String], done: Box<dyn FnOnce(Option<PathBuf>)>) {
+        let Some(mut loc) = native_smb::parse_smb_input(share_uri).ok() else { return done(None) };
+        loc.subpath = subpath.to_vec();
+        // GFile::path is a string read, not I/O; every metadata call runs on the worker.
+        let native = gio::File::for_uri(share_uri).path();
+        let token = self.cancel.borrow().clone();
+        let window = self.window.clone();
+        let alive: Rc<dyn Fn() -> bool> = Rc::new(move || !token.is_cancelled() && window.upgrade().is_some());
+        let lookup: Arc<dyn Fn() -> native_smb::Lookup + Send + Sync> = Arc::new(move || {
+            native_smb::lookup_full(
+                native.as_deref(),
+                &|| {
+                    native_core::gvfs_smb_shares_now()
+                        .into_iter()
+                        .map(|(host, share, path)| native_smb::MountedShare { host, share, path: PathBuf::from(path) })
+                        .collect()
+                },
+                &loc,
+            )
+        });
+        native_smb::resolve_async(Rc::new(GioSched), alive, lookup, done);
+    }
+
+    fn cancel(&self) {
+        self.cancel.borrow().cancel();
     }
 }
 
@@ -18193,6 +18679,247 @@ Broken: error.\n";
         assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
         column_chooser_d157();
         row_strip_follows_visible_columns_d157();
+    }
+
+    #[test]
+    fn legacy_config_without_networks_still_loads_d156_connect() {
+        let mut json = serde_json::to_value(AppConfig::default()).unwrap();
+        assert!(json.as_object_mut().unwrap().remove("remembered_networks").is_some());
+        let c: AppConfig = serde_json::from_value(json).expect("a config written before this field still loads");
+        assert!(c.remembered_networks.is_empty());
+        let mut c = c;
+        c.remembered_networks.push(native_smb::RememberedNetwork { uri: "smb://nas/media".into(), label: "media on nas".into() });
+        let text = serde_json::to_string(&c).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.remembered_networks, c.remembered_networks);
+    }
+
+    /// D-156 connect: fake backend, real window, real modal, Scratch paths.
+    #[test]
+    fn connect_gtk_d156_connect_alone() {
+        if std::env::var("WAYFINDER_D156C_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        connect_gtk_d156_connect();
+    }
+
+    struct FakeSmb {
+        calls: Rc<RefCell<Vec<String>>>,
+        shares: Vec<native_smb::ShareEntry>,
+        root: PathBuf,
+    }
+    impl native_smb::SmbBackend for FakeSmb {
+        fn list_shares(&self, uri: &str, done: Box<dyn FnOnce(Result<Vec<native_smb::ShareEntry>, native_smb::SmbFail>)>) {
+            self.calls.borrow_mut().push(format!("list {uri}"));
+            done(Ok(self.shares.clone()));
+        }
+        fn mount_share(&self, uri: &str, done: Box<dyn FnOnce(Result<(), native_smb::SmbFail>)>) {
+            self.calls.borrow_mut().push(format!("mount {uri}"));
+            done(Ok(()));
+        }
+        fn resolve(&self, uri: &str, _subpath: &[String], done: Box<dyn FnOnce(Option<PathBuf>)>) {
+            self.calls.borrow_mut().push(format!("path {uri}"));
+            let dir = uri.rsplit('/').next().map(|name| self.root.join(name)).filter(|d| d.is_dir());
+            glib::idle_add_local_once(move || done(dir));
+        }
+        fn cancel(&self) {
+            self.calls.borrow_mut().push("cancel".into());
+        }
+    }
+
+    fn connect_gtk_d156_connect() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d156c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, mounted, start) = (root.join("home"), root.join("mounted"), root.join("start"));
+        for d in [&home, &start, &mounted.join("media"), &mounted.join("docs")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let scans = scans.clone();
+            let scan: DriveScan = Arc::new(move || {
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            });
+            TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = Some(scan));
+        }
+        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let fake = || -> Rc<dyn native_smb::SmbBackend> {
+            Rc::new(FakeSmb {
+                calls: calls.clone(),
+                shares: vec![
+                    native_smb::ShareEntry { name: "media".into(), display: "Media Files".into() },
+                    native_smb::ShareEntry { name: "docs".into(), display: "smb://user:hunter2@evil/x".into() },
+                    native_smb::ShareEntry::plain("media"),
+                    native_smb::ShareEntry::plain("IPC$"),
+                ],
+                root: mounted.clone(),
+            })
+        };
+        let open_window = |id: &str| {
+            let app = adw::Application::builder().application_id(id).flags(gio::ApplicationFlags::NON_UNIQUE).build();
+            app.register(gio::Cancellable::NONE).expect("register test application");
+            build_ui(&app, Some(start.to_string_lossy().to_string()), None);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            wait_for("listing", || state.borrow().cwd == start.to_string_lossy());
+            state.borrow_mut().smb_backend = Some(fake());
+            (app, state, ui)
+        };
+        let named = |ui: &Ui, name: &str| -> Vec<gtk::Widget> {
+            all_widgets(ui.window.upcast_ref()).into_iter().filter(|w| w.widget_name() == name).collect()
+        };
+        let dialog_windows = || -> Vec<gtk::Window> {
+            gtk::Window::list_toplevels().into_iter().filter_map(|w| w.downcast::<gtk::Window>().ok()).filter(|w| w.widget_name() == "wf-connect-dialog").collect()
+        };
+        let dialog_widget = |name: &str| -> gtk::Widget {
+            let win = dialog_windows().pop().expect("dialog open");
+            all_widgets(win.upcast_ref()).into_iter().find(|w| w.widget_name() == name).unwrap_or_else(|| panic!("no {name}"))
+        };
+
+        let (_app, state, ui) = open_window("com.kadaken.wayfinder.d156ctest");
+        // startup and rendering: the Network row is there, nothing touched the network
+        pump();
+        assert_eq!(named(&ui, "wf-connect-server-row").len(), 1, "one Connect to Server row");
+        assert!(named(&ui, "wf-remembered-network-row").is_empty());
+        assert!(calls.borrow().is_empty(), "startup made backend calls: {:?}", calls.borrow());
+        assert!(dialog_windows().is_empty());
+
+        // the row opens one modal owned by the window
+        named(&ui, "wf-connect-server-row").pop().unwrap().downcast::<gtk::ListBoxRow>().unwrap().emit_by_name::<()>("activate", &[]);
+        wait_for("dialog", || dialog_windows().len() == 1);
+        let dialog = dialog_windows().pop().unwrap();
+        assert!(dialog.is_modal());
+        assert_eq!(dialog.transient_for().as_ref(), Some(ui.window.upcast_ref::<gtk::Window>()));
+
+        // Cancel closes it with no network call
+        dialog_widget("wf-connect-cancel").downcast::<gtk::Button>().unwrap().emit_clicked();
+        wait_for("dialog closed", || dialog_windows().is_empty());
+        assert!(calls.borrow().iter().all(|c| c == "cancel"), "{:?}", calls.borrow());
+        calls.borrow_mut().clear();
+
+        // server-only address through the address entry: browse, chooser, choose
+        ui.path_entry.set_text("\\\\nas");
+        ui.path_entry.emit_activate();
+        wait_for("chooser", || dialog_windows().len() == 1 && dialog_widget("wf-connect-shares").downcast::<gtk::ListBox>().unwrap().first_child().is_some());
+        assert_eq!(calls.borrow().as_slice(), ["list smb://nas/"]);
+        let rows: Vec<gtk::Widget> = all_widgets(dialog_windows()[0].upcast_ref()).into_iter().filter(|w| w.widget_name() == "wf-connect-share-row").collect();
+        let labels: Vec<String> = rows.iter().map(|r| r.tooltip_text().unwrap().to_string()).collect();
+        assert_eq!(labels, ["smb://nas/docs", "smb://nas/IPC%24", "smb://nas/media"], "sorted, deduplicated, admin share kept, URI from the actual name");
+        let shown: Vec<String> = rows.iter().filter_map(|r| r.first_child()).filter_map(|c| c.downcast::<gtk::Label>().ok()).map(|l| l.label().to_string()).collect();
+        assert_eq!(shown, ["docs", "IPC$", "Media Files"]);
+        assert_eq!(state.borrow().cwd, start.to_string_lossy());
+        let scans_before = scans.load(std::sync::atomic::Ordering::SeqCst);
+        rows[2].clone().downcast::<gtk::ListBoxRow>().unwrap().emit_by_name::<()>("activate", &[]);
+        let media = mounted.join("media");
+        wait_for("navigated", || state.borrow().cwd == media.to_string_lossy());
+        wait_for("dialog gone", || dialog_windows().is_empty());
+        pump();
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst) - scans_before, 1, "exactly one drive refresh");
+        assert_eq!(calls.borrow().iter().filter(|c| c.starts_with("mount ")).count(), 1);
+
+        // saved once, canonical, credential free
+        let remembered = state.borrow().remembered_networks.clone();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].uri, "smb://nas/media");
+        assert_eq!(named(&ui, "wf-remembered-network-row").len(), 1);
+
+        // second spelling of the same share converges and does not duplicate
+        calls.borrow_mut().clear();
+        ui.path_entry.set_text("smb://nas/media");
+        ui.path_entry.emit_activate();
+        wait_for("second nav", || calls.borrow().iter().any(|c| c.starts_with("mount ")));
+        assert_eq!(calls.borrow().iter().filter(|c| c.starts_with("list ")).count(), 0, "a share address skips browse");
+        pump();
+        assert_eq!(state.borrow().remembered_networks.len(), 1);
+        ui.path_entry.set_text("\\\\NAS\\docs");
+        ui.path_entry.emit_activate();
+        wait_for("docs", || state.borrow().cwd == mounted.join("docs").to_string_lossy());
+        assert_eq!(state.borrow().remembered_networks.len(), 2);
+
+        // a rejected address never reaches the backend and keeps the folder
+        calls.borrow_mut().clear();
+        ui.path_entry.set_text("smb://user:secret@nas/media");
+        ui.path_entry.emit_activate();
+        pump();
+        assert!(calls.borrow().is_empty());
+        assert!(!ui.status.label().contains("secret"));
+
+        // restart: a new window over the same HOME shows the rows, no network
+        ui.window.destroy();
+        pump();
+        calls.borrow_mut().clear();
+        let hostile = "user:hunter2@nas\u{7}".to_string() + &"Z".repeat(3000);
+        update_config(|c| {
+            for n in c.remembered_networks.iter_mut() {
+                n.label = hostile.clone();
+            }
+            c.remembered_networks.push(native_smb::RememberedNetwork { uri: "smb://user:hunter2@nas/x".into(), label: hostile.clone() });
+        });
+        let (_app2, state2, ui2) = open_window("com.kadaken.wayfinder.d156ctest2");
+        pump();
+        assert!(calls.borrow().is_empty(), "restart made backend calls");
+        assert_eq!(named(&ui2, "wf-remembered-network-row").len(), 2);
+        let config_dir_text = {
+            let mut all = String::new();
+            let mut stack = vec![home.clone()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if let Ok(t) = std::fs::read_to_string(&p) {
+                        all.push_str(&t);
+                    }
+                }
+            }
+            all
+        };
+        assert!(config_dir_text.contains("smb://nas/media") && config_dir_text.contains("smb://nas/docs"));
+        assert!(!config_dir_text.contains("secret") && !config_dir_text.contains("/gvfs"));
+        // hostile stored labels: not on any label or tooltip, and ignored
+        for w in all_widgets(ui2.window.upcast_ref()) {
+            let mut texts = vec![w.tooltip_text().map(|t| t.to_string()).unwrap_or_default()];
+            if let Some(l) = w.downcast_ref::<gtk::Label>() {
+                texts.push(l.label().to_string());
+            }
+            for t in texts {
+                assert!(!t.contains("hunter2") && !t.contains("ZZZZ"), "hostile text on screen: {t:.60}");
+            }
+        }
+        assert!(!ui2.status.label().contains("hunter2"));
+
+        // Forget removes only its target
+        assert!(named(&ui2, "wf-remembered-network-row").iter().any(|w| w.tooltip_text().as_deref() == Some("smb://nas/docs")));
+        forget_remembered_network(&state2, &ui2, "smb://nas/docs");
+        pump();
+        assert_eq!(
+            state2.borrow().remembered_networks.iter().map(|n| n.uri.clone()).collect::<Vec<_>>(),
+            ["smb://nas/media", "smb://user:hunter2@nas/x"],
+            "only the target went; the unrelated invalid entry is not rewritten or dropped"
+        );
+        let on_disk = update_config(|_| {}).expect("config readable");
+        let media = on_disk.remembered_networks.iter().find(|n| n.uri == "smb://nas/media").unwrap();
+        assert_eq!(media.label, "media on nas", "a valid entry's label is rewritten from its URI");
+        assert_eq!(named(&ui2, "wf-remembered-network-row").len(), 1);
+
+        // activating a remembered row reconnects through the same flow
+        named(&ui2, "wf-remembered-network-row").pop().unwrap().downcast::<gtk::ListBoxRow>().unwrap().emit_by_name::<()>("activate", &[]);
+        wait_for("reconnect", || calls.borrow().iter().any(|c| c == "mount smb://nas/media"));
+        assert!(calls.borrow().iter().all(|c| !c.starts_with("list ")));
+
+        ui2.window.destroy();
+        pump();
+        TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     /// D-157: real window, real secondary click, real rows.
