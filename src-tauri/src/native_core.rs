@@ -436,6 +436,178 @@ pub fn search_dir(
     Ok(out)
 }
 
+/// Remote filesystem kinds shown as network rows. Portal, AppImage, archive,
+/// encrypted-overlay and other local FUSE mounts are deliberately not listed.
+fn is_remote_fstype(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "nfs"
+            | "nfs4"
+            | "cifs"
+                | "smb3"
+                | "smbfs"
+                | "davfs"
+                | "fuse.sshfs"
+                | "fuse.davfs2"
+                | "fuse.curlftpfs"
+                | "fuse.smbnetfs"
+                | "fuse.s3fs"
+                | "fuse.gcsfuse"
+    )
+}
+
+/// The desktop's runtime FUSE root whose child directories are the real shares.
+const GVFS_FSTYPE: &str = "fuse.gvfsd-fuse";
+
+/// Kernel mount-field escapes (`\040` space, `\011` tab, `\134` backslash, any
+/// `\NNN` octal) back to the real path.
+fn decode_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let value = (bytes[i + 1] - b'0') as u32 * 64
+                + (bytes[i + 2] - b'0') as u32 * 8
+                + (bytes[i + 3] - b'0') as u32;
+            if value < 256 {
+                out.push(value as u8);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A label with control characters removed and credentials never included.
+fn clean_label(text: &str) -> String {
+    let text = text.rsplit('@').next().unwrap_or(text);
+    text.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()
+}
+
+/// `Media on NAS` from a mount source such as `//nas/Media` or `nas:/export/Media`;
+/// user names and passwords in the source are dropped, never shown.
+fn label_from_source(source: &str) -> Option<String> {
+    let (host, share) = if let Some(rest) = source.strip_prefix("//") {
+        let (host, path) = rest.split_once('/')?;
+        (host, path)
+    } else {
+        source.split_once(':')?
+    };
+    let host = clean_label(host);
+    let share = clean_label(share.trim_matches('/').rsplit('/').next().unwrap_or(""));
+    match (share.is_empty(), host.is_empty()) {
+        (false, false) => Some(format!("{share} on {host}")),
+        (true, false) => Some(host),
+        _ => None,
+    }
+}
+
+/// A GVfs child directory name (`smb-share:server=nas,share=media`,
+/// `sftp:host=example.com,user=bob`) as a plain label. Only server, share and
+/// host are read; `user`, `password` and everything else is ignored.
+fn label_from_gvfs_child(name: &str) -> String {
+    let (scheme, params) = name.split_once(':').unwrap_or((name, ""));
+    let get = |key: &str| {
+        params
+            .split(',')
+            .filter_map(|part| part.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| clean_label(v))
+            .filter(|v| !v.is_empty())
+    };
+    let friendly = match (get("share"), get("server").or_else(|| get("host"))) {
+        (Some(share), Some(host)) => Some(format!("{share} on {host}")),
+        (None, Some(host)) => Some(host),
+        _ => None,
+    };
+    friendly.unwrap_or_else(|| {
+        let plain = clean_label(scheme);
+        if plain.is_empty() || params.contains("password") {
+            "Network share".to_string()
+        } else {
+            plain
+        }
+    })
+}
+
+/// Immediate child directories of a GVfs runtime root; a missing or unreadable
+/// root is `None`, and an entry that vanishes mid-scan is skipped alone.
+fn gvfs_children(root: &str) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kind.is_dir() && !name.starts_with('.') {
+            names.push(name);
+        }
+    }
+    Some(names)
+}
+
+/// Network rows from `/proc/mounts` text: direct remote mounts anywhere, plus one
+/// row per immediate child of a GVfs runtime root (never the root itself).
+/// Deduplicated by decoded lexical path (no canonicalizing, no remote traversal),
+/// skipping `taken`, sorted by label then path. Pure apart from `children`.
+pub fn network_drives(
+    mounts: &str,
+    taken: &std::collections::HashSet<String>,
+    children: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Vec<Drive> {
+    let mut seen: std::collections::HashSet<String> = taken.clone();
+    let mut rows: Vec<Drive> = Vec::new();
+    let mut push = |label: String, path: String, fstype: &str| {
+        if seen.insert(path.clone()) {
+            rows.push(Drive {
+                name: if label.is_empty() { "Network share".to_string() } else { label },
+                path: path.clone(),
+                mountpoint: path,
+                size: 0,
+                fstype: fstype.to_string(),
+                kind: "network".to_string(),
+                removable: false,
+                space: None,
+            });
+        }
+    };
+    for line in mounts.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let (source, fstype) = (decode_mount_field(fields[0]), fields[2]);
+        let mountpoint = decode_mount_field(fields[1]);
+        if !mountpoint.starts_with('/') || mountpoint.contains('\0') || mountpoint.contains('\n') {
+            continue;
+        }
+        if fstype == GVFS_FSTYPE {
+            let Some(names) = children(&mountpoint) else { continue };
+            for name in names {
+                if name.is_empty() || name.contains('/') {
+                    continue;
+                }
+                let path = format!("{}/{name}", mountpoint.trim_end_matches('/'));
+                push(label_from_gvfs_child(&name), path, fstype);
+            }
+        } else if is_remote_fstype(fstype) {
+            let label = label_from_source(&source).unwrap_or_else(|| {
+                clean_label(mountpoint.trim_end_matches('/').rsplit('/').next().unwrap_or(""))
+            });
+            push(label, mountpoint, fstype);
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.path.cmp(&b.path))
+    });
+    rows
+}
+
 pub fn list_drives() -> Vec<Drive> {
     list_drives_with(&probe_space)
 }
@@ -505,7 +677,7 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
             if fields.len() < 3 {
                 continue;
             }
-            let (device, mountpoint, fstype) = (fields[0], fields[1], fields[2]);
+            let (mountpoint, fstype) = (fields[1], fields[2]);
             if mountpoint.contains("/GoogleDrive") || fstype.contains("rclone") {
                 out.push(Drive {
                     name: "Google Drive".to_string(),
@@ -517,29 +689,23 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
                     removable: false,
                     space: None,
                 });
-            } else if (fstype.starts_with("nfs") || fstype == "cifs" || fstype.starts_with("fuse."))
-                && mountpoint.starts_with("/home")
-                && !mountpoint.contains("/doc")
-            {
-                out.push(Drive {
-                    name: mountpoint.rsplit('/').next().unwrap_or(device).to_string(),
-                    path: mountpoint.to_string(),
-                    mountpoint: mountpoint.to_string(),
-                    size: 0,
-                    fstype: fstype.to_string(),
-                    kind: "network".to_string(),
-                    removable: false,
-                    space: None,
-                });
             }
         }
+        let taken: std::collections::HashSet<String> =
+            out.iter().map(|d| d.mountpoint.clone()).filter(|m| !m.is_empty()).collect();
+        out.extend(network_drives(&mounts, &taken, &gvfs_children));
     }
 
-    for drive in out.iter_mut().filter(|d| !d.mountpoint.is_empty()) {
+    probe_local_space(&mut out, probe);
+    out
+}
+
+/// One space probe per mounted drive, except network rows: a dead remote share
+/// can block `statvfs`, so discovery never touches one and leaves its space unknown.
+fn probe_local_space(drives: &mut [Drive], probe: &dyn Fn(&str) -> Option<Space>) {
+    for drive in drives.iter_mut().filter(|d| !d.mountpoint.is_empty() && d.kind != "network") {
         drive.space = probe(&drive.mountpoint);
     }
-
-    out
 }
 
 /// Result of running the mount command: `Ok(())` on a zero exit, `Err(stderr)` on
@@ -4821,6 +4987,189 @@ mod tests {
         assert_eq!(drive.space_view().fraction, Some(0.75));
     }
 
+    // ---- D-156: already-mounted network shares ----
+
+    const D156_MOUNTS: &str = "\
+/dev/nvme0n1p2 / ext4 rw 0 0
+//nas/Media /mnt/nas-media cifs rw 0 0
+//bob:hunter2@nas/Media /mnt/nas-media cifs rw 0 0
+srv:/export/Photos /run/media/zito/My\\040Share nfs4 rw 0 0
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0
+gvfsd-fuse /run/user/1001/gvfs fuse.gvfsd-fuse rw 0 0
+portal /run/user/1000/doc fuse.portal rw 0 0
+appimage /tmp/.mount_App fuse.appimagefs rw 0 0
+encfs /home/zito/private fuse.encfs rw 0 0
+ratarmount /home/zito/arch fuse.ratarmount rw 0 0
+/dev/loop0 /mnt/local ext4 rw 0 0
+tmpfs /run/user/1000 tmpfs rw 0 0
+rclone: /home/zito/GoogleDrive fuse.rclone rw 0 0
+";
+
+    fn d156_children(root: &str) -> Option<Vec<String>> {
+        match root {
+            "/run/user/1000/gvfs" => Some(vec![
+                "smb-share:server=nas,share=Backup".to_string(),
+                "sftp:host=example.com,user=bob".to_string(),
+                "weird:user=bob,password=hunter2".to_string(),
+            ]),
+            _ => None, // the 1001 root is unreadable
+        }
+    }
+
+    /// The rule before D-156: direct nfs/cifs and any fuse.* only under /home.
+    fn d156_legacy_rows(mounts: &str) -> Vec<String> {
+        mounts
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                let (mp, fs) = (f.get(1)?, f.get(2)?);
+                ((fs.starts_with("nfs") || *fs == "cifs" || fs.starts_with("fuse."))
+                    && mp.starts_with("/home")
+                    && !mp.contains("/doc")
+                    && !mp.contains("/GoogleDrive")
+                    && !fs.contains("rclone"))
+                .then(|| mp.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mount_escapes_decode_d156() {
+        assert_eq!(decode_mount_field("/run/media/a\\040b"), "/run/media/a b");
+        assert_eq!(decode_mount_field("a\\011b\\134c"), "a\tb\\c");
+        assert_eq!(decode_mount_field("plain\\9"), "plain\\9");
+        assert_eq!(decode_mount_field("end\\04"), "end\\04");
+    }
+
+    #[test]
+    fn network_rows_direct_gvfs_dedup_order_and_decoys_d156() {
+        let taken: std::collections::HashSet<String> = ["/home/zito/GoogleDrive".to_string()].into();
+        let rows = network_drives(D156_MOUNTS, &taken, &d156_children);
+        let got: Vec<(&str, &str)> = rows.iter().map(|d| (d.name.as_str(), d.path.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Backup on nas", "/run/user/1000/gvfs/smb-share:server=nas,share=Backup"),
+                ("example.com", "/run/user/1000/gvfs/sftp:host=example.com,user=bob"),
+                ("Media on nas", "/mnt/nas-media"),
+                ("Network share", "/run/user/1000/gvfs/weird:user=bob,password=hunter2"),
+                ("Photos on srv", "/run/media/zito/My Share"),
+            ]
+        );
+        assert!(rows.iter().all(|d| d.kind == "network" && d.mountpoint == d.path && !d.removable));
+        for d in &rows {
+            for secret in ["hunter2", "bob", "password"] {
+                assert!(!d.name.contains(secret), "credential in label: {}", d.name);
+            }
+        }
+        assert!(rows.iter().all(|d| d.path != "/run/user/1000/gvfs"), "aggregate root is not a row");
+        assert_eq!(network_drives(D156_MOUNTS, &taken, &d156_children).len(), rows.len(), "stable");
+        // a path already found elsewhere is not repeated
+        let taken: std::collections::HashSet<String> = ["/mnt/nas-media".to_string()].into();
+        assert_eq!(network_drives(D156_MOUNTS, &taken, &d156_children).len(), 4);
+        // every root unreadable: direct rows survive
+        assert_eq!(network_drives(D156_MOUNTS, &Default::default(), &|_| None).len(), 2);
+    }
+
+    #[test]
+    fn network_discovery_before_after_and_scale_d156() {
+        let before = d156_legacy_rows(D156_MOUNTS);
+        let after = network_drives(D156_MOUNTS, &["/home/zito/GoogleDrive".to_string()].into(), &d156_children);
+        let mut big = String::new();
+        for i in 0..1000 {
+            big.push_str(&format!("//h{i}/s{i} /mnt/n{i} cifs rw 0 0\n"));
+        }
+        big.push_str("gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n");
+        let kids: Vec<String> = (0..100).map(|i| format!("smb-share:server=h{i},share=s{i}")).collect();
+        let started = std::time::Instant::now();
+        let listed = std::cell::Cell::new(0);
+        let rows = network_drives(&big, &Default::default(), &|_| {
+            listed.set(listed.get() + 1);
+            Some(kids.clone())
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(rows.len(), 1100);
+        assert_eq!(listed.get(), 1, "one immediate-child listing only");
+        println!(
+            "D156 MEASURE before: {} rows {:?} (decoy encfs/ratarmount counted, shares missed); after: {} rows; scan of 1000 lines + 100 children: {} rows in {} us",
+            before.len(),
+            before,
+            after.len(),
+            rows.len(),
+            elapsed.as_micros()
+        );
+        assert!(elapsed < std::time::Duration::from_millis(500), "{elapsed:?}");
+        assert_eq!(after.len(), 5);
+    }
+
+    #[test]
+    fn rclone_google_drive_is_unchanged_and_not_a_network_row_d156() {
+        let rows = network_drives(D156_MOUNTS, &Default::default(), &d156_children);
+        // rclone is reached by the existing branch; as a fuse.rclone type it is not remote here
+        assert!(rows.iter().all(|d| !d.path.contains("GoogleDrive")));
+    }
+
+    #[test]
+    fn nfsd_and_local_fuse_are_not_remote_kinds_d156() {
+        for yes in ["nfs", "nfs4", "cifs", "smb3", "fuse.sshfs"] {
+            assert!(is_remote_fstype(yes), "{yes}");
+        }
+        for no in ["nfsd", "rpc_pipefs", "fuse.portal", "fuse.appimagefs", "fuse.encfs", "fuse.ratarmount", "fuse", "ext4", "tmpfs", "fuse.rclone"] {
+            assert!(!is_remote_fstype(no), "{no}");
+        }
+        let rows = network_drives("nfsd /proc/fs/nfsd nfsd rw 0 0\n", &Default::default(), &|_| None);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn network_paths_are_never_probed_but_local_drives_still_are_d156() {
+        let mk = |kind: &str, path: &str| Drive {
+            name: "x".into(),
+            path: path.into(),
+            mountpoint: path.into(),
+            size: 0,
+            fstype: "x".into(),
+            kind: kind.into(),
+            removable: false,
+            space: None,
+        };
+        let mut drives = vec![
+            mk("drive", "/mnt/usb"),
+            mk("gdrive", "/home/z/GoogleDrive"),
+            mk("network", "/mnt/nas"),
+            mk("network", "/run/user/1000/gvfs/smb-share:server=a,share=b"),
+        ];
+        let probed = std::cell::RefCell::new(Vec::new());
+        probe_local_space(&mut drives, &|m| {
+            probed.borrow_mut().push(m.to_string());
+            Some(Space { total: 10, available: 5 })
+        });
+        assert_eq!(*probed.borrow(), vec!["/mnt/usb", "/home/z/GoogleDrive"]);
+        assert!(drives[2].space.is_none() && drives[3].space.is_none());
+        assert!(drives[0].space.is_some() && drives[1].space.is_some());
+    }
+
+    #[test]
+    fn every_immediate_gvfs_child_is_listed_without_a_cap_d156() {
+        let root = scratch_case("wf-d156-many");
+        for i in 0..1205 {
+            fs::create_dir(root.join(format!("smb-share:server=h,share=s{i}"))).unwrap();
+        }
+        assert_eq!(gvfs_children(root.to_str().unwrap()).unwrap().len(), 1205);
+    }
+
+    #[test]
+    fn a_real_directory_root_lists_only_immediate_directories_d156() {
+        let root = scratch_case("wf-d156-root");
+        fs::create_dir_all(root.join("smb-share:server=a,share=b/deep/deeper")).unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        fs::write(root.join("file"), "x").unwrap();
+        let mut names = gvfs_children(root.to_str().unwrap()).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["smb-share:server=a,share=b".to_string()]);
+        assert!(gvfs_children(root.join("gone").to_str().unwrap()).is_none());
+    }
+
     #[test]
     fn drive_scan_probes_only_mounted_drives_with_the_injected_probe_d46() {
         let probed = std::cell::RefCell::new(Vec::new());
@@ -4828,10 +5177,12 @@ mod tests {
             probed.borrow_mut().push(mountpoint.to_string());
             Some(Space { total: 1000, available: 1 })
         });
-        let mounted: Vec<_> = drives.iter().filter(|d| !d.mountpoint.is_empty()).collect();
-        assert_eq!(probed.borrow().len(), mounted.len(), "one probe per mounted drive");
+        // Network rows are never probed (a dead share can block), so they stay None.
+        let mounted: Vec<_> = drives.iter().filter(|d| !d.mountpoint.is_empty() && d.kind != "network").collect();
+        assert_eq!(probed.borrow().len(), mounted.len(), "one probe per mounted non-network drive");
+        assert!(drives.iter().filter(|d| d.kind == "network").all(|d| !probed.borrow().contains(&d.mountpoint)));
         for d in &drives {
-            let expected = (!d.mountpoint.is_empty()).then_some(Space { total: 1000, available: 1 });
+            let expected = (!d.mountpoint.is_empty() && d.kind != "network").then_some(Space { total: 1000, available: 1 });
             assert_eq!(d.space, expected, "{}", d.name);
         }
         let failed = list_drives_with(&|_| None);
