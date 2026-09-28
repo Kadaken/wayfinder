@@ -11615,8 +11615,32 @@ Broken: error.\n";
                 .downcast::<gtk::Button>()
                 .unwrap_or_else(|_| panic!("{name} is not a button"))
         };
-        let toggle = |card: &gtk::Window, name: &str| -> gtk::ToggleButton {
-            find(card.upcast_ref(), name).unwrap().downcast::<gtk::ToggleButton>().unwrap()
+        let toggle = |card: &gtk::Window, name: &str| -> gtk::CheckButton {
+            find(card.upcast_ref(), name)
+                .unwrap_or_else(|| panic!("no widget {name}"))
+                .downcast::<gtk::CheckButton>()
+                .unwrap_or_else(|_| panic!("{name} is not a real GTK radio control (CheckButton)"))
+        };
+        // A real radio control has no "clicked" signal. Turning an inactive
+        // one on is GTK's own group exclusivity, exercised directly. Turning
+        // an already-active one off is the card's installed production
+        // repeat-clear handler, not a test-only shortcut: find the exact
+        // capture-phase GestureClick the card attached to this control and
+        // fire it, the same precedent used for the outside-press watcher
+        // test above. This panics if that controller is missing or was
+        // disconnected, so the assertion below fails without it.
+        let click_radio = |cb: &gtk::CheckButton| {
+            if !cb.is_active() {
+                cb.set_active(true);
+                return;
+            }
+            let gesture = cb
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|o| o.ok()?.downcast::<gtk::GestureClick>().ok())
+                .find(|g| g.propagation_phase() == gtk::PropagationPhase::Capture)
+                .expect("production repeat-clear gesture installed on this radio");
+            gesture.emit_by_name::<()>("pressed", &[&1i32, &0.0f64, &0.0f64]);
         };
         let label_text = |card: &gtk::Window, name: &str| -> String {
             find(card.upcast_ref(), name).unwrap().downcast::<gtk::Label>().unwrap().text().to_string()
@@ -11732,7 +11756,7 @@ Broken: error.\n";
         // ---- Sitting 2: Save for later writes the canonical progress file. ----
         let s2 = open_sitting("two", checklist_text);
         let card = wait_card();
-        toggle(&card, "guide-card-broken-1").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-broken-1"));
         set_notes(&card, 1, "menu was empty");
         button(&card, "guide-card-save").emit_clicked();
         wait_for("save closed both", || cards().is_empty() && !s2.ui.window.is_visible());
@@ -11810,13 +11834,85 @@ Broken: error.\n";
                 assert!(!toggle(&card, &format!("guide-card-{v}-{n}")).is_active(), "no default on step {n}");
             }
         }
+        // Locked parity with checkrun 15c493e: coloured Works/Broken prefixes,
+        // vertical radio order, exact placeholder, no outline/tick unanswered.
+        let says_works = find(card.upcast_ref(), "guide-card-says-works-1").unwrap().downcast::<gtk::Label>().unwrap();
+        assert!(says_works.label().contains("foreground=\"#3fb950\""), "{}", says_works.label());
+        let says_broken = find(card.upcast_ref(), "guide-card-says-broken-1").unwrap().downcast::<gtk::Label>().unwrap();
+        assert!(says_broken.label().contains("foreground=\"#f0883e\""), "{}", says_broken.label());
+        let choices3 = find(card.upcast_ref(), "guide-card-choices-3").unwrap().downcast::<gtk::Box>().unwrap();
+        assert_eq!(choices3.orientation(), gtk::Orientation::Vertical, "radios stack vertically");
+        let order: Vec<String> = {
+            let mut out = Vec::new();
+            let mut c = choices3.first_child();
+            while let Some(ch) = c {
+                let cb = ch
+                    .downcast_ref::<gtk::CheckButton>()
+                    .unwrap_or_else(|| panic!("answer control is not a real GTK radio (CheckButton)"));
+                out.push(cb.label().unwrap_or_default().to_string());
+                c = ch.next_sibling();
+            }
+            out
+        };
+        assert_eq!(order, vec!["Worked", "Broken", "Skipped"]);
+        // Real radio semantics: all three share one exclusive group, not just
+        // a CSS/label resemblance. This fails on 68f3f47, where the controls
+        // are plain gtk::ToggleButton (no group, no radio accessible role).
+        let worked3 = toggle(&card, "guide-card-worked-3");
+        let broken3 = toggle(&card, "guide-card-broken-3");
+        let skipped3 = toggle(&card, "guide-card-skipped-3");
+        assert_eq!(worked3.accessible_role(), gtk::AccessibleRole::Radio, "real radio role");
+        assert_eq!(broken3.accessible_role(), gtk::AccessibleRole::Radio, "real radio role");
+        assert_eq!(skipped3.accessible_role(), gtk::AccessibleRole::Radio, "real radio role");
+        assert!(!worked3.is_active() && !broken3.is_active() && !skipped3.is_active(), "starts clear");
+        worked3.set_active(true);
+        assert!(worked3.is_active() && !broken3.is_active() && !skipped3.is_active());
+        broken3.set_active(true);
+        assert!(!worked3.is_active() && broken3.is_active() && !skipped3.is_active(), "switching stays exclusive");
+        // Pressing the active radio again clears the whole group, without
+        // landing on another answer or advancing (outline/tick proven below,
+        // once the frame is in scope, by the same click_radio path).
+        click_radio(&broken3);
+        assert!(!worked3.is_active() && !broken3.is_active() && !skipped3.is_active(), "repeat-click clears the group");
+        let placeholder3 = find(card.upcast_ref(), "guide-card-notes-placeholder-3").unwrap().downcast::<gtk::Label>().unwrap();
+        assert_eq!(placeholder3.text(), "What you saw (only if broken, or worth saying)");
+        assert!(placeholder3.is_visible(), "placeholder shows while notes are empty");
+        let frame3 = find(card.upcast_ref(), "guide-card-step-3").unwrap().downcast::<gtk::Box>().unwrap();
+        assert!(!frame3.has_css_class("guide-step-worked") && !frame3.has_css_class("guide-step-broken")
+            && !frame3.has_css_class("guide-step-skipped"), "unanswered step 3 has no outline yet");
+        // Answering, clearing and re-answering drives the outline/tick and the placeholder.
+        click_radio(&toggle(&card, "guide-card-broken-3"));
+        pump();
+        assert!(frame3.has_css_class("guide-step-broken"), "answered step gets its outline");
+        assert!(label_text(&card, "guide-card-head-3").contains('\u{2713}'), "answered heading gets a tick");
+        set_notes(&card, 3, "x");
+        pump();
+        assert!(!placeholder3.is_visible(), "placeholder hides once notes have text");
+        set_notes(&card, 3, "");
+        pump();
+        assert!(placeholder3.is_visible(), "placeholder returns once notes are cleared");
+        click_radio(&toggle(&card, "guide-card-broken-3")); // clears it (same answer again)
+        pump();
+        assert!(!frame3.has_css_class("guide-step-broken"), "clearing removes the outline");
+        assert!(!label_text(&card, "guide-card-head-3").contains('\u{2713}'), "clearing removes the tick");
+        click_radio(&toggle(&card, "guide-card-worked-3"));
+        pump();
+        click_radio(&toggle(&card, "guide-card-broken-3")); // switching stays exclusive
+        pump();
+        assert!(!toggle(&card, "guide-card-worked-3").is_active() && toggle(&card, "guide-card-broken-3").is_active());
+        // The locked step (already answered) renders the same saved state.
+        let frame1 = find(card.upcast_ref(), "guide-card-step-1").unwrap().downcast::<gtk::Box>().unwrap();
+        assert!(frame1.has_css_class("guide-step-broken"), "restored saved answer keeps its outline");
+        assert!(label_text(&card, "guide-card-head-1").contains('\u{2713}'));
         // Left placement, measured; follow a move and a resize.
         let adjacent = |parent: &adw::ApplicationWindow, card: &gtk::Window| -> bool {
             let (p, c) = (window_geometry(parent).unwrap(), window_geometry(card).unwrap());
             c.0 + c.2 == p.0 && c.1 == p.1
         };
         wait_for("card on the left edge", || adjacent(&s3.ui.window, &card));
-        assert_eq!(card.transient_for().as_ref(), Some(s3.ui.window.upcast_ref::<gtk::Window>()));
+        // Attachment is the descriptor-bound poller alone: never a WM transient
+        // relationship, which would let the card's placement constrain the app.
+        assert!(card.transient_for().is_none(), "card must never be a WM transient of the app");
         println!("D154 start parent={:?} card={:?}", window_geometry(&s3.ui.window), window_geometry(&card));
         // Show me where: the REAL button, the exact bound state, no other window.
         button(&card, "guide-card-show-1").emit_clicked();
@@ -11827,17 +11923,17 @@ Broken: error.\n";
         assert!(dstate.borrow().guide_target.is_none(), "decoy rings nothing");
         assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
         // Answering step 1 moves the ring to step 2's control.
-        toggle(&card, "guide-card-worked-1").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-worked-1"));
         pump();
         assert!(toggle(&card, "guide-card-worked-1").is_active() && !toggle(&card, "guide-card-broken-1").is_active(), "one answer per step");
         assert!(matches!(&s3.state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == "open-with-other-app"));
         assert!(matches!(dstate.borrow().guide_pending, GuideRequest::Clear));
         // Choosing the same answer again takes it back off.
-        toggle(&card, "guide-card-worked-1").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-worked-1"));
         assert!(!toggle(&card, "guide-card-worked-1").is_active());
-        toggle(&card, "guide-card-worked-1").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-worked-1"));
         // Step 2 answered: the last tagged step, so the ring clears.
-        toggle(&card, "guide-card-broken-2").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-broken-2"));
         pump();
         assert!(matches!(s3.state.borrow().guide_pending, GuideRequest::Clear));
         // Copy helpers and notes.
@@ -11853,7 +11949,7 @@ Broken: error.\n";
         wait_for("screenshot row", || find(card.upcast_ref(), "guide-card-remove-shot-2-0").is_some());
         wait_for("card back on the left edge", || adjacent(&s3.ui.window, &card));
         // Every step answered, so Submit really goes to checkrun from here on.
-        toggle(&card, "guide-card-skipped-3").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-skipped-3"));
         // Refusal: an unwritable answers folder: canonical writer fails, no file, no temp, no false success.
         std::fs::set_permissions(&cl, std::fs::Permissions::from_mode(0o555)).unwrap();
         button(&card, "guide-card-submit").emit_clicked();
@@ -11863,23 +11959,31 @@ Broken: error.\n";
         assert!(no_temp(&cl));
         assert!(card.is_visible() && s3.ui.window.is_visible(), "no false success, no closed window");
         assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["lifecycle"], "open");
-        // Parent move and resize keep the card attached.
-        let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
-        x11_move(&s3.ui.window, px + 137, py + 61);
-        wait_for("card follows the move", || adjacent(&s3.ui.window, &card));
-        let moved = (window_geometry(&s3.ui.window).unwrap(), window_geometry(&card).unwrap());
-        println!("D154 after move parent={:?} card={:?}", moved.0, moved.1);
-        assert_eq!(moved.0 .0, px + 137);
+        // Parent move and resize keep the card attached; the card never
+        // constrains the app: its exact requested position always lands, a
+        // few moves in a row, never a WM transient relationship.
+        for step in [(137, 61), (-40, 25), (300, -10)] {
+            let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
+            x11_move(&s3.ui.window, px + step.0, py + step.1);
+            wait_for("card follows the move", || adjacent(&s3.ui.window, &card));
+            let moved = window_geometry(&s3.ui.window).unwrap();
+            println!("D154 after move parent={:?} card={:?}", moved, window_geometry(&card));
+            assert_eq!((moved.0, moved.1), (px + step.0, py + step.1), "no snap: exact requested position");
+            assert!(card.transient_for().is_none(), "no WM transient relationship at any point");
+        }
         let (_, _, w0, h0) = window_geometry(&s3.ui.window).unwrap();
         crate::guide_sitting::x11_resize(&s3.ui.window, (w0 + 180) as u32, (h0 + 90) as u32);
         wait_for("resized", || window_geometry(&s3.ui.window).map_or(false, |g| g.2 > w0 && g.3 > h0));
         let (_, _, w1, h1) = window_geometry(&s3.ui.window).unwrap();
         println!("D154 resize parent {w0}x{h0} -> {w1}x{h1}");
         wait_for("card still attached after resize", || adjacent(&s3.ui.window, &card));
-        // Detach: once, stops coupling, both windows stay.
+        let decoy_before = window_geometry(&dui.window);
+        // Detach: stops following, leaves both windows open, button becomes Reattach.
+        assert_eq!(button(&card, "guide-card-detach").label().as_deref(), Some("Detach"));
         button(&card, "guide-card-detach").emit_clicked();
         pump();
         assert!(card.transient_for().is_none());
+        assert_eq!(button(&card, "guide-card-detach").label().as_deref(), Some("Reattach"));
         let before = window_geometry(&card).unwrap();
         let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
         x11_move(&s3.ui.window, px + 90, py + 40);
@@ -11887,13 +11991,41 @@ Broken: error.\n";
         std::thread::sleep(Duration::from_millis(300));
         pump();
         assert_eq!(window_geometry(&card).unwrap(), before, "detached card must not follow");
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["state"], "detached");
+        // Reattach: same button, same window only, restarts exactly one follow poller.
+        button(&card, "guide-card-detach").emit_clicked();
+        pump();
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["state"], "attached");
+        assert_eq!(button(&card, "guide-card-detach").label().as_deref(), Some("Detach"));
+        wait_for("card resumes following on the left edge", || adjacent(&s3.ui.window, &card));
+        let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
+        x11_move(&s3.ui.window, px + 55, py + 15);
+        wait_for("card follows again after reattach", || adjacent(&s3.ui.window, &card));
+        assert!(card.transient_for().is_none(), "reattach must not restore a WM transient");
+        assert_eq!(window_geometry(&dui.window), decoy_before, "decoy untouched by detach/reattach");
+        // Detach works again after a successful reattach.
         button(&card, "guide-card-detach").emit_clicked();
         pump();
         assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["state"], "detached");
+        assert_eq!(button(&card, "guide-card-detach").label().as_deref(), Some("Reattach"));
+        button(&card, "guide-card-detach").emit_clicked();
+        pump();
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3.desc))["state"], "attached");
         // Submit: canonical answers, then exactly the card and the bound window close.
+        let s3_state_for_id = s3.state.clone();
         button(&card, "guide-card-submit").emit_clicked();
         wait_for("submit closed both", || cards().is_empty() && !s3.ui.window.is_visible());
         pump();
+        // The exact bound window (not the decoy) is gone from WINDOWS, which
+        // drops its explicit app.hold() so the launcher can exit.
+        assert!(
+            WINDOWS.with(|w| w.borrow().ui_for_state(&s3_state_for_id)).is_none(),
+            "bound window removed from the registry, its hold released"
+        );
+        assert!(
+            WINDOWS.with(|w| w.borrow().ui_for_state(&dstate)).is_some(),
+            "decoy window still registered"
+        );
         let answers = std::fs::read_to_string(cl.join("three_ANSWERS.md")).unwrap();
         let lines: Vec<&str> = answers.lines().collect();
         assert_eq!(lines[0], "Answers — three", "{answers}");
@@ -11921,7 +12053,7 @@ Broken: error.\n";
         pump();
         assert!(matches!(s4.state.borrow().guide_pending, GuideRequest::Clear), "stale ack: nothing rung");
         assert!(s4.state.borrow().guide_target.is_none());
-        toggle(&card, "guide-card-worked-1").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-worked-1"));
         button(&card, "guide-card-save").emit_clicked();
         pump();
         assert!(!cl.join("four_PROGRESS.md").exists(), "stale ack: nothing written");
@@ -11936,7 +12068,7 @@ Broken: error.\n";
         let card = wait_card();
         wait_for("card on the left edge", || adjacent(&s5.ui.window, &card));
         std::fs::write(&s5.checklist, format!("{checklist_text}4. Extra.\n- Click: x\n")).unwrap();
-        toggle(&card, "guide-card-worked-1").emit_clicked();
+        click_radio(&toggle(&card, "guide-card-worked-1"));
         button(&card, "guide-card-save").emit_clicked();
         pump();
         assert!(!cl.join("five_PROGRESS.md").exists(), "edited checklist: nothing written");

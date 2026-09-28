@@ -438,6 +438,44 @@ impl<A: Adapter> Sitting<A> {
         false
     }
 
+    /// Reverse of `detach()`: only from an open, detached sitting, only back
+    /// onto the same still-claimed app. Fails closed with state matching
+    /// reality; a failed record undoes the coupling so nothing is coupled
+    /// that the record does not say is coupled.
+    pub fn reattach(&mut self) -> bool {
+        self.reconcile();
+        if !self.is_open() || self.state.as_deref() != Some("detached") {
+            return false;
+        }
+        if !(self.claimed_by)(&self.app_key) {
+            return self.note_error("window did not claim the descriptor token".into());
+        }
+        if let Err(why) = (self.verify)() {
+            return self.note_error(format!("descriptor/ack refused: {why}"));
+        }
+        let Some(card) = self.card_key.clone() else {
+            return self.note_error("no card to reattach".into());
+        };
+        let app = self.app_key.clone();
+        if let Err(e) = self.adapter.place_card_left(&app, &card) {
+            return self.note_error(format!("reattach failed: {e}"));
+        }
+        if let Err(e) = self.adapter.couple(&app, &card) {
+            return self.note_error(format!("reattach failed: {e}"));
+        }
+        if self.transition(Some("attached"), None) {
+            return true;
+        }
+        // The record would not hold: reality must not claim coupling the
+        // record does not have. Undo it and report the original failure.
+        let why = self.error.clone();
+        if let Err(e) = self.adapter.uncouple(&card) {
+            return self.note_error(format!("{why}; and uncoupling failed: {e}"));
+        }
+        self.error = why;
+        false
+    }
+
     pub fn show_me_where(&mut self, control: &str) -> bool {
         self.reconcile();
         if !self.is_open() || !self.live() {
@@ -556,7 +594,7 @@ impl<A: Adapter> Sitting<A> {
 
 // ---- GTK4 adapter (adapter one) --------------------------------------------
 
-use super::{guide_apply, guide_claimed_by, guide_descriptor_path, ui_for_state, AppState, GuideRequest};
+use super::{guide_apply, guide_claimed_by, guide_descriptor_path, ui_for_state, unregister_window, AppState, GuideRequest};
 use adw::gtk;
 use adw::prelude::*;
 use adw::gtk::{gdk, glib};
@@ -645,21 +683,31 @@ fn with_sitting<R>(cell: &SittingCell, f: impl FnOnce(&mut Sitting<GtkAdapter>) 
 }
 
 const VERDICT_NAMES: [&str; 3] = ["Worked", "Broken", "Skipped"];
-const CARD_CSS: &str = ".guide-card-ring { outline: 4px solid #e8590c; outline-offset: 2px; }";
+const CARD_CSS: &str = "\
+.guide-card-ring { outline: 4px solid #e8590c; outline-offset: 2px; }
+.guide-step-worked { outline: 2px solid #3fb950; outline-offset: 2px; }
+.guide-step-broken { outline: 2px solid #f0883e; outline-offset: 2px; }
+.guide-step-skipped { outline: 2px solid #8b949e; outline-offset: 2px; }
+";
+const NOTES_PLACEHOLDER: &str = "What you saw (only if broken, or worth saying)";
 
 /// Everything one step draws and answers with.
 pub struct StepUi {
     pub n: Value,
     pub tag: String,
     pub show: Option<gtk::Button>,
-    pub toggles: Vec<gtk::ToggleButton>,
+    pub toggles: Vec<gtk::CheckButton>,
     pub copy_buttons: Vec<gtk::Button>,
     pub notes: gtk::TextView,
+    pub notes_placeholder: gtk::Label,
     pub copy_notes: gtk::Button,
     pub grab: gtk::Button,
     pub shot_rows: gtk::Box,
     pub shots: RefCell<Vec<PathBuf>>,
     pub remove_buttons: RefCell<Vec<gtk::Button>>,
+    pub frame: gtk::Box,
+    pub head: gtk::Label,
+    head_text: String,
     copy_texts: Vec<String>,
     was: RefCell<String>,
     locked: bool,
@@ -681,6 +729,7 @@ pub struct CardUi {
     busy: Cell<bool>,
     building: Cell<bool>,
     confirm_skip: Cell<bool>,
+    pub attached: Cell<bool>,
     cell: SittingCell,
 }
 
@@ -709,6 +758,32 @@ impl CardUi {
     fn notes_of(st: &StepUi) -> String {
         let b = st.notes.buffer();
         b.text(&b.start_iter(), &b.end_iter(), false).trim().to_string()
+    }
+
+    /// The 2px outline colour and heading tick track the live/saved/cleared
+    /// answer; a cleared answer removes both.
+    fn mark_step(&self, i: usize) {
+        let st = &self.steps[i];
+        for c in ["guide-step-worked", "guide-step-broken", "guide-step-skipped"] {
+            st.frame.remove_css_class(c);
+        }
+        let ns = n_str(&st.n);
+        let base = format!("<b>{}. {}</b>", ns, glib::markup_escape_text(&st.head_text));
+        match self.verdict_of(i) {
+            Some("Worked") => {
+                st.frame.add_css_class("guide-step-worked");
+                st.head.set_markup(&format!("{base} \u{2713}"));
+            }
+            Some("Broken") => {
+                st.frame.add_css_class("guide-step-broken");
+                st.head.set_markup(&format!("{base} \u{2713}"));
+            }
+            Some("Skipped") => {
+                st.frame.add_css_class("guide-step-skipped");
+                st.head.set_markup(&format!("{base} \u{2713}"));
+            }
+            _ => st.head.set_markup(&base),
+        }
     }
 
     fn results(&self, fill_skipped: bool) -> Value {
@@ -947,8 +1022,8 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
         .title(payload["title"].as_str().unwrap_or("Checklist"))
         .default_width(CARD_W)
         .default_height(CARD_H)
-        .transient_for(parent)
         .build();
+    let _ = parent; // placement follows the app; the card is never its WM transient
     window.set_widget_name("guide-card");
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
     root.set_margin_top(8);
@@ -985,7 +1060,9 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
         let head = gtk::Label::new(None);
         head.set_xalign(0.0);
         head.set_wrap(true);
-        head.set_markup(&format!("<b>{}. {}</b>", ns, glib::markup_escape_text(step["do"].as_str().unwrap_or(""))));
+        let head_text = step["do"].as_str().unwrap_or("").to_string();
+        head.set_widget_name(&format!("guide-card-head-{ns}"));
+        head.set_markup(&format!("<b>{}. {}</b>", ns, glib::markup_escape_text(&head_text)));
         frame.append(&head);
         let hops = gtk::Grid::new();
         hops.set_column_spacing(8);
@@ -1009,13 +1086,16 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
             frame.append(&b);
             Some(b)
         };
-        for (word, key) in [("Works", "works"), ("Broken", "broken")] {
+        for (word, key, color) in [("Works", "works", "#3fb950"), ("Broken", "broken", "#f0883e")] {
             let t = step[key].as_str().unwrap_or("");
             if !t.is_empty() {
                 let l = gtk::Label::new(None);
                 l.set_xalign(0.0);
                 l.set_wrap(true);
-                l.set_markup(&format!("<b>{word}:</b> {}", glib::markup_escape_text(t)));
+                l.set_markup(&format!(
+                    "<b><span foreground=\"{color}\">{word}:</span></b> {}",
+                    glib::markup_escape_text(t)
+                ));
                 l.set_widget_name(&format!("guide-card-says-{key}-{ns}"));
                 frame.append(&l);
             }
@@ -1030,22 +1110,60 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
             frame.append(&b);
             copy_buttons.push(b);
         }
-        let choices = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let toggles: Vec<gtk::ToggleButton> = VERDICT_NAMES
-            .iter()
-            .map(|v| {
-                let t = gtk::ToggleButton::with_label(v);
-                t.set_widget_name(&format!("guide-card-{}-{ns}", v.to_lowercase()));
-                choices.append(&t);
-                t
-            })
-            .collect();
+        let choices = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        choices.set_widget_name(&format!("guide-card-choices-{ns}"));
+        let mut toggles: Vec<gtk::CheckButton> = Vec::new();
+        for v in VERDICT_NAMES.iter() {
+            let t = gtk::CheckButton::with_label(v);
+            t.set_widget_name(&format!("guide-card-{}-{ns}", v.to_lowercase()));
+            t.set_halign(gtk::Align::Start);
+            if let Some(first) = toggles.first() {
+                t.set_group(Some(first));
+            }
+            choices.append(&t);
+            toggles.push(t);
+        }
+        // A grouped radio can only be switched ON by clicking; GTK never lets
+        // a click turn the active one back off. The locked contract requires
+        // exactly that (repeat-click clears the step), so a capture-phase
+        // click gesture claims the press on the already-active control and
+        // clears it directly before the widget's own click handling runs.
+        for t in &toggles {
+            let gesture = gtk::GestureClick::new();
+            gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let tt = t.clone();
+            gesture.connect_pressed(move |g, _n, _x, _y| {
+                if tt.is_active() {
+                    tt.set_active(false);
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                }
+            });
+            t.add_controller(gesture);
+        }
         frame.append(&choices);
         let notes = gtk::TextView::new();
         notes.set_wrap_mode(gtk::WrapMode::WordChar);
         notes.set_widget_name(&format!("guide-card-notes-{ns}"));
         notes.set_height_request(48);
-        frame.append(&notes);
+        let notes_overlay = gtk::Overlay::new();
+        notes_overlay.set_child(Some(&notes));
+        let notes_placeholder = gtk::Label::new(Some(NOTES_PLACEHOLDER));
+        notes_placeholder.set_widget_name(&format!("guide-card-notes-placeholder-{ns}"));
+        notes_placeholder.set_xalign(0.0);
+        notes_placeholder.set_valign(gtk::Align::Start);
+        notes_placeholder.set_halign(gtk::Align::Start);
+        notes_placeholder.set_margin_top(4);
+        notes_placeholder.set_margin_start(4);
+        notes_placeholder.add_css_class("dim-label");
+        notes_placeholder.set_can_target(false);
+        notes_overlay.add_overlay(&notes_placeholder);
+        {
+            let ph = notes_placeholder.clone();
+            notes.buffer().connect_changed(move |b| {
+                ph.set_visible(b.text(&b.start_iter(), &b.end_iter(), false).is_empty());
+            });
+        }
+        frame.append(&notes_overlay);
         let copy_notes = gtk::Button::with_label("Copy notes");
         copy_notes.set_widget_name(&format!("guide-card-copy-notes-{ns}"));
         copy_notes.set_halign(gtk::Align::Start);
@@ -1077,8 +1195,9 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
         }
         list.append(&frame);
         steps.push(StepUi {
-            n, tag, show, toggles, copy_buttons, notes, copy_notes, grab, shot_rows,
+            n, tag, show, toggles, copy_buttons, notes, notes_placeholder, copy_notes, grab, shot_rows,
             shots: RefCell::new(Vec::new()), remove_buttons: RefCell::new(Vec::new()),
+            frame, head, head_text,
             copy_texts, was: RefCell::new(String::new()), locked, guard: Cell::new(false),
         });
     }
@@ -1099,7 +1218,7 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
     let ui = Rc::new(CardUi {
         window, payload: payload.clone(), steps, detach, back, back_says, notice, save, submit,
         marked: Cell::new(None), busy: Cell::new(false), building: Cell::new(true),
-        confirm_skip: Cell::new(false), cell: cell.clone(),
+        confirm_skip: Cell::new(false), attached: Cell::new(true), cell: cell.clone(),
     });
     for (i, st) in ui.steps.iter().enumerate() {
         if let Some(b) = &st.show {
@@ -1133,19 +1252,32 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
                     }
                     st.guard.set(false);
                     *st.was.borrow_mut() = VERDICT_NAMES[ti].into();
+                    u.mark_step(i);
                     if !u.building.get() {
                         u.advance(i);
                     }
                 } else {
                     st.was.borrow_mut().clear();
+                    u.mark_step(i);
                 }
             });
         }
     }
+    for i in 0..ui.steps.len() {
+        ui.mark_step(i);
+    }
     ui.building.set(false);
     let u = ui.clone();
     ui.detach.connect_clicked(move |_| {
-        if with_sitting(&u.cell, |s| s.detach()) == Some(false) {
+        let ok = if u.attached.get() {
+            with_sitting(&u.cell, |s| s.detach())
+        } else {
+            with_sitting(&u.cell, |s| s.reattach())
+        };
+        if ok == Some(true) {
+            u.attached.set(!u.attached.get());
+            u.detach.set_label(if u.attached.get() { "Detach" } else { "Reattach" });
+        } else {
             let e = with_sitting(&u.cell, |s| s.error.clone()).unwrap_or_default();
             u.say(&e);
         }
@@ -1240,9 +1372,8 @@ impl Adapter for GtkAdapter {
     }
 
     fn uncouple(&mut self, _card_key: &str) -> Result<(), String> {
-        let ui = self.card.clone().ok_or("no card")?;
+        self.card.as_ref().ok_or("no card")?;
         self.stop_poll();
-        ui.window.set_transient_for(None::<&gtk::Window>);
         Ok(())
     }
 
@@ -1275,7 +1406,20 @@ impl Adapter for GtkAdapter {
 
     fn close_app(&mut self, _app_key: &str) -> Result<(), String> {
         self.stop_poll();
-        self.window.destroy();
+        let state = self.state.upgrade().ok_or("app state gone")?;
+        match ui_for_state(&state) {
+            // Same state, but its registered window is no longer this exact
+            // window: never unregister or close some other window instead.
+            Some(ui) if ui.window != self.window => {
+                return Err("bound window identity changed".into());
+            }
+            _ => {}
+        }
+        // Drops the explicit app.hold() so the launcher process can exit.
+        // Idempotent: a window already closed by the user is already gone
+        // from the registry, and this call proceeds to close it anyway.
+        unregister_window(&state);
+        self.window.close();
         Ok(())
     }
 }
@@ -1568,6 +1712,93 @@ mod protocol_tests {
         assert!(!s.detach());
         assert_eq!(record(&r)["state"], "detached");
         assert_eq!(calls(&r, "uncouple"), 3);
+    }
+
+    #[test]
+    fn reattach_restores_follow_to_the_same_window_and_detach_works_again() {
+        let (r, mut s) = rig("reattach");
+        s.open().unwrap();
+        assert!(s.detach());
+        assert!(!s.is_attached());
+        let follows_before = r.world.borrow().follows;
+        assert!(s.reattach());
+        assert!(s.is_attached());
+        assert_eq!(record(&r)["state"], "attached");
+        assert!(r.world.borrow().coupled);
+        assert_eq!(r.world.borrow().follows, follows_before + 1, "exactly one place on reattach");
+        assert_eq!(calls(&r, "couple"), 2, "one poller started, not stacked");
+        // Detach works again after a successful reattach.
+        assert!(s.detach());
+        assert!(!s.is_attached());
+    }
+
+    #[test]
+    fn reattach_refuses_while_attached_or_before_open() {
+        let (r, mut s) = rig("reattach-not-detached");
+        assert!(!s.reattach(), "never open");
+        s.open().unwrap();
+        assert!(!s.reattach(), "already attached");
+        assert!(s.is_attached());
+        assert_eq!(calls(&r, "couple"), 1, "no extra poller from a refused reattach");
+    }
+
+    #[test]
+    fn reattach_refuses_closed_and_creates_no_second_card() {
+        let (r, mut s) = rig("reattach-closed");
+        s.open().unwrap();
+        assert!(s.detach());
+        submit_ok(&r, &mut s);
+        assert_eq!(s.poll(), Some(true));
+        assert!(!s.is_open());
+        assert!(!s.reattach(), "sitting is closed");
+        assert_eq!(calls(&r, "create"), 1, "never a second card");
+    }
+
+    #[test]
+    fn reattach_refuses_when_the_app_no_longer_owns_the_token() {
+        let (r, mut s) = rig("reattach-gone");
+        s.open().unwrap();
+        assert!(s.detach());
+        r.claimed.set(false);
+        assert!(!s.reattach());
+        assert!(!s.is_attached(), "state matches reality: still detached");
+        assert!(!r.world.borrow().coupled, "no decoy coupling");
+    }
+
+    #[test]
+    fn reattach_refuses_when_the_ack_is_stale() {
+        let (r, mut s) = rig("reattach-stale");
+        s.open().unwrap();
+        assert!(s.detach());
+        r.ok.set(false);
+        assert!(!s.reattach());
+        assert!(!s.is_attached());
+        assert!(!r.world.borrow().coupled);
+    }
+
+    #[test]
+    fn reattach_place_couple_or_record_failure_fails_closed_with_no_duplicate_poller() {
+        for op in ["place", "couple"] {
+            let (r, mut s) = rig(&format!("reattach-fail-{op}"));
+            s.open().unwrap();
+            assert!(s.detach());
+            r.fail.borrow_mut().push(op);
+            assert!(!s.reattach(), "{op}");
+            assert!(!s.is_attached(), "{op}");
+            assert_eq!(record(&r)["state"], "detached", "{op}");
+            assert!(!r.world.borrow().coupled, "{op}: no half-coupled state");
+        }
+        // Record failure: coupling succeeded but the write did not hold, so it
+        // must be undone rather than left ahead of the record.
+        let (r, mut s) = rig("reattach-fail-record");
+        s.open().unwrap();
+        assert!(s.detach());
+        let (p, keep) = break_record(&r);
+        assert!(!s.reattach());
+        assert!(!s.is_attached());
+        assert!(!r.world.borrow().coupled, "coupling undone when the record would not hold");
+        fix_record(&p, &keep);
+        assert_eq!(record(&r)["state"], "detached");
     }
 
     fn submit_ok(r: &Rig, s: &mut Sitting<Fake>) {
