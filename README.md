@@ -85,7 +85,8 @@ For a local native build, see [Build from Source](#build-from-source).
 | **Image thumbnails** | In grid view, the first 60 images load in the background (two at a time). A file-type icon remains visible until each thumbnail is ready. |
 | **Video pictures** | In grid view, each video shows a real frame pulled from the file (two at a time). The generic video icon remains visible until a frame is ready. |
 | **Sort** | Click any column header to sort ascending; click again for descending |
-| **Files before folders** | The current native view keeps regular files above folders, regardless of sort direction. |
+| **Folders before files** | Folders stay above files regardless of sort direction. |
+| **Choose columns** | Right-click the Details or Compact header to show or hide Size, Type and Modified. Name always stays. The choice is remembered. |
 | **Search / Filter** | Type in the search box to live-filter the current folder |
 | **Hidden files** | Toggle with the checkbox at the bottom of the sidebar |
 | **Icon zoom** | `Ctrl+scroll` in the file area to scale icons from 60% to 240% |
