@@ -11910,6 +11910,13 @@ Broken: error.\n";
             c.0 + c.2 == p.0 && c.1 == p.1
         };
         wait_for("card on the left edge", || adjacent(&s3.ui.window, &card));
+        // D-159: the scroller must bound the mapped card, not propagate the
+        // full checklist's natural height. A three-step checklist's natural
+        // content is well over 1000 px; the mapped card must stay near the
+        // fixed CARD_H (640) plus its small fixed chrome, leaving real
+        // vertical travel instead of a KWin-clamped full-height window.
+        let mapped_h = window_geometry(&card).unwrap().3;
+        assert!(mapped_h < 800, "mapped card height {mapped_h} must be bounded by the scroller, not the list's natural height");
         // Attachment is the descriptor-bound poller alone: never a WM transient
         // relationship, which would let the card's placement constrain the app.
         assert!(card.transient_for().is_none(), "card must never be a WM transient of the app");
@@ -11970,6 +11977,33 @@ Broken: error.\n";
             println!("D154 after move parent={:?} card={:?}", moved, window_geometry(&card));
             assert_eq!((moved.0, moved.1), (px + step.0, py + step.1), "no snap: exact requested position");
             assert!(card.transient_for().is_none(), "no WM transient relationship at any point");
+        }
+        // D-159: a pure vertical parent move must move the card by the same
+        // Y delta while X stays the exact left seam (the owner's real
+        // failure: card Y stuck while app Y moved).
+        {
+            let before_card = window_geometry(&card).unwrap();
+            let (px, py, _, _) = window_geometry(&s3.ui.window).unwrap();
+            x11_move(&s3.ui.window, px, py + 36);
+            wait_for("card follows a pure vertical move", || adjacent(&s3.ui.window, &card));
+            let after_card = window_geometry(&card).unwrap();
+            assert_eq!(after_card.1 - before_card.1, 36, "card Y must move by the same delta as the parent");
+            assert_eq!(after_card.0, before_card.0, "card X must stay the exact left seam on a pure vertical move");
+        }
+        // D-159: a requested axis the compositor refuses (simulated here by
+        // displacing the card directly, without moving the parent) must not
+        // be recorded as placed. The poll must keep observing the card's
+        // real origin and correct it, not just note that a move was sent.
+        {
+            let parent_before = window_geometry(&s3.ui.window).unwrap();
+            let (cx, cy, cw, ch) = window_geometry(&card).unwrap();
+            crate::guide_sitting::x11_move(&card, cx, cy + 70);
+            wait_for("displaced card Y observed", || window_geometry(&card).map_or(false, |c| c.1 == cy + 70));
+            assert_eq!(window_geometry(&s3.ui.window).unwrap(), parent_before, "parent did not move");
+            wait_for("card corrected back to the exact seam", || adjacent(&s3.ui.window, &card));
+            let restored = window_geometry(&card).unwrap();
+            assert_eq!((restored.0, restored.1), (cx, cy), "poll observed and corrected the refused axis, not just sent a move");
+            assert_eq!((restored.2, restored.3), (cw, ch), "card size unaffected by the correction");
         }
         let (_, _, w0, h0) = window_geometry(&s3.ui.window).unwrap();
         crate::guide_sitting::x11_resize(&s3.ui.window, (w0 + 180) as u32, (h0 + 90) as u32);

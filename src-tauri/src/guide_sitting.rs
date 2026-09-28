@@ -37,6 +37,11 @@ use std::time::{Duration, Instant};
 const CARD_W: i32 = 460;
 const CARD_H: i32 = 640;
 const POLL_MS: u64 = 40;
+/// A move is asked for again every poll while the card's observed origin
+/// disagrees with the desired seam. Past this many consecutive unmatched
+/// polls (~1 s) a mismatch is treated as a permanently refused axis and the
+/// poll stops re-issuing `XMoveWindow`, rather than storming it forever.
+const MAX_PLACE_STALL: u32 = 25;
 
 /// Every callback returns Ok only when the thing really happened.
 pub trait Adapter {
@@ -1203,6 +1208,15 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
     }
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
+    // The step list is the only part allowed to grow with the checklist's
+    // length; the fixed top controls and Save/Submit must stay reachable
+    // instead of being pushed off by a tall card. Without a cap here the
+    // scroller propagates the list's full natural height (evidence: 1040 px
+    // for a two-step list against a 640 px CARD_H) and the window grows to
+    // fit it, leaving the compositor to clamp the mapped size instead of
+    // GTK ever actually bounding it.
+    scroll.set_propagate_natural_height(true);
+    scroll.set_max_content_height(CARD_H);
     scroll.set_child(Some(&list));
     root.append(&scroll);
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1297,7 +1311,15 @@ pub struct GtkAdapter {
     payload: Value,
     pub card: Option<Rc<CardUi>>,
     poll: Option<glib::SourceId>,
+    /// Parent geometry the current `desired` seam was computed from.
     placed_for: Option<(i32, i32, i32, i32)>,
+    /// Desired card client origin (x, y) for `placed_for`. Reaching it is
+    /// confirmed only by observing the card's own geometry, never assumed
+    /// from having sent the move.
+    desired: Option<(i32, i32)>,
+    /// Consecutive `place_card_left` calls since `desired` last changed
+    /// where the card's observed origin still disagreed with it.
+    stall: u32,
     cell: SittingCell,
 }
 
@@ -1308,10 +1330,23 @@ impl GtkAdapter {
         }
     }
 
-    /// True when the parent's origin or size differs from what the card was
-    /// last placed for (or it was never successfully placed yet).
+    /// True when the parent moved/resized since the last placement request,
+    /// or the card's own observed origin still disagrees with the seam that
+    /// request asked for and the mismatch has not yet been bounded off as a
+    /// permanent refusal.
     pub fn needs_place(&self) -> bool {
-        window_geometry(&self.window).map_or(false, |g| self.placed_for != Some(g))
+        let Some(g) = window_geometry(&self.window) else { return false };
+        if self.placed_for != Some(g) {
+            return true;
+        }
+        let Some(desired) = self.desired else { return false };
+        if self.stall >= MAX_PLACE_STALL {
+            return false;
+        }
+        match self.card.as_ref().and_then(|c| window_geometry(&c.window)) {
+            Some((ox, oy, _, _)) => (ox, oy) != desired,
+            None => false,
+        }
     }
 }
 
@@ -1345,13 +1380,30 @@ impl Adapter for GtkAdapter {
     fn place_card_left(&mut self, _app_key: &str, _card_key: &str) -> Result<(), String> {
         let ui = self.card.as_ref().ok_or("no card")?;
         let g = window_geometry(&self.window).ok_or("parent geometry unavailable")?;
-        let (d, xid) = x11_handle(&ui.window).ok_or("card has no X11 surface")?;
         let card_w = if ui.window.width() > 0 { ui.window.width() } else { CARD_W };
+        let desired = (g.0 - card_w, g.1);
+        if self.placed_for != Some(g) || self.desired != Some(desired) {
+            self.placed_for = Some(g);
+            self.desired = Some(desired);
+            self.stall = 0;
+        }
+        let observed = window_geometry(&ui.window).map(|(x, y, _, _)| (x, y));
+        if observed == Some(desired) {
+            self.stall = 0;
+            return Ok(());
+        }
+        // A sent XMoveWindow is not acknowledgement: only an observed match
+        // clears the stall count. Past the bound, stop re-issuing the move
+        // instead of storming a permanently refused axis every 40 ms.
+        if self.stall >= MAX_PLACE_STALL {
+            return Ok(());
+        }
+        let (d, xid) = x11_handle(&ui.window).ok_or("card has no X11 surface")?;
         unsafe {
-            XMoveWindow(d, xid, g.0 - card_w, g.1);
+            XMoveWindow(d, xid, desired.0, desired.1);
             XFlush(d);
         }
-        self.placed_for = Some(g);
+        self.stall += 1;
         Ok(())
     }
 
@@ -1476,6 +1528,8 @@ pub fn start(state: &Rc<RefCell<AppState>>, window_key: usize) {
                 card: None,
                 poll: None,
                 placed_for: None,
+                desired: None,
+                stall: 0,
                 cell: cell.clone(),
             };
             let checklist = payload["checklist"].clone();
