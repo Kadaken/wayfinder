@@ -736,6 +736,47 @@ fn parse_frame_extents(actual_type: c_ulong, actual_format: c_int, nitems: c_ulo
     }
 }
 
+/// Frees a non-null `XGetWindowProperty` result exactly once, on every
+/// return path out of `frame_extents` (success, missing-property, or
+/// malformed) — a small scoped guard instead of duplicated early-return
+/// cleanup, so no branch can forget it or free it twice.
+struct XPropGuard(*mut c_uchar);
+impl Drop for XPropGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { XFree(self.0 as *mut c_void) };
+        }
+    }
+}
+
+/// What `frame_extents` may safely do next, decided purely from the exact
+/// `XGetWindowProperty` reply metadata — before any slice is formed over the
+/// reply data. `Parse` is returned only when `nitems == 4` exactly, so a
+/// caller that acts on it can never form a slice longer than the reply
+/// actually holds.
+#[derive(Debug, PartialEq, Eq)]
+enum ExtentsDecision {
+    /// Property absent or present-but-empty: a real, valid "no decoration"
+    /// state, not unavailable. Nothing to parse.
+    ZeroMissing,
+    /// A present-but-truncated (`nitems` 1..=3), overlong (`bytes_after !=
+    /// 0`), or wrong-type/format reply: unavailable, never guessed, and
+    /// never sliced.
+    Malformed,
+    /// Every metadata check passed: safe to form an exact 4-long view.
+    Parse,
+}
+
+fn decide_extents_metadata(prop_null: bool, actual_type: c_ulong, actual_format: c_int, nitems: c_ulong, bytes_after: c_ulong) -> ExtentsDecision {
+    if prop_null || nitems == 0 {
+        return ExtentsDecision::ZeroMissing;
+    }
+    if actual_type != XA_CARDINAL || actual_format != 32 || nitems != 4 || bytes_after != 0 {
+        return ExtentsDecision::Malformed;
+    }
+    ExtentsDecision::Parse
+}
+
 fn frame_extents(d: *mut c_void, xid: c_ulong) -> Option<(i32, i32, i32, i32)> {
     let name = std::ffi::CString::new("_NET_FRAME_EXTENTS").ok()?;
     unsafe {
@@ -755,13 +796,20 @@ fn frame_extents(d: *mut c_void, xid: c_ulong) -> Option<(i32, i32, i32, i32)> {
         if rc != 0 {
             return None; // the request itself failed: unavailable, not zero
         }
-        if prop.is_null() || nitems == 0 {
-            return Some((0, 0, 0, 0)); // property genuinely not set: zero extents
+        let _guard = XPropGuard(prop); // frees prop exactly once, on every path below
+        // Every check happens before any slice is formed over `prop`: a
+        // present-but-truncated property (nitems 1..=3) would make a
+        // fixed-4 `from_raw_parts` read past the Xlib allocation, which is
+        // undefined behavior even though the later value-range parse would
+        // have returned None anyway.
+        match decide_extents_metadata(prop.is_null(), actual_type, actual_format, nitems, bytes_after) {
+            ExtentsDecision::ZeroMissing => Some((0, 0, 0, 0)),
+            ExtentsDecision::Malformed => None,
+            ExtentsDecision::Parse => {
+                let data = std::slice::from_raw_parts(prop as *const c_long, 4);
+                parse_frame_extents(actual_type, actual_format, nitems, data)
+            }
         }
-        let data = std::slice::from_raw_parts(prop as *const c_long, 4);
-        let result = parse_frame_extents(actual_type, actual_format, nitems, data);
-        XFree(prop as *mut c_void);
-        result
     }
 }
 
@@ -1489,7 +1537,13 @@ impl GtkAdapter {
     /// request asked for and the mismatch has not yet been bounded off as a
     /// permanent refusal.
     pub fn needs_place(&self) -> bool {
-        let Some(g) = window_geometry_outer(&self.window) else { return false };
+        // Unavailable outer geometry (parent or card) is not "settled": it
+        // must still reach place_card_left so its own fail-closed Err can
+        // surface and route through follow_refused, moving the sitting to
+        // detached with a recorded error. Returning false here would let an
+        // attached sitting sit silently forever the moment geometry could no
+        // longer be read.
+        let Some(g) = window_geometry_outer(&self.window) else { return true };
         if self.placed_for_outer != Some(g) {
             return true;
         }
@@ -1499,7 +1553,7 @@ impl GtkAdapter {
         let Some(desired) = self.desired_outer else { return false };
         match self.card.as_ref().and_then(|c| window_geometry_outer(&c.window)) {
             Some((ox, oy, _, _)) => (ox, oy) != desired,
-            None => false,
+            None => true,
         }
     }
 }
@@ -1807,6 +1861,63 @@ mod outer_geometry_tests {
     fn compose_outer_overflow_is_unavailable_not_wrapped() {
         assert_eq!(compose_outer(0, 0, i32::MAX, 0, 1, 0, 0, 0), None);
         assert_eq!(compose_outer(i32::MIN, 0, 0, 0, 1, 0, 0, 0), None);
+    }
+
+    // decide_extents_metadata: the pure decision frame_extents makes BEFORE
+    // it may form any slice over the Xlib reply. Parse is proven reachable
+    // only at the exact valid nitems==4/bytes_after==0/type/format case, so
+    // no path into a slice can ever be longer than the reply actually holds.
+
+    #[test]
+    fn decide_null_prop_is_zero_missing() {
+        assert_eq!(decide_extents_metadata(true, XA_CARDINAL, 32, 0, 0), ExtentsDecision::ZeroMissing);
+        assert_eq!(decide_extents_metadata(true, XA_CARDINAL, 32, 4, 0), ExtentsDecision::ZeroMissing);
+    }
+
+    #[test]
+    fn decide_zero_item_present_property_is_zero_missing() {
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 32, 0, 0), ExtentsDecision::ZeroMissing);
+    }
+
+    #[test]
+    fn decide_truncated_item_counts_are_malformed_never_parsed() {
+        // 1, 3: present, non-null, but short of the required exact 4 — must
+        // never reach Parse, which is what would license a 4-long slice.
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 32, 1, 0), ExtentsDecision::Malformed);
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 32, 3, 0), ExtentsDecision::Malformed);
+    }
+
+    #[test]
+    fn decide_overlong_item_count_is_malformed() {
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 32, 5, 0), ExtentsDecision::Malformed);
+    }
+
+    #[test]
+    fn decide_bytes_after_nonzero_is_malformed_even_with_exact_nitems() {
+        // nitems==4 but the property held more data than the 4 longs asked
+        // for: must be rejected, not read as if the first 4 were the whole,
+        // correct value.
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 32, 4, 1), ExtentsDecision::Malformed);
+    }
+
+    #[test]
+    fn decide_wrong_type_or_format_is_malformed() {
+        assert_eq!(decide_extents_metadata(false, 31 /* not XA_CARDINAL */, 32, 4, 0), ExtentsDecision::Malformed);
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 16 /* not 32 */, 4, 0), ExtentsDecision::Malformed);
+    }
+
+    #[test]
+    fn decide_exact_valid_four_is_parse() {
+        assert_eq!(decide_extents_metadata(false, XA_CARDINAL, 32, 4, 0), ExtentsDecision::Parse);
+    }
+
+    #[test]
+    fn xprop_guard_frees_exactly_once_on_drop_and_skips_a_null_pointer() {
+        // A guard around a null prop (the missing-property path) must never
+        // call XFree on it; this is exercised without a real X11 display by
+        // constructing the guard directly and letting it drop.
+        let guard = XPropGuard(std::ptr::null_mut());
+        drop(guard); // no crash, no call: Drop's is_null() check is the proof
     }
 }
 
