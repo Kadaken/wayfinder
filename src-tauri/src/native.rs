@@ -11523,7 +11523,7 @@ mod tests {
     /// answers folder), canonical Submit, exact-PID cleanup and the decoy.
     #[cfg(feature = "guide")]
     fn guide_sitting_attached_card_d154() {
-        use crate::guide_sitting::{backend_is_x11, live_sittings, window_geometry, x11_move};
+        use crate::guide_sitting::{backend_is_x11, live_sittings, window_geometry, window_geometry_outer, x11_move, MAX_PLACE_STALL, POLL_MS};
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let old_home = std::env::var("HOME").unwrap();
         // Earlier suite tests may leave HOME pointing at a scratch dir: find the
@@ -12098,12 +12098,21 @@ Broken: Either state is wrong.\n";
         let s3b = open_sitting("test2", test2_text);
         let card = wait_card();
         wait_for("test2 card on the left edge", || adjacent(&s3b.ui.window, &card));
-        // D-159 (second correction): initial observed client Y must equal
-        // the parent's client Y exactly — the owner's live read-back showed
-        // this already 8 px false before any drag on the rejected commit.
+        // D-159 (second correction): a window attachment is between OUTER,
+        // decorated-frame edges, not client-content edges — a decorated
+        // card's client origin is title-bar-height below its own outer
+        // origin, and comparing that to an undecorated parent's client
+        // origin (which has no such offset) can never agree. The seam that
+        // must be exact is outer-to-outer.
         let (_, py0, _, _) = window_geometry(&s3b.ui.window).unwrap();
         let (_, cy0, _, ch0) = window_geometry(&card).unwrap();
-        assert_eq!(cy0, py0, "initial observed card Y must equal parent Y exactly");
+        let app_outer0 = window_geometry_outer(&s3b.ui.window).unwrap();
+        let card_outer0 = window_geometry_outer(&card).unwrap();
+        assert_eq!(card_outer0.1, app_outer0.1, "initial observed card OUTER Y must equal parent OUTER Y exactly");
+        assert_eq!(card_outer0.0 + card_outer0.2, app_outer0.0, "initial observed card OUTER right edge must equal parent OUTER left edge exactly");
+        // The pure 36 px client-delta assertion below still holds separately:
+        // client and outer Y move together, only their absolute origins
+        // differ by the card's own title bar.
         // D-159 (second correction): CARD_H must bound the WHOLE card, not
         // just its scroller. The rejected commit mapped this exact two-step
         // checklist at 1012 client px (1040 px outer with the 28 px frame
@@ -12113,6 +12122,16 @@ Broken: Either state is wrong.\n";
         assert!(outer_h0 < 1040, "mapped outer card height {outer_h0} must leave room inside the 1040 px work area (D-159)");
         assert!(1040 - outer_h0 >= 100, "outer height {outer_h0} leaves only {} px of travel, not the required real margin", 1040 - outer_h0);
         println!("D159 test2 shape parent_y={py0} card_y={cy0} client_h={ch0} outer_h={outer_h0}");
+        // A correctly decorated, correctly seamed card must never age into a
+        // false refusal: hold well past MAX_PLACE_STALL polls and require
+        // the descriptor to still read open/attached with an empty error.
+        std::thread::sleep(Duration::from_millis((MAX_PLACE_STALL as u64 + 5) * POLL_MS));
+        pump();
+        let held = read_json(&crate::guide_sitting::sitting_path(&s3b.desc));
+        assert_eq!(held["lifecycle"], "open", "a correctly seamed test2 card must not age into refusal");
+        assert_eq!(held["state"], "attached", "a correctly seamed test2 card must not age into refusal");
+        assert_eq!(held["error"], "", "a correctly seamed test2 card must record no error");
+        assert!(card.is_visible() && s3b.ui.window.is_visible(), "test2 card and app must both still be open after the stall hold");
         // Pure vertical parent move: same Y delta, exact left seam held.
         {
             let before_card = window_geometry(&card).unwrap();

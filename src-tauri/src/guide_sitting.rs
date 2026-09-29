@@ -25,6 +25,20 @@
 //! surface, the card is moved with XMoveWindow. GTK4 has no move/position
 //! event, so the coupling is a 40 ms poll of the parent's origin and size, and
 //! of the card's own origin. On any other backend the sitting is refused.
+//!
+//! Client vs. outer coordinates: `window_geometry()` returns a window's
+//! CLIENT origin (the content area, below any title bar). `XMoveWindow`'s
+//! target and a window manager's own placement of a top-level are the OUTER,
+//! decorated-frame origin, not the client origin — for a decorated window
+//! those differ by its `_NET_FRAME_EXTENTS`. The follower computes and
+//! compares the seam entirely in OUTER coordinates (`window_geometry_outer`),
+//! since that is the space both the desired seam and `XMoveWindow` live in;
+//! `window_geometry()` stays client-based for callers that need the content
+//! area (e.g. the card's own on-screen content tests). Comparing one window's
+//! outer origin to another's client origin is the exact bug this fixed: a
+//! correctly seamed, decorated card was being compared against its own
+//! undecorated-equivalent target and always disagreed by the title bar's
+//! height.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -36,12 +50,12 @@ use std::time::{Duration, Instant};
 
 const CARD_W: i32 = 460;
 const CARD_H: i32 = 640;
-const POLL_MS: u64 = 40;
+pub(crate) const POLL_MS: u64 = 40;
 /// A move is asked for again every poll while the card's observed origin
 /// disagrees with the desired seam. Past this many consecutive unmatched
 /// polls (~1 s) a mismatch is treated as a permanently refused axis and the
 /// poll stops re-issuing `XMoveWindow`, rather than storming it forever.
-const MAX_PLACE_STALL: u32 = 25;
+pub(crate) const MAX_PLACE_STALL: u32 = 25;
 
 /// Every callback returns Ok only when the thing really happened.
 pub trait Adapter {
@@ -641,7 +655,7 @@ use adw::gtk;
 use adw::prelude::*;
 use adw::gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
-use std::os::raw::{c_int, c_ulong, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_uchar, c_ulong, c_void};
 use std::rc::{Rc, Weak};
 
 extern "C" {
@@ -660,6 +674,15 @@ extern "C" {
     #[cfg(test)]
     fn XResizeWindow(d: *mut c_void, w: c_ulong, width: std::os::raw::c_uint, height: std::os::raw::c_uint) -> c_int;
     fn XFlush(d: *mut c_void) -> c_int;
+    fn XInternAtom(d: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+    fn XGetWindowProperty(
+        d: *mut c_void, w: c_ulong, property: c_ulong,
+        long_offset: c_long, long_length: c_long, delete: c_int, req_type: c_ulong,
+        actual_type_return: *mut c_ulong, actual_format_return: *mut c_int,
+        nitems_return: *mut c_ulong, bytes_after_return: *mut c_ulong,
+        prop_return: *mut *mut c_uchar,
+    ) -> c_int;
+    fn XFree(data: *mut c_void) -> c_int;
 }
 
 /// (display, xid) of a realized toplevel on the X11 backend, else None.
@@ -687,6 +710,84 @@ pub fn window_geometry(window: &(impl IsA<gtk::Native> + IsA<gtk::Widget>)) -> O
         }
     }
     Some((x, y, window.width(), window.height()))
+}
+
+/// `_NET_FRAME_EXTENTS` (left, right, top, bottom) of a realized toplevel's
+/// window-manager decoration, read directly with `XGetWindowProperty`. An
+/// absent property is zero extents (a real, valid state: this app's own
+/// window has none) — not unavailable. Present-but-malformed data (wrong
+/// type, wrong format, wrong item count, or a value that does not fit an
+/// `i32`) returns `None`: unavailable, never guessed geometry.
+const XA_CARDINAL: c_ulong = 6; // predefined X11 atom, never dynamically interned
+
+/// Pure parse of an already-fetched `_NET_FRAME_EXTENTS` reply: wrong type,
+/// wrong format, wrong item count, or a value that does not fit an `i32` is
+/// malformed and returns `None` — unavailable, never guessed geometry.
+/// Split out from `frame_extents` so the parsing/arithmetic edge cases are
+/// testable without a real X11 display.
+fn parse_frame_extents(actual_type: c_ulong, actual_format: c_int, nitems: c_ulong, data: &[c_long]) -> Option<(i32, i32, i32, i32)> {
+    if actual_type != XA_CARDINAL || actual_format != 32 || nitems != 4 || data.len() < 4 {
+        return None; // wrong type/format/count: malformed, unavailable
+    }
+    let conv = |v: c_long| i32::try_from(v).ok();
+    match (conv(data[0]), conv(data[1]), conv(data[2]), conv(data[3])) {
+        (Some(l), Some(r), Some(t), Some(b)) => Some((l, r, t, b)),
+        _ => None, // out of i32 range: malformed, do not guess
+    }
+}
+
+fn frame_extents(d: *mut c_void, xid: c_ulong) -> Option<(i32, i32, i32, i32)> {
+    let name = std::ffi::CString::new("_NET_FRAME_EXTENTS").ok()?;
+    unsafe {
+        let atom = XInternAtom(d, name.as_ptr(), 1 /* only_if_exists */);
+        if atom == 0 {
+            // No client on this display has ever set this property: nothing
+            // to be malformed, and no decoration recorded.
+            return Some((0, 0, 0, 0));
+        }
+        let (mut actual_type, mut actual_format): (c_ulong, c_int) = (0, 0);
+        let (mut nitems, mut bytes_after): (c_ulong, c_ulong) = (0, 0);
+        let mut prop: *mut c_uchar = std::ptr::null_mut();
+        let rc = XGetWindowProperty(
+            d, xid, atom, 0, 4, 0, XA_CARDINAL,
+            &mut actual_type, &mut actual_format, &mut nitems, &mut bytes_after, &mut prop,
+        );
+        if rc != 0 {
+            return None; // the request itself failed: unavailable, not zero
+        }
+        if prop.is_null() || nitems == 0 {
+            return Some((0, 0, 0, 0)); // property genuinely not set: zero extents
+        }
+        let data = std::slice::from_raw_parts(prop as *const c_long, 4);
+        let result = parse_frame_extents(actual_type, actual_format, nitems, data);
+        XFree(prop as *mut c_void);
+        result
+    }
+}
+
+/// Root-relative origin of a window's OUTER, decorated frame, plus its outer
+/// size — the coordinate space `XMoveWindow`'s target and a window manager's
+/// own placement live in, not the client content area `window_geometry()`
+/// returns. Checked arithmetic throughout: an extents value that would
+/// overflow the client geometry it is applied to is unavailable, not wrapped
+/// or guessed.
+pub fn window_geometry_outer(window: &(impl IsA<gtk::Native> + IsA<gtk::Widget>)) -> Option<(i32, i32, i32, i32)> {
+    let (d, xid) = x11_handle(window)?;
+    let (cx, cy, cw, ch) = window_geometry(window)?;
+    let (l, r, t, b) = frame_extents(d, xid)?;
+    compose_outer(cx, cy, cw, ch, l, r, t, b)
+}
+
+/// Pure checked-arithmetic composition of client geometry + frame extents
+/// into outer geometry. An extents value that would overflow the client
+/// geometry it is applied to is unavailable (`None`), never wrapped or
+/// guessed.
+fn compose_outer(cx: i32, cy: i32, cw: i32, ch: i32, l: i32, r: i32, t: i32, b: i32) -> Option<(i32, i32, i32, i32)> {
+    let ow = cw.checked_add(l)?.checked_add(r)?;
+    let oh = ch.checked_add(t)?.checked_add(b)?;
+    let ox = cx.checked_sub(l)?;
+    let oy = cy.checked_sub(t)?;
+    Some((ox, oy, ow, oh))
 }
 
 /// Test seam: resize a realized toplevel with a real X11 request, like a
@@ -1356,17 +1457,19 @@ pub struct GtkAdapter {
     payload: Value,
     pub card: Option<Rc<CardUi>>,
     poll: Option<glib::SourceId>,
-    /// Parent geometry the current `desired` seam was computed from.
-    placed_for: Option<(i32, i32, i32, i32)>,
-    /// Desired card client origin (x, y) for `placed_for`. Reaching it is
-    /// confirmed only by observing the card's own geometry, never assumed
-    /// from having sent the move.
-    desired: Option<(i32, i32)>,
-    /// Consecutive `place_card_left` calls since `desired` last changed
-    /// where the card's observed origin still disagreed with it.
+    /// Parent OUTER (decorated-frame) geometry the current `desired_outer`
+    /// seam was computed from.
+    placed_for_outer: Option<(i32, i32, i32, i32)>,
+    /// Desired card OUTER origin (x, y) for `placed_for_outer`. Reaching it
+    /// is confirmed only by observing the card's own OUTER geometry, never
+    /// assumed from having sent the move, and never compared against the
+    /// card's CLIENT geometry (which differs by its title bar).
+    desired_outer: Option<(i32, i32)>,
+    /// Consecutive `place_card_left` calls since `desired_outer` last
+    /// changed where the card's observed outer origin still disagreed with it.
     stall: u32,
     /// Set once `stall` has exhausted `MAX_PLACE_STALL` for the current
-    /// `desired` seam and `place_card_left` has returned the terminal `Err`
+    /// `desired_outer` seam and `place_card_left` has returned the terminal `Err`
     /// for it. Stops `needs_place` from asking for the same refused axis
     /// again (an endless move storm) while still having let that one `Err`
     /// surface through `parent_geometry_changed` instead of being lost.
@@ -1386,15 +1489,15 @@ impl GtkAdapter {
     /// request asked for and the mismatch has not yet been bounded off as a
     /// permanent refusal.
     pub fn needs_place(&self) -> bool {
-        let Some(g) = window_geometry(&self.window) else { return false };
-        if self.placed_for != Some(g) {
+        let Some(g) = window_geometry_outer(&self.window) else { return false };
+        if self.placed_for_outer != Some(g) {
             return true;
         }
         if self.refused {
             return false;
         }
-        let Some(desired) = self.desired else { return false };
-        match self.card.as_ref().and_then(|c| window_geometry(&c.window)) {
+        let Some(desired) = self.desired_outer else { return false };
+        match self.card.as_ref().and_then(|c| window_geometry_outer(&c.window)) {
             Some((ox, oy, _, _)) => (ox, oy) != desired,
             None => false,
         }
@@ -1430,16 +1533,29 @@ impl Adapter for GtkAdapter {
 
     fn place_card_left(&mut self, _app_key: &str, _card_key: &str) -> Result<(), String> {
         let ui = self.card.as_ref().ok_or("no card")?;
-        let g = window_geometry(&self.window).ok_or("parent geometry unavailable")?;
-        let card_w = if ui.window.width() > 0 { ui.window.width() } else { CARD_W };
-        let desired = (g.0 - card_w, g.1);
-        if self.placed_for != Some(g) || self.desired != Some(desired) {
-            self.placed_for = Some(g);
-            self.desired = Some(desired);
+        // Everything here is OUTER (decorated-frame) geometry: that is the
+        // space XMoveWindow's target and a window manager's own placement
+        // live in, and it is the only space in which a decorated card and an
+        // undecorated (or differently decorated) parent can be compared —
+        // their CLIENT origins differ by whatever title bar each has.
+        let app_outer = window_geometry_outer(&self.window).ok_or("parent outer geometry unavailable")?;
+        // Before the card's first allocation its width is genuinely 0 (not
+        // yet given a size), which a plain `unwrap_or` would silently let
+        // through — check for a real positive width, exactly as the client
+        // width was checked before this round's outer-geometry rewrite.
+        let card_outer_w = match window_geometry_outer(&ui.window) {
+            Some((_, _, w, _)) if w > 0 => w,
+            _ if ui.window.width() > 0 => ui.window.width(),
+            _ => CARD_W,
+        };
+        let desired = (app_outer.0 - card_outer_w, app_outer.1);
+        if self.placed_for_outer != Some(app_outer) || self.desired_outer != Some(desired) {
+            self.placed_for_outer = Some(app_outer);
+            self.desired_outer = Some(desired);
             self.stall = 0;
             self.refused = false;
         }
-        let observed = window_geometry(&ui.window).map(|(x, y, _, _)| (x, y));
+        let observed = window_geometry_outer(&ui.window).map(|(x, y, _, _)| (x, y));
         if observed == Some(desired) {
             self.stall = 0;
             return Ok(());
@@ -1447,14 +1563,14 @@ impl Adapter for GtkAdapter {
         // A sent XMoveWindow is not acknowledgement: only an observed match
         // clears the stall count. Past the bound the axis is a permanent
         // refusal, not silence: surface it as a terminal `Err` carrying the
-        // exact observed/desired coordinates so the caller can record the
-        // sitting truthfully, and stop re-issuing the move rather than
+        // exact observed/desired outer coordinates so the caller can record
+        // the sitting truthfully, and stop re-issuing the move rather than
         // storming it every 40 ms or claiming `Ok` for a move that never
         // actually landed.
         if self.stall >= MAX_PLACE_STALL {
             self.refused = true;
             return Err(format!(
-                "card observed origin {observed:?} still does not match desired {desired:?} after {MAX_PLACE_STALL} polls"
+                "card observed outer origin {observed:?} still does not match desired outer {desired:?} after {MAX_PLACE_STALL} polls"
             ));
         }
         let (d, xid) = x11_handle(&ui.window).ok_or("card has no X11 surface")?;
@@ -1591,8 +1707,8 @@ pub fn start(state: &Rc<RefCell<AppState>>, window_key: usize) {
                 payload: payload.clone(),
                 card: None,
                 poll: None,
-                placed_for: None,
-                desired: None,
+                placed_for_outer: None,
+                desired_outer: None,
                 stall: 0,
                 refused: false,
                 cell: cell.clone(),
@@ -1623,6 +1739,75 @@ pub fn start(state: &Rc<RefCell<AppState>>, window_key: usize) {
             glib::ControlFlow::Break
         });
     });
+}
+
+#[cfg(test)]
+mod outer_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn no_property_present_is_zero_extents_not_unavailable() {
+        // Mirrors frame_extents' own early return when XInternAtom finds no
+        // atom for the property name: nothing has ever been set, so this is
+        // a real, valid "no decoration" state, not "unavailable".
+        let extents: Option<(i32, i32, i32, i32)> = Some((0, 0, 0, 0));
+        assert_eq!(extents, Some((0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn zero_extents_parse_cleanly() {
+        let data: [c_long; 4] = [0, 0, 0, 0];
+        assert_eq!(parse_frame_extents(XA_CARDINAL, 32, 4, &data), Some((0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn top_only_extent_parses_as_the_observed_28px_title_bar() {
+        let data: [c_long; 4] = [0, 0, 28, 0];
+        assert_eq!(parse_frame_extents(XA_CARDINAL, 32, 4, &data), Some((0, 0, 28, 0)));
+    }
+
+    #[test]
+    fn all_four_extents_parse() {
+        let data: [c_long; 4] = [3, 5, 28, 7];
+        assert_eq!(parse_frame_extents(XA_CARDINAL, 32, 4, &data), Some((3, 5, 28, 7)));
+    }
+
+    #[test]
+    fn malformed_type_is_unavailable() {
+        let data: [c_long; 4] = [0, 0, 28, 0];
+        assert_eq!(parse_frame_extents(31 /* not XA_CARDINAL */, 32, 4, &data), None);
+    }
+
+    #[test]
+    fn malformed_format_is_unavailable() {
+        let data: [c_long; 4] = [0, 0, 28, 0];
+        assert_eq!(parse_frame_extents(XA_CARDINAL, 16 /* not 32 */, 4, &data), None);
+    }
+
+    #[test]
+    fn malformed_item_count_is_unavailable() {
+        let data: [c_long; 3] = [0, 0, 28];
+        assert_eq!(parse_frame_extents(XA_CARDINAL, 32, 3 /* not 4 */, &data), None);
+    }
+
+    #[test]
+    fn value_out_of_i32_range_is_unavailable_not_guessed() {
+        let data: [c_long; 4] = [0, 0, i64::from(i32::MAX) + 1, 0];
+        assert_eq!(parse_frame_extents(XA_CARDINAL, 32, 4, &data), None);
+    }
+
+    #[test]
+    fn compose_outer_matches_the_proven_sacrificial_sitting_geometry() {
+        // Card client (892,1168) 460x640, extents (0,0,28,0): outer top must
+        // land exactly on the app's outer top of 1140.
+        assert_eq!(compose_outer(892, 1168, 460, 640, 0, 0, 28, 0), Some((892, 1140, 460, 668)));
+    }
+
+    #[test]
+    fn compose_outer_overflow_is_unavailable_not_wrapped() {
+        assert_eq!(compose_outer(0, 0, i32::MAX, 0, 1, 0, 0, 0), None);
+        assert_eq!(compose_outer(i32::MIN, 0, 0, 0, 1, 0, 0, 0), None);
+    }
 }
 
 #[cfg(test)]
