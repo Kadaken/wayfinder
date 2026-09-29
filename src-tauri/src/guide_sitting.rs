@@ -53,6 +53,11 @@ pub trait Adapter {
     fn clear_marks(&mut self, app_key: &str) -> Result<(), String>;
     fn close_card(&mut self, card_key: &str) -> Result<(), String>;
     fn close_app(&mut self, app_key: &str) -> Result<(), String>;
+    /// Clear any bounded-refusal state left over from a prior follow, so the
+    /// next `place_card_left` starts a fresh bounded acknowledgement instead
+    /// of immediately refusing again on the same, still-unchanged desired
+    /// seam. A no-op by default; adapters that track refusal override it.
+    fn reset_follow(&mut self, _app_key: &str, _card_key: &str) {}
 }
 
 #[derive(Debug)]
@@ -417,16 +422,25 @@ impl<A: Adapter> Sitting<A> {
 
     /// A follow (`place_card_left`) came back with a terminal `Err`: the
     /// card's observed origin will not reach the desired seam. The record
-    /// must never go on saying "attached" after this. State is moved off
-    /// "attached" in memory FIRST, then the record write is attempted; a
-    /// write failure leaves memory correctly non-attached anyway (marked
-    /// `dirty` for a later `reconcile`) instead of reverting to "attached"
-    /// and inventing a success that did not happen. `owned` is untouched so
-    /// the card and app windows this sitting still owns stay tracked for an
-    /// exact close.
+    /// must never go on saying "attached" after this, and the shared schema
+    /// (`guide_sitting.py`) only knows `attached`/`detached` — there is no
+    /// third state, so this moves to the existing `detached` value, exactly
+    /// as `detach()` does, rather than inventing a schema-invalid one.
+    /// Coupling is stopped (the poll that kept re-driving a refused move),
+    /// matching the meaning of "detached". State is moved off "attached" in
+    /// memory FIRST, then the record write is attempted; a write failure
+    /// leaves memory correctly non-attached anyway (marked `dirty` for a
+    /// later `reconcile`) instead of reverting to "attached" and inventing a
+    /// success that did not happen. `owned` is untouched so the card and app
+    /// windows this sitting still owns stay tracked for an exact close.
+    /// Reattach clears the adapter's own refusal/stall bookkeeping before
+    /// trying again, so this refusal does not repeat forever.
     fn follow_refused(&mut self, why: String) -> bool {
         self.error = why;
-        self.state = Some("follow_failed".into());
+        if let Some(card) = self.card_key.clone() {
+            let _ = self.adapter.uncouple(&card);
+        }
+        self.state = Some("detached".into());
         if self.record().is_err() {
             self.dirty = true;
         }
@@ -480,6 +494,11 @@ impl<A: Adapter> Sitting<A> {
             return self.note_error("no card to reattach".into());
         };
         let app = self.app_key.clone();
+        // A prior follow may have hit the bounded refusal and left the
+        // adapter's own retry bookkeeping in the refused state; clear it so
+        // this reattach gets a fresh bounded acknowledgement rather than
+        // failing again immediately on the same still-unchanged seam.
+        self.adapter.reset_follow(&app, &card);
         if let Err(e) = self.adapter.place_card_left(&app, &card) {
             return self.note_error(format!("reattach failed: {e}"));
         }
@@ -1496,6 +1515,11 @@ impl Adapter for GtkAdapter {
         Ok(())
     }
 
+    fn reset_follow(&mut self, _app_key: &str, _card_key: &str) {
+        self.stall = 0;
+        self.refused = false;
+    }
+
     fn close_app(&mut self, _app_key: &str) -> Result<(), String> {
         self.stop_poll();
         let state = self.state.upgrade().ok_or("app state gone")?;
@@ -2139,10 +2163,13 @@ mod protocol_tests {
         r.fail.borrow_mut().push("place"); // the adapter's terminal Err after its own bounded stall
         assert!(!s.parent_geometry_changed());
         assert!(!s.is_attached(), "a terminal follow refusal must never stay recorded as attached");
-        assert_eq!(s.state.as_deref(), Some("follow_failed"));
+        // The shared schema only knows attached/detached; there is no third
+        // state, so this lands on the existing "detached" value.
+        assert_eq!(s.state.as_deref(), Some("detached"));
         assert!(s.error.contains("follow failed"), "{}", s.error);
+        assert!(!r.world.borrow().coupled, "coupling must stop, not keep re-driving a refused move");
         let rec = record(&r);
-        assert_eq!(rec["state"], "follow_failed");
+        assert_eq!(rec["state"], "detached");
         assert_eq!(rec["lifecycle"], "open");
         assert_eq!(rec["owned"], json!(["card", "app"]), "windows stay tracked for exact cleanup");
         assert!(rec["error"].as_str().unwrap().contains("follow failed"));
@@ -2152,19 +2179,39 @@ mod protocol_tests {
     fn follow_terminal_refusal_record_write_failure_fails_closed_not_attached() {
         let (r, mut s) = rig("follow-refused-norec");
         s.open().unwrap(); // write 1
-        fail_writes(&s, &[2]); // the follow_failed write
+        fail_writes(&s, &[2]); // the detached-on-refusal write
         r.fail.borrow_mut().push("place");
         assert!(!s.parent_geometry_changed());
         // Memory must reflect the truth even though the write did not land —
         // never revert to "attached" and invent a success that never happened.
         assert!(!s.is_attached());
-        assert_eq!(s.state.as_deref(), Some("follow_failed"));
+        assert_eq!(s.state.as_deref(), Some("detached"));
         assert_eq!(record(&r)["state"], "attached", "not yet writable");
         assert!(s.error.contains("follow failed"));
         // Reconciling once writes work again catches the record up to reality.
         fail_writes(&s, &[]);
         assert!(s.reconcile());
-        assert_eq!(record(&r)["state"], "follow_failed");
+        assert_eq!(record(&r)["state"], "detached");
+        assert_eq!(record(&r)["owned"], json!(["card", "app"]));
+    }
+
+    #[test]
+    fn reattach_after_a_refusal_clears_it_and_succeeds_once_the_condition_lifts() {
+        let (r, mut s) = rig("follow-refused-reattach");
+        s.open().unwrap();
+        r.fail.borrow_mut().push("place");
+        assert!(!s.parent_geometry_changed());
+        assert_eq!(s.state.as_deref(), Some("detached"));
+        assert!(!r.world.borrow().coupled);
+        // The refusal condition clears (e.g. the real adapter's bounded
+        // retry would reset once the desired seam changes); Reattach must
+        // not inherit the old refusal and must start a fresh bounded
+        // acknowledgement instead of failing again on stale bookkeeping.
+        r.fail.borrow_mut().retain(|op| *op != "place");
+        assert!(s.reattach());
+        assert!(s.is_attached());
+        assert!(r.world.borrow().coupled);
+        assert_eq!(record(&r)["state"], "attached");
         assert_eq!(record(&r)["owned"], json!(["card", "app"]));
     }
 
