@@ -12075,6 +12075,97 @@ Broken: error.\n";
         finish_child(s3, 0);
         assert_eq!(live_sittings().iter().filter(|s| s.borrow().is_open()).count(), 0, "no sitting left open");
 
+        // ---- Sitting 3b: D-159 second correction — the EXACT two-step TEST2
+        // owner checklist, not a three-step synthetic stand-in. Proves the
+        // real mapped card leaves explicit vertical travel inside a 1040 px
+        // work area, the initial observed seam is exact on both axes, and
+        // the same follow/displacement/detach/reattach/submit behaviors the
+        // three-step sitting above already proved also hold on this exact
+        // live shape. ----
+        let test2_text = "About 3 minutes.\n\
+Why again: the attachment, Reattach and Submit code changed after this check was Broken.\n\
+1. Wayfinder moves freely while the checklist follows.\n\
+- Drag: Wayfinder's title bar a short distance away from the screen edge\n\
+Works: Wayfinder stays where you leave it, with the checklist beside it.\n\
+Broken: Wayfinder snaps to an edge, or leaves the checklist behind.\n\
+2. The same button detaches and reattaches.\n\
+- Click: Detach at the top of the checklist\n\
+- Drag: Wayfinder's title bar a short distance\n\
+- Click: Reattach in the same place\n\
+- Drag: Wayfinder's title bar a short distance again\n\
+Works: Wayfinder moves alone after Detach, and the checklist returns to its left and follows after Reattach.\n\
+Broken: Either state is wrong.\n";
+        let s3b = open_sitting("test2", test2_text);
+        let card = wait_card();
+        wait_for("test2 card on the left edge", || adjacent(&s3b.ui.window, &card));
+        // D-159 (second correction): initial observed client Y must equal
+        // the parent's client Y exactly — the owner's live read-back showed
+        // this already 8 px false before any drag on the rejected commit.
+        let (_, py0, _, _) = window_geometry(&s3b.ui.window).unwrap();
+        let (_, cy0, _, ch0) = window_geometry(&card).unwrap();
+        assert_eq!(cy0, py0, "initial observed card Y must equal parent Y exactly");
+        // D-159 (second correction): CARD_H must bound the WHOLE card, not
+        // just its scroller. The rejected commit mapped this exact two-step
+        // checklist at 1012 client px (1040 px outer with the 28 px frame
+        // top) — flush against the cited 1040 px work area, leaving no real
+        // travel. The corrected card must leave explicit nonzero travel.
+        let outer_h0 = ch0 + 28;
+        assert!(outer_h0 < 1040, "mapped outer card height {outer_h0} must leave room inside the 1040 px work area (D-159)");
+        assert!(1040 - outer_h0 >= 100, "outer height {outer_h0} leaves only {} px of travel, not the required real margin", 1040 - outer_h0);
+        println!("D159 test2 shape parent_y={py0} card_y={cy0} client_h={ch0} outer_h={outer_h0}");
+        // Pure vertical parent move: same Y delta, exact left seam held.
+        {
+            let before_card = window_geometry(&card).unwrap();
+            let (px, py, _, _) = window_geometry(&s3b.ui.window).unwrap();
+            x11_move(&s3b.ui.window, px, py + 36);
+            wait_for("test2 card follows a pure vertical move", || adjacent(&s3b.ui.window, &card));
+            let after_card = window_geometry(&card).unwrap();
+            assert_eq!(after_card.1 - before_card.1, 36, "test2 card Y must move by the same delta as the parent");
+            assert_eq!(after_card.0, before_card.0, "test2 card X must stay the exact left seam on a pure vertical move");
+        }
+        // Displaced-card recovery: a refused axis must be observed and
+        // corrected, never just recorded as placed because a move was sent.
+        {
+            let parent_before = window_geometry(&s3b.ui.window).unwrap();
+            let (cx, cy, cw, ch) = window_geometry(&card).unwrap();
+            crate::guide_sitting::x11_move(&card, cx, cy + 70);
+            wait_for("test2 displaced card Y observed", || window_geometry(&card).map_or(false, |c| c.1 == cy + 70));
+            assert_eq!(window_geometry(&s3b.ui.window).unwrap(), parent_before, "parent did not move");
+            wait_for("test2 card corrected back to the exact seam", || adjacent(&s3b.ui.window, &card));
+            let restored = window_geometry(&card).unwrap();
+            assert_eq!((restored.0, restored.1), (cx, cy), "poll observed and corrected the refused axis, not just sent a move");
+            assert_eq!((restored.2, restored.3), (cw, ch), "card size unaffected by the correction");
+        }
+        // Detach/Reattach on the exact live shape.
+        assert_eq!(button(&card, "guide-card-detach").label().as_deref(), Some("Detach"));
+        button(&card, "guide-card-detach").emit_clicked();
+        pump();
+        let before = window_geometry(&card).unwrap();
+        let (px, py, _, _) = window_geometry(&s3b.ui.window).unwrap();
+        x11_move(&s3b.ui.window, px + 90, py + 40);
+        wait_for("test2 parent moved", || window_geometry(&s3b.ui.window).unwrap().0 == px + 90);
+        std::thread::sleep(Duration::from_millis(300));
+        pump();
+        assert_eq!(window_geometry(&card).unwrap(), before, "detached test2 card must not follow");
+        button(&card, "guide-card-detach").emit_clicked();
+        pump();
+        assert_eq!(button(&card, "guide-card-detach").label().as_deref(), Some("Detach"));
+        wait_for("test2 card resumes following on the left edge", || adjacent(&s3b.ui.window, &card));
+        // Submit gate on the exact live shape.
+        click_radio(&toggle(&card, "guide-card-worked-1"));
+        click_radio(&toggle(&card, "guide-card-worked-2"));
+        pump();
+        button(&card, "guide-card-submit").emit_clicked();
+        wait_for("test2 submit closed both", || cards().is_empty() && !s3b.ui.window.is_visible());
+        pump();
+        let answers = std::fs::read_to_string(cl.join("test2_ANSWERS.md")).unwrap();
+        assert!(answers.contains("1. WORKED — "), "{answers}");
+        assert!(answers.contains("2. WORKED — "), "{answers}");
+        assert!(no_temp(&cl));
+        assert_eq!(read_json(&crate::guide_sitting::sitting_path(&s3b.desc))["lifecycle"], "submitted");
+        finish_child(s3b, 0);
+        assert_eq!(live_sittings().iter().filter(|s| s.borrow().is_open()).count(), 0, "no sitting left open after test2");
+
         // ---- Sitting 4: a stale ack refuses Show me where and Save; checkrun fails closed. ----
         let s4 = open_sitting("four", checklist_text);
         let card = wait_card();

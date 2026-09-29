@@ -408,11 +408,29 @@ impl<A: Adapter> Sitting<A> {
             if let Some(card) = self.card_key.clone() {
                 let app = self.app_key.clone();
                 if let Err(e) = self.adapter.place_card_left(&app, &card) {
-                    return self.note_error(format!("follow failed: {e}"));
+                    return self.follow_refused(format!("follow failed: {e}"));
                 }
             }
         }
         true
+    }
+
+    /// A follow (`place_card_left`) came back with a terminal `Err`: the
+    /// card's observed origin will not reach the desired seam. The record
+    /// must never go on saying "attached" after this. State is moved off
+    /// "attached" in memory FIRST, then the record write is attempted; a
+    /// write failure leaves memory correctly non-attached anyway (marked
+    /// `dirty` for a later `reconcile`) instead of reverting to "attached"
+    /// and inventing a success that did not happen. `owned` is untouched so
+    /// the card and app windows this sitting still owns stay tracked for an
+    /// exact close.
+    fn follow_refused(&mut self, why: String) -> bool {
+        self.error = why;
+        self.state = Some("follow_failed".into());
+        if self.record().is_err() {
+            self.dirty = true;
+        }
+        false
     }
 
     pub fn detach(&mut self) -> bool {
@@ -1206,19 +1224,6 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
             copy_texts, was: RefCell::new(String::new()), locked, guard: Cell::new(false),
         });
     }
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_vexpand(true);
-    // The step list is the only part allowed to grow with the checklist's
-    // length; the fixed top controls and Save/Submit must stay reachable
-    // instead of being pushed off by a tall card. Without a cap here the
-    // scroller propagates the list's full natural height (evidence: 1040 px
-    // for a two-step list against a 640 px CARD_H) and the window grows to
-    // fit it, leaving the compositor to clamp the mapped size instead of
-    // GTK ever actually bounding it.
-    scroll.set_propagate_natural_height(true);
-    scroll.set_max_content_height(CARD_H);
-    scroll.set_child(Some(&list));
-    root.append(&scroll);
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let save = gtk::Button::with_label("Save for later");
     save.set_widget_name("guide-card-save");
@@ -1226,6 +1231,27 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
     submit.set_widget_name("guide-card-submit");
     bottom.append(&save);
     bottom.append(&submit);
+    // CARD_H is the whole card's mapped-height budget, not an allowance for
+    // the scroller alone. Capping only the scroller's own natural height
+    // (the earlier, rejected fix) still let the fixed chrome above it — top
+    // controls, back/notice/duration, margins — plus the fixed Save/Submit
+    // row below it stack on top of a full CARD_H-tall scroller, so the real
+    // two-step card still mapped at 1012 client px against a 640 px CARD_H.
+    // Measure the chrome already built into `root` and the bottom row's own
+    // natural height before either the scroller or the bottom row is
+    // attached, then give the scroller only what's left of CARD_H, so the
+    // WHOLE window — chrome, scroller and bottom row together — totals
+    // CARD_H instead of CARD_H being added on top of the chrome.
+    let (_, chrome_nat, _, _) = root.measure(gtk::Orientation::Vertical, CARD_W);
+    let (_, bottom_nat, _, _) = bottom.measure(gtk::Orientation::Vertical, CARD_W);
+    let spacing_reserve = root.spacing() * 2; // the two gaps root adds for the scroll and bottom rows
+    let scroll_cap = (CARD_H - chrome_nat - bottom_nat - spacing_reserve).max(80);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_propagate_natural_height(true);
+    scroll.set_max_content_height(scroll_cap);
+    scroll.set_child(Some(&list));
+    root.append(&scroll);
     root.append(&bottom);
     window.set_child(Some(&root));
 
@@ -1320,6 +1346,12 @@ pub struct GtkAdapter {
     /// Consecutive `place_card_left` calls since `desired` last changed
     /// where the card's observed origin still disagreed with it.
     stall: u32,
+    /// Set once `stall` has exhausted `MAX_PLACE_STALL` for the current
+    /// `desired` seam and `place_card_left` has returned the terminal `Err`
+    /// for it. Stops `needs_place` from asking for the same refused axis
+    /// again (an endless move storm) while still having let that one `Err`
+    /// surface through `parent_geometry_changed` instead of being lost.
+    refused: bool,
     cell: SittingCell,
 }
 
@@ -1339,10 +1371,10 @@ impl GtkAdapter {
         if self.placed_for != Some(g) {
             return true;
         }
-        let Some(desired) = self.desired else { return false };
-        if self.stall >= MAX_PLACE_STALL {
+        if self.refused {
             return false;
         }
+        let Some(desired) = self.desired else { return false };
         match self.card.as_ref().and_then(|c| window_geometry(&c.window)) {
             Some((ox, oy, _, _)) => (ox, oy) != desired,
             None => false,
@@ -1386,6 +1418,7 @@ impl Adapter for GtkAdapter {
             self.placed_for = Some(g);
             self.desired = Some(desired);
             self.stall = 0;
+            self.refused = false;
         }
         let observed = window_geometry(&ui.window).map(|(x, y, _, _)| (x, y));
         if observed == Some(desired) {
@@ -1393,10 +1426,17 @@ impl Adapter for GtkAdapter {
             return Ok(());
         }
         // A sent XMoveWindow is not acknowledgement: only an observed match
-        // clears the stall count. Past the bound, stop re-issuing the move
-        // instead of storming a permanently refused axis every 40 ms.
+        // clears the stall count. Past the bound the axis is a permanent
+        // refusal, not silence: surface it as a terminal `Err` carrying the
+        // exact observed/desired coordinates so the caller can record the
+        // sitting truthfully, and stop re-issuing the move rather than
+        // storming it every 40 ms or claiming `Ok` for a move that never
+        // actually landed.
         if self.stall >= MAX_PLACE_STALL {
-            return Ok(());
+            self.refused = true;
+            return Err(format!(
+                "card observed origin {observed:?} still does not match desired {desired:?} after {MAX_PLACE_STALL} polls"
+            ));
         }
         let (d, xid) = x11_handle(&ui.window).ok_or("card has no X11 surface")?;
         unsafe {
@@ -1530,6 +1570,7 @@ pub fn start(state: &Rc<RefCell<AppState>>, window_key: usize) {
                 placed_for: None,
                 desired: None,
                 stall: 0,
+                refused: false,
                 cell: cell.clone(),
             };
             let checklist = payload["checklist"].clone();
@@ -2077,6 +2118,54 @@ mod protocol_tests {
         assert_eq!(rec["state"], "detached");
         assert!(rec["error"].as_str().unwrap().contains("re-coupling failed"));
         assert!(!r.world.borrow().coupled);
+    }
+
+    #[test]
+    fn follow_success_stays_attached_and_records_it() {
+        let (r, mut s) = rig("follow-ok");
+        s.open().unwrap();
+        let before = r.world.borrow().follows;
+        assert!(s.parent_geometry_changed());
+        assert_eq!(r.world.borrow().follows, before + 1);
+        assert!(s.is_attached());
+        assert_eq!(record(&r)["state"], "attached");
+        assert_eq!(record(&r)["error"], "");
+    }
+
+    #[test]
+    fn follow_terminal_refusal_moves_off_attached_with_exact_error_and_keeps_owned() {
+        let (r, mut s) = rig("follow-refused");
+        s.open().unwrap();
+        r.fail.borrow_mut().push("place"); // the adapter's terminal Err after its own bounded stall
+        assert!(!s.parent_geometry_changed());
+        assert!(!s.is_attached(), "a terminal follow refusal must never stay recorded as attached");
+        assert_eq!(s.state.as_deref(), Some("follow_failed"));
+        assert!(s.error.contains("follow failed"), "{}", s.error);
+        let rec = record(&r);
+        assert_eq!(rec["state"], "follow_failed");
+        assert_eq!(rec["lifecycle"], "open");
+        assert_eq!(rec["owned"], json!(["card", "app"]), "windows stay tracked for exact cleanup");
+        assert!(rec["error"].as_str().unwrap().contains("follow failed"));
+    }
+
+    #[test]
+    fn follow_terminal_refusal_record_write_failure_fails_closed_not_attached() {
+        let (r, mut s) = rig("follow-refused-norec");
+        s.open().unwrap(); // write 1
+        fail_writes(&s, &[2]); // the follow_failed write
+        r.fail.borrow_mut().push("place");
+        assert!(!s.parent_geometry_changed());
+        // Memory must reflect the truth even though the write did not land —
+        // never revert to "attached" and invent a success that never happened.
+        assert!(!s.is_attached());
+        assert_eq!(s.state.as_deref(), Some("follow_failed"));
+        assert_eq!(record(&r)["state"], "attached", "not yet writable");
+        assert!(s.error.contains("follow failed"));
+        // Reconciling once writes work again catches the record up to reality.
+        fail_writes(&s, &[]);
+        assert!(s.reconcile());
+        assert_eq!(record(&r)["state"], "follow_failed");
+        assert_eq!(record(&r)["owned"], json!(["card", "app"]));
     }
 
     #[test]
