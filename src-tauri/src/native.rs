@@ -8309,6 +8309,12 @@ thread_local! {
     /// Test seam: the program that stages a copy, so a controlled fixture can
     /// copy slowly. Read on the GTK thread only.
     static TRANSFER_COPY_PROGRAM: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Test seam: forces MOVE onto the cross-device staged-copy path even on
+    /// one filesystem, so a fixture can exercise real progress and Cancel for
+    /// MOVE without a second filesystem or real device. Read on the GTK
+    /// thread, before the worker is spawned; production always passes false
+    /// and gains no setting, environment switch or user-visible branch.
+    static TRANSFER_FORCE_CROSS_DEVICE: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn transfer_copy_program() -> String {
@@ -8317,6 +8323,14 @@ fn transfer_copy_program() -> String {
         return program;
     }
     "cp".to_string()
+}
+
+fn transfer_force_cross_device() -> bool {
+    #[cfg(any(test))]
+    if TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow()) {
+        return true;
+    }
+    false
 }
 
 fn run_transfer(
@@ -8361,6 +8375,7 @@ fn run_transfer(
     show_transfer_strip(&ui, &transfer_strip(is_copy, native_core::TransferEvent::Preparing));
 
     let program = transfer_copy_program();
+    let force_cross_device = transfer_force_cross_device();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let events = tx.clone();
@@ -8375,7 +8390,7 @@ fn run_transfer(
             is_copy,
             on_conflict,
             &|_| Ok(()),
-            false,
+            force_cross_device,
             &ctl,
         );
         let _ = tx.send(TransferMsg::Done(result));
@@ -12429,6 +12444,7 @@ Broken: Either state is wrong.\n";
         #[cfg(feature = "guide")]
         guide_sitting_attached_card_d154();
         transfer_progress_and_cancel_d155();
+        transfer_progress_and_cancel_d185();
     }
 
     /// D-84: a disposable fixture of tiny real (not real-photo) PNGs proves the
@@ -19103,6 +19119,202 @@ Broken: Either state is wrong.\n";
         assert!(state.borrow().clipboard.is_none(), "cut clipboard clears only on success");
         assert_eq!(state.borrow().undo_stack.len(), undo_before + 1);
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-185 alone on a virtual display: real GTK progress and Cancel for
+    /// both a large local COPY and a forced-cross-device local MOVE.
+    #[test]
+    fn transfer_progress_and_cancel_d185_alone() {
+        if std::env::var("WAYFINDER_D185_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        transfer_progress_and_cancel_d185();
+    }
+
+    /// D-185: the production GTK transfer path, not a second design. A large
+    /// synthetic local COPY and a test-only forced-cross-device local MOVE
+    /// (ordinary same-filesystem MOVE stays an instant rename and cannot show
+    /// this) each show at least two strictly advancing byte states on the
+    /// real status strip, honour Cancel in under 250 ms measured to the
+    /// matching terminal UI, and leave the source byte-identical, the
+    /// destination absent and no owned residue once the main loop is fully
+    /// drained. Labels never show a source filename or path.
+    fn transfer_progress_and_cancel_d185() {
+        use sha2::{Digest, Sha256};
+        let sha256_of = |p: &Path| -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(std::fs::read(p).unwrap());
+            format!("{:x}", hasher.finalize())
+        };
+        let percent_seen = |seen: &[String], verb: &str| -> Vec<u64> {
+            seen.iter().filter_map(|l| l.strip_prefix(verb)?.split('%').next()?.parse().ok()).collect()
+        };
+
+        let root = crate::native_core::scratch_root().join(format!("wf-d185-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, src, dest) = (root.join("home"), root.join("src"), root.join("dest"));
+        for d in [&home, &src, &dest] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let bytes: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let slow = root.join("slowcp.sh");
+        std::fs::write(
+            &slow,
+            "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
+             while [ $i -lt 16 ]; do\n\
+             dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
+             i=$((i+1)); sleep 0.12; done\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d185test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dest.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().cwd == dest.to_string_lossy());
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
+
+        let no_residue = || {
+            std::fs::read_dir(&dest).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".wf-replace-"))
+                && std::fs::read_dir(&src).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".wf-replace-"))
+        };
+        let collect_two_percents = |verb: &str| -> Vec<String> {
+            let mut seen: Vec<String> = Vec::new();
+            let end = Instant::now() + Duration::from_secs(20);
+            loop {
+                let label = ui.status.label().to_string();
+                if seen.last() != Some(&label) {
+                    seen.push(label);
+                }
+                if percent_seen(&seen, verb).len() >= 2 {
+                    break;
+                }
+                assert!(Instant::now() < end, "timed out waiting for two advancing {verb} states: {seen:?}");
+                pump();
+            }
+            seen
+        };
+
+        // ---- COPY proof: real GTK production path, no test-only branch. ----
+        {
+            let name = "copy-src.bin";
+            std::fs::write(src.join(name), &bytes).unwrap();
+            let before_sha = sha256_of(&src.join(name));
+            let transfer = Transfer {
+                srcs: vec![src.join(name).to_string_lossy().to_string()],
+                dest: dest.to_string_lossy().to_string(),
+                is_copy: true,
+                clear_cut_after: false,
+                style: TransferStyle::Paste,
+            };
+            run_transfer(state.clone(), ui.clone(), transfer, native_core::PasteConflict::KeepBoth);
+            let seen = collect_two_percents("Copying ");
+            let shown = percent_seen(&seen, "Copying ");
+            assert!(shown.windows(2).all(|w| w[1] >= w[0]), "percent never goes back: {shown:?}");
+            assert!(seen.iter().any(|l| l.contains("MB of 16 MB")), "byte totals shown: {seen:?}");
+            for l in &seen {
+                assert!(!l.contains("copy-src") && !l.contains(&*root.to_string_lossy()), "no source filename or path in: {l}");
+            }
+            assert!(ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
+            let clicked = Instant::now();
+            ui.transfer_cancel.emit_clicked();
+            assert!(!ui.transfer_cancel.is_sensitive(), "Cancel is spent after one click");
+            assert_eq!(ui.status.label(), "Cancelling copy");
+            let ctx = glib::MainContext::default();
+            let copy_latency = loop {
+                while ctx.iteration(false) {}
+                if state.borrow().active_transfer.is_none() && ui.status.label() == "Copy cancelled" {
+                    break clicked.elapsed();
+                }
+                assert!(clicked.elapsed() < Duration::from_secs(5), "copy cancel never reached the UI");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            while ctx.iteration(false) {}
+            println!("D185 MEASURE copy click-to-terminal-UI: {} ms", copy_latency.as_millis());
+            assert!(copy_latency < Duration::from_millis(250), "copy terminal UI in {copy_latency:?}");
+            assert!(!ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible(), "controls hidden after cancel");
+            assert_eq!(sha256_of(&src.join(name)), before_sha, "source byte-identical after a cancelled copy");
+            assert!(!dest.join(name).exists(), "destination absent after a cancelled copy");
+            assert!(no_residue(), "no owned staging residue after a cancelled copy");
+            std::fs::remove_file(src.join(name)).unwrap();
+        }
+
+        // ---- MOVE proof: the production cross-device branch, forced on for the
+        // test only, captured before the worker is spawned. ----
+        {
+            let name = "move-src.bin";
+            std::fs::write(src.join(name), &bytes).unwrap();
+            let before_sha = sha256_of(&src.join(name));
+            state.borrow_mut().clipboard = Some(FileClipboard {
+                mode: ClipboardMode::Cut,
+                paths: vec![src.join(name).to_string_lossy().to_string()],
+            });
+            let undo_before = state.borrow().undo_stack.len();
+            TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = true);
+            let transfer = Transfer {
+                srcs: vec![src.join(name).to_string_lossy().to_string()],
+                dest: dest.to_string_lossy().to_string(),
+                is_copy: false,
+                clear_cut_after: true,
+                style: TransferStyle::Paste,
+            };
+            run_transfer(state.clone(), ui.clone(), transfer, native_core::PasteConflict::KeepBoth);
+            TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = false);
+            let seen = collect_two_percents("Moving ");
+            let shown = percent_seen(&seen, "Moving ");
+            assert!(shown.windows(2).all(|w| w[1] >= w[0]), "move percent never goes back: {shown:?}");
+            assert!(seen.iter().any(|l| l.contains("MB of 16 MB")), "move byte totals shown: {seen:?}");
+            for l in &seen {
+                assert!(!l.contains("move-src") && !l.contains(&*root.to_string_lossy()), "no source filename or path in: {l}");
+            }
+            assert!(ui.transfer_cancel.is_sensitive());
+            let clicked = Instant::now();
+            ui.transfer_cancel.emit_clicked();
+            assert!(!ui.transfer_cancel.is_sensitive(), "Cancel is spent after one click");
+            assert_eq!(ui.status.label(), "Cancelling move");
+            let ctx = glib::MainContext::default();
+            let move_latency = loop {
+                while ctx.iteration(false) {}
+                if state.borrow().active_transfer.is_none() && ui.status.label() == "Move cancelled" {
+                    break clicked.elapsed();
+                }
+                assert!(clicked.elapsed() < Duration::from_secs(5), "move cancel never reached the UI");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            while ctx.iteration(false) {}
+            println!("D185 MEASURE move click-to-terminal-UI: {} ms", move_latency.as_millis());
+            assert!(move_latency < Duration::from_millis(250), "move terminal UI in {move_latency:?}");
+            assert!(!ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible(), "controls hidden after cancel");
+            assert_eq!(sha256_of(&src.join(name)), before_sha, "move source byte-identical after a cancelled move");
+            assert!(!dest.join(name).exists(), "destination absent after a cancelled move");
+            assert!(no_residue(), "no owned staging residue after a cancelled move");
+            assert!(state.borrow().clipboard.is_some(), "cut clipboard survives a cancel");
+            assert_eq!(state.borrow().undo_stack.len(), undo_before, "no Undo entry for a cancel");
+            std::fs::remove_file(src.join(name)).unwrap();
+            state.borrow_mut().clipboard = None;
+        }
+
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+        TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = false);
         ui.window.destroy();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
