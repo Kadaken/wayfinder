@@ -12244,6 +12244,98 @@ Broken: Either state is wrong.\n";
         guide_sitting_attached_card_d154();
     }
 
+    /// Runs the D-53 keyboard-focus-binding proof alone on a virtual display.
+    /// A decoy surface deliberately holds X focus first, proving the old
+    /// ambient-xdotool seam delivers Return nowhere useful (zero clicks) while
+    /// the corrected exact-XID binding rebinds focus and clicks exactly once.
+    #[cfg(feature = "guide")]
+    #[test]
+    fn d53_keyboard_focus_binds_to_intended_surface_alone() {
+        if std::env::var("WAYFINDER_D53_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let geometry = |target: &str| -> (i32, i32) {
+            let geo = xdo(&["getwindowgeometry", "--shell", target]);
+            let num = |key: &str| -> i32 {
+                geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
+            };
+            (num("X="), num("Y="))
+        };
+
+        // A decoy surface that will hold X focus before the real button is used.
+        let decoy = gtk::Window::builder().title("wf-d53-decoy").default_width(200).default_height(80).build();
+        decoy.present();
+        pump();
+        std::thread::sleep(Duration::from_millis(200));
+        pump();
+
+        // The intended surface: one real button, observed for clicks.
+        let target = gtk::Window::builder().title("wf-d53-target").default_width(200).default_height(80).build();
+        let button = gtk::Button::with_label("intended");
+        target.set_child(Some(&button));
+        target.present();
+        pump();
+        std::thread::sleep(Duration::from_millis(200));
+        pump();
+
+        let clicked = Rc::new(std::cell::Cell::new(0u32));
+        let counter = clicked.clone();
+        button.connect_clicked(move |_| counter.set(counter.get() + 1));
+
+        let decoy_id = xdo(&["search", "--name", "wf-d53-decoy"]).lines().next().expect("decoy window id").to_string();
+        let target_id = xdo(&["search", "--name", "wf-d53-target"]).lines().next().expect("target window id").to_string();
+        let (tx, ty) = geometry(&target_id);
+        let b = button.compute_bounds(&target).expect("bounds");
+        let (x, y) = (tx + (b.x() + b.width() / 2.0) as i32, ty + (b.y() + b.height() / 2.0) as i32);
+
+        // Steal X focus onto the decoy surface first, as an earlier popover
+        // close can leave X focus on some other surface in the real app.
+        xdo(&["windowfocus", "--sync", &decoy_id]);
+        pump();
+        assert_eq!(xdo(&["getwindowfocus"]).trim(), decoy_id, "decoy holds X focus before the old seam is tried");
+
+        // Old ambient seam: grab GTK focus, then send a bare untargeted Return.
+        // It is delivered wherever X focus already sits — the decoy — never
+        // reaching the button. This reproduces D-53's clicked == 0.
+        button.grab_focus();
+        pump();
+        xdo(&["key", "Return"]);
+        pump();
+        assert_eq!(clicked.get(), 0, "the old ambient-focus seam must reproduce zero clicks when another surface holds X focus");
+
+        // Steal focus back onto the decoy before trying the corrected route.
+        xdo(&["windowfocus", "--sync", &decoy_id]);
+        pump();
+        assert_eq!(xdo(&["getwindowfocus"]).trim(), decoy_id, "decoy holds X focus again before the corrected seam is tried");
+
+        // Corrected seam: bind Return delivery to the exact intended XID,
+        // requiring GTK focus and X focus on that surface before sending it.
+        xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+        pump();
+        xdo(&["windowfocus", "--sync", &target_id]);
+        pump();
+        assert!(button.grab_focus(), "grab_focus must succeed before the keyboard route can be trusted");
+        pump();
+        assert!(button.has_focus(), "the widget must hold GTK focus before Return is sent");
+        assert_eq!(xdo(&["getwindowfocus"]).trim(), target_id, "X input focus must already be on the intended surface before Return is sent");
+        xdo(&["key", "--window", &target_id, "Return"]);
+        pump();
+        assert_eq!(clicked.get(), 1, "the corrected exact-XID binding must deliver exactly one Return to the intended button");
+
+        target.destroy();
+        decoy.destroy();
+        pump();
+    }
+
     /// Runs only under a virtual display (see the env guard), so it can never
     /// open a window on the owner's screen.
     /// All GTK tests share one thread (GTK initializes once) and run only under
@@ -14761,15 +14853,57 @@ Broken: Either state is wrong.\n";
             xdo(&["mouseup", "1"]);
             pump();
         };
-        // The keyboard route: focus the control with the pointer over it, press Enter.
+        // The X surface that actually owns a widget: the main window, or a
+        // popover's own native surface when the widget lives inside one.
+        let intended_xid = |w: &gtk::Widget| -> String {
+            if let Some(pop) = w.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()) {
+                let native = pop.native().expect("popover native");
+                let surface = native.surface().expect("popover surface");
+                let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) };
+                xid.to_string()
+            } else {
+                win_id.clone()
+            }
+        };
+        // The keyboard route: bind Return delivery to the exact surface that owns
+        // the control, never to xdotool's ambient current window. grab_focus()
+        // must actually succeed, the widget must actually hold GTK focus, and X
+        // input focus must already be on that exact XID before the key is sent —
+        // otherwise a stray focus left by an earlier surface silently eats the
+        // Return and the click never fires (D-53).
         let key = |w: &gtk::Widget| {
             let (x, y) = centre(w);
+            let xid = intended_xid(w);
             xdo(&["mousemove", &x.to_string(), &y.to_string()]);
             pump();
-            w.grab_focus();
+            xdo(&["windowfocus", "--sync", &xid]);
+            // A real X FocusIn on the exact surface, and GDK/GTK noticing it,
+            // is a genuine round trip through the X server and the main loop —
+            // not instantaneous. Wait for it rather than racing a fixed pump().
+            wait_for("grab_focus succeeds on the intended control", || w.grab_focus());
+            wait_for("GTK and X focus both land on the intended surface", || {
+                w.has_focus() && xdo(&["getwindowfocus"]).trim() == xid
+            });
+            let focused = xdo(&["getwindowfocus"]).trim().to_string();
+            assert_eq!(focused, xid, "X input focus must already be on the intended surface before Return is sent");
+            xdo(&["key", "--window", &xid, "Return"]);
             pump();
-            xdo(&["key", "Return"]);
-            pump();
+            // Binding focus to a popover surface (or leaving it explicitly set
+            // at all) is test-only scaffolding; put real X focus back on the
+            // main window afterward so later, unrelated test sections see the
+            // same ambient focus state this fix's own explicit binding did not
+            // exist to disturb.
+            if xid != win_id {
+                xdo(&["windowfocus", "--sync", &win_id]);
+                // Confirm the restore actually landed before returning — a
+                // fire-and-forget restore leaves a window where later,
+                // unrelated test sections can still observe the popover's
+                // stale X focus if the FocusIn hadn't propagated yet.
+                wait_for("X focus restored to the main window", || {
+                    xdo(&["getwindowfocus"]).trim() == win_id
+                });
+                pump();
+            }
         };
         let observe = |w: &gtk::Widget| -> Rc<std::cell::Cell<u32>> {
             let n = Rc::new(std::cell::Cell::new(0));

@@ -3,6 +3,7 @@
 # removed by THIS parent process on exit, interrupt, terminate, abort or timeout.
 #   headless-gtk-test.sh full        the full gtk_headless_suite
 #   headless-gtk-test.sh d154        the standalone real-card gate
+#   headless-gtk-test.sh d53         the standalone keyboard-focus-binding gate
 #   headless-gtk-test.sh -- CMD...   any command (used by the self-check)
 # Env: WF_HEADLESS_TIMEOUT seconds (default 900).
 set -u
@@ -37,6 +38,8 @@ case "$mode" in
   full) cmd=("${cargo_t[@]}" gtk_headless_suite);;
   d154) export WAYFINDER_D154_ONLY=1
         cmd=("${cargo_t[@]}" guide_sitting_attached_card_d154_alone -- --nocapture);;
+  d53)  export WAYFINDER_D53_ONLY=1
+        cmd=("${cargo_t[@]}" d53_keyboard_focus_binds_to_intended_surface_alone -- --nocapture);;
   --) shift; cmd=("$@");;
   *) echo "usage: $0 full|d154|-- CMD..." >&2; exit 2;;
 esac
