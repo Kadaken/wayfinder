@@ -4,6 +4,8 @@
 #   headless-gtk-test.sh full        the full gtk_headless_suite
 #   headless-gtk-test.sh d154        the standalone real-card gate
 #   headless-gtk-test.sh d53         the standalone keyboard-focus-binding gate
+#   headless-gtk-test.sh d155        the standalone transfer progress/cancel gate
+#   headless-gtk-test.sh d185        the standalone forced-cross-device transfer gate
 #   headless-gtk-test.sh -- CMD...   any command (used by the self-check)
 # Env: WF_HEADLESS_TIMEOUT seconds (default 900).
 set -u
@@ -40,8 +42,12 @@ case "$mode" in
         cmd=("${cargo_t[@]}" guide_sitting_attached_card_d154_alone -- --nocapture);;
   d53)  export WAYFINDER_D53_ONLY=1
         cmd=("${cargo_t[@]}" d53_keyboard_focus_binds_to_intended_surface_alone -- --nocapture);;
+  d155) export WAYFINDER_D155_ONLY=1
+        cmd=("${cargo_t[@]}" transfer_progress_and_cancel_d155_alone -- --nocapture);;
+  d185) export WAYFINDER_D185_ONLY=1
+        cmd=("${cargo_t[@]}" transfer_progress_and_cancel_d185_alone -- --nocapture);;
   --) shift; cmd=("$@");;
-  *) echo "usage: $0 full|d154|-- CMD..." >&2; exit 2;;
+  *) echo "usage: $0 full|d154|d53|d155|d185|-- CMD..." >&2; exit 2;;
 esac
 
 setsid timeout -k 5 "$t" xvfb-run -a -s "-screen 0 1920x1080x24" "${cmd[@]}" &
