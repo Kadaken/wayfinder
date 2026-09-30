@@ -19158,6 +19158,18 @@ Broken: Either state is wrong.\n";
             seen.iter().filter_map(|l| l.strip_prefix(verb)?.split('%').next()?.parse().ok()).collect()
         };
 
+        // Resets both cfg(test) transfer seams on every exit path, including a
+        // panic unwind mid-assertion, so leftover state can never leak into a
+        // later test even when this one fails partway through.
+        struct TransferSeamGuard;
+        impl Drop for TransferSeamGuard {
+            fn drop(&mut self) {
+                TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+                TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = false);
+            }
+        }
+        let _seams = TransferSeamGuard;
+
         let root = crate::native_core::scratch_root().join(format!("wf-d185-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let _cleanup = ScratchCleanup(root.clone());
@@ -19166,13 +19178,28 @@ Broken: Either state is wrong.\n";
             std::fs::create_dir_all(d).unwrap();
         }
         let bytes: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
-        let slow = root.join("slowcp.sh");
+        // The exact writer `copy_item` spawns and later kills-and-waits: one
+        // interpreted process, no `dd`, `sleep` or any other child. The
+        // `#!/usr/bin/env python3` shebang execs python3 in place of the
+        // spawned `env`, so the PID Rust receives from `spawn()` is the same
+        // PID doing every read, write and sleep below — the only process
+        // capable of writing the stage, and the only one `kill()` needs to
+        // stop.
+        let slow = root.join("slowcp.py");
         std::fs::write(
             &slow,
-            "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
-             while [ $i -lt 16 ]; do\n\
-             dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
-             i=$((i+1)); sleep 0.12; done\n",
+            "#!/usr/bin/env python3\n\
+             import sys, time\n\
+             src, stage = sys.argv[4], sys.argv[5]\n\
+             chunk = 1024 * 1024\n\
+             with open(src, 'rb') as r, open(stage, 'wb') as w:\n\
+             \x20   while True:\n\
+             \x20       data = r.read(chunk)\n\
+             \x20       if not data:\n\
+             \x20           break\n\
+             \x20       w.write(data)\n\
+             \x20       w.flush()\n\
+             \x20       time.sleep(0.12)\n",
         )
         .unwrap();
         {
@@ -19197,6 +19224,10 @@ Broken: Either state is wrong.\n";
             std::fs::read_dir(&dest).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".wf-replace-"))
                 && std::fs::read_dir(&src).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".wf-replace-"))
         };
+        // Waits for at least two strictly increasing percent states for
+        // `verb` (e.g. "Copying " or "Moving "), so a click-Cancel that
+        // follows always lands after a real, nonzero, still-advancing
+        // transfer — never at 0% or against a single stale reading.
         let collect_two_percents = |verb: &str| -> Vec<String> {
             let mut seen: Vec<String> = Vec::new();
             let end = Instant::now() + Duration::from_secs(20);
@@ -19205,10 +19236,11 @@ Broken: Either state is wrong.\n";
                 if seen.last() != Some(&label) {
                     seen.push(label);
                 }
-                if percent_seen(&seen, verb).len() >= 2 {
+                let shown = percent_seen(&seen, verb);
+                if shown.len() >= 2 && shown.windows(2).any(|w| w[1] > w[0]) && *shown.last().unwrap() > 0 {
                     break;
                 }
-                assert!(Instant::now() < end, "timed out waiting for two advancing {verb} states: {seen:?}");
+                assert!(Instant::now() < end, "timed out waiting for two strictly advancing {verb} states: {seen:?}");
                 pump();
             }
             seen
@@ -19219,6 +19251,12 @@ Broken: Either state is wrong.\n";
             let name = "copy-src.bin";
             std::fs::write(src.join(name), &bytes).unwrap();
             let before_sha = sha256_of(&src.join(name));
+            state.borrow_mut().clipboard = Some(FileClipboard {
+                mode: ClipboardMode::Cut,
+                paths: vec!["/dev/null/unrelated-clipboard-sentinel".to_string()],
+            });
+            let clipboard_before = state.borrow().clipboard.clone();
+            let undo_before = state.borrow().undo_stack.len();
             let transfer = Transfer {
                 srcs: vec![src.join(name).to_string_lossy().to_string()],
                 dest: dest.to_string_lossy().to_string(),
@@ -19229,7 +19267,8 @@ Broken: Either state is wrong.\n";
             run_transfer(state.clone(), ui.clone(), transfer, native_core::PasteConflict::KeepBoth);
             let seen = collect_two_percents("Copying ");
             let shown = percent_seen(&seen, "Copying ");
-            assert!(shown.windows(2).all(|w| w[1] >= w[0]), "percent never goes back: {shown:?}");
+            assert!(shown.windows(2).all(|w| w[1] > w[0]), "percent strictly increases: {shown:?}");
+            assert!(*shown.last().unwrap() > 0, "a nonzero percent was displayed before Cancel: {shown:?}");
             assert!(seen.iter().any(|l| l.contains("MB of 16 MB")), "byte totals shown: {seen:?}");
             for l in &seen {
                 assert!(!l.contains("copy-src") && !l.contains(&*root.to_string_lossy()), "no source filename or path in: {l}");
@@ -19255,6 +19294,13 @@ Broken: Either state is wrong.\n";
             assert_eq!(sha256_of(&src.join(name)), before_sha, "source byte-identical after a cancelled copy");
             assert!(!dest.join(name).exists(), "destination absent after a cancelled copy");
             assert!(no_residue(), "no owned staging residue after a cancelled copy");
+            let clipboard_after = state.borrow().clipboard.clone();
+            assert!(
+                matches!((&clipboard_before, &clipboard_after), (Some(a), Some(b)) if a.mode == b.mode && a.paths == b.paths),
+                "an unrelated clipboard survives a copy cancel untouched"
+            );
+            assert_eq!(state.borrow().undo_stack.len(), undo_before, "no Undo entry for a cancelled copy");
+            state.borrow_mut().clipboard = None;
             std::fs::remove_file(src.join(name)).unwrap();
         }
 
@@ -19281,7 +19327,8 @@ Broken: Either state is wrong.\n";
             TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = false);
             let seen = collect_two_percents("Moving ");
             let shown = percent_seen(&seen, "Moving ");
-            assert!(shown.windows(2).all(|w| w[1] >= w[0]), "move percent never goes back: {shown:?}");
+            assert!(shown.windows(2).all(|w| w[1] > w[0]), "move percent strictly increases: {shown:?}");
+            assert!(*shown.last().unwrap() > 0, "a nonzero move percent was displayed before Cancel: {shown:?}");
             assert!(seen.iter().any(|l| l.contains("MB of 16 MB")), "move byte totals shown: {seen:?}");
             for l in &seen {
                 assert!(!l.contains("move-src") && !l.contains(&*root.to_string_lossy()), "no source filename or path in: {l}");
@@ -19313,8 +19360,8 @@ Broken: Either state is wrong.\n";
             state.borrow_mut().clipboard = None;
         }
 
-        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
-        TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = false);
+        // Both seams are reset by `_seams`'s Drop, on this ordinary return and
+        // on any panic unwind above.
         ui.window.destroy();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
