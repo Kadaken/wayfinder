@@ -12274,18 +12274,18 @@ Broken: Either state is wrong.\n";
         // A decoy surface that will hold X focus before the real button is used.
         let decoy = gtk::Window::builder().title("wf-d53-decoy").default_width(200).default_height(80).build();
         decoy.present();
-        pump();
-        std::thread::sleep(Duration::from_millis(200));
-        pump();
+        wait_for("decoy window mapped with a usable XID", || {
+            !xdo(&["search", "--name", "wf-d53-decoy"]).trim().is_empty()
+        });
 
         // The intended surface: one real button, observed for clicks.
         let target = gtk::Window::builder().title("wf-d53-target").default_width(200).default_height(80).build();
         let button = gtk::Button::with_label("intended");
         target.set_child(Some(&button));
         target.present();
-        pump();
-        std::thread::sleep(Duration::from_millis(200));
-        pump();
+        wait_for("target window mapped with a usable XID", || {
+            !xdo(&["search", "--name", "wf-d53-target"]).trim().is_empty()
+        });
 
         let clicked = Rc::new(std::cell::Cell::new(0u32));
         let counter = clicked.clone();
@@ -12296,36 +12296,51 @@ Broken: Either state is wrong.\n";
         let (tx, ty) = geometry(&target_id);
         let b = button.compute_bounds(&target).expect("bounds");
         let (x, y) = (tx + (b.x() + b.width() / 2.0) as i32, ty + (b.y() + b.height() / 2.0) as i32);
+        let focused_on = |xid: &str| xdo(&["getwindowfocus"]).trim() == xid;
 
-        // Steal X focus onto the decoy surface first, as an earlier popover
-        // close can leave X focus on some other surface in the real app.
+        // The window manager's own auto-focus-on-map for the just-presented
+        // target window is asynchronous and can still be in flight here. Wait
+        // for it to settle before deliberately moving focus elsewhere, or that
+        // late FocusIn can land after our own steal below and silently retake
+        // focus from the decoy before the old-seam assertion runs.
+        wait_for("target's own initial map-focus settles", || focused_on(&target_id));
+
+        // Old ambient seam: establish the button's internal GTK focus first —
+        // grab_focus() itself can carry the side effect of moving real X
+        // input focus onto the button's own surface — then deliberately steal
+        // X focus onto the decoy *after* that call, so the decoy's ownership
+        // is proven immediately before the bare Return, not merely assumed
+        // from an earlier steal that grab_focus() could since have undone.
+        assert!(button.grab_focus(), "grab_focus must succeed before the ambient-seam proof means anything");
+        pump();
         xdo(&["windowfocus", "--sync", &decoy_id]);
-        pump();
-        assert_eq!(xdo(&["getwindowfocus"]).trim(), decoy_id, "decoy holds X focus before the old seam is tried");
+        wait_for("decoy holds X focus after grab_focus(), before the bare Return", || focused_on(&decoy_id));
+        assert_eq!(
+            xdo(&["getwindowfocus"]).trim(),
+            decoy_id,
+            "the decoy must still own X focus immediately before the old seam's bare Return for zero clicks to mean anything"
+        );
 
-        // Old ambient seam: grab GTK focus, then send a bare untargeted Return.
-        // It is delivered wherever X focus already sits — the decoy — never
-        // reaching the button. This reproduces D-53's clicked == 0.
-        button.grab_focus();
-        pump();
+        // A bare, untargeted Return is delivered wherever X focus already
+        // sits — the decoy — never reaching the button. This reproduces
+        // D-53's clicked == 0.
         xdo(&["key", "Return"]);
         pump();
         assert_eq!(clicked.get(), 0, "the old ambient-focus seam must reproduce zero clicks when another surface holds X focus");
 
         // Steal focus back onto the decoy before trying the corrected route.
         xdo(&["windowfocus", "--sync", &decoy_id]);
-        pump();
-        assert_eq!(xdo(&["getwindowfocus"]).trim(), decoy_id, "decoy holds X focus again before the corrected seam is tried");
+        wait_for("decoy holds X focus again before the corrected seam is tried", || focused_on(&decoy_id));
 
         // Corrected seam: bind Return delivery to the exact intended XID,
         // requiring GTK focus and X focus on that surface before sending it.
         xdo(&["mousemove", &x.to_string(), &y.to_string()]);
         pump();
         xdo(&["windowfocus", "--sync", &target_id]);
-        pump();
-        assert!(button.grab_focus(), "grab_focus must succeed before the keyboard route can be trusted");
-        pump();
-        assert!(button.has_focus(), "the widget must hold GTK focus before Return is sent");
+        wait_for("grab_focus succeeds on the intended button", || button.grab_focus());
+        wait_for("GTK and X focus both land on the intended surface", || {
+            button.has_focus() && focused_on(&target_id)
+        });
         assert_eq!(xdo(&["getwindowfocus"]).trim(), target_id, "X input focus must already be on the intended surface before Return is sent");
         xdo(&["key", "--window", &target_id, "Return"]);
         pump();
@@ -14206,7 +14221,8 @@ Broken: Either state is wrong.\n";
             assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        let geo = xdo(&["search", "--name", "wf-d52-proof", "getwindowgeometry", "--shell"]);
+        let win_id = xdo(&["search", "--name", "wf-d52-proof"]).lines().next().expect("main window id").to_string();
+        let geo = xdo(&["getwindowgeometry", "--shell", &win_id]);
         let num = |key: &str| -> i32 {
             geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
         };
@@ -14259,13 +14275,19 @@ Broken: Either state is wrong.\n";
         let d64_png = crate::native_core::scratch_root().join(format!("wf-d64-{}.png", std::process::id()));
         // D-64: the one arrow must be a broad magenta head and shaft whose tip touches the row from the
         // side GTK actually placed it. Returns the pixel just inside the tip, where the arrow covers the row.
-        let arrow_check = |key: &str, row: &gtk::Widget, frame_name: &str| -> (i32, i32) {
+        let arrow_check = |key: &str, row: &gtk::Widget, frame_name: &str| -> (i32, i32, String) {
             for _ in 0..4 {
                 pump();
             }
             let pops = arrow_pops();
             assert_eq!(pops.len(), 1, "{key}: exactly one arrow surface");
             assert!(!pops[0].can_target() && !pops[0].is_focusable() && !pops[0].can_focus(), "{key}: the arrow cannot take input");
+            let arrow_xid = {
+                use glib::translate::ToGlibPtr;
+                let native = pops[0].native().expect("arrow popover native");
+                let surface = native.surface().expect("arrow popover surface");
+                unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) }.to_string()
+            };
             assert!(
                 all_widgets(pops[0].upcast_ref())
                     .iter()
@@ -14304,11 +14326,44 @@ Broken: Either state is wrong.\n";
             let covered = if tip_left { tip_x + 2 } else { tip_x - 2 };
             assert!(magenta(&d64_png, covered, tip_y, 1, 1) > 0.5, "{key}: the pixel just inside the tip is magenta");
             assert!(covered >= rx && covered < rx + rw, "{key}: that pixel lies over the row itself");
-            (covered, tip_y)
+            (covered, tip_y, arrow_xid)
         };
-        let click_at = |x: i32, y: i32| {
+        // The bare XTEST press below is only a valid proof of pass-through once
+        // the X server itself reports the arrow's own input-shape region as
+        // empty — that region is set from the GTK side, and a caller here has
+        // no other way to know it has actually reached the X server. Querying
+        // a pointer-window oracle instead was tried and rejected: under this
+        // no-window-manager Xvfb, `menu.native().surface()` resolves to the
+        // 1180x760 toplevel rather than a distinct drive-menu input window,
+        // and `xdotool getmouselocation --shell` then reports a stable
+        // WINDOW=0, which does not identify the real GTK event owner.
+        let click_at = |x: i32, y: i32, arrow_xid: &str| {
+            use glib::translate::ToGlibPtr;
             xdo(&["mousemove", &x.to_string(), &y.to_string()]);
-            pump();
+            let xid: std::os::raw::c_ulong = arrow_xid.parse().expect("arrow xid parses");
+            let xdisplay = unsafe { gdk_x11_display_get_xdisplay(gdk::Display::default().expect("default display").to_glib_none().0) };
+            let input_shape_count = || {
+                let mut count: std::os::raw::c_int = 0;
+                let mut ordering: std::os::raw::c_int = 0;
+                let rects = unsafe { XShapeGetRectangles(xdisplay, xid, SHAPE_INPUT, &mut count, &mut ordering) };
+                if !rects.is_null() {
+                    unsafe { XFree(rects as *mut std::os::raw::c_void) };
+                }
+                (count, ordering)
+            };
+            let mut result = input_shape_count();
+            for _ in 0..80 {
+                if result.0 == 0 {
+                    break;
+                }
+                pump();
+                result = input_shape_count();
+            }
+            assert_eq!(
+                result.0, 0,
+                "arrow xid {arrow_xid}: input-shape rectangle count {} ordering {}",
+                result.0, result.1
+            );
             xdo(&["mousedown", "1"]);
             pump();
             xdo(&["mouseup", "1"]);
@@ -14638,13 +14693,13 @@ Broken: Either state is wrong.\n";
         assert_eq!(geometry(&opener), g0, "after clearing: nothing was left changed");
         // A real pointer press at a pixel the arrow tip covers reaches the row exactly once.
         put("open-with-other-app", "Click the tip");
-        let (cx_, cy_) = arrow_check("tip click", &opener, "d52-3-tip-click.png");
+        let (cx_, cy_, arrow_xid) = arrow_check("tip click", &opener, "d52-3-tip-click.png");
         let taps = Rc::new(std::cell::Cell::new(0));
         {
             let taps = taps.clone();
             opener.downcast_ref::<gtk::Button>().expect("a real button").connect_clicked(move |_| taps.set(taps.get() + 1));
         }
-        click_at(cx_, cy_);
+        click_at(cx_, cy_, &arrow_xid);
         assert_eq!(taps.get(), 1, "the click at the arrow tip fired the row action exactly once");
         assert_eq!(pending(), GuideRequest::Clear, "and the guide cleared");
         no_visual("after the tip click");
@@ -14686,14 +14741,14 @@ Broken: Either state is wrong.\n";
                 .find(|p| !p.has_css_class("wf-guide-label"))
                 .expect("drive menu");
             assert!(menu.is_mapped(), "{key}: the menu stays open");
-            let (cx_, cy_) = arrow_check(key, &target, &format!("d52-4-{key}.png"));
+            let (cx_, cy_, arrow_xid) = arrow_check(key, &target, &format!("d52-4-{key}.png"));
             if key == "drive-open-crucial" {
                 let taps = Rc::new(std::cell::Cell::new(0));
                 {
                     let taps = taps.clone();
                     target.downcast_ref::<gtk::Button>().expect("a real button").connect_clicked(move |_| taps.set(taps.get() + 1));
                 }
-                click_at(cx_, cy_);
+                click_at(cx_, cy_, &arrow_xid);
                 assert_eq!(taps.get(), 1, "{key}: the click at the arrow tip fired the row action once");
                 assert_eq!(pending(), GuideRequest::Clear, "{key}: and the guide cleared");
                 no_visual("drive tip click");
@@ -14732,6 +14787,35 @@ Broken: Either state is wrong.\n";
     #[cfg(feature = "guide")]
     extern "C" {
         fn gdk_x11_surface_get_xid(surface: *mut gdk::ffi::GdkSurface) -> std::os::raw::c_ulong;
+        fn gdk_x11_display_get_xdisplay(display: *mut gdk::ffi::GdkDisplay) -> *mut std::os::raw::c_void;
+    }
+
+    // Test-only: the X Shape extension is used solely to prove, from the X
+    // server's own side, that the arrow popover's empty input region has
+    // actually landed before a bare XTEST click is sent through it.
+    #[cfg(feature = "guide")]
+    #[repr(C)]
+    struct XRectangle {
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    }
+
+    #[cfg(feature = "guide")]
+    const SHAPE_INPUT: std::os::raw::c_int = 2;
+
+    #[cfg(feature = "guide")]
+    #[link(name = "Xext")]
+    extern "C" {
+        fn XShapeGetRectangles(
+            display: *mut std::os::raw::c_void,
+            window: std::os::raw::c_ulong,
+            kind: std::os::raw::c_int,
+            count: *mut std::os::raw::c_int,
+            ordering: *mut std::os::raw::c_int,
+        ) -> *mut XRectangle;
+        fn XFree(data: *mut std::os::raw::c_void) -> std::os::raw::c_int;
     }
 
     #[cfg(feature = "guide")]
