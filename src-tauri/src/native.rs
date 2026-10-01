@@ -6494,6 +6494,12 @@ fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::Ent
 }
 
 fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
+    // D-188: a ZIP member has no real path to rename on disk; the slow-click
+    // gate has no is_zip() check of its own, so refuse here (REJECT 1).
+    if entry.source.is_zip() {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    }
     state.borrow_mut().inline_rename = Some(InlineRename::new(&entry.source.to_path_string(), &entry.name));
     state.borrow_mut().last_name_click = None;
     refresh_row(state, ui, &entry.source);
