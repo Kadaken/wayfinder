@@ -7736,7 +7736,14 @@ fn selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> {
         .collect()
 }
 
+/// A ZIP member is never a valid picker result: the picker hands its result
+/// to an external caller (stdout or a webview), which must only ever see a
+/// real filesystem path, never the NUL-marker encoding a ZipMember would
+/// otherwise round-trip through (D-188).
 fn picker_entry_can_submit(picker: &PickerState, entry: &Entry) -> bool {
+    if entry.source.is_zip() {
+        return false;
+    }
     if picker.config.directory {
         entry.is_dir
     } else {
@@ -7751,7 +7758,10 @@ fn picker_selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> 
     let mut paths = selected_entries(state, ui)
         .into_iter()
         .filter(|entry| picker_entry_can_submit(&picker, entry))
-        .map(|entry| entry.source.to_path_string())
+        .filter_map(|entry| match entry.source {
+            native_core::EntrySource::Real(path) => Some(path.to_string_lossy().into_owned()),
+            native_core::EntrySource::ZipMember(_) => None,
+        })
         .collect::<Vec<_>>();
     if !picker.config.multiple {
         paths.truncate(1);
