@@ -420,7 +420,7 @@ pub fn validate_zip_member_name(
 
 /// Resource bounds enforced while indexing and streaming a ZIP (D-188). Kept
 /// as one named place so a limit is never silently re-chosen at a call site.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ZipLimits {
     pub max_members: usize,
     pub max_name_len: usize,
@@ -458,12 +458,135 @@ static TEST_ZIP_LIMITS: std::sync::Mutex<Option<ZipLimits>> = std::sync::Mutex::
 
 #[cfg(test)]
 fn effective_zip_limits() -> ZipLimits {
-    TEST_ZIP_LIMITS.lock().unwrap().unwrap_or(DEFAULT_ZIP_LIMITS)
+    TEST_ZIP_LIMITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(DEFAULT_ZIP_LIMITS)
 }
 
 #[cfg(test)]
-pub fn set_test_zip_limits(limits: Option<ZipLimits>) {
-    *TEST_ZIP_LIMITS.lock().unwrap() = limits;
+fn set_test_zip_limits(limits: Option<ZipLimits>) {
+    *TEST_ZIP_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = limits;
+}
+
+/// Serializes every test that can read `effective_zip_limits()` through
+/// listing, revalidation, Open or Copy Out — with or without its own
+/// override — so two such tests running concurrently (the default test
+/// harness) cannot observe or restore each other's value. Held by
+/// `TestZipLimitsGuard` for its whole lifetime, kept separate from
+/// `TEST_ZIP_LIMITS` itself so a production worker thread's plain read of
+/// the value can never deadlock behind a guard that also held the value
+/// mutex.
+#[cfg(test)]
+pub static TEST_ZIP_LIMITS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// `TEST_ZIP_LIMITS_LOCK` is a plain, non-reentrant `std::sync::Mutex`: it
+// exists to serialize *different test threads* against each other, not to
+// forbid a test from nesting a second `TestZipLimitsGuard` inside its own
+// `catch_unwind` on the same thread (the unwind-safety proofs below need
+// exactly that). This counts outstanding guards on the current thread so
+// only the outermost one actually locks/unlocks the mutex.
+#[cfg(test)]
+thread_local! {
+    static ZIP_LIMITS_LOCK_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+/// Test-only, unwind-safe override of the ZIP limits every production
+/// listing/Open/Copy Out call reads through `effective_zip_limits()`.
+/// Captures the exact prior `Option<ZipLimits>` on construction and
+/// restores it in `Drop`, including on panic/unwind and every early-return
+/// path, so one test's boundary fixture can never leak into another's —
+/// there must be no happy-path-only tail restore of this process-wide
+/// state (D-188 #55-#61). Holds `TEST_ZIP_LIMITS_LOCK` for its entire
+/// lifetime; a test with nothing to override still constructs one with
+/// `None` so it is serialized against every test that does.
+#[cfg(test)]
+pub struct TestZipLimitsGuard {
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
+    prior: Option<ZipLimits>,
+}
+
+#[cfg(test)]
+impl TestZipLimitsGuard {
+    pub fn new(limits: Option<ZipLimits>) -> Self {
+        let depth = ZIP_LIMITS_LOCK_DEPTH.with(|d| d.get());
+        let lock = if depth == 0 {
+            Some(TEST_ZIP_LIMITS_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+        ZIP_LIMITS_LOCK_DEPTH.with(|d| d.set(depth + 1));
+        let prior = *TEST_ZIP_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+        set_test_zip_limits(limits);
+        TestZipLimitsGuard { _lock: lock, prior }
+    }
+
+    pub fn set(&self, limits: Option<ZipLimits>) {
+        set_test_zip_limits(limits);
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestZipLimitsGuard {
+    fn drop(&mut self) {
+        set_test_zip_limits(self.prior);
+        ZIP_LIMITS_LOCK_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+#[cfg(test)]
+mod zip_limits_guard_tests_d188 {
+    use super::*;
+
+    #[test]
+    fn restores_a_prior_value_through_a_panic_d188() {
+        let outer = TestZipLimitsGuard::new(Some(ZipLimits { max_members: 111, ..DEFAULT_ZIP_LIMITS }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inner = TestZipLimitsGuard::new(Some(ZipLimits { max_members: 222, ..DEFAULT_ZIP_LIMITS }));
+            assert_eq!(effective_zip_limits().max_members, 222);
+            let _ = &inner;
+            panic!("simulated mid-test failure");
+        }));
+        assert!(result.is_err());
+        assert_eq!(effective_zip_limits().max_members, 111, "the outer override must survive the inner guard's panic unwind");
+        drop(outer);
+        assert_eq!(effective_zip_limits(), DEFAULT_ZIP_LIMITS, "once every guard is dropped, limits must fall back to the shipped defaults");
+    }
+
+    #[test]
+    fn restores_absence_through_a_panic_d188() {
+        // Serialized for its complete limits-reading lifetime against every
+        // other test that can reach `effective_zip_limits()` (D-188 DEFECT
+        // 2); installs no override of its own, so the prior it captures and
+        // restores is the shipped absence.
+        let outer = TestZipLimitsGuard::new(None);
+        assert_eq!(effective_zip_limits(), DEFAULT_ZIP_LIMITS, "no override installed anywhere must mean the shipped defaults");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = TestZipLimitsGuard::new(Some(ZipLimits { max_members: 333, ..DEFAULT_ZIP_LIMITS }));
+            assert_eq!(effective_zip_limits().max_members, 333);
+            let _ = &guard;
+            panic!("simulated mid-test failure");
+        }));
+        assert!(result.is_err());
+        assert_eq!(effective_zip_limits(), DEFAULT_ZIP_LIMITS, "a panic while overridden must restore to the prior absence, not leak the override");
+        drop(outer);
+    }
+
+    /// D-188 #55-#60 DEFECT 3: with no override installed anywhere, the
+    /// production hook must read back exactly the shipped `DEFAULT_ZIP_LIMITS`
+    /// field values — this is what makes a typo or divergence in the real
+    /// shipped constants fail, not just the override mechanism itself.
+    #[test]
+    fn shipped_constants_are_the_effective_limits_with_no_override_d188() {
+        let _guard = TestZipLimitsGuard::new(None);
+        let effective = effective_zip_limits();
+        assert_eq!(effective.max_members, 200_000);
+        assert_eq!(effective.max_name_len, 1024);
+        assert_eq!(effective.max_total_claimed_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(effective.max_entry_claimed_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(effective.max_compression_ratio, 1200);
+        assert_eq!(effective, DEFAULT_ZIP_LIMITS);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -791,6 +914,31 @@ pub static TEST_STREAM_CHUNK_DELAY_MICROS: AtomicU64 = AtomicU64::new(0);
 /// outside a test build.
 #[cfg(test)]
 pub static TEST_INDEX_ENTRY_DELAY_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Unwind-safe RAII install for `TEST_INDEX_ENTRY_DELAY_MICROS`: captures the
+/// exact prior value on construction and restores it in `Drop`, including on
+/// panic/unwind, instead of a happy-path-only tail `.store(0, ...)` (D-188
+/// round-wide shared-state audit).
+#[cfg(test)]
+pub struct TestIndexEntryDelayGuard {
+    prior: u64,
+}
+
+#[cfg(test)]
+impl TestIndexEntryDelayGuard {
+    pub fn new(micros: u64) -> Self {
+        let prior = TEST_INDEX_ENTRY_DELAY_MICROS.load(Ordering::Relaxed);
+        TEST_INDEX_ENTRY_DELAY_MICROS.store(micros, Ordering::Relaxed);
+        TestIndexEntryDelayGuard { prior }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestIndexEntryDelayGuard {
+    fn drop(&mut self) {
+        TEST_INDEX_ENTRY_DELAY_MICROS.store(self.prior, Ordering::Relaxed);
+    }
+}
 
 fn stream_zip_member_to(archive_path: &Path, member: &ZipMemberRef, out_path: &Path, cancelled: &AtomicBool) -> Result<(), String> {
     let (mut archive, index) = locate_and_validate_zip_member(archive_path, member, cancelled)?;

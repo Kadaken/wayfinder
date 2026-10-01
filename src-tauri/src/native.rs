@@ -13546,6 +13546,12 @@ Broken: Either state is wrong.\n";
         // real-trash tests and use the ambient `$HOME` instead.
         let _trash_guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
         let _xdg_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
+        // Installs no override (limits stay at the shipped defaults for this
+        // test) but holds the ZIP-limits serialization lock for the test's
+        // full limits-reading lifetime, so no concurrently-run #55-#61
+        // boundary test can race this test's own listing/Open/Copy Out
+        // reads of `effective_zip_limits()` (D-188 DEFECT 2).
+        let _zip_limits_guard = native_core::TestZipLimitsGuard::new(None);
         gtk::init().expect("gtk init on the virtual display");
         let root = crate::native_core::scratch_root().join(format!("wf-d188-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -14310,6 +14316,9 @@ Broken: Either state is wrong.\n";
         let xdg_dir = root.join("xdg-runtime");
         std::fs::create_dir_all(&xdg_dir).unwrap();
         let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
+        // Installs no override but holds the ZIP-limits serialization lock
+        // for this test's full limits-reading lifetime (D-188 DEFECT 2).
+        let _zip_limits_guard = native_core::TestZipLimitsGuard::new(None);
 
         let stored_options: zip::write::FileOptions<'_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -14796,7 +14805,7 @@ Broken: Either state is wrong.\n";
     /// claimed bytes, compression ratio) is proven at a below-limit,
     /// exactly-at-limit and over-limit fixture through the real production
     /// listing path (`list_zip_dir_cancellable`, reached by ordinary
-    /// `open_entry`/`navigate`), using `native_core::set_test_zip_limits` to
+    /// `open_entry`/`navigate`), using `native_core::TestZipLimitsGuard` to
     /// hold each limit down to a size a fixture can cheaply exercise without
     /// a real multi-gigabyte archive on disk. Only the one field under test
     /// is tightened at a time; every other field stays at
@@ -14895,8 +14904,15 @@ Broken: Either state is wrong.\n";
             assert!(!state.borrow().cwd.is_zip(), "{zip_name}: a refused archive must never be entered");
         }
 
+        // Held for the whole test: an unwind-safe, serialized override of
+        // the production ZIP limits (D-188 #55-#61 DEFECT 1/2). Restores
+        // the exact prior value in `Drop`, including on panic, and holds
+        // `TEST_ZIP_LIMITS_LOCK` for its entire lifetime so no other test
+        // reading `effective_zip_limits()` can race this one.
+        let zip_limits_guard = native_core::TestZipLimitsGuard::new(None);
+
         // ---- #55: member count. max_members tightened to 2.
-        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_members: 2, ..native_core::DEFAULT_ZIP_LIMITS }));
+        zip_limits_guard.set(Some(native_core::ZipLimits { max_members: 2, ..native_core::DEFAULT_ZIP_LIMITS }));
         let dir55 = group_dir("g55-members");
         for (fixture, n) in [("below.zip", 1usize), ("atlimit.zip", 2), ("over.zip", 3)] {
             let file = std::fs::File::create(dir55.join(fixture)).unwrap();
@@ -14912,7 +14928,7 @@ Broken: Either state is wrong.\n";
         open_and_expect_refused(&state, &ui, &dir55, "over.zip", "archive has too many entries");
 
         // ---- #56: name length. max_name_len tightened to 8.
-        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_name_len: 8, ..native_core::DEFAULT_ZIP_LIMITS }));
+        zip_limits_guard.set(Some(native_core::ZipLimits { max_name_len: 8, ..native_core::DEFAULT_ZIP_LIMITS }));
         let dir57 = group_dir("g57-namelen");
         for (fixture, name) in [("below.zip", "a.txt"), ("atlimit.zip", "abcde.tx"), ("over.zip", "abcdef.txt")] {
             assert!(matches!(name.len(), 5 | 8 | 10), "fixture names must stay at their named, exact lengths");
@@ -14930,7 +14946,7 @@ Broken: Either state is wrong.\n";
         // tightened to 50; the fixture's declared and real content lengths
         // are the same actual bytes (no field patch needed), so this group
         // never also exercises #59's streamed-bytes check.
-        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_entry_claimed_bytes: 50, ..native_core::DEFAULT_ZIP_LIMITS }));
+        zip_limits_guard.set(Some(native_core::ZipLimits { max_entry_claimed_bytes: 50, ..native_core::DEFAULT_ZIP_LIMITS }));
         let dir58 = group_dir("g58-entrybytes");
         for (fixture, declared) in [("below.zip", 10usize), ("atlimit.zip", 50), ("over.zip", 51)] {
             let path = dir58.join(fixture);
@@ -14948,7 +14964,7 @@ Broken: Either state is wrong.\n";
         // max_total_claimed_bytes tightened to 100, each fixture carrying
         // two equal-size members so their declared sum lands exactly
         // below/at/over.
-        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_total_claimed_bytes: 100, ..native_core::DEFAULT_ZIP_LIMITS }));
+        zip_limits_guard.set(Some(native_core::ZipLimits { max_total_claimed_bytes: 100, ..native_core::DEFAULT_ZIP_LIMITS }));
         let dir56 = group_dir("g56-totalbytes");
         for (fixture, each) in [("below.zip", 40usize), ("atlimit.zip", 50), ("over.zip", 51)] {
             let path = dir56.join(fixture);
@@ -14970,7 +14986,7 @@ Broken: Either state is wrong.\n";
         // byte-patched to a chosen value, so the ratio lands on an exact
         // integer boundary — real Deflate output cannot be relied on to
         // land exactly on one.
-        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_compression_ratio: 5, ..native_core::DEFAULT_ZIP_LIMITS }));
+        zip_limits_guard.set(Some(native_core::ZipLimits { max_compression_ratio: 5, ..native_core::DEFAULT_ZIP_LIMITS }));
         let dir60 = group_dir("g60-ratio");
         for (fixture, fake_compressed) in [("below.zip", 34u32), ("atlimit.zip", 20u32), ("over.zip", 16u32)] {
             let path = dir60.join(fixture);
@@ -14989,7 +15005,7 @@ Broken: Either state is wrong.\n";
         open_and_expect_ok(&state, &ui, &dir60, "atlimit.zip");
         open_and_expect_refused(&state, &ui, &dir60, "over.zip", "has a suspicious compression ratio");
 
-        native_core::set_test_zip_limits(None);
+        zip_limits_guard.set(None);
 
         // ---- #59: actual streamed bytes, below/at/over the archive's own
         // declared size, through production Open and Copy Out. Each
@@ -15127,8 +15143,8 @@ Broken: Either state is wrong.\n";
         // bound, and the GTK main loop keeps pumping meanwhile rather than
         // blocking — proved by a plain periodic timeout counter ticking
         // while `index_zip` runs on its own worker thread.
-        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_members: 50, ..native_core::DEFAULT_ZIP_LIMITS }));
-        native_core::TEST_INDEX_ENTRY_DELAY_MICROS.store(5_000, Ordering::Relaxed);
+        zip_limits_guard.set(Some(native_core::ZipLimits { max_members: 50, ..native_core::DEFAULT_ZIP_LIMITS }));
+        let _delay_guard = native_core::TestIndexEntryDelayGuard::new(5_000);
         let dir61 = group_dir("g61-slow-refusal");
         {
             let file = std::fs::File::create(dir61.join("slowmany.zip")).unwrap();
@@ -15149,8 +15165,7 @@ Broken: Either state is wrong.\n";
         open_and_expect_refused(&state, &ui, &dir61, "slowmany.zip", "archive has too many entries");
         let slow_refusal_elapsed = slow_refusal_started.elapsed();
         tick_source.remove();
-        native_core::TEST_INDEX_ENTRY_DELAY_MICROS.store(0, Ordering::Relaxed);
-        native_core::set_test_zip_limits(None);
+        drop(_delay_guard);
         assert!(
             slow_refusal_elapsed < Duration::from_secs(10),
             "D-188 #61: the slow boundary refusal exceeded its named 10s bound: {slow_refusal_elapsed:?}"
