@@ -3,11 +3,11 @@ use adw::gtk::gio::prelude::FileExt;
 use adw::gtk::glib;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const IMG_EXT: [&str; 12] = [
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
@@ -228,6 +228,16 @@ pub struct ZipMemberRef {
     /// that name. 0/0 for a directory row, which never reaches extraction.
     pub size: u64,
     pub crc32: u32,
+    /// The archive file's byte length at listing time (D-188 REJECT 5):
+    /// archive identity, checked alongside the member's own size/CRC so a
+    /// wholesale archive replacement is caught even on the rare chance it
+    /// preserves one member's name, size and CRC.
+    pub archive_len: u64,
+    /// This member's position in the archive's own central directory at
+    /// listing time (D-188 REJECT 5): exact entry identity, checked against a
+    /// fresh full re-index of the live archive before streaming — never a
+    /// scan that stops at the first matching name.
+    pub member_index: usize,
 }
 
 /// Where a row's bytes actually come from, carried instead of a serialized
@@ -245,8 +255,23 @@ impl EntrySource {
         Self::Real(path.into())
     }
 
-    pub fn zip_member(archive: impl Into<PathBuf>, internal: impl Into<String>, size: u64, crc32: u32) -> Self {
-        Self::ZipMember(ZipMemberRef { archive: archive.into(), internal: internal.into(), size, crc32 })
+    #[allow(clippy::too_many_arguments)]
+    pub fn zip_member(
+        archive: impl Into<PathBuf>,
+        internal: impl Into<String>,
+        size: u64,
+        crc32: u32,
+        archive_len: u64,
+        member_index: usize,
+    ) -> Self {
+        Self::ZipMember(ZipMemberRef {
+            archive: archive.into(),
+            internal: internal.into(),
+            size,
+            crc32,
+            archive_len,
+            member_index,
+        })
     }
 
     pub fn is_zip(&self) -> bool {
@@ -460,6 +485,12 @@ pub struct ZipIndexEntry {
     /// time (D-188 REJECT 5). 0 for a directory (real or synthesized) — never
     /// read back for one.
     pub crc32: u32,
+    /// This entry's position in the archive's own central directory (D-188
+    /// REJECT 5), so a member can be re-located by physical identity, not
+    /// just by a name that a replacement archive could reuse at a different
+    /// position. `usize::MAX` for a synthesized implicit directory, which has
+    /// no physical entry of its own and never streams.
+    pub physical_index: usize,
 }
 
 /// Reads only the ZIP central directory (no member bytes) and returns every
@@ -480,7 +511,7 @@ pub fn index_zip<R: Read + std::io::Seek>(
     // directory (explicit or an ancestor of something else), `false` =
     // reserved as a file.
     let mut namespace: HashMap<String, bool> = HashMap::new();
-    let mut explicit_entries: Vec<(String, bool, u64, u32)> = Vec::with_capacity(archive.len());
+    let mut explicit_entries: Vec<(String, bool, u64, u32, usize)> = Vec::with_capacity(archive.len());
     let mut seen_explicit_dirs: HashSet<String> = HashSet::new();
     let mut total_claimed: u64 = 0;
 
@@ -568,17 +599,29 @@ pub fn index_zip<R: Read + std::io::Seek>(
             seen_explicit_dirs.insert(normalized.clone());
         }
 
-        explicit_entries.push((normalized, is_dir, size, crc32));
+        explicit_entries.push((normalized, is_dir, size, crc32, i));
     }
 
     let mut out: Vec<ZipIndexEntry> = Vec::with_capacity(namespace.len());
-    let explicit_paths: HashSet<&str> = explicit_entries.iter().map(|(p, _, _, _)| p.as_str()).collect();
-    for (path, is_dir, size, crc32) in &explicit_entries {
-        out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: *is_dir, size: *size, crc32: *crc32 });
+    let explicit_paths: HashSet<&str> = explicit_entries.iter().map(|(p, _, _, _, _)| p.as_str()).collect();
+    for (path, is_dir, size, crc32, physical_index) in &explicit_entries {
+        out.push(ZipIndexEntry {
+            logical_path: path.clone(),
+            is_dir: *is_dir,
+            size: *size,
+            crc32: *crc32,
+            physical_index: *physical_index,
+        });
     }
     for (path, is_dir) in &namespace {
         if *is_dir && !explicit_paths.contains(path.as_str()) {
-            out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: true, size: 0, crc32: 0 });
+            out.push(ZipIndexEntry {
+                logical_path: path.clone(),
+                is_dir: true,
+                size: 0,
+                crc32: 0,
+                physical_index: usize::MAX,
+            });
         }
     }
     Ok(out)
@@ -598,90 +641,142 @@ pub fn index_zip<R: Read + std::io::Seek>(
 /// plus the caller's expected size/CRC (D-188 REJECT 5: catches an archive
 /// changed since it was listed). Returns the entry's index so the caller can
 /// stream it without a second scan.
+/// A collision-proof name for a transaction-owned file this call will create
+/// with `create_new` (D-188 REJECT 4/5): pid plus a process-wide counter, not
+/// a predictable `{pid}-{i}` — two transactions racing in the same process
+/// never pick the same name, and `create_new`'s `O_EXCL` semantics refuse any
+/// name an unrelated process happens to already hold.
+fn next_zip_stage_name(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!(".{prefix}-wf-zip-{}-{n}", std::process::id())
+}
+
+/// Re-locates and fully revalidates `member` against the live archive
+/// (D-188 REJECT 5): re-opens the archive, re-indexes its whole namespace
+/// with the same order-independent, duplicate-detecting pass every listing
+/// uses (`index_zip`, not a scan that resets its seen-sets per entry and
+/// stops at the first name match), and checks archive identity (byte length)
+/// plus exact entry identity (central-directory position) alongside the
+/// size/CRC captured at listing time. A replacement archive that happens to
+/// preserve one member's name, size and CRC at a different position is
+/// caught by the position check even though the size/CRC check alone would
+/// pass it. Returns an archive handle open on the revalidated file plus the
+/// physical index to stream from, so the caller never re-scans.
 fn locate_and_validate_zip_member(
-    archive: &mut zip::ZipArchive<std::fs::File>,
-    internal: &str,
-    expected_size: u64,
-    expected_crc32: u32,
-) -> Result<usize, String> {
-    let mut found = None;
-    for i in 0..archive.len() {
-        let raw = archive.by_index_raw(i).map_err(|e| format!("archive is corrupt: {e}"))?;
-        let raw_name = raw.name().to_string();
-        if raw.encrypted() || raw.unix_mode().is_some_and(is_disallowed_unix_mode) {
-            continue;
-        }
-        let seen_files = HashSet::new();
-        let seen_dirs = HashSet::new();
-        if let Ok(normalized) = validate_zip_member_name(&raw_name, &seen_files, &seen_dirs, false) {
-            if normalized == internal {
-                found = Some(i);
-                break;
-            }
-        }
-    }
-    let index = found.ok_or_else(|| format!("\"{internal}\" was not found in the archive"))?;
-    let entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
-    if entry.size() > DEFAULT_ZIP_LIMITS.max_entry_claimed_bytes {
-        return Err(format!("\"{internal}\" is too large"));
-    }
-    let compressed = entry.compressed_size().max(1);
-    if entry.size() / compressed > DEFAULT_ZIP_LIMITS.max_compression_ratio {
-        return Err(format!("\"{internal}\" has a suspicious compression ratio"));
-    }
-    #[allow(deprecated)]
-    if matches!(entry.compression(), zip::CompressionMethod::Unsupported(_)) {
-        return Err(format!("\"{internal}\" uses an unsupported compression method"));
-    }
-    if entry.size() != expected_size || entry.crc32() != expected_crc32 {
+    archive_path: &Path,
+    member: &ZipMemberRef,
+    cancelled: &AtomicBool,
+) -> Result<(zip::ZipArchive<std::fs::File>, usize), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
+    let archive_len = file.metadata().map_err(|e| format!("could not read archive metadata: {e}"))?.len();
+    if archive_len != member.archive_len {
         return Err(format!(
-            "\"{internal}\" no longer matches what was listed — the archive changed since it was browsed"
+            "\"{}\" no longer matches what was listed — the archive changed since it was browsed",
+            member.internal
         ));
     }
-    Ok(index)
+    let index = index_zip(file, &DEFAULT_ZIP_LIMITS, cancelled)
+        .map_err(|e| format!("could not re-read the archive: {e}"))?;
+    let entry = index
+        .iter()
+        .find(|e| e.logical_path == member.internal)
+        .ok_or_else(|| format!("\"{}\" was not found in the archive", member.internal))?;
+    if entry.is_dir
+        || entry.size != member.size
+        || entry.crc32 != member.crc32
+        || entry.physical_index != member.member_index
+    {
+        return Err(format!(
+            "\"{}\" no longer matches what was listed — the archive changed since it was browsed",
+            member.internal
+        ));
+    }
+    let physical_index = entry.physical_index;
+
+    let reopened = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
+    let mut archive = zip::ZipArchive::new(reopened).map_err(|e| format!("could not open archive: {e}"))?;
+    {
+        let raw = archive
+            .by_index(physical_index)
+            .map_err(|e| format!("could not read \"{}\": {e}", member.internal))?;
+        if raw.size() > DEFAULT_ZIP_LIMITS.max_entry_claimed_bytes {
+            return Err(format!("\"{}\" is too large", member.internal));
+        }
+        let compressed = raw.compressed_size().max(1);
+        if raw.size() / compressed > DEFAULT_ZIP_LIMITS.max_compression_ratio {
+            return Err(format!("\"{}\" has a suspicious compression ratio", member.internal));
+        }
+        #[allow(deprecated)]
+        if matches!(raw.compression(), zip::CompressionMethod::Unsupported(_)) {
+            return Err(format!("\"{}\" uses an unsupported compression method", member.internal));
+        }
+    }
+    Ok((archive, physical_index))
 }
 
-/// Validates `internal` against the live archive without writing anything
+/// Validates `member` against the live archive without writing anything
 /// (D-188 REJECT 4 preflight pass: every requested member is checked before
 /// any is staged).
-fn validate_zip_member_matches(archive_path: &Path, internal: &str, expected_size: u64, expected_crc32: u32) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
-    locate_and_validate_zip_member(&mut archive, internal, expected_size, expected_crc32)?;
+fn validate_zip_member_matches(archive_path: &Path, member: &ZipMemberRef, cancelled: &AtomicBool) -> Result<(), String> {
+    locate_and_validate_zip_member(archive_path, member, cancelled)?;
     Ok(())
 }
 
-/// Revalidates and streams `internal`'s exact bytes to `out_path` (a path
-/// this call owns outright — never the final destination). Separated from
-/// publishing so a caller can stage several members before committing any of
-/// them (D-188 REJECT 4).
-fn stream_zip_member_to(archive_path: &Path, internal: &str, expected_size: u64, expected_crc32: u32, out_path: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
-    let index = locate_and_validate_zip_member(&mut archive, internal, expected_size, expected_crc32)?;
-    let mut entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
-    let mut out = std::fs::File::create(out_path).map_err(|e| format!("could not write {}: {e}", out_path.display()))?;
-    std::io::copy(&mut entry, &mut out).map_err(|e| {
+/// Revalidates and streams `member`'s exact bytes to `out_path` (a path this
+/// call owns outright, created with exclusive `create_new` ownership — never
+/// the final destination, and never a truncating open that could silently
+/// overwrite a pre-existing stage). Streaming is a manual chunked loop, not
+/// `std::io::copy`, so it can enforce the archive's own claimed byte count
+/// (D-188 REJECT 5: never write more than the entry's own size) and check
+/// `cancelled` between chunks. Separated from publishing so a caller can
+/// stage several members before committing any of them (D-188 REJECT 4).
+fn stream_zip_member_to(archive_path: &Path, member: &ZipMemberRef, out_path: &Path, cancelled: &AtomicBool) -> Result<(), String> {
+    let (mut archive, index) = locate_and_validate_zip_member(archive_path, member, cancelled)?;
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|e| format!("could not read \"{}\": {e}", member.internal))?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out_path)
+        .map_err(|e| format!("could not create {}: {e}", out_path.display()))?;
+
+    let expected = entry.size();
+    let mut written: u64 = 0;
+    let mut buf = [0u8; 64 * 1024];
+    let result = (|| -> Result<(), String> {
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("cancelled".to_string());
+            }
+            let n = entry.read(&mut buf).map_err(|e| format!("could not extract \"{}\": {e}", member.internal))?;
+            if n == 0 {
+                break;
+            }
+            written = written.saturating_add(n as u64);
+            if written > expected {
+                return Err(format!("\"{}\" streamed more bytes than the archive claimed", member.internal));
+            }
+            out.write_all(&buf[..n]).map_err(|e| format!("could not write {}: {e}", out_path.display()))?;
+        }
+        if written != expected {
+            return Err(format!("\"{}\" streamed fewer bytes than the archive claimed", member.internal));
+        }
+        Ok(())
+    })();
+    drop(out);
+    if let Err(e) = result {
         let _ = std::fs::remove_file(out_path);
-        format!("could not extract \"{internal}\": {e}")
-    })?;
+        return Err(e);
+    }
     Ok(())
 }
 
-pub fn extract_zip_member(
-    archive_path: &Path,
-    internal: &str,
-    expected_size: u64,
-    expected_crc32: u32,
-    dest_file: &Path,
-) -> Result<(), String> {
-    let tmp_name = format!(
-        ".{}.wf-zip-tmp-{}",
-        dest_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id()
-    );
+pub fn extract_zip_member(member: &ZipMemberRef, dest_file: &Path, cancelled: &AtomicBool) -> Result<(), String> {
+    let tmp_name = next_zip_stage_name(&dest_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     let tmp = dest_file.with_file_name(tmp_name);
-    stream_zip_member_to(archive_path, internal, expected_size, expected_crc32, &tmp)?;
+    stream_zip_member_to(&member.archive, member, &tmp, cancelled)?;
     rename_no_replace(&tmp, dest_file).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("could not publish {}: {e}", dest_file.display())
@@ -746,38 +841,102 @@ impl Drop for ZipOpenCacheRoot {
 /// rename. A failure at any point removes only the stages and outputs this
 /// call itself created — never a raced or unrelated object — and the
 /// returned paths are exact receipts for Undo/Redo.
-pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String, u64, u32)], dest_dir: &Path) -> Result<Vec<String>, String> {
-    for (internal, _file_name, size, crc32) in members {
-        validate_zip_member_matches(archive_path, internal, *size, *crc32)?;
-    }
+pub fn copy_zip_members_out(
+    archive_path: &Path,
+    members: &[(ZipMemberRef, String)],
+    dest_dir: &Path,
+    cancelled: &AtomicBool,
+) -> Result<Vec<String>, String> {
+    copy_zip_members_out_inner(archive_path, members, dest_dir, cancelled, &|| {})
+}
 
-    let mut stages: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (i, (internal, file_name, size, crc32)) in members.iter().enumerate() {
-        let stage = dest_dir.join(format!(".wf-zip-stage-{}-{i}", std::process::id()));
-        if let Err(e) = stream_zip_member_to(archive_path, internal, *size, *crc32, &stage) {
-            for (s, _) in &stages {
-                let _ = std::fs::remove_file(s);
+/// Identity of a file this transaction just created, captured before it is
+/// renamed into place (D-188 REJECT 4): rollback re-stats the published path
+/// and removes it only if this identity still matches, so a rollback after a
+/// raced replacement never deletes someone else's object that merely landed
+/// at the same name.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Removes `path` only if its live identity still matches what this
+/// transaction captured when it created (or just published) the file —
+/// never a plain remove-by-name (D-188 REJECT 4).
+fn remove_if_still_owned(path: &Path, owned_identity: Option<(u64, u64)>) {
+    if file_identity(path) == owned_identity && owned_identity.is_some() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `after_preflight` runs once every member has passed revalidation and
+/// before anything is staged — the real production call passes a no-op, and
+/// a test passes a closure that creates a destination file at this exact
+/// point, to prove the check-then-stage-then-publish race the fail-closed
+/// rename refusal must catch (D-188 REJECT 4).
+fn copy_zip_members_out_inner(
+    archive_path: &Path,
+    members: &[(ZipMemberRef, String)],
+    dest_dir: &Path,
+    cancelled: &AtomicBool,
+    after_preflight: &dyn Fn(),
+) -> Result<Vec<String>, String> {
+    for (member, _file_name) in members {
+        validate_zip_member_matches(archive_path, member, cancelled)?;
+    }
+    after_preflight();
+
+    let mut stages: Vec<(PathBuf, Option<(u64, u64)>, PathBuf)> = Vec::new();
+    for (member, file_name) in members {
+        let stage = dest_dir.join(next_zip_stage_name(file_name));
+        if let Err(e) = stream_zip_member_to(archive_path, member, &stage, cancelled) {
+            for (s, id, _) in &stages {
+                remove_if_still_owned(s, *id);
             }
             let _ = std::fs::remove_file(&stage);
             return Err(e);
         }
-        stages.push((stage, dest_dir.join(file_name)));
+        let identity = file_identity(&stage);
+        stages.push((stage, identity, dest_dir.join(file_name)));
     }
 
-    let mut created = Vec::new();
-    for (stage, dest) in &stages {
+    let mut created: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+    for (stage, identity, dest) in &stages {
         if let Err(e) = rename_no_replace(stage, dest) {
-            for (s, _) in &stages {
-                let _ = std::fs::remove_file(s);
+            for (s, id, _) in &stages {
+                remove_if_still_owned(s, *id);
             }
-            for path in &created {
-                let _: Result<(), _> = std::fs::remove_file(path);
+            for (path, id) in &created {
+                remove_if_still_owned(Path::new(path), *id);
             }
             return Err(format!("could not publish {}: {e}", dest.display()));
         }
-        created.push(dest.to_string_lossy().into_owned());
+        created.push((dest.to_string_lossy().into_owned(), *identity));
     }
+    let created: Vec<String> = created.into_iter().map(|(path, _)| path).collect();
     Ok(created)
+}
+
+/// Test-only entry point that exposes the `after_preflight` injection point
+/// (D-188 REJECT 4): lets a test land a conflicting destination file at the
+/// exact moment after preflight validation completes and before anything is
+/// staged, proving the real check-then-stage-then-publish race rather than
+/// one simulated by writing the conflict before the call even starts.
+#[cfg(test)]
+pub fn copy_zip_members_out_for_test(
+    archive_path: &Path,
+    members: &[(ZipMemberRef, String)],
+    dest_dir: &Path,
+    cancelled: &AtomicBool,
+    after_preflight: &dyn Fn(),
+) -> Result<Vec<String>, String> {
+    copy_zip_members_out_inner(archive_path, members, dest_dir, cancelled, after_preflight)
 }
 
 /// Immediate children of `internal` (the virtual directory being browsed; ""
@@ -785,9 +944,9 @@ pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String, u64
 /// contract in `list_dir_cancellable` (D-188). Each row's `source` is a typed
 /// `EntrySource::ZipMember`, so navigation/activation code matches on the
 /// type instead of needing a ZIP special case for a path string.
-pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
+pub fn zip_dir_children(archive: &Path, archive_len: u64, index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
     let prefix = if internal.is_empty() { String::new() } else { format!("{internal}/") };
-    let mut children: HashMap<String, (bool, u64, u32)> = HashMap::new();
+    let mut children: HashMap<String, (bool, u64, u32, usize)> = HashMap::new();
     for item in index {
         let Some(rest) = item.logical_path.strip_prefix(prefix.as_str()) else { continue };
         if rest.is_empty() {
@@ -797,19 +956,20 @@ pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str)
             Some((first, _)) => (first.to_string(), true),
             None => (rest.to_string(), item.is_dir),
         };
-        let existing = children.entry(name).or_insert((is_direct_dir, 0, 0));
+        let existing = children.entry(name).or_insert((is_direct_dir, 0, 0, usize::MAX));
         if !is_direct_dir {
             existing.1 = item.size;
             existing.2 = item.crc32;
+            existing.3 = item.physical_index;
         }
         existing.0 = existing.0 || is_direct_dir;
     }
     let mut out: Vec<Entry> = children
         .into_iter()
-        .map(|(name, (is_dir, size, crc32))| {
+        .map(|(name, (is_dir, size, crc32, physical_index))| {
             let fake_path = Path::new(&name);
             let child_internal = if internal.is_empty() { name.clone() } else { format!("{internal}/{name}") };
-            let source = EntrySource::zip_member(archive.to_path_buf(), child_internal, size, crc32);
+            let source = EntrySource::zip_member(archive.to_path_buf(), child_internal, size, crc32, archive_len, physical_index);
             Entry {
                 icon: icon_name(fake_path, is_dir).to_string(),
                 is_image: is_image(fake_path),
@@ -1103,6 +1263,7 @@ pub fn list_zip_dir_cancellable(
         return Err(ListDirError::Cancelled);
     }
     let file = fs::File::open(archive).map_err(|e| ListDirError::Open(e.to_string()))?;
+    let archive_len = file.metadata().map_err(|e| ListDirError::Open(e.to_string()))?.len();
     let index = index_zip(file, &DEFAULT_ZIP_LIMITS, cancelled).map_err(|e| match e {
         ZipIndexError::Cancelled => ListDirError::Cancelled,
         other => ListDirError::Open(other.to_string()),
@@ -1110,7 +1271,7 @@ pub fn list_zip_dir_cancellable(
     if cancelled.load(Ordering::Relaxed) {
         return Err(ListDirError::Cancelled);
     }
-    let entries = zip_dir_children(archive, &index, internal);
+    let entries = zip_dir_children(archive, archive_len, &index, internal);
     Ok(DirectoryListing { entries, metadata_unavailable: 0, unreadable_entries: 0 })
 }
 
@@ -6376,7 +6537,7 @@ mod zip_index_tests_d188 {
     #[test]
     fn zip_root_children_are_folders_first_then_alphabetical_d188() {
         let entries = idx(&[("zeta.txt", b"z"), ("alpha/", b""), ("mid.txt", b"m")]);
-        let children = zip_dir_children(Path::new("sample.zip"), &entries, "");
+        let children = zip_dir_children(Path::new("sample.zip"), 0, &entries, "");
         let names: Vec<_> = children.iter().map(|e| (e.name.clone(), e.is_dir)).collect();
         assert_eq!(names, vec![
             ("alpha".to_string(), true),
@@ -6388,9 +6549,9 @@ mod zip_index_tests_d188 {
     #[test]
     fn nested_children_only_show_one_level_d188() {
         let entries = idx(&[("a/b/c.txt", b"x"), ("a/d.txt", b"y")]);
-        let root_children = zip_dir_children(Path::new("sample.zip"), &entries, "");
+        let root_children = zip_dir_children(Path::new("sample.zip"), 0, &entries, "");
         assert_eq!(root_children.len(), 1, "only 'a' at the root");
-        let a_children = zip_dir_children(Path::new("sample.zip"), &entries, "a");
+        let a_children = zip_dir_children(Path::new("sample.zip"), 0, &entries, "a");
         let names: HashSet<_> = a_children.iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, HashSet::from(["b".to_string(), "d.txt".to_string()]));
     }
@@ -6544,14 +6705,23 @@ mod zip_extraction_tests_d188 {
         writer.finish().unwrap();
     }
 
-    /// Size and CRC-32 for one logical path, as `index_zip` would list it —
-    /// the metadata these tests pass to `extract_zip_member`/
-    /// `copy_zip_members_out` for revalidation (D-188 REJECT 5).
-    fn indexed_meta(archive: &Path, internal: &str) -> (u64, u32) {
+    /// A `ZipMemberRef` for one logical path, as a real listing would build
+    /// it (D-188 REJECT 5): archive length and physical index captured
+    /// alongside size/CRC, the metadata these tests pass to
+    /// `extract_zip_member`/`copy_zip_members_out` for revalidation.
+    fn indexed_member(archive: &Path, internal: &str) -> ZipMemberRef {
         let file = std::fs::File::open(archive).unwrap();
+        let archive_len = file.metadata().unwrap().len();
         let entries = index_zip(file, &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false)).unwrap();
         let entry = entries.iter().find(|e| e.logical_path == internal).expect("member must be indexed");
-        (entry.size, entry.crc32)
+        ZipMemberRef {
+            archive: archive.to_path_buf(),
+            internal: internal.to_string(),
+            size: entry.size,
+            crc32: entry.crc32,
+            archive_len,
+            member_index: entry.physical_index,
+        }
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -6570,8 +6740,8 @@ mod zip_extraction_tests_d188 {
         let archive = dir.join("a.zip");
         write_zip_file(&[("notes/todo.txt", b"buy milk")], &archive);
         let dest = dir.join("todo.txt");
-        let (size, crc32) = indexed_meta(&archive, "notes/todo.txt");
-        extract_zip_member(&archive, "notes/todo.txt", size, crc32, &dest).unwrap();
+        let member = indexed_member(&archive, "notes/todo.txt");
+        extract_zip_member(&member, &dest, &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"buy milk");
     }
 
@@ -6581,7 +6751,15 @@ mod zip_extraction_tests_d188 {
         let archive = dir.join("a.zip");
         write_zip_file(&[("a.txt", b"x")], &archive);
         let dest = dir.join("out.txt");
-        assert!(extract_zip_member(&archive, "not-there.txt", 0, 0, &dest).is_err());
+        let member = ZipMemberRef {
+            archive: archive.clone(),
+            internal: "not-there.txt".to_string(),
+            size: 0,
+            crc32: 0,
+            archive_len: std::fs::metadata(&archive).unwrap().len(),
+            member_index: 0,
+        };
+        assert!(extract_zip_member(&member, &dest, &AtomicBool::new(false)).is_err());
         assert!(!dest.exists());
     }
 
@@ -6590,11 +6768,30 @@ mod zip_extraction_tests_d188 {
         let dir = scratch("changed");
         let archive = dir.join("a.zip");
         write_zip_file(&[("a.txt", b"original")], &archive);
-        let (size, crc32) = indexed_meta(&archive, "a.txt");
+        let member = indexed_member(&archive, "a.txt");
         // Replace the archive's bytes for the same logical name after listing.
         write_zip_file(&[("a.txt", b"replaced bytes, different length")], &archive);
         let dest = dir.join("out.txt");
-        let err = extract_zip_member(&archive, "a.txt", size, crc32, &dest).unwrap_err();
+        let err = extract_zip_member(&member, &dest, &AtomicBool::new(false)).unwrap_err();
+        assert!(err.contains("no longer matches what was listed"), "got: {err}");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn extract_zip_member_rejects_replacement_archive_preserving_name_size_crc_d188() {
+        // D-188 REJECT 5: a replacement archive that happens to preserve the
+        // selected member's name, size and CRC at a *different* position must
+        // still be refused — archive identity (length) or exact entry
+        // identity (physical index) must catch what size/CRC alone would miss.
+        let dir = scratch("replaced-archive");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("decoy.txt", b"x"), ("a.txt", b"same-bytes")], &archive);
+        let member = indexed_member(&archive, "a.txt");
+        // Rebuild the archive with "a.txt" containing identical bytes (so size
+        // and CRC are unchanged) but at a different physical position.
+        write_zip_file(&[("a.txt", b"same-bytes"), ("decoy.txt", b"x")], &archive);
+        let dest = dir.join("out.txt");
+        let err = extract_zip_member(&member, &dest, &AtomicBool::new(false)).unwrap_err();
         assert!(err.contains("no longer matches what was listed"), "got: {err}");
         assert!(!dest.exists());
     }
@@ -6623,15 +6820,13 @@ mod zip_extraction_tests_d188 {
         write_zip_file(&[("x.txt", b"one"), ("y.txt", b"two")], &archive);
         let dest = dir.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
-        let (x_size, x_crc32) = indexed_meta(&archive, "x.txt");
-        let (y_size, y_crc32) = indexed_meta(&archive, "y.txt");
+        let x = indexed_member(&archive, "x.txt");
+        let y = indexed_member(&archive, "y.txt");
         let created = copy_zip_members_out(
             &archive,
-            &[
-                ("x.txt".to_string(), "x.txt".to_string(), x_size, x_crc32),
-                ("y.txt".to_string(), "y.txt".to_string(), y_size, y_crc32),
-            ],
+            &[(x, "x.txt".to_string()), (y, "y.txt".to_string())],
             &dest,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(created.len(), 2);
@@ -6647,46 +6842,47 @@ mod zip_extraction_tests_d188 {
         let dest = dir.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("y.txt"), b"already here").unwrap();
-        let (x_size, x_crc32) = indexed_meta(&archive, "x.txt");
-        let (y_size, y_crc32) = indexed_meta(&archive, "y.txt");
+        let x = indexed_member(&archive, "x.txt");
+        let y = indexed_member(&archive, "y.txt");
         let result = copy_zip_members_out(
             &archive,
-            &[
-                ("x.txt".to_string(), "x.txt".to_string(), x_size, x_crc32),
-                ("y.txt".to_string(), "y.txt".to_string(), y_size, y_crc32),
-            ],
+            &[(x, "x.txt".to_string()), (y, "y.txt".to_string())],
             &dest,
+            &AtomicBool::new(false),
         );
         assert!(result.is_err());
         assert!(!dest.join("x.txt").exists());
         assert_eq!(std::fs::read(dest.join("y.txt")).unwrap(), b"already here");
     }
 
+    /// The pre-existing-conflict test above proves rollback when the clash is
+    /// visible at the start of the call. This proves the real race (D-188
+    /// REJECT 4): nothing clashes at preflight time, something else creates
+    /// the destination *after* every member has passed validation and before
+    /// staging/publish — through the test-only `after_preflight` hook, which
+    /// exists for exactly this proof and runs at no other time in production.
     #[test]
     fn copy_zip_members_out_refuses_destination_created_after_preflight_d188() {
-        // D-188 REJECT 4: the old check-then-extract race could overwrite a
-        // destination that appeared after the `exists()` preflight check but
-        // before the write. There is no production hook to land a file mid-call
-        // here, but this proves the publish step itself (not a preflight
-        // snapshot) is what refuses the conflict, and that a raced object the
-        // transaction did not create is left untouched.
         let dir = scratch("race");
         let archive = dir.join("a.zip");
         write_zip_file(&[("x.txt", b"one"), ("y.txt", b"two")], &archive);
         let dest = dir.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
-        let (x_size, x_crc32) = indexed_meta(&archive, "x.txt");
-        let (y_size, y_crc32) = indexed_meta(&archive, "y.txt");
-        // Nothing exists yet, so preflight (if any existed) would pass for both.
-        // Land the conflicting file now, simulating it appearing mid-transaction.
-        std::fs::write(dest.join("y.txt"), b"raced in").unwrap();
-        let result = copy_zip_members_out(
+        let x = indexed_member(&archive, "x.txt");
+        let y = indexed_member(&archive, "y.txt");
+        // Nothing exists yet, so preflight passes for both. The hook lands the
+        // conflicting file at the exact moment after preflight completes and
+        // before staging begins — the real check-then-use race, not a file
+        // written before the call ever starts.
+        let dest_for_hook = dest.clone();
+        let result = copy_zip_members_out_for_test(
             &archive,
-            &[
-                ("x.txt".to_string(), "x.txt".to_string(), x_size, x_crc32),
-                ("y.txt".to_string(), "y.txt".to_string(), y_size, y_crc32),
-            ],
+            &[(x, "x.txt".to_string()), (y, "y.txt".to_string())],
             &dest,
+            &AtomicBool::new(false),
+            &|| {
+                std::fs::write(dest_for_hook.join("y.txt"), b"raced in").unwrap();
+            },
         );
         assert!(result.is_err());
         assert!(!dest.join("x.txt").exists(), "owned output from this transaction must be rolled back");
@@ -6695,7 +6891,7 @@ mod zip_extraction_tests_d188 {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(".wf-zip-stage-"))
+            .filter(|n| n.contains("-wf-zip-"))
             .collect();
         assert!(leftovers.is_empty(), "no owned stage may survive a failed transaction, found {leftovers:?}");
     }

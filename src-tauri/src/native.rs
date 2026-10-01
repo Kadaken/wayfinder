@@ -8115,7 +8115,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         let native_core::EntrySource::Real(archive) = &entry.source else { unreachable!() };
         navigate(state, native_core::Location::zip_root(archive.clone()));
     } else if let Some(member) = zip_member {
-        open_zip_member(state, ui, &member.archive, &member.internal, member.size, member.crc32, &entry.name);
+        open_zip_member(state, ui, &member, &entry.name);
     } else if entry.is_dir {
         navigate(state, entry.source.to_location());
     } else {
@@ -8153,7 +8153,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
 /// old code, this never falls back to the shared, world-readable process
 /// temp dir. The cache root's owner lives in `AppState` so its `Drop` removes
 /// only that one root, at app teardown.
-fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, archive: &Path, internal: &str, expected_size: u64, expected_crc32: u32, display_name: &str) {
+fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, member: &native_core::ZipMemberRef, display_name: &str) {
     static SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static NEXT_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let session_id = SESSION_ID.get_or_init(|| std::process::id().to_string()).clone();
@@ -8165,16 +8165,16 @@ fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, archive: &Path, inter
             return;
         }
     };
-    let archive = archive.to_path_buf();
-    let internal = internal.to_string();
-    let internal_for_log = internal.clone();
+    let member = member.clone();
+    let internal_for_log = member.internal.clone();
     let display_name = display_name.to_string();
     ui.status.set_label(&format!("Opening {display_name}"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let cancelled = AtomicBool::new(false);
         let result = native_core::ZipOpenCacheRoot::create(&runtime_dir, &session_id, slot).and_then(|root| {
             let dest = root.path().join(&display_name);
-            native_core::extract_zip_member(&archive, &internal, expected_size, expected_crc32, &dest)?;
+            native_core::extract_zip_member(&member, &dest, &cancelled)?;
             Ok((root, dest))
         });
         let _ = tx.send(result);
@@ -11843,16 +11843,14 @@ fn spawn_child(ui: &Ui, launch: ChildLaunch) -> Result<(), native_core::LaunchEr
 /// selected row, only when the whole selection is one or more regular
 /// (non-directory) `ZipMemberRef` rows — never offered for a directory or a
 /// mixed/ineligible selection (D-188 REJECT 4 picker contract).
-fn eligible_zip_members_for_copy_out(entries: &[Entry]) -> Option<Vec<(PathBuf, String, u64, u32)>> {
+fn eligible_zip_members_for_copy_out(entries: &[Entry]) -> Option<Vec<native_core::ZipMemberRef>> {
     if entries.is_empty() {
         return None;
     }
     entries
         .iter()
         .map(|entry| match (&entry.source, entry.is_dir) {
-            (native_core::EntrySource::ZipMember(native_core::ZipMemberRef { archive, internal, size, crc32 }), false) => {
-                Some((archive.clone(), internal.clone(), *size, *crc32))
-            }
+            (native_core::EntrySource::ZipMember(member), false) => Some(member.clone()),
             _ => None,
         })
         .collect()
@@ -11899,14 +11897,14 @@ fn copy_out_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 /// overwriting) on a name clash. The committed copy enters the accepted
 /// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
 /// New Folder/New File — Undo simply deletes the real files it made.
-fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String, u64, u32)>, dest_path: PathBuf) {
-    let archive = zip_srcs[0].0.clone();
+fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<native_core::ZipMemberRef>, dest_path: PathBuf) {
+    let archive = zip_srcs[0].archive.clone();
     let count = zip_srcs.len();
-    let members: Vec<(String, String, u64, u32)> = zip_srcs
+    let members: Vec<(native_core::ZipMemberRef, String)> = zip_srcs
         .into_iter()
-        .map(|(_, internal, size, crc32)| {
-            let name = internal.rsplit('/').next().unwrap_or(&internal).to_string();
-            (internal, name, size, crc32)
+        .map(|member| {
+            let name = member.internal.rsplit('/').next().unwrap_or(&member.internal).to_string();
+            (member, name)
         })
         .collect();
     run_job(
@@ -11914,7 +11912,8 @@ fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: V
         ui,
         format!("Copying {count} item{} out of the ZIP", plural(count)),
         move || {
-            let created = native_core::copy_zip_members_out(&archive, &members, &dest_path)?;
+            let cancelled = AtomicBool::new(false);
+            let created = native_core::copy_zip_members_out(&archive, &members, &dest_path, &cancelled)?;
             Ok(JobOutcome::undo(
                 format!("Copied {count} item{} out of the ZIP", plural(count)),
                 UndoAction::Created { paths: created },
