@@ -14175,23 +14175,17 @@ Broken: Either state is wrong.\n";
             std::fs::write(&path, &bytes).unwrap();
         }
 
-        // ---- Duplicate regular-file logical path (ledger #44): re-attempted
-        // by byte-level construction per the ruling that writer-API shape is
-        // not an acceptable reason to call it unreachable. The exact reader
-        // mechanism that defeats it: `zip::ZipArchive::new` parses the central
-        // directory into an `IndexMap<String, ZipFileData>` keyed by name via
-        // `index_map.insert(file.file_name.clone(), file)` (zip-2.4.2
-        // src/read.rs:74) — a plain map insert, so a second central-directory
-        // record sharing an exact name silently overwrites the first entry in
-        // that map before `index_zip` (which only ever walks `shared.files`
-        // through the crate's public iteration, never the raw central
-        // directory bytes) can observe it. This holds for a crate-written
-        // archive byte-patched after `finish()` AND for a fully hand-built
-        // raw-bytes archive with two complete, independent local-header +
-        // central-directory-record pairs sharing one name — both constructions
-        // were tried; both collapse to one entry at this exact insert call,
-        // because it is `ZipArchive::new` itself, not anything the writer
-        // produced, that performs the collapse. Left OPEN with this finding.
+        // ---- Duplicate regular-file logical path (ledger #44): UNREACHABLE-CLOSED.
+        // zip-2.4.2/src/read.rs:74 inserts central-directory entries into an
+        // IndexMap keyed by file_name, so a duplicate regular-file name is
+        // collapsed before Wayfinder ever receives the archive entries.
+        // Wayfinder's own hostile-entry refusal is represented by SpecialEntry
+        // at src-tauri/src/native_core.rs:354, but no duplicate pair survives
+        // the dependency reader for our production code to observe or refuse.
+        // Confirmed for both a crate-written archive byte-patched after
+        // finish() and a fully hand-built raw-bytes archive with two complete,
+        // independent local-header + central-directory-record pairs sharing
+        // one name — both collapse at this exact insert call.
 
         // ---- Unsafe separator: a raw name carrying a backslash.
         {
