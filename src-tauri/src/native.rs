@@ -722,6 +722,11 @@ enum UndoAction {
     Renamed {
         from: String,
         to: String,
+        /// D-187: content fingerprint of `to` at the moment this entry was
+        /// recorded. Checked before Undo or Redo executes the rename, so an
+        /// edit/substitution in between is refused instead of silently
+        /// renaming the wrong content.
+        fp: native_core::Fingerprint,
     },
     BatchRenamed {
         items: Vec<ResolvedItem>,
@@ -739,6 +744,13 @@ struct JobOutcome {
     message: String,
     undo: Option<UndoAction>,
     refresh_to: Option<String>,
+    /// D-187: set only by `perform_undo`/`perform_redo`, never by a regular
+    /// mutating job. It is the exact transition the *other* history stack
+    /// needs next (Undo produces the Redo entry and vice versa). Kept separate
+    /// from `undo` so `complete_job`'s unconditional push onto `undo_stack`
+    /// never fires for it; `undo_action`/`redo_action` push it onto the
+    /// correct stack themselves.
+    reciprocal: Option<UndoAction>,
 }
 
 impl JobOutcome {
@@ -747,6 +759,7 @@ impl JobOutcome {
             message: message.into(),
             undo: None,
             refresh_to: None,
+            reciprocal: None,
         }
     }
 
@@ -755,6 +768,7 @@ impl JobOutcome {
             message: message.into(),
             undo: Some(undo),
             refresh_to: None,
+            reciprocal: None,
         }
     }
 
@@ -763,6 +777,16 @@ impl JobOutcome {
             message: message.into(),
             undo: None,
             refresh_to: Some(path),
+            reciprocal: None,
+        }
+    }
+
+    fn reciprocal(message: impl Into<String>, reciprocal: UndoAction) -> Self {
+        Self {
+            message: message.into(),
+            undo: None,
+            refresh_to: None,
+            reciprocal: Some(reciprocal),
         }
     }
 }
@@ -1351,6 +1375,13 @@ struct AppState {
     /// D-155: the one transfer whose progress and Cancel the strip shows.
     active_transfer: Option<ActiveTransfer>,
     undo_stack: Vec<UndoAction>,
+    /// D-187: entries Undo has reversed, each the exact reciprocal transition
+    /// Redo must perform next. A successful new mutation clears this (branching
+    /// history); Undo/Redo themselves never clear it except by consuming it.
+    redo_stack: Vec<UndoAction>,
+    /// D-187: true while an Undo or Redo transition is in flight, so a repeated
+    /// button/shortcut press cannot launch the same top entry twice.
+    history_busy: bool,
     picker: Option<PickerState>,
     /// Every navigation owns one cancellable folder load. A late response must
     /// never overwrite the folder the user navigated to afterwards.
@@ -2778,6 +2809,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         clipboard: None,
         active_transfer: None,
         undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
+        history_busy: false,
         picker: picker.clone(),
         listing_generation: 0,
         listing_cancel: None,
@@ -2964,6 +2997,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     let new_folder = icon_button("folder-new-symbolic", "New folder");
     let new_file = icon_button("document-new-symbolic", "New file");
     let undo = icon_button("edit-undo-symbolic", "Undo");
+    let redo = icon_button("edit-redo-symbolic", "Redo");
     let rename = icon_button("edit-rename-symbolic", "Rename");
     let copy = icon_button("edit-copy-symbolic", "Copy");
     let cut = icon_button("edit-cut-symbolic", "Cut");
@@ -3052,6 +3086,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     command_bar.append(&trash);
     command_bar.append(&command_divider());
     command_bar.append(&undo);
+    command_bar.append(&redo);
     command_bar.append(&terminal);
     let command_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     command_spacer.set_hexpand(true);
@@ -3360,6 +3395,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         new_folder,
         new_file,
         undo,
+        redo,
         rename,
         copy,
         cut,
@@ -5072,6 +5108,7 @@ fn connect_actions(
     new_folder: gtk::Button,
     new_file: gtk::Button,
     undo: gtk::Button,
+    redo: gtk::Button,
     rename: gtk::Button,
     copy: gtk::Button,
     cut: gtk::Button,
@@ -5145,6 +5182,11 @@ fn connect_actions(
         let state = state.clone();
         let ui = ui.clone();
         undo.connect_clicked(move |_| undo_action(state.clone(), ui.clone()));
+    }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        redo.connect_clicked(move |_| redo_action(state.clone(), ui.clone()));
     }
     {
         let state = state.clone();
@@ -5608,6 +5650,13 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             undo_action(state.clone(), ui.clone())
         }));
     }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        menu.append(&context_button("Redo", &popover, move || {
+            redo_action(state.clone(), ui.clone())
+        }));
+    }
 
     menu.append(&context_separator());
     {
@@ -5720,6 +5769,18 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         }
         if ctrl && (key == gdk::Key::V || key == gdk::Key::v) {
             paste_clipboard(state_for_keys.clone(), ui_for_keys.clone());
+            return glib::Propagation::Stop;
+        }
+        // D-187: Shift-Z must be caught before the broad Ctrl-Z branch below —
+        // Shift+z produces the same uppercase `Key::Z` keyval Ctrl+Z alone can
+        // also deliver on a plain press, so checking `shift` first is what
+        // keeps Ctrl+Shift+Z from falling through to Undo.
+        if ctrl && shift && (key == gdk::Key::Z || key == gdk::Key::z) {
+            redo_action(state_for_keys.clone(), ui_for_keys.clone());
+            return glib::Propagation::Stop;
+        }
+        if ctrl && (key == gdk::Key::Y || key == gdk::Key::y) {
+            redo_action(state_for_keys.clone(), ui_for_keys.clone());
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::Z || key == gdk::Key::z) {
@@ -6427,7 +6488,12 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
     match native_core::rename_path(&path, &typed) {
         Ok(to) => {
             state.borrow_mut().inline_rename = None;
-            push_undo(state, UndoAction::Renamed { from: path, to: to.clone() });
+            match native_core::fingerprint(&to) {
+                Ok(fp) => push_undo(state, UndoAction::Renamed { from: path, to: to.clone(), fp }),
+                Err(err) => ui.status.set_label(&format!(
+                    "Renamed, but could not record Undo (no fingerprint: {err})"
+                )),
+            }
             // D-91 follow-up: arm the one-shot reveal so the reload below reselects
             // and scrolls to the renamed row, at its natural sorted position
             // (never pinned_top, which would jump it out of sort order).
@@ -8008,9 +8074,10 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
             move || {
                 let from = path.clone();
                 let to = native_core::rename_path(&from, &name)?;
+                let fp = native_core::fingerprint(&to)?;
                 Ok(JobOutcome::undo(
                     format!("Renamed to {to}"),
-                    UndoAction::Renamed { from, to },
+                    UndoAction::Renamed { from, to, fp },
                 ))
             },
             |_, _, _| {},
@@ -8834,6 +8901,10 @@ fn copy_paths_to_system_clipboard(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 }
 
+/// D-187: a successful user mutation that is NOT itself Undo/Redo. Records the
+/// new entry and clears the entire Redo chain (branching history) — Undo/Redo
+/// never call this for their own reciprocal push, only `complete_job` for a
+/// normal forward action does.
 fn push_undo(state: &Rc<RefCell<AppState>>, undo: UndoAction) {
     let mut state = state.borrow_mut();
     state.undo_stack.push(undo);
@@ -8841,23 +8912,108 @@ fn push_undo(state: &Rc<RefCell<AppState>>, undo: UndoAction) {
     if overflow > 0 {
         state.undo_stack.drain(0..overflow);
     }
+    state.redo_stack.clear();
+}
+
+fn push_redo(state: &Rc<RefCell<AppState>>, redo: UndoAction) {
+    let mut state = state.borrow_mut();
+    state.redo_stack.push(redo);
+    let overflow = state.redo_stack.len().saturating_sub(100);
+    if overflow > 0 {
+        state.redo_stack.drain(0..overflow);
+    }
 }
 
 fn undo_action(state: Rc<RefCell<AppState>>, ui: Ui) {
+    if state.borrow().history_busy {
+        ui.status.set_label("A history action is already in progress");
+        return;
+    }
     let Some(action) = state.borrow().undo_stack.last().cloned() else {
         ui.status.set_label("Nothing to undo");
         return;
     };
     let label = undo_label(&action);
-    run_job(
+    state.borrow_mut().history_busy = true;
+    run_history_job(
         state,
         ui,
         format!("Undoing {label}"),
         move || perform_undo(action),
-        |state, _, _| {
+        |state, outcome| {
             state.borrow_mut().undo_stack.pop();
+            if let Some(reciprocal) = outcome.reciprocal.clone() {
+                push_redo(state, reciprocal);
+            }
         },
     );
+}
+
+fn redo_action(state: Rc<RefCell<AppState>>, ui: Ui) {
+    if state.borrow().history_busy {
+        ui.status.set_label("A history action is already in progress");
+        return;
+    }
+    let Some(action) = state.borrow().redo_stack.last().cloned() else {
+        ui.status.set_label("Nothing to redo");
+        return;
+    };
+    let label = redo_label(&action);
+    state.borrow_mut().history_busy = true;
+    run_history_job(
+        state,
+        ui,
+        format!("Redoing {label}"),
+        move || perform_redo(action),
+        |state, outcome| {
+            state.borrow_mut().redo_stack.pop();
+            if let Some(reciprocal) = outcome.reciprocal.clone() {
+                let mut st = state.borrow_mut();
+                st.undo_stack.push(reciprocal);
+                let overflow = st.undo_stack.len().saturating_sub(100);
+                if overflow > 0 {
+                    st.undo_stack.drain(0..overflow);
+                }
+            }
+        },
+    );
+}
+
+/// D-187: like `run_job`, but guarantees `history_busy` clears on every path —
+/// success, a refused (`Err`) transition, and a disconnected worker — so a
+/// refusal (the common case this round's gate exercises) can never leave the
+/// in-flight guard stuck shut.
+fn run_history_job<F, A>(state: Rc<RefCell<AppState>>, ui: Ui, label: String, job: F, on_success: A)
+where
+    F: FnOnce() -> Result<JobOutcome, String> + Send + 'static,
+    A: Fn(&Rc<RefCell<AppState>>, &JobOutcome) + 'static,
+{
+    let refresh_path = state.borrow().cwd.clone();
+    ui.status.set_label(&label);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+    });
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || match rx.try_recv() {
+        Ok(Ok(outcome)) => {
+            on_success(&state, &outcome);
+            state.borrow_mut().history_busy = false;
+            let target = outcome.refresh_to.clone().unwrap_or_else(|| refresh_path.clone());
+            navigate_to_with_message(&state, target, NavMode::Record, Some(outcome.message.clone()));
+            glib::ControlFlow::Break
+        }
+        Ok(Err(err)) => {
+            state.borrow_mut().history_busy = false;
+            ui.status.set_label(&err);
+            glib::ControlFlow::Break
+        }
+        Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(TryRecvError::Disconnected) => {
+            state.borrow_mut().history_busy = false;
+            ui.status.set_label("Operation failed");
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 fn undo_label(action: &UndoAction) -> String {
@@ -8893,14 +9049,9 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
                 plural(count)
             )))
         }
-        UndoAction::Renamed { from, to } => {
-            let old_name = PathBuf::from(&from)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or("bad original name")?
-                .to_string();
-            native_core::rename_path(&to, &old_name)?;
-            Ok(JobOutcome::message("Undid rename"))
+        UndoAction::Renamed { from, to, fp } => {
+            let reciprocal = reciprocal_rename(from, to, fp, "Undo")?;
+            Ok(JobOutcome::reciprocal("Undid rename", reciprocal))
         }
         UndoAction::BatchRenamed { items } => {
             let count = items.len();
@@ -8934,6 +9085,76 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
                 "Restored {count} item{} from Trash",
                 plural(count)
             )))
+        }
+    }
+}
+
+/// D-187: self-symmetric rename transition shared by Undo and Redo. `to` is
+/// the current path; renaming moves it to the name carried by `from`. Rename
+/// never touches content, so the same `fp` guards and survives both
+/// directions: refuse (fail closed, nothing renamed) if `to` is missing or its
+/// content no longer matches what this history entry recorded, otherwise
+/// return the entry the *other* stack needs — the same shape with `from`/`to`
+/// swapped to the path this transition just produced.
+fn reciprocal_rename(
+    from: String,
+    to: String,
+    fp: native_core::Fingerprint,
+    verb: &str,
+) -> Result<UndoAction, String> {
+    let now = native_core::fingerprint(&to)
+        .map_err(|err| format!("{verb} refused: {to} is missing or unreadable ({err})"))?;
+    if now != fp {
+        return Err(format!(
+            "{verb} refused: {to} changed since this history entry was recorded"
+        ));
+    }
+    let old_name = PathBuf::from(&from)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{verb} refused: bad original name"))?
+        .to_string();
+    let result = native_core::rename_path(&to, &old_name)?;
+    Ok(UndoAction::Renamed { from: to, to: result, fp })
+}
+
+fn redo_label(action: &UndoAction) -> String {
+    match action {
+        UndoAction::Created { paths } => {
+            format!("create/copy of {} item{}", paths.len(), plural(paths.len()))
+        }
+        UndoAction::Renamed { .. } => "rename".to_string(),
+        UndoAction::BatchRenamed { items } => {
+            format!(
+                "batch rename of {} item{}",
+                items.len(),
+                plural(items.len())
+            )
+        }
+        UndoAction::Pasted { items, was_copy } => {
+            let verb = if *was_copy { "copy" } else { "move" };
+            format!("{verb} of {} item{}", items.len(), plural(items.len()))
+        }
+        UndoAction::Trashed { paths } => {
+            format!("Trash move of {} item{}", paths.len(), plural(paths.len()))
+        }
+    }
+}
+
+/// D-187: the reciprocal of `perform_undo`. Only variants a real Undo can have
+/// produced onto `redo_stack` are handled with a working transition; the rest
+/// are reachable only once their own slice of this round lands.
+fn perform_redo(action: UndoAction) -> Result<JobOutcome, String> {
+    match action {
+        UndoAction::Renamed { from, to, fp } => {
+            let reciprocal = reciprocal_rename(from, to, fp, "Redo")?;
+            Ok(JobOutcome::reciprocal("Redid rename", reciprocal))
+        }
+        UndoAction::Created { .. }
+        | UndoAction::BatchRenamed { .. }
+        | UndoAction::Pasted { .. }
+        | UndoAction::Trashed { .. } => {
+            Err("Redo not yet implemented for this action (D-187 in progress)".to_string())
         }
     }
 }
@@ -12463,6 +12684,7 @@ Broken: Either state is wrong.\n";
         drag_ghost_builds_compact_translucent_item();
         emptied_folder_keeps_focus_on_the_view_root_d20();
         new_folder_menu_and_shared_inline_editor_d21();
+        undo_redo_cycle_renamed_d187();
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
@@ -18706,6 +18928,111 @@ Broken: Either state is wrong.\n";
         assert!(state.borrow().inline_rename.is_none() && state.borrow().reveal_path.is_none());
         assert_eq!(undo_len(&state), undo_before, "no undo entry for a failed creation");
         assert!(inline_field(ui.list.upcast_ref()).is_none());
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        drop(win);
+    }
+
+    /// D-187: a single rename's Undo and Redo, driven through the window's real
+    /// key controller (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) exactly as a real press
+    /// would deliver them, round-trips the exact name twice and proves the
+    /// Ctrl+Shift+Z-must-not-fall-through-to-Undo keybinding-order fix end to
+    /// end rather than by code inspection alone.
+    fn undo_redo_cycle_renamed_d187() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d187-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("original.txt"), "d187 rename payload").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d187renametest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        let win: gtk::Widget = ui.window.clone().upcast();
+        let created = |name: &str| dir.join(name);
+
+        let press = |key: gdk::Key, mods: gdk::ModifierType| {
+            let handled = ui
+                .window
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
+            pump();
+            handled
+        };
+
+        // ---- Seed one real rename so there is a reciprocal Undo entry.
+        let old_path = created("original.txt").to_string_lossy().to_string();
+        let start_index = state.borrow().visible_entries.iter().position(|e| e.path == old_path).expect("target listed");
+        ui.list_selection.select_item(start_index as u32, true);
+        update_selection(&state, &ui);
+        assert_eq!(selected_paths(&state, &ui), vec![old_path.clone()], "target selected before rename");
+        rename_action(state.clone(), ui.clone());
+        wait_for("inline editor", || inline_field(ui.list.upcast_ref()).is_some());
+        let field = inline_field(ui.list.upcast_ref()).unwrap();
+        field.set_text("renamed.txt");
+        field.emit_activate();
+        wait_for("rename lands", || created("renamed.txt").is_file() && !created("original.txt").exists());
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Renamed { .. })));
+        assert_eq!(state.borrow().redo_stack.len(), 0, "nothing to redo before any Undo");
+
+        // ---- Ctrl+Shift+Z before any Undo exists: refused, must not fall through to Undo.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK));
+        wait_for("empty-redo status", || state.borrow().redo_stack.is_empty());
+        assert!(created("renamed.txt").is_file(), "Ctrl+Shift+Z with nothing to redo must not Undo");
+
+        // ---- Ctrl+Z: Undo the rename.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("undo restores original name", || created("original.txt").is_file() && !created("renamed.txt").exists());
+        assert_eq!(state.borrow().redo_stack.len(), 1, "Undo pushed the exact reciprocal onto Redo");
+        assert!(matches!(state.borrow().redo_stack.last(), Some(UndoAction::Renamed { .. })));
+
+        // ---- Ctrl+Y: Redo re-applies the rename.
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("redo re-applies rename", || created("renamed.txt").is_file() && !created("original.txt").exists());
+        assert_eq!(state.borrow().undo_stack.last().is_some(), true);
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Renamed { .. })));
+        assert_eq!(state.borrow().redo_stack.len(), 0, "Redo consumed the only Redo entry");
+
+        // ---- Ctrl+Shift+Z: Redo's sibling shortcut also works (nothing to redo now, must refuse quietly).
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK));
+        assert!(created("renamed.txt").is_file(), "no-op Redo must not touch disk");
+
+        // ---- Ctrl+Z again: Undo the Redo.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("second undo restores original name", || created("original.txt").is_file() && !created("renamed.txt").exists());
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+
+        // ---- Fail-closed: edit the file's content between recording and replay, then try Redo.
+        std::fs::write(created("original.txt"), "content changed after the Undo entry was recorded").unwrap();
+        let busy_before = state.borrow().history_busy;
+        assert!(!busy_before);
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("redo refused on content change", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Redo refused:"), "status was {:?}", ui.status.label());
+        assert_eq!(state.borrow().redo_stack.len(), 1, "a refused Redo must not be consumed");
+        assert!(created("original.txt").is_file(), "refused Redo must not rename the changed file");
+        assert!(!created("renamed.txt").exists(), "refused Redo must not create the destination");
 
         ui.window.close();
         pump();
