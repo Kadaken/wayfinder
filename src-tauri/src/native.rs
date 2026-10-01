@@ -739,6 +739,11 @@ enum UndoAction {
     Pasted {
         items: Vec<ResolvedItem>,
         was_copy: bool,
+        /// D-187: one content fingerprint per `items[i].to`, at the moment this
+        /// entry was recorded. Checked before Undo/Redo touches anything, so an
+        /// edit/substitution of any single pasted or moved item refuses the
+        /// whole batch (all-or-nothing), matching BatchRenamed's guard.
+        fps: Vec<native_core::Fingerprint>,
     },
     Trashed {
         receipts: Vec<native_core::TrashReceipt>,
@@ -8283,7 +8288,11 @@ fn transfer_outcome(
     if !warnings.is_empty() {
         message.push_str(&format!(" (warning: {})", warnings.join("; ")));
     }
-    Ok(JobOutcome::undo(message, UndoAction::Pasted { items, was_copy: is_copy }))
+    let fps = items
+        .iter()
+        .map(|item| native_core::fingerprint(&item.to))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(JobOutcome::undo(message, UndoAction::Pasted { items, was_copy: is_copy, fps }))
 }
 
 /// True when keyboard focus is `root` or somewhere inside it.
@@ -9038,7 +9047,7 @@ fn undo_label(action: &UndoAction) -> String {
                 plural(items.len())
             )
         }
-        UndoAction::Pasted { items, was_copy } => {
+        UndoAction::Pasted { items, was_copy, .. } => {
             let verb = if *was_copy { "copy" } else { "move" };
             format!("{verb} of {} item{}", items.len(), plural(items.len()))
         }
@@ -9062,21 +9071,13 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
             let reciprocal = reciprocal_batch_rename(items, fps, "Undo")?;
             Ok(JobOutcome::reciprocal("Undid batch rename", reciprocal))
         }
-        UndoAction::Pasted { items, was_copy } => {
-            let count = items.len();
+        UndoAction::Pasted { items, was_copy, fps } => {
             if was_copy {
-                let paths: Vec<String> = items.into_iter().map(|item| item.to).collect();
-                native_core::trash_paths(&paths)?;
-                Ok(JobOutcome::message(format!(
-                    "Undid copy: moved {count} item{} to Trash",
-                    plural(count)
-                )))
+                let reciprocal = reciprocal_trash_checked(items, fps, "Undo")?;
+                Ok(JobOutcome::reciprocal("Undid paste: moved to Trash", reciprocal))
             } else {
-                native_core::restore_moved_items(&items)?;
-                Ok(JobOutcome::message(format!(
-                    "Undid move of {count} item{}",
-                    plural(count)
-                )))
+                let reciprocal = reciprocal_move(items, fps, "Undo")?;
+                Ok(JobOutcome::reciprocal("Undid move", reciprocal))
             }
         }
         UndoAction::Trashed { receipts, fps } => {
@@ -9196,6 +9197,66 @@ fn reciprocal_restore(
     Ok(UndoAction::Created { paths })
 }
 
+/// D-187: Undo/Redo of a copy-paste. Checks every pasted item's current
+/// fingerprint against what was recorded before trashing any of them (one
+/// changed item refuses the whole batch), then trashes the copies by exact
+/// receipt — the identical shape `reciprocal_trash` already gives Created,
+/// since "trash these paths" is the same operation whichever direction it is
+/// reached from.
+fn reciprocal_trash_checked(
+    items: Vec<ResolvedItem>,
+    fps: Vec<native_core::Fingerprint>,
+    verb: &str,
+) -> Result<UndoAction, String> {
+    if items.len() != fps.len() {
+        return Err(format!("{verb} refused: history entry is malformed"));
+    }
+    for (item, fp) in items.iter().zip(fps.iter()) {
+        let now = native_core::fingerprint(&item.to)
+            .map_err(|err| format!("{verb} refused: {} is missing or unreadable ({err})", item.to))?;
+        if &now != fp {
+            return Err(format!(
+                "{verb} refused: {} changed since this history entry was recorded",
+                item.to
+            ));
+        }
+    }
+    let to_paths: Vec<String> = items.into_iter().map(|item| item.to).collect();
+    reciprocal_trash(to_paths).map_err(|err| format!("{verb} refused: {err}"))
+}
+
+/// D-187: self-symmetric move transition shared by Undo and Redo, exactly
+/// like `reciprocal_rename` but across directories. Checks every item's
+/// current fingerprint before touching anything (all-or-nothing), then moves
+/// each back from `item.to` to `item.from`, refusing fail-closed if any
+/// destination is already occupied; `restore_moved_items` itself returns the
+/// swapped items the opposite stack needs.
+fn reciprocal_move(
+    items: Vec<ResolvedItem>,
+    fps: Vec<native_core::Fingerprint>,
+    verb: &str,
+) -> Result<UndoAction, String> {
+    if items.len() != fps.len() {
+        return Err(format!("{verb} refused: history entry is malformed"));
+    }
+    for (item, fp) in items.iter().zip(fps.iter()) {
+        let now = native_core::fingerprint(&item.to)
+            .map_err(|err| format!("{verb} refused: {} is missing or unreadable ({err})", item.to))?;
+        if &now != fp {
+            return Err(format!(
+                "{verb} refused: {} changed since this history entry was recorded",
+                item.to
+            ));
+        }
+    }
+    let swapped = native_core::restore_moved_items(&items).map_err(|err| format!("{verb} refused: {err}"))?;
+    let fps = swapped
+        .iter()
+        .map(|item| native_core::fingerprint(&item.to))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(UndoAction::Pasted { items: swapped, was_copy: false, fps })
+}
+
 fn redo_label(action: &UndoAction) -> String {
     match action {
         UndoAction::Created { paths } => {
@@ -9209,7 +9270,7 @@ fn redo_label(action: &UndoAction) -> String {
                 plural(items.len())
             )
         }
-        UndoAction::Pasted { items, was_copy } => {
+        UndoAction::Pasted { items, was_copy, .. } => {
             let verb = if *was_copy { "copy" } else { "move" };
             format!("{verb} of {} item{}", items.len(), plural(items.len()))
         }
@@ -9240,8 +9301,14 @@ fn perform_redo(action: UndoAction) -> Result<JobOutcome, String> {
             let reciprocal = reciprocal_restore(receipts, fps, "Redo")?;
             Ok(JobOutcome::reciprocal("Redid restore from Trash", reciprocal))
         }
-        UndoAction::Pasted { .. } => {
-            Err("Redo not yet implemented for this action (D-187 in progress)".to_string())
+        UndoAction::Pasted { items, was_copy, fps } => {
+            if was_copy {
+                let reciprocal = reciprocal_trash_checked(items, fps, "Redo")?;
+                Ok(JobOutcome::reciprocal("Redid paste: moved to Trash", reciprocal))
+            } else {
+                let reciprocal = reciprocal_move(items, fps, "Redo")?;
+                Ok(JobOutcome::reciprocal("Redid move", reciprocal))
+            }
         }
     }
 }
@@ -11509,6 +11576,81 @@ mod tests {
         result.expect("Created/Trashed reciprocal round trip and fail-closed refusal should hold");
     }
 
+    /// D-187: Undo of a copy-paste trashes the pasted copy by exact receipt
+    /// (reciprocal_trash_checked), checking its fingerprint first so a direct
+    /// edit of the copy between pasting and Undo refuses instead of trashing
+    /// changed content; Redo (reciprocal_restore, reused from Created/Trashed)
+    /// restores it exactly.
+    #[test]
+    fn pasted_copy_reciprocal_round_trip_and_fail_closed() {
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let home = std::env::var("HOME").expect("HOME");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = format!("wf-d187-pastedcopy-{}-{nanos}", std::process::id());
+        let dir = std::path::PathBuf::from(&home).join(".cache").join(&stem);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("original.txt");
+        let pasted = dir.join("copy.txt");
+        let trash_files = std::path::PathBuf::from(&home).join(".local/share/Trash/files");
+        let trash_info = std::path::PathBuf::from(&home).join(".local/share/Trash/info");
+        let mut cleanup: Vec<String> = Vec::new();
+
+        let mut run = || -> Result<(), String> {
+            fs::write(&src, b"original, untouched").unwrap();
+            fs::write(&pasted, b"pasted copy payload").unwrap();
+            let pasted_str = pasted.to_string_lossy().to_string();
+            let items = vec![ResolvedItem { from: src.to_string_lossy().to_string(), to: pasted_str.clone() }];
+            let fps = vec![native_core::fingerprint(&pasted_str)?];
+
+            // ---- Fail-closed: edit the copy before Undo even runs.
+            fs::write(&pasted, b"edited after paste, before undo").unwrap();
+            let refused = reciprocal_trash_checked(items.clone(), fps.clone(), "Undo");
+            let err = refused.expect_err("a changed pasted copy must refuse Undo");
+            assert!(err.starts_with("Undo refused:"), "message was {err:?}");
+            assert!(pasted.is_file(), "a refused Undo must not trash the copy");
+
+            // ---- Restore the original content, then Undo trashes it for real.
+            fs::write(&pasted, b"pasted copy payload").unwrap();
+            let trashed = reciprocal_trash_checked(items, fps, "Undo")?;
+            let (receipts, fps2) = match trashed {
+                UndoAction::Trashed { receipts, fps } => (receipts, fps),
+                other => panic!("expected Trashed, got {other:?}"),
+            };
+            cleanup.push(
+                std::path::Path::new(&receipts[0].selector)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            assert!(!pasted.exists(), "Undo of a copy-paste must move the copy to Trash");
+            assert!(src.is_file(), "the original source must be untouched");
+
+            // ---- Redo restores the exact copy.
+            let restored = reciprocal_restore(receipts, fps2, "Redo")?;
+            match &restored {
+                UndoAction::Created { paths } => assert_eq!(paths, &vec![pasted_str.clone()]),
+                other => panic!("expected Created, got {other:?}"),
+            }
+            assert_eq!(fs::read(&pasted).unwrap(), b"pasted copy payload", "restored exact bytes");
+
+            Ok(())
+        };
+
+        let result = run();
+        fs::remove_file(&src).ok();
+        fs::remove_file(&pasted).ok();
+        for stem in &cleanup {
+            fs::remove_file(trash_files.join(stem)).ok();
+            fs::remove_file(trash_info.join(format!("{stem}.trashinfo"))).ok();
+        }
+        fs::remove_dir_all(&dir).ok();
+        result.expect("Pasted copy reciprocal round trip and fail-closed refusal should hold");
+    }
+
     #[test]
     fn transfer_seam_cancel_starts_nothing_and_cut_clears_only_on_success() {
         let started = std::cell::Cell::new(0);
@@ -12869,6 +13011,7 @@ Broken: Either state is wrong.\n";
         new_folder_menu_and_shared_inline_editor_d21();
         undo_redo_cycle_renamed_d187();
         undo_redo_cycle_batch_renamed_d187();
+        undo_redo_cycle_pasted_move_d187();
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
@@ -18682,15 +18825,23 @@ Broken: Either state is wrong.\n";
 
     #[test]
     fn committed_transfer_warning_keeps_undo_and_an_error_has_none_d24() {
-        let item = native_core::ResolvedItem { from: "/s/a".into(), to: "/d/a".into() };
+        // D-187: transfer_outcome now fingerprints each destination for the
+        // reciprocal, so `to` must be a real file.
+        let root = std::env::temp_dir().join(format!("wf-d24-transfer-outcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dest = root.join("a");
+        std::fs::write(&dest, b"payload").unwrap();
+        let item = native_core::ResolvedItem { from: "/s/a".into(), to: dest.to_string_lossy().to_string() };
         let committed = native_core::TransferResult {
             items: vec![item.clone()],
             warnings: vec!["could not remove a backup".into()],
         };
         let outcome = transfer_outcome("Pasted", true, Ok(committed)).unwrap();
         assert!(outcome.message.contains("warning"));
-        assert!(matches!(outcome.undo, Some(UndoAction::Pasted { was_copy: true, ref items }) if items.len() == 1));
+        assert!(matches!(outcome.undo, Some(UndoAction::Pasted { was_copy: true, ref items, .. }) if items.len() == 1));
         assert!(transfer_outcome("Pasted", true, Err("rolled back".into())).is_err());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -19306,6 +19457,98 @@ Broken: Either state is wrong.\n";
         assert!(ui.status.label().starts_with("Undo refused:"), "status was {:?}", ui.status.label());
         assert_eq!(content("a.txt"), "content changed after the swap was recorded", "refused Undo must not touch a.txt");
         assert_eq!(content("b.txt"), "payload A", "refused Undo must not touch b.txt either (all-or-nothing)");
+        assert_eq!(state.borrow().undo_stack.last().is_some(), true, "a refused Undo must not be consumed");
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        drop(win);
+    }
+
+    /// D-187: a real move's Undo/Redo is self-symmetric, like Renamed, but
+    /// across directories. Undo moves the item back to its source directory;
+    /// Redo moves it back to the destination; a second Undo moves it back
+    /// again. Also proves the fail-closed refusal on a content edit between
+    /// recording and replay.
+    fn undo_redo_cycle_pasted_move_d187() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d187-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("moved.txt"), "d187 move payload").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d187movetest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dst_str = dst.to_string_lossy().to_string();
+        build_ui(&app, Some(dst_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.is_empty());
+        let win: gtk::Widget = ui.window.clone().upcast();
+
+        let press = |key: gdk::Key, mods: gdk::ModifierType| {
+            let handled = ui
+                .window
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
+            pump();
+            handled
+        };
+
+        // ---- Seed one real move, recorded exactly as transfer_outcome would.
+        let from = src.join("moved.txt").to_string_lossy().to_string();
+        let to = dst.join("moved.txt").to_string_lossy().to_string();
+        std::fs::rename(&from, &to).unwrap();
+        let items = vec![native_core::ResolvedItem { from: from.clone(), to: to.clone() }];
+        let fps = vec![native_core::fingerprint(&to).unwrap()];
+        push_undo(&state, UndoAction::Pasted { items, was_copy: false, fps });
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+
+        // ---- Ctrl+Z: Undo the move.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("undo moves it back to source", || std::path::Path::new(&from).is_file() && !std::path::Path::new(&to).exists());
+        assert_eq!(
+            std::fs::read_to_string(&from).unwrap(),
+            "d187 move payload",
+            "exact bytes preserved"
+        );
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+        assert!(matches!(state.borrow().redo_stack.last(), Some(UndoAction::Pasted { was_copy: false, .. })));
+
+        // ---- Ctrl+Y: Redo re-applies the move.
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("redo moves it back to destination", || std::path::Path::new(&to).is_file() && !std::path::Path::new(&from).exists());
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Pasted { was_copy: false, .. })));
+
+        // ---- Fail-closed: edit the moved file's content, then Undo must refuse.
+        std::fs::write(&to, "content changed after the move was recorded").unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("undo refused on content change", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Undo refused:"), "status was {:?}", ui.status.label());
+        assert_eq!(
+            std::fs::read_to_string(&to).unwrap(),
+            "content changed after the move was recorded",
+            "refused Undo must not touch the destination"
+        );
+        assert!(!std::path::Path::new(&from).exists(), "refused Undo must not recreate the source");
         assert_eq!(state.borrow().undo_stack.last().is_some(), true, "a refused Undo must not be consumed");
 
         ui.window.close();
