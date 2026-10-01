@@ -711,7 +711,7 @@ enum ClipboardMode {
 #[derive(Clone)]
 struct FileClipboard {
     mode: ClipboardMode,
-    paths: Vec<String>,
+    paths: Vec<native_core::ClipboardSource>,
 }
 
 #[derive(Clone, Debug)]
@@ -8205,6 +8205,11 @@ fn copy_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.status.set_label("Nothing selected");
         return;
     }
+    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    }
+    let paths = paths.into_iter().map(|p| native_core::ClipboardSource::Real(p.into())).collect();
     state.borrow_mut().clipboard = Some(FileClipboard {
         mode: ClipboardMode::Copy,
         paths,
@@ -8222,6 +8227,7 @@ fn cut_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let paths = paths.into_iter().map(|p| native_core::ClipboardSource::Real(p.into())).collect();
     state.borrow_mut().clipboard = Some(FileClipboard {
         mode: ClipboardMode::Cut,
         paths,
@@ -8237,11 +8243,12 @@ fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.to_path_string();
     let is_copy = clipboard.mode == ClipboardMode::Copy;
     let clear_after = clipboard.mode == ClipboardMode::Cut;
+    let srcs = clipboard.paths.iter().map(|p| p.to_path_string()).collect();
     transfer_with_preflight(
         state,
         ui,
         Transfer {
-            srcs: clipboard.paths,
+            srcs,
             dest: cwd,
             is_copy,
             clear_cut_after: clear_after,
@@ -20974,7 +20981,7 @@ Broken: Either state is wrong.\n";
         // 3. A second transfer cannot steal the controls; Cancel hits the live one.
         state.borrow_mut().clipboard = Some(FileClipboard {
             mode: ClipboardMode::Cut,
-            paths: vec![src.join("big.bin").to_string_lossy().to_string()],
+            paths: vec![native_core::ClipboardSource::Real(src.join("big.bin"))],
         });
         let undo_before = state.borrow().undo_stack.len();
         let before = crate::native_core::fingerprint(root.to_str().unwrap()).unwrap();
@@ -21158,7 +21165,7 @@ Broken: Either state is wrong.\n";
             let before_sha = sha256_of(&src.join(name));
             state.borrow_mut().clipboard = Some(FileClipboard {
                 mode: ClipboardMode::Cut,
-                paths: vec!["/dev/null/unrelated-clipboard-sentinel".to_string()],
+                paths: vec![native_core::ClipboardSource::Real(PathBuf::from("/dev/null/unrelated-clipboard-sentinel"))],
             });
             let clipboard_before = state.borrow().clipboard.clone();
             let undo_before = state.borrow().undo_stack.len();
@@ -21217,7 +21224,7 @@ Broken: Either state is wrong.\n";
             let before_sha = sha256_of(&src.join(name));
             state.borrow_mut().clipboard = Some(FileClipboard {
                 mode: ClipboardMode::Cut,
-                paths: vec![src.join(name).to_string_lossy().to_string()],
+                paths: vec![native_core::ClipboardSource::Real(src.join(name))],
             });
             let undo_before = state.borrow().undo_stack.len();
             TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = true);
