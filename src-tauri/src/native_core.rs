@@ -731,6 +731,13 @@ fn validate_zip_member_matches(archive_path: &Path, member: &ZipMemberRef, cance
 /// (D-188 REJECT 5: never write more than the entry's own size) and check
 /// `cancelled` between chunks. Separated from publishing so a caller can
 /// stage several members before committing any of them (D-188 REJECT 4).
+/// D-188 REJECT 3: a per-chunk delay a test can switch on, so a GTK
+/// main-loop tick-advancement proof does not depend on how fast the test
+/// machine happens to memcpy a large member — it instead controls, exactly,
+/// how long one real streaming extraction takes.
+#[cfg(test)]
+pub static TEST_STREAM_CHUNK_DELAY_MICROS: AtomicU64 = AtomicU64::new(0);
+
 fn stream_zip_member_to(archive_path: &Path, member: &ZipMemberRef, out_path: &Path, cancelled: &AtomicBool) -> Result<(), String> {
     let (mut archive, index) = locate_and_validate_zip_member(archive_path, member, cancelled)?;
     let mut entry = archive
@@ -759,6 +766,13 @@ fn stream_zip_member_to(archive_path: &Path, member: &ZipMemberRef, out_path: &P
                 return Err(format!("\"{}\" streamed more bytes than the archive claimed", member.internal));
             }
             out.write_all(&buf[..n]).map_err(|e| format!("could not write {}: {e}", out_path.display()))?;
+            #[cfg(test)]
+            {
+                let micros = TEST_STREAM_CHUNK_DELAY_MICROS.load(Ordering::Relaxed);
+                if micros > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(micros));
+                }
+            }
         }
         if written != expected {
             return Err(format!("\"{}\" streamed fewer bytes than the archive claimed", member.internal));
