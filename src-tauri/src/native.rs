@@ -14634,8 +14634,11 @@ Broken: Either state is wrong.\n";
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("big.bin", options).unwrap();
             std::io::Write::write_all(&mut writer, &vec![0x5Au8; KILL_MEMBER_LEN]).unwrap();
+            writer.start_file("small.bin", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"small member bytes").unwrap();
             writer.finish().unwrap();
         }
+        let archive_bytes_before = std::fs::read(&archive_path).unwrap();
         let dest = root.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("unrelated.txt"), b"unrelated bytes").unwrap();
@@ -14651,26 +14654,77 @@ Broken: Either state is wrong.\n";
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().unwrap().is_none(), "the child must still be mid-stream when killed, or this proof is not testing a hard kill");
+        let child_pid = child.id();
         unsafe {
-            libc::kill(child.id() as i32, libc::SIGKILL);
+            libc::kill(child_pid as i32, libc::SIGKILL);
         }
         let status = child.wait().unwrap();
         assert!(!status.success(), "a SIGKILLed child must not report success");
 
-        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+        // D-188 ledger #20: immediately after the kill, the dead-owner stage
+        // file the child never got to clean up itself is still present —
+        // production only sweeps it ahead of the *next* Copy Out into this
+        // same folder, never reactively on its own.
+        let leftovers_after_kill: Vec<_> = std::fs::read_dir(&dest)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains("-wf-zip-"))
             .collect();
-        assert!(leftovers.is_empty(), "a hard-killed transaction must leave no owned stage residue, found {leftovers:?}");
+        assert_eq!(leftovers_after_kill.len(), 1, "exactly one owned stage must remain right after the kill, found {leftovers_after_kill:?}");
+        let dead_stage_name = leftovers_after_kill[0].clone();
         assert!(!dest.join("big.bin").exists(), "a hard-killed transaction must never publish a partial member under its real name");
         assert_eq!(
             std::fs::read(dest.join("unrelated.txt")).unwrap(),
             b"unrelated bytes",
             "an unrelated destination object must survive a hard-killed transaction untouched"
         );
-        assert_eq!(std::fs::read(&archive_path).unwrap().len(), archive_path.metadata().unwrap().len() as usize, "archive untouched");
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive untouched by the kill");
+
+        // A same-folder decoy that merely resembles the stage grammar (no
+        // leading dot) and an exact-grammar stage whose embedded PID is this
+        // very test process — alive — must both survive the next sweep.
+        let decoy_name = format!("big.bin-wf-zip-{}-0", std::process::id());
+        std::fs::write(dest.join(&decoy_name), b"decoy, not ours to touch").unwrap();
+        let live_owner_stage_name = format!(".big.bin-wf-zip-{}-999", std::process::id());
+        std::fs::write(dest.join(&live_owner_stage_name), b"a live sibling transaction's stage").unwrap();
+
+        // D-188 ledger #20 production-gate proof: the next real Copy Out into
+        // this same folder sweeps the dead-PID stage and completes normally.
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let archive_len = file.metadata().unwrap().len();
+        let entries = native_core::index_zip(file, &native_core::DEFAULT_ZIP_LIMITS, &AtomicBool::new(false)).unwrap();
+        let small_entry = entries.iter().find(|e| e.logical_path == "small.bin").unwrap();
+        let small_member = native_core::ZipMemberRef {
+            archive: archive_path.clone(),
+            internal: small_entry.logical_path.clone(),
+            size: small_entry.size,
+            crc32: small_entry.crc32,
+            archive_len,
+            member_index: small_entry.physical_index,
+        };
+        let created = native_core::copy_zip_members_out(&archive_path, &[(small_member, "small.bin".to_string())], &dest, &AtomicBool::new(false))
+            .expect("the next Copy Out into this folder must complete, sweeping the dead stage ahead of it");
+        assert_eq!(created, vec![dest.join("small.bin").to_string_lossy().into_owned()]);
+        assert_eq!(std::fs::read(dest.join("small.bin")).unwrap(), b"small member bytes");
+
+        assert!(!dest.join(&dead_stage_name).exists(), "the dead-PID owned stage must be swept by the next Copy Out");
+        assert_eq!(
+            std::fs::read(dest.join(&decoy_name)).unwrap(),
+            b"decoy, not ours to touch",
+            "a decoy that does not exactly match the stage grammar must survive the sweep untouched"
+        );
+        assert_eq!(
+            std::fs::read(dest.join(&live_owner_stage_name)).unwrap(),
+            b"a live sibling transaction's stage",
+            "an exact-grammar stage whose embedded PID is still alive must survive the sweep untouched"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("unrelated.txt")).unwrap(),
+            b"unrelated bytes",
+            "an unrelated destination object must survive the kill, sweep and successful-copy sequence untouched"
+        );
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive untouched across the whole kill/sweep/copy sequence");
     }
 
     fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> native_core::Location {
