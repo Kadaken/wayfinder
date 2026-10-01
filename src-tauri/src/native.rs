@@ -13757,6 +13757,21 @@ Broken: Either state is wrong.\n";
         let cached_file = walk_find_file(&cache_root, "readme.txt").expect("cached readme.txt");
         assert_eq!(std::fs::read(&cached_file).unwrap(), b"read me");
 
+        // D-188 ledger #10: the Open cache resolves beneath this test's own
+        // unique scratch root (xdg_dir, standing in for $XDG_RUNTIME_DIR),
+        // and its owned leaf slot folder is mode 0700.
+        assert!(cached_file.starts_with(&xdg_dir), "the cache must resolve beneath this session's own scratch root");
+        use std::os::unix::fs::PermissionsExt;
+        let readme_slot_root_mode = cached_file
+            .parent()
+            .expect("readme's owned cache slot folder")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(readme_slot_root_mode, 0o700, "the owned cache slot folder must be mode 0700");
+
         // D-188 REJECT 3: exactly one launcher call, for the exact owned cache path.
         let calls = TEST_LAUNCHER_CALLS.with(|c| c.borrow().clone());
         assert_eq!(calls, vec![cached_file.to_string_lossy().to_string()], "Open must launch the owned cache path exactly once");
