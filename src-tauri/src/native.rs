@@ -3504,23 +3504,23 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         let ui = ui.clone();
         let list = ui.list.clone();
         let gate = state.borrow().activation_gate.clone();
-        let paths = {
+        let sources = {
             let state = state.clone();
             Rc::new(move |position: u32| {
-                state.borrow().visible_entries.get(position as usize).map(|e| e.source.to_path_string())
-            }) as Rc<dyn Fn(u32) -> Option<String>>
+                state.borrow().visible_entries.get(position as usize).map(|e| e.source.clone())
+            }) as Rc<dyn Fn(u32) -> Option<native_core::EntrySource>>
         };
         let open = {
             let (state, ui) = (state.clone(), ui.clone());
-            Rc::new(move |path: String| {
-                let entry = state.borrow().visible_entries.iter().find(|e| e.source.to_path_string() == path).cloned();
+            Rc::new(move |source: native_core::EntrySource| {
+                let entry = state.borrow().visible_entries.iter().find(|e| e.source == source).cloned();
                 if let Some(entry) = entry {
                     let (state, ui) = (state.clone(), ui.clone());
                     defer_after_signal(move || open_entry(&state, &ui, entry));
                 }
-            }) as Rc<dyn Fn(String)>
+            }) as Rc<dyn Fn(native_core::EntrySource)>
         };
-        connect_gated_activate(&list, gate, paths, open);
+        connect_gated_activate(&list, gate, sources, open);
     }
     {
         let state = state.clone();
@@ -6859,7 +6859,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             press.set_button(1);
             press.set_propagation_phase(gtk::PropagationPhase::Capture);
             let gate = state.borrow().activation_gate.clone();
-            let path = entry.source.to_path_string();
+            let source = entry.source.clone();
             press.connect_pressed(move |g, _, _, _| {
                 let plain = !g.current_event_state().intersects(
                     gdk::ModifierType::CONTROL_MASK
@@ -6868,12 +6868,14 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                         | gdk::ModifierType::SUPER_MASK
                         | gdk::ModifierType::META_MASK,
                 );
-                gate.borrow_mut().press(&path, std::time::Instant::now(), plain);
+                gate.borrow_mut().press(&source, std::time::Instant::now(), plain);
             });
             line.add_controller(press);
         }
         connect_file_drag(&line, state.clone(), ui.clone(), &entry.source, Some(&size));
-        if entry.is_dir {
+        // D-188: a ZIP directory row has no real path to drop onto; skip the
+        // drop controller entirely rather than converting one (REJECT 1).
+        if entry.is_dir && !entry.source.is_zip() {
             connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.source.to_path_string());
         }
         connect_row_context(&line, item.position(), state.clone(), ui.clone(), entry.clone());
@@ -7129,7 +7131,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             }
             grid_child.set_child(Some(&grid_item));
             connect_file_drag(&grid_child, state.clone(), ui.clone(), &entry.source, None);
-            if entry.is_dir {
+            // D-188: a ZIP directory row has no real path to drop onto; skip the
+            // drop controller entirely rather than converting one (REJECT 1).
+            if entry.is_dir && !entry.source.is_zip() {
                 connect_file_drop_to_dir(
                     &grid_child,
                     state.clone(),
@@ -7353,7 +7357,11 @@ fn grid_file_icon(
     slot.set_halign(gtk::Align::Center);
     slot.set_valign(gtk::Align::Center);
 
-    if (entry.is_image || native_core::is_video_path(&entry.source.to_path_string())) && wants_thumbnail {
+    // D-188: a ZIP member has no real path to decode a thumbnail/poster from;
+    // give it only its ordinary file-type icon, never queue it into a real
+    // filesystem/media worker (REJECT 1).
+    let is_real_video = matches!(&entry.source, native_core::EntrySource::Real(p) if native_core::is_video_path(&p.to_string_lossy()));
+    if (entry.is_image || is_real_video) && wants_thumbnail && !entry.source.is_zip() {
         // Keep a normal file-type icon visible while the thumbnail/poster is
         // decoded asynchronously. Each queue is bounded and cancelled as soon
         // as the user changes folder or view.
@@ -9648,7 +9656,7 @@ fn f2_starts_inline_rename(selected: usize, view: ViewMode) -> bool {
 /// path close together. A plain click or Ctrl+click never opens.
 #[derive(Default)]
 struct ActivationGate {
-    presses: Vec<(String, std::time::Instant, bool)>,
+    presses: Vec<(native_core::EntrySource, std::time::Instant, bool)>,
     enter_at: Option<std::time::Instant>,
 }
 
@@ -9657,8 +9665,8 @@ impl ActivationGate {
     const ENTER: Duration = Duration::from_millis(400);
 
     /// `plain` is false when Ctrl, Shift, Alt or Super was held for the press.
-    fn press(&mut self, path: &str, now: std::time::Instant, plain: bool) {
-        self.presses.push((path.to_string(), now, plain));
+    fn press(&mut self, source: &native_core::EntrySource, now: std::time::Instant, plain: bool) {
+        self.presses.push((source.clone(), now, plain));
         if self.presses.len() > 2 {
             self.presses.remove(0);
         }
@@ -9668,7 +9676,7 @@ impl ActivationGate {
         self.enter_at = Some(now);
     }
 
-    fn allows(&mut self, path: &str, now: std::time::Instant) -> bool {
+    fn allows(&mut self, source: &native_core::EntrySource, now: std::time::Instant) -> bool {
         if self.enter_at.take().is_some_and(|at| now.duration_since(at) <= Self::ENTER) {
             return true;
         }
@@ -9676,8 +9684,8 @@ impl ActivationGate {
             [(a, ta, pa), (b, tb, pb)] => {
                 *pa
                     && *pb
-                    && a == path
-                    && b == path
+                    && a == source
+                    && b == source
                     && tb.duration_since(*ta) <= Self::DOUBLE
                     && now.duration_since(*tb) <= Self::DOUBLE
             }
@@ -9701,8 +9709,8 @@ fn defer_after_signal(open: impl FnOnce() + 'static) {
 fn connect_gated_activate(
     list: &gtk::ListView,
     gate: Rc<RefCell<ActivationGate>>,
-    path_at: Rc<dyn Fn(u32) -> Option<String>>,
-    open: Rc<dyn Fn(String)>,
+    source_at: Rc<dyn Fn(u32) -> Option<native_core::EntrySource>>,
+    open: Rc<dyn Fn(native_core::EntrySource)>,
 ) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -9718,13 +9726,14 @@ fn connect_gated_activate(
     list.add_controller(keys);
     list.connect_activate(move |_, position| {
         let started = std::time::Instant::now();
-        let Some(path) = path_at(position) else { return };
-        let allowed = gate.borrow_mut().allows(&path, started);
+        let Some(source) = source_at(position) else { return };
+        let allowed = gate.borrow_mut().allows(&source, started);
         if allowed {
-            open(path.clone());
+            open(source.clone());
         }
         eprintln!(
-            "wf-event: activate {path} allowed={allowed} took={}ms",
+            "wf-event: activate {} allowed={allowed} took={}ms",
+            source.to_path_string(),
             started.elapsed().as_millis()
         );
     });
@@ -17718,8 +17727,9 @@ Broken: Either state is wrong.\n";
             assert_eq!(state.borrow().cwd.to_path_string(), dir_str, "a bare activation opens nothing");
             {
                 let gate = state.borrow().activation_gate.clone();
-                gate.borrow_mut().press(&sub_str, std::time::Instant::now(), true);
-                gate.borrow_mut().press(&sub_str, std::time::Instant::now(), true);
+                let sub_source = native_core::EntrySource::real(&sub_str);
+                gate.borrow_mut().press(&sub_source, std::time::Instant::now(), true);
+                gate.borrow_mut().press(&sub_source, std::time::Instant::now(), true);
             }
             let generation = state.borrow().listing_generation;
             let rows = ui.list_store.n_items();
@@ -20885,59 +20895,63 @@ Broken: Either state is wrong.\n";
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let mut g = ActivationGate::default();
+        let a = native_core::EntrySource::real("/d/a");
+        let b = native_core::EntrySource::real("/d/b");
+        let x = native_core::EntrySource::real("/d/x");
         // one plain click, then a stray position-only activation
-        g.press("/d/a", ms(0), true);
-        assert!(!g.allows("/d/a", ms(10)));
+        g.press(&a, ms(0), true);
+        assert!(!g.allows(&a, ms(10)));
         // a click on another file, then an activation naming the first: refused
-        g.press("/d/b", ms(100), true);
-        g.press("/d/a", ms(200), true);
-        assert!(!g.allows("/d/a", ms(210)), "the presses were on different files");
+        g.press(&b, ms(100), true);
+        g.press(&a, ms(200), true);
+        assert!(!g.allows(&a, ms(210)), "the presses were on different files");
         // real double-click on one file opens once
-        g.press("/d/a", ms(1000), true);
-        g.press("/d/a", ms(1150), true);
-        assert!(g.allows("/d/a", ms(1155)));
-        assert!(!g.allows("/d/a", ms(1160)), "consumed");
+        g.press(&a, ms(1000), true);
+        g.press(&a, ms(1150), true);
+        assert!(g.allows(&a, ms(1155)));
+        assert!(!g.allows(&a, ms(1160)), "consumed");
         // two slow presses do not open
-        g.press("/d/a", ms(3000), true);
-        g.press("/d/a", ms(4000), true);
-        assert!(!g.allows("/d/a", ms(4005)));
+        g.press(&a, ms(3000), true);
+        g.press(&a, ms(4000), true);
+        assert!(!g.allows(&a, ms(4005)));
         // Ctrl-click twice, Shift-click twice, or one modified press: never opens
-        g.press("/d/a", ms(8000), false);
-        g.press("/d/a", ms(8100), false);
-        assert!(!g.allows("/d/a", ms(8110)), "double Ctrl-click only selects");
-        g.press("/d/a", ms(8200), false);
-        g.press("/d/a", ms(8300), true);
-        assert!(!g.allows("/d/a", ms(8310)), "one modified press refuses");
-        g.press("/d/a", ms(8400), true);
-        g.press("/d/a", ms(8500), false);
-        assert!(!g.allows("/d/a", ms(8510)), "modified second press refuses");
+        g.press(&a, ms(8000), false);
+        g.press(&a, ms(8100), false);
+        assert!(!g.allows(&a, ms(8110)), "double Ctrl-click only selects");
+        g.press(&a, ms(8200), false);
+        g.press(&a, ms(8300), true);
+        assert!(!g.allows(&a, ms(8310)), "one modified press refuses");
+        g.press(&a, ms(8400), true);
+        g.press(&a, ms(8500), false);
+        assert!(!g.allows(&a, ms(8510)), "modified second press refuses");
         // Enter opens, once, only when fresh
         g.enter(ms(5000));
-        assert!(g.allows("/d/x", ms(5050)));
-        assert!(!g.allows("/d/x", ms(5060)));
+        assert!(g.allows(&x, ms(5050)));
+        assert!(!g.allows(&x, ms(5060)));
         g.enter(ms(6000));
-        assert!(!g.allows("/d/x", ms(7000)), "stale Enter");
+        assert!(!g.allows(&x, ms(7000)), "stale Enter");
     }
 
     fn list_activation_gate_on_real_listview_opens_only_when_allowed() {
         let list = gtk::ListView::new(None::<gtk::SelectionModel>, None::<gtk::ListItemFactory>);
         let gate = Rc::new(RefCell::new(ActivationGate::default()));
         let opened = Rc::new(RefCell::new(Vec::<String>::new()));
-        let path_at: Rc<dyn Fn(u32) -> Option<String>> =
-            Rc::new(|p| Some(format!("/d/file{p}")));
-        let open: Rc<dyn Fn(String)> = {
+        let source_at: Rc<dyn Fn(u32) -> Option<native_core::EntrySource>> =
+            Rc::new(|p| Some(native_core::EntrySource::real(format!("/d/file{p}"))));
+        let open: Rc<dyn Fn(native_core::EntrySource)> = {
             let opened = opened.clone();
-            Rc::new(move |p| opened.borrow_mut().push(p))
+            Rc::new(move |source| opened.borrow_mut().push(source.to_path_string()))
         };
-        connect_gated_activate(&list, gate.clone(), path_at, open);
+        connect_gated_activate(&list, gate.clone(), source_at, open);
         let started = std::time::Instant::now();
         list.emit_by_name::<()>("activate", &[&0u32]);
         assert!(opened.borrow().is_empty(), "a bare activation opens nothing");
-        gate.borrow_mut().press("/d/file1", std::time::Instant::now(), true);
-        gate.borrow_mut().press("/d/file1", std::time::Instant::now(), true);
+        let file1 = native_core::EntrySource::real("/d/file1");
+        gate.borrow_mut().press(&file1, std::time::Instant::now(), true);
+        gate.borrow_mut().press(&file1, std::time::Instant::now(), true);
         list.emit_by_name::<()>("activate", &[&1u32]);
         assert_eq!(*opened.borrow(), vec!["/d/file1".to_string()]);
-        gate.borrow_mut().press("/d/file1", std::time::Instant::now(), true);
+        gate.borrow_mut().press(&file1, std::time::Instant::now(), true);
         list.emit_by_name::<()>("activate", &[&2u32]);
         assert_eq!(opened.borrow().len(), 1, "a click on one file never opens another");
         assert!(started.elapsed() < Duration::from_millis(500), "activation returns promptly");
