@@ -2067,8 +2067,7 @@ const GUIDE_OPEN_FILE: &str = "open-file-other-app";
 
 #[cfg(feature = "guide")]
 fn guide_is_open_file_fixture(entry: &Entry) -> bool {
-    let owned = entry.source.to_path_string();
-    let path = Path::new(&owned);
+    let Some(path) = entry.source.real_path() else { return false };
     !entry.is_dir
         && path.file_name().is_some_and(|n| n == "open-me.txt")
         && path.parent().and_then(Path::file_name).is_some_and(|n| n == "Throwaways")
@@ -2144,7 +2143,8 @@ const GUIDE_CRUCIAL_BACK: &str = "drive-mounted-again-crucial";
 /// Exactly one cached, non-removable `drive` called `Launch Box SSD 2TB` with an absolute
 /// mountpoint, and the current folder is that mountpoint or below it (whole path components).
 #[cfg(feature = "guide")]
-fn guide_crucial_context(drives: &[Drive], cwd: &str) -> bool {
+fn guide_crucial_context(drives: &[Drive], cwd: &native_core::Location) -> bool {
+    let Some(cwd) = cwd.real_path() else { return false };
     // Absolute and free of `..`: a parent-traversal path could lexically match while leaving the mount.
     // Harmless `.` spellings are already normalized away by the path components.
     let plain = |p: &str| {
@@ -2155,7 +2155,7 @@ fn guide_crucial_context(drives: &[Drive], cwd: &str) -> bool {
         d.kind == "drive" && !d.removable && d.name == "Launch Box SSD 2TB" && plain(&d.mountpoint)
     });
     match (eligible.next(), eligible.next()) {
-        (Some(d), None) => plain(cwd) && Path::new(cwd).starts_with(&d.mountpoint),
+        (Some(d), None) => cwd.is_absolute() && cwd.components().all(|c| !matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) && cwd.starts_with(&d.mountpoint),
         _ => false,
     }
 }
@@ -2202,7 +2202,7 @@ fn guide_retry_after_paint(state: &Rc<RefCell<AppState>>, target: &gtk::Widget) 
 fn guide_sync_crucial(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let eligible = {
         let st = state.borrow();
-        guide_crucial_context(&st.drives, &st.cwd.to_path_string())
+        guide_crucial_context(&st.drives, &st.cwd)
     };
     let named = ui.files_stack.widget_name() == GUIDE_CRUCIAL_BACK;
     if eligible != named {
@@ -4132,7 +4132,7 @@ fn close_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn edit_path_action(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let cwd = state.borrow().cwd.to_path_string();
+    let cwd = state.borrow().cwd.display_string();
     ui.path_entry.set_text(&cwd);
     ui.path_stack.set_visible_child_name("entry");
     ui.path_entry.grab_focus();
@@ -4152,7 +4152,10 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 
     let (cwd, sidebar_active_key) = {
         let state = state.borrow();
-        (state.cwd.to_path_string(), state.sidebar_active_key.clone())
+        (
+            state.cwd.real_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            state.sidebar_active_key.clone(),
+        )
     };
     let mut active_target: Option<String> = None;
     let favorites = state.borrow().favorites.clone();
@@ -4930,7 +4933,10 @@ fn mark_sidebar_active(
 fn update_sidebar_active_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let (cwd, sidebar_active_key) = {
         let state = state.borrow();
-        (state.cwd.to_path_string(), state.sidebar_active_key.clone())
+        (
+            state.cwd.real_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            state.sidebar_active_key.clone(),
+        )
     };
     let mut active_set = false;
     let mut child = ui.sidebar.first_child();
@@ -5699,6 +5705,19 @@ fn is_new_window_shortcut(ctrl: bool, shift: bool, alt: bool, key: gdk::Key) -> 
     ctrl && !shift && !alt && (key == gdk::Key::n || key == gdk::Key::N)
 }
 
+/// The nearest real on-disk directory for `loc`: itself if it's already real,
+/// otherwise the real folder containing the ZIP archive (D-188: a ZIP member
+/// has no real path of its own to hand to a real-path-only API).
+fn nearest_real_dir(loc: &native_core::Location) -> String {
+    let mut loc = loc.clone();
+    loop {
+        if let Some(path) = loc.real_path() {
+            return path.to_string_lossy().into_owned();
+        }
+        loc = loc.parent();
+    }
+}
+
 /// Opens `path` in its own independent window of this same application.
 fn open_new_window(ui: &Ui, path: String) {
     if let Some(app) = ui
@@ -5729,7 +5748,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if is_new_window_shortcut(ctrl, shift, alt, key) {
-            open_new_window(&ui_for_keys, state_for_keys.borrow().cwd.to_path_string());
+            open_new_window(&ui_for_keys, nearest_real_dir(&state_for_keys.borrow().cwd));
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::D || key == gdk::Key::d) {
@@ -5755,10 +5774,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         }
         if alt && key == gdk::Key::Return {
             let selection = selected_entries(&state_for_keys, &ui_for_keys);
-            let path = selection
-                .first()
-                .map(|entry| entry.source.to_path_string())
-                .unwrap_or_else(|| state_for_keys.borrow().cwd.to_path_string());
+            let path = match selection.first() {
+                Some(entry) => entry.source.real_path_string(),
+                None => state_for_keys.borrow().cwd.real_path_string(),
+            };
+            let Some(path) = path else { return glib::Propagation::Stop };
             show_properties_for_path(ui_for_keys.clone(), path);
             return glib::Propagation::Stop;
         }
@@ -5975,7 +5995,7 @@ fn navigate_to_with_message(
             let item_count = listing.entries.len();
             let metadata_unavailable = listing.metadata_unavailable;
             let unreadable_entries = listing.unreadable_entries;
-            let path_str = path.to_path_string();
+            let path_str = path.real_path_string().unwrap_or_default();
             {
                 let mut state = state.borrow_mut();
                 state.listing_cancel = None;
@@ -6500,7 +6520,8 @@ fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    state.borrow_mut().inline_rename = Some(InlineRename::new(&entry.source.to_path_string(), &entry.name));
+    let Some(real_path) = entry.source.real_path_string() else { return };
+    state.borrow_mut().inline_rename = Some(InlineRename::new(&real_path, &entry.name));
     state.borrow_mut().last_name_click = None;
     refresh_row(state, ui, &entry.source);
 }
@@ -6805,7 +6826,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .borrow()
             .inline_rename
             .as_ref()
-            .filter(|edit| edit.path == entry.source.to_path_string())
+            .filter(|edit| Some(&edit.path) == entry.source.real_path_string().as_ref())
             .cloned();
         let name: gtk::Widget = match editing {
             Some(edit) => build_inline_editor(&state, &ui, &entry, &edit).upcast(),
@@ -7006,7 +7027,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // ahead of folders and every sort key.
     let pinned = state.borrow().pinned_top.clone();
     if let Some(pin) = pinned {
-        if let Some(pos) = visible_entries.iter().position(|entry| entry.source.to_path_string() == pin) {
+        if let Some(pos) = visible_entries.iter().position(|entry| entry.source.real_path_string() == Some(pin.clone())) {
             let entry = visible_entries.remove(pos);
             visible_entries.insert(0, entry);
         }
@@ -7123,7 +7144,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 .borrow()
                 .inline_rename
                 .as_ref()
-                .filter(|edit| edit.path == entry.source.to_path_string())
+                .filter(|edit| Some(&edit.path) == entry.source.real_path_string().as_ref())
                 .cloned();
             match editing {
                 Some(edit) => {
@@ -7143,17 +7164,17 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 connect_file_drop_to_dir(&grid_child, state.clone(), ui.clone(), path.to_path_buf());
             }
             ui.grid.append(&grid_child);
-            if let Some(picture) = thumbnail {
-                if native_core::is_video_path(&entry.source.to_path_string()) {
+            if let (Some(picture), Some(real_path)) = (thumbnail, entry.source.real_path_string()) {
+                if native_core::is_video_path(&real_path) {
                     if let Some(queue) = &video_poster_queue {
                         queue.borrow_mut().pending.push_back(VideoPosterJob {
-                            path: entry.source.to_path_string(),
+                            path: real_path,
                             picture,
                         });
                     }
                 } else if let Some(queue) = &thumbnail_queue {
                     queue.borrow_mut().pending.push_back(ThumbnailJob {
-                        path: entry.source.to_path_string(),
+                        path: real_path,
                         picture,
                         width: thumbnail_size.0,
                         height: thumbnail_size.1,
@@ -7737,7 +7758,7 @@ fn selected_entries(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<Entry> {
 fn selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> {
     selected_entries(state, ui)
         .into_iter()
-        .map(|entry| entry.source.to_path_string())
+        .filter_map(|entry| entry.source.real_path_string())
         .collect()
 }
 
@@ -8019,7 +8040,9 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
 fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
     if let Some(picker) = state.borrow().picker.clone() {
         if !entry.is_dir && picker_entry_can_submit(&picker, &entry) {
-            picker_write_and_exit(&picker, vec![entry.source.to_path_string()], 0);
+            if let Some(real_path) = entry.source.real_path_string() {
+                picker_write_and_exit(&picker, vec![real_path], 0);
+            }
         }
         if entry.is_dir {
             navigate(state, entry.source.to_location());
@@ -8046,14 +8069,20 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         open_zip_member(ui, &member.archive, &member.internal, &entry.name);
     } else if entry.is_dir {
         navigate(state, entry.source.to_location());
-    } else if std::fs::symlink_metadata(entry.source.to_path_string()).is_err() {
-        // A stale row must never hand a vanished path to an external app: some
-        // of them create the missing file.
-        eprintln!("wf-event: open refused, path is gone: {}", entry.source.to_path_string());
-        ui.status.set_label(&format!("{} no longer exists", entry.name));
     } else {
-        eprintln!("wf-event: open {}", entry.source.to_path_string());
-        match native_core::open_path(entry.source.to_path_string().as_str()) {
+        let Some(real_path) = entry.source.real_path_string() else {
+            ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+            return;
+        };
+        if std::fs::symlink_metadata(&real_path).is_err() {
+            // A stale row must never hand a vanished path to an external app: some
+            // of them create the missing file.
+            eprintln!("wf-event: open refused, path is gone: {real_path}");
+            ui.status.set_label(&format!("{} no longer exists", entry.name));
+            return;
+        }
+        eprintln!("wf-event: open {real_path}");
+        match native_core::open_path(&real_path) {
             Err(err) => ui.status.set_label(&format!("Open failed: {err}")),
             // D-75: only a launch that succeeded clears the tutorial.
             #[cfg(feature = "guide")]
@@ -8105,7 +8134,7 @@ fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let cwd = state.borrow().cwd.to_path_string();
+    let cwd = state.borrow().cwd.real_path_string().expect("checked is_zip above");
     run_job(
         state,
         ui,
@@ -8138,7 +8167,7 @@ fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let cwd = state.borrow().cwd.to_path_string();
+    let cwd = state.borrow().cwd.real_path_string().expect("checked is_zip above");
     let ui_for_action = ui.clone();
     show_name_dialog(&ui, "New file", "new.txt", NameSelection::StemOnly, move |name| {
         let state = state.clone();
@@ -8184,7 +8213,7 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         return;
     }
     let old_name = entry.name.clone();
-    let old_path = entry.source.to_path_string();
+    let old_path = entry.source.real_path_string().expect("checked is_zip above");
     let default_name = old_name.clone();
     let ui_for_action = ui.clone();
     show_name_dialog(
@@ -8757,7 +8786,7 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
+    let paths: Vec<String> = entries.into_iter().filter_map(|e| e.source.real_path_string()).collect();
     let count = paths.len();
     run_job(
         state,
@@ -8784,7 +8813,7 @@ fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
+    let paths: Vec<String> = entries.into_iter().filter_map(|e| e.source.real_path_string()).collect();
     let count = paths.len();
     show_confirm_dialog(
         &ui,
@@ -8819,7 +8848,10 @@ fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn terminal_here(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let cwd = state.borrow().cwd.to_path_string();
+    let Some(cwd) = state.borrow().cwd.real_path_string() else {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    };
     launch_terminal(&ui, &cwd);
 }
 
@@ -8949,7 +8981,10 @@ fn eject_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
 }
 
 fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) {
-    let root = state.borrow().cwd.to_path_string();
+    let Some(root) = state.borrow().cwd.real_path_string() else {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    };
     let show_hidden = state.borrow().show_hidden;
     let search_in_files = state.borrow().search_in_files;
     ui.status
@@ -9006,8 +9041,8 @@ fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let cwd = state.borrow().cwd.to_path_string();
-    let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
+    let cwd = state.borrow().cwd.real_path_string().expect("checked is_zip above");
+    let paths: Vec<String> = entries.into_iter().filter_map(|e| e.source.real_path_string()).collect();
     let count = paths.len();
     run_job(
         state,
@@ -9030,7 +9065,7 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let cwd = state.borrow().cwd.to_path_string();
+    let cwd = state.borrow().cwd.real_path_string().expect("checked is_zip above");
     let stem = native_core::archive_stem(&path);
     run_job(
         state,
@@ -9085,7 +9120,7 @@ fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
-    let cwd = state.borrow().cwd.to_path_string();
+    let cwd = state.borrow().cwd.real_path_string().expect("checked is_zip above");
     run_job(
         state,
         ui,
@@ -9125,7 +9160,9 @@ fn empty_trash_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 fn copy_paths_to_system_clipboard(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let mut paths = selected_paths(state, ui);
     if paths.is_empty() {
-        paths.push(state.borrow().cwd.to_path_string());
+        if let Some(cwd) = state.borrow().cwd.real_path_string() {
+            paths.push(cwd);
+        }
     }
     if let Some(display) = gdk::Display::default() {
         display.clipboard().set_text(&paths.join("\n"));
@@ -9727,7 +9764,7 @@ fn connect_gated_activate(
         }
         eprintln!(
             "wf-event: activate {} allowed={allowed} took={}ms",
-            source.to_path_string(),
+            source.display_string(),
             started.elapsed().as_millis()
         );
     });
@@ -10042,12 +10079,12 @@ fn batch_rename_requests(
     entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| {
-            (
-                entry.source.to_path_string(),
+        .filter_map(|(index, entry)| {
+            Some((
+                entry.source.real_path_string()?,
                 entry.name.clone(),
                 batch_new_name(&entry.name, find, replace, pattern, start, index),
-            )
+            ))
         })
         .collect()
 }
@@ -10363,23 +10400,20 @@ fn show_item_context_menu(
             open_path_in_new_tab(&state, &ui, path.clone())
         }));
     }
-    if entry.is_dir {
+    if let (true, Some(path)) = (entry.is_dir, entry.source.real_path_string()) {
         let ui = ui.clone();
-        let path = entry.source.to_path_string();
         menu.append(&context_item("window-new-symbolic", "Open in New Window", "", &popover, move || {
             open_new_window(&ui, path.clone())
         }));
     }
-    if !entry.is_dir {
+    if let (false, Some(path)) = (entry.is_dir, entry.source.real_path_string()) {
         let ui = ui.clone();
-        let path = entry.source.to_path_string();
         menu.append(&context_open_with(&popover, ui.clone(), path.clone()));
     }
-    if entry.is_dir {
-        let favorite = is_favorite(&state.borrow(), &entry.source.to_path_string());
+    if let (true, Some(path)) = (entry.is_dir, entry.source.real_path_string()) {
+        let favorite = is_favorite(&state.borrow(), &path);
         let state_for_fav = state.clone();
         let ui_for_fav = ui.clone();
-        let path = entry.source.to_path_string();
         let label = if favorite {
             "Remove from Favorites"
         } else {
@@ -10442,21 +10476,20 @@ fn show_item_context_menu(
             compress_selection(state.clone(), ui.clone())
         }));
     }
-    if native_core::is_archive_path(&entry.source.to_path_string()) {
+    if let Some(path) = entry.source.real_path_string().filter(|p| native_core::is_archive_path(p)) {
         {
             // Default action: a new folder named after the archive, so a badly
             // packed archive cannot scatter loose files over the current folder.
             let state = state.clone();
             let ui = ui.clone();
-            let path = entry.source.to_path_string();
-            let label = format!("Extract to \"{}\"", native_core::archive_stem(&entry.source.to_path_string()));
+            let path = path.clone();
+            let label = format!("Extract to \"{}\"", native_core::archive_stem(&path));
             menu.append(&context_button(&label, &popover, move || {
                 extract_archive_to_folder_action(state.clone(), ui.clone(), path.clone())
             }));
         }
         let state = state.clone();
         let ui = ui.clone();
-        let path = entry.source.to_path_string();
         menu.append(&context_item("archive-extract-symbolic", "Extract Here", "", &popover, move || {
             extract_archive_action(state.clone(), ui.clone(), path.clone())
         }));
@@ -10479,20 +10512,16 @@ fn show_item_context_menu(
     }
 
     menu.append(&context_separator());
-    {
+    if let Some(path) = entry.source.real_path_string() {
         let ui = ui.clone();
-        let path = entry.source.to_path_string();
         menu.append(&context_item("document-properties-symbolic", "Properties", "Alt+Enter", &popover, move || {
             show_properties_for_path(ui.clone(), path.clone())
         }));
     }
-    {
+    if let Some(terminal_path) = entry.source.real_path_string().map(|path| {
+        if entry.is_dir { path } else { native_core::parent_dir(&path) }
+    }) {
         let ui = ui.clone();
-        let terminal_path = if entry.is_dir {
-            entry.source.to_path_string()
-        } else {
-            native_core::parent_dir(&entry.source.to_path_string())
-        };
         menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
             launch_terminal(&ui, &terminal_path);
         }));
@@ -10625,17 +10654,16 @@ fn show_background_context_menu(
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
-    if state.borrow().cwd.to_path_string().contains("/Trash/files") {
+    if state.borrow().cwd.real_path().is_some_and(|p| p.to_string_lossy().contains("/Trash/files")) {
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("user-trash-full-symbolic", "Empty Trash", "", &popover, move || {
             empty_trash_action(state.clone(), ui.clone())
         }));
     }
-    {
+    if let Some(cwd) = state.borrow().cwd.real_path_string() {
         let state_for_fav = state.clone();
         let ui_for_fav = ui.clone();
-        let cwd = state.borrow().cwd.to_path_string();
         let favorite = is_favorite(&state.borrow(), &cwd);
         let label = if favorite {
             "Remove Current Folder from Favorites"
@@ -10652,11 +10680,11 @@ fn show_background_context_menu(
     }
 
     menu.append(&context_separator());
-    {
+    if state.borrow().cwd.real_path().is_some() {
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("document-properties-symbolic", "Properties", "Alt+Enter", &popover, move || {
-            let cwd = state.borrow().cwd.to_path_string();
+            let Some(cwd) = state.borrow().cwd.real_path_string() else { return };
             show_properties_for_path(ui.clone(), cwd);
         }));
     }
@@ -11203,10 +11231,7 @@ fn connect_file_drag<W: IsA<gtk::Widget>>(
     source: &native_core::EntrySource,
     box_select_edge: Option<&gtk::Label>,
 ) {
-    if source.is_zip() {
-        return;
-    }
-    let path = source.to_path_string();
+    let Some(path) = source.real_path_string() else { return };
     // The multi-select payload is built from real rows only: a ZIP member
     // mixed into the selection must not be offered to an external drop
     // target through its serialized pseudo-path.
@@ -13516,7 +13541,7 @@ Broken: Either state is wrong.\n";
         let (state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
-        let before_cwd = state.borrow().cwd.to_path_string();
+        let before_cwd = state.borrow().cwd.real_path_string().unwrap_or_default();
 
         let assert_refused = |zip_name: &str, expect_fragment: Option<&str>| {
             wait_for("listing shows the fixture", || {
@@ -13529,7 +13554,7 @@ Broken: Either state is wrong.\n";
             if let Some(fragment) = expect_fragment {
                 assert!(label.contains(fragment), "{zip_name}: status {label:?} should contain {fragment:?}");
             }
-            assert_eq!(state.borrow().cwd.to_path_string(), before_cwd, "{zip_name}: cwd is preserved after a bad zip");
+            assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), before_cwd, "{zip_name}: cwd is preserved after a bad zip");
             assert!(
                 !state.borrow().cwd.is_zip(),
                 "{zip_name}: never left sitting inside a bad archive"
@@ -14945,7 +14970,7 @@ Broken: Either state is wrong.\n";
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
         ui.window.present();
-        wait_for("outside listing", || state.borrow().cwd.to_path_string() == outside.to_string_lossy() && !state.borrow().visible_entries.is_empty());
+        wait_for("outside listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == outside.to_string_lossy() && !state.borrow().visible_entries.is_empty());
         wait_for("laid out", || ui.files_stack.width() > 0);
         pump();
 
@@ -14974,7 +14999,7 @@ Broken: Either state is wrong.\n";
         };
         let nav = |path: &std::path::Path| {
             navigate(&state, native_core::Location::real(path));
-            wait_for("navigated", || state.borrow().cwd.to_path_string() == path.to_string_lossy() && !state.borrow().visible_entries.is_empty());
+            wait_for("navigated", || state.borrow().cwd.real_path_string().unwrap_or_default() == path.to_string_lossy() && !state.borrow().visible_entries.is_empty());
             pump();
         };
         let none = |why: &str| {
@@ -15014,13 +15039,13 @@ Broken: Either state is wrong.\n";
         assert!(state.borrow().visible_entries.iter().any(|e| e.name == "game.txt"), "LaunchBox listing is nonempty");
         one("LaunchBox");
         history_step(&state, false);
-        wait_for("back to the root", || state.borrow().cwd.to_path_string() == mp);
+        wait_for("back to the root", || state.borrow().cwd.real_path_string().unwrap_or_default() == mp);
         one("back at the root");
         nav(&mount.join("ES-DE"));
         assert!(state.borrow().visible_entries.iter().any(|e| e.name == "theme.txt"), "ES-DE listing is nonempty");
         one("ES-DE");
         history_step(&state, false);
-        wait_for("back to the root again", || state.borrow().cwd.to_path_string() == mp);
+        wait_for("back to the root again", || state.borrow().cwd.real_path_string().unwrap_or_default() == mp);
         one("back again");
         set_view_mode(&state, &ui, ViewMode::Grid);
         one("grid view");
@@ -15060,9 +15085,9 @@ Broken: Either state is wrong.\n";
             refresh(vec![good()]);
             one(&format!("restored after {why}"));
         }
-        assert!(guide_crucial_context(&[good()], &format!("{mp}/LaunchBox")) && !guide_crucial_context(&[good()], &format!("{mp}-evil")));
-        assert!(!guide_crucial_context(&[good()], &format!("{mp}/../outside")), "a parent-traversal cwd is rejected");
-        assert!(!guide_crucial_context(&[drive("Launch Box SSD 2TB", "drive", false, &format!("{mp}/../mount-crucial"))], &mp), "a non-normal mountpoint is rejected");
+        assert!(guide_crucial_context(&[good()], &native_core::Location::real(format!("{mp}/LaunchBox"))) && !guide_crucial_context(&[good()], &native_core::Location::real(format!("{mp}-evil"))));
+        assert!(!guide_crucial_context(&[good()], &native_core::Location::real(format!("{mp}/../outside"))), "a parent-traversal cwd is rejected");
+        assert!(!guide_crucial_context(&[drive("Launch Box SSD 2TB", "drive", false, &format!("{mp}/../mount-crucial"))], &native_core::Location::real(&mp)), "a non-normal mountpoint is rejected");
 
         // Another tutorial's visual survives the same navigation and refresh paths.
         put("terminal-here-folder", "Terminal");
@@ -15196,7 +15221,7 @@ Broken: Either state is wrong.\n";
         let item_for = |path: &str| -> gtk::Widget {
             let mode = state.borrow().view_mode;
             if mode == ViewMode::Grid {
-                let entry_ix = state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == path).expect("entry");
+                let entry_ix = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == path).expect("entry");
                 ui.grid.child_at_index(entry_ix as i32).expect("grid child").upcast()
             } else {
                 tree().into_iter().find(|w| w.has_css_class("wf-file-row") && w.tooltip_text().as_deref() == Some(path)).expect("list row")
@@ -15266,7 +15291,7 @@ Broken: Either state is wrong.\n";
         put(GUIDE_OPEN_FILE, "Again");
         assert_eq!(rings().len(), 1);
         navigate(&state, native_core::Location::real(elsewhere.clone()));
-        wait_for("Elsewhere listing", || state.borrow().cwd.to_path_string() == elsewhere.to_string_lossy());
+        wait_for("Elsewhere listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == elsewhere.to_string_lossy());
         wait_for("stale visual gone", || rings().is_empty() && label_pops().is_empty());
         assert!(by_name(GUIDE_OPEN_FILE).is_empty(), "an open-me.txt outside Throwaways is never named");
         assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Again"), "still pending");
@@ -15324,7 +15349,7 @@ Broken: Either state is wrong.\n";
 
         // Negatives at the external-open success boundary: none of these opens anything, so none
         // may clear. Each calls the real open route directly.
-        let entry = state.borrow().visible_entries.iter().find(|e| e.source.to_path_string() == open_me).cloned().expect("fixture entry");
+        let entry = state.borrow().visible_entries.iter().find(|e| e.source.real_path_string().unwrap_or_default() == open_me).cloned().expect("fixture entry");
         let still_pending = |why: &str| {
             assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Back"), "{why}: request kept");
             assert_eq!(rings().len(), 1, "{why}: circle kept");
@@ -16482,7 +16507,7 @@ Broken: Either state is wrong.\n";
                 assert_eq!(file_sig(), before);
                 let status = ui.status.label().to_string();
                 if key_name.starts_with("drive-open") {
-                    assert_eq!(state.borrow().cwd.to_path_string(), dir.to_string_lossy(), "{key_name}: opened the Scratch folder");
+                    assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), dir.to_string_lossy(), "{key_name}: opened the Scratch folder");
                 } else {
                     assert!(!status.is_empty(), "{key_name} {route}: the ordinary action ran (it failed safely with no PATH)");
                 }
@@ -17645,7 +17670,7 @@ Broken: Either state is wrong.\n";
         // Ordinary navigation replaces it with the normal listing status.
         navigate(&state, native_core::Location::real(&other_str));
         wait_for("ordinary status", || ui.status.label() == "1 item shown");
-        assert_eq!(state.borrow().cwd.to_path_string(), other_str);
+        assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), other_str);
 
         // A failed listing shows its error, never the queued success.
         run_job(
@@ -17672,11 +17697,11 @@ Broken: Either state is wrong.\n";
         );
         navigate(&state, native_core::Location::real(&dir_str));
         wait_for("newer path", || {
-            state.borrow().cwd.to_path_string() == dir_str && ui.status.label() == "1 item shown"
+            state.borrow().cwd.real_path_string().unwrap_or_default() == dir_str && ui.status.label() == "1 item shown"
         });
         pump();
         pump();
-        assert_eq!(state.borrow().cwd.to_path_string(), dir_str);
+        assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), dir_str);
         assert_eq!(ui.status.label(), "1 item shown", "the stale message never appears");
 
         ui.window.destroy();
@@ -17713,7 +17738,7 @@ Broken: Either state is wrong.\n";
             .expect("the test window is registered");
         let back_to_dir = |mode: ViewMode| {
             navigate(&state, native_core::Location::real(&dir_str));
-            wait_for("listing", || state.borrow().cwd.to_path_string() == dir_str && state.borrow().visible_entries.len() == 3);
+            wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dir_str && state.borrow().visible_entries.len() == 3);
             set_view_mode(&state, &ui, mode);
             pump();
         };
@@ -17728,7 +17753,7 @@ Broken: Either state is wrong.\n";
             // a bare activation opens nothing, even after the deferred turn
             ui.list.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
             pump();
-            assert_eq!(state.borrow().cwd.to_path_string(), dir_str, "a bare activation opens nothing");
+            assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), dir_str, "a bare activation opens nothing");
             {
                 let gate = state.borrow().activation_gate.clone();
                 let sub_source = native_core::EntrySource::real(&sub_str);
@@ -17740,7 +17765,7 @@ Broken: Either state is wrong.\n";
             ui.list.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
             assert_eq!(state.borrow().listing_generation, generation, "no navigation began inside the signal");
             assert_eq!(ui.list_store.n_items(), rows, "the activated row is still alive when the signal returns");
-            wait_for("deferred open", || state.borrow().cwd.to_path_string() == sub_str);
+            wait_for("deferred open", || state.borrow().cwd.real_path_string().unwrap_or_default() == sub_str);
             wait_for("sub listing", || state.borrow().visible_entries.len() == 1);
         }
 
@@ -17752,7 +17777,7 @@ Broken: Either state is wrong.\n";
         child.emit_by_name::<()>("activate", &[]);
         assert_eq!(state.borrow().listing_generation, generation, "no navigation began inside the grid signal");
         assert!(child.parent().is_some(), "the activated grid child is still alive when the signal returns");
-        wait_for("deferred grid open", || state.borrow().cwd.to_path_string() == sub_str);
+        wait_for("deferred grid open", || state.borrow().cwd.real_path_string().unwrap_or_default() == sub_str);
         wait_for("sub listing", || state.borrow().visible_entries.len() == 1);
 
         // Identity survives deferral: both files vanish so nothing can launch, then the
@@ -18113,7 +18138,7 @@ Broken: Either state is wrong.\n";
         button_labelled(menu.upcast_ref(), "Open").unwrap().emit_clicked();
         pump();
         assert_eq!(
-            state.borrow().tabs.active().path.to_path_string(),
+            state.borrow().tabs.active().path.real_path_string().unwrap_or_default(),
             mount.to_string_lossy().to_string(),
             "the drive Open action navigated to the mountpoint"
         );
@@ -18187,7 +18212,7 @@ Broken: Either state is wrong.\n";
         ui.list_selection.select_item(0, true);
         update_selection(&state, &ui);
         let entry = state.borrow().visible_entries[0].clone();
-        let file_path = entry.source.to_path_string();
+        let file_path = entry.source.real_path_string().unwrap_or_default();
         show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
         pump();
         pump();
@@ -18259,7 +18284,7 @@ Broken: Either state is wrong.\n";
         let focus = || gtk::prelude::GtkWindowExt::focus(&ui.window);
         let back_to_dir = |mode: ViewMode| {
             navigate(&state, native_core::Location::real(&dir_str));
-            wait_for("listing", || state.borrow().cwd.to_path_string() == dir_str && state.borrow().visible_entries.len() == 3);
+            wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dir_str && state.borrow().visible_entries.len() == 3);
             set_view_mode(&state, &ui, mode);
             pump();
         };
@@ -18284,9 +18309,9 @@ Broken: Either state is wrong.\n";
             navigate(&state, native_core::Location::real(&sub_str));
             assert_eq!(rows(), 0, "the old rows are removed synchronously");
             assert_eq!(focus(), Some(root_widget.clone()), "the view root owns focus before the next frame");
-            wait_for("sub listing", || state.borrow().cwd.to_path_string() == sub_str && state.borrow().visible_entries.len() == 1);
+            wait_for("sub listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == sub_str && state.borrow().visible_entries.len() == 1);
             pump();
-            assert_eq!(state.borrow().cwd.to_path_string(), sub_str);
+            assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), sub_str);
         }
 
         // Focus outside the file pane is never taken.
@@ -18297,7 +18322,7 @@ Broken: Either state is wrong.\n";
         assert!(outside.is_some() && !focus_within(&ui.window, &ui.list) && !focus_within(&ui.window, &ui.grid));
         navigate(&state, native_core::Location::real(&sub_str));
         assert_eq!(focus(), outside, "focus outside the file view is not stolen");
-        wait_for("sub listing", || state.borrow().cwd.to_path_string() == sub_str && state.borrow().visible_entries.len() == 1);
+        wait_for("sub listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == sub_str && state.borrow().visible_entries.len() == 1);
         pump();
 
         ui.window.destroy();
@@ -18416,7 +18441,7 @@ Broken: Either state is wrong.\n";
         let windows: Vec<_> = WINDOWS.with(|w| w.borrow().windows()).into_iter().filter(|w| mine(w)).collect();
         assert_eq!(windows.len(), 2);
         let find = |cwd: &str| {
-            windows.iter().find(|(s, _)| s.borrow().cwd.to_path_string() == cwd).cloned().expect("window by cwd")
+            windows.iter().find(|(s, _)| s.borrow().cwd.real_path_string().unwrap_or_default() == cwd).cloned().expect("window by cwd")
         };
         let (sa, ua) = find(&p(3));
         let (sb, ub) = find(&p(4));
@@ -18427,7 +18452,7 @@ Broken: Either state is wrong.\n";
         pump();
         let snap = |s: &Rc<RefCell<AppState>>, u: &Ui| {
             let s = s.borrow();
-            (s.cwd.to_path_string(), s.tabs.tabs.clone(), selected_indices(u))
+            (s.cwd.real_path_string().unwrap_or_default(), s.tabs.tabs.clone(), selected_indices(u))
         };
         let (snap_a, snap_b) = (snap(&sa, &ua), snap(&sb, &ub));
         assert_eq!(snap_a.2, vec![0]);
@@ -18480,7 +18505,7 @@ Broken: Either state is wrong.\n";
 
         // Stale window B navigates: only its new visit appears.
         navigate(&sb, native_core::Location::real(&p(5)));
-        wait_for("new visit", || sb.borrow().cwd.to_path_string() == p(5) && sb.borrow().visible_entries.len() == 1);
+        wait_for("new visit", || sb.borrow().cwd.real_path_string().unwrap_or_default() == p(5) && sb.borrow().visible_entries.len() == 1);
         assert_eq!(disk_recents(), vec![p(5)], "only the new visit is on disk");
         assert_eq!(sb.borrow().recents.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), vec![p(5)]);
         assert_eq!(others(), others_before);
@@ -18707,7 +18732,7 @@ Broken: Either state is wrong.\n";
         // Activating a drive row uses the cache: no new scan.
         let scans = calls.load(Ordering::SeqCst);
         activate_sidebar_row(&state, &ui, &row_a);
-        wait_for("navigated to the drive", || state.borrow().cwd.to_path_string() == mount_a.to_string_lossy());
+        wait_for("navigated to the drive", || state.borrow().cwd.real_path_string().unwrap_or_default() == mount_a.to_string_lossy());
         assert_eq!(calls.load(Ordering::SeqCst), scans, "row activation scanned drives");
 
         // A later result replaces the cache: no stale rows, and an unmount clears the bar.
@@ -18866,7 +18891,7 @@ Broken: Either state is wrong.\n";
         let rest_of = |chosen: &[&str]| -> Vec<&str> {
             all_names.iter().copied().filter(|n| !chosen.contains(n)).collect()
         };
-        let index_of = |n: &str| state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == path(n)).unwrap();
+        let index_of = |n: &str| state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == path(n)).unwrap();
         let grid = |ui: &Ui| ui.grid.clone();
         let pick = |mode: ViewMode, n: &str, extend: bool| {
             let i = index_of(n);
@@ -18934,7 +18959,7 @@ Broken: Either state is wrong.\n";
         // a filter limits invert to visible rows; no filtered-out path is selected
         ui.search.set_text("a.txt");
         wait_for("filtered", || state.borrow().visible_entries.len() == 4);
-        let visible: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.source.to_path_string()).collect();
+        let visible: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.source.real_path_string().unwrap_or_default()).collect();
         assert_eq!(visible.len(), 4, "{visible:?}");
         assert!(visible.iter().all(|p| p.ends_with("a.txt")), "{visible:?}");
         pick(ViewMode::Details, "alpha.txt", false);
@@ -19113,12 +19138,12 @@ Broken: Either state is wrong.\n";
             .expect("the test window is registered");
         let at = |p: &str| {
             let (state, p) = (state.clone(), p.to_string());
-            move || state.borrow().cwd.to_path_string() == p
+            move || state.borrow().cwd.real_path_string().unwrap_or_default() == p
         };
         let hist = |i: usize| {
             let s = state.borrow();
             let history: Vec<String> =
-                s.tabs.tabs[i].history.iter().map(|l| l.to_path_string()).collect();
+                s.tabs.tabs[i].history.iter().map(|l| l.real_path_string().unwrap_or_default()).collect();
             (history, s.tabs.tabs[i].index)
         };
         let v = |x: &[&String]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -19205,7 +19230,7 @@ Broken: Either state is wrong.\n";
         wait_for("B shown", at(&b1));
         pump();
         assert_eq!((hist(0), hist(1)), before);
-        assert_eq!(state.borrow().cwd.to_path_string(), b1);
+        assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), b1);
 
         // a failed listing leaves the ACTIVE tab's sensitivity, not the prior tab's
         history_step(&state, false);
@@ -19287,7 +19312,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(size_after.label(), native_core::fmt_size(2048));
         assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()], "selection kept");
         assert_eq!(state.borrow().visible_entries[1].size, 2048);
-        assert_eq!(state.borrow().entries.iter().find(|e| e.source.to_path_string() == b_path).unwrap().size, 2048);
+        assert_eq!(state.borrow().entries.iter().find(|e| e.source.real_path_string().unwrap_or_default() == b_path).unwrap().size, 2048);
         assert_eq!(object_before.downcast::<glib::BoxedAnyObject>().unwrap().borrow::<Entry>().size, 2048);
 
         // ---- Structural: a created file rebuilds, the selection survives.
@@ -19305,7 +19330,7 @@ Broken: Either state is wrong.\n";
         select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&b_path));
         let (c_size, c_modified) = b_labels(&state).unwrap();
         let c_row = c_size.parent().unwrap();
-        let b_index = state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == b_path).unwrap() as u32;
+        let b_index = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == b_path).unwrap() as u32;
         let c_object = ui.list_store.item(b_index).unwrap();
         let c_text = c_size.label();
         std::fs::write(dir.join("b.txt"), vec![b'z'; 8192]).unwrap();
@@ -19327,7 +19352,7 @@ Broken: Either state is wrong.\n";
             .collect();
         std::fs::write(dir.join("b.txt"), vec![b'y'; 4096]).unwrap();
         wait_for("grid state merged", || {
-            state.borrow().visible_entries.iter().any(|e| e.source.to_path_string() == b_path && e.size == 4096)
+            state.borrow().visible_entries.iter().any(|e| e.source.real_path_string().unwrap_or_default() == b_path && e.size == 4096)
         });
         for _ in 0..40 {
             pump();
@@ -19545,7 +19570,7 @@ Broken: Either state is wrong.\n";
         set.active_mut().record(loc("/a1"));
         set.active_mut().record(loc("/a1"));
         let hist_strs = |t: &TabState| -> Vec<String> {
-            t.history.iter().map(|l| l.to_path_string()).collect()
+            t.history.iter().map(|l| l.real_path_string().unwrap_or_default()).collect()
         };
         assert_eq!(hist_strs(set.active()), ["/a0", "/a1"], "same path is not appended twice");
         set.open(loc("/b0"));
@@ -19677,7 +19702,7 @@ Broken: Either state is wrong.\n";
         let pinned_before = state.borrow().pinned_top.clone();
 
         let index_of = |st: &Rc<RefCell<AppState>>, path: &str| {
-            st.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == path)
+            st.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == path)
         };
         let start_index = index_of(&state, &old_path).expect("target present before rename");
         match view {
@@ -19700,7 +19725,7 @@ Broken: Either state is wrong.\n";
         // which calls this same production function directly.
         match view {
             ViewMode::Grid => {
-                let entry = state.borrow().visible_entries.iter().find(|e| e.source.to_path_string() == old_path).cloned();
+                let entry = state.borrow().visible_entries.iter().find(|e| e.source.real_path_string().unwrap_or_default() == old_path).cloned();
                 begin_inline_rename(&state, &ui, &entry.expect("target entry"));
             }
             ViewMode::Details | ViewMode::Compact => rename_action(state.clone(), ui.clone()),
@@ -20016,7 +20041,7 @@ Broken: Either state is wrong.\n";
 
         // ---- Seed one real rename so there is a reciprocal Undo entry.
         let old_path = created("original.txt").to_string_lossy().to_string();
-        let start_index = state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == old_path).expect("target listed");
+        let start_index = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == old_path).expect("target listed");
         ui.list_selection.select_item(start_index as u32, true);
         update_selection(&state, &ui);
         assert_eq!(selected_paths(&state, &ui), vec![old_path.clone()], "target selected before rename");
@@ -20944,7 +20969,7 @@ Broken: Either state is wrong.\n";
             Rc::new(|p| Some(native_core::EntrySource::real(format!("/d/file{p}"))));
         let open: Rc<dyn Fn(native_core::EntrySource)> = {
             let opened = opened.clone();
-            Rc::new(move |source| opened.borrow_mut().push(source.to_path_string()))
+            Rc::new(move |source| opened.borrow_mut().push(source.real_path_string().unwrap_or_default()))
         };
         connect_gated_activate(&list, gate.clone(), source_at, open);
         let started = std::time::Instant::now();
@@ -21013,7 +21038,7 @@ Broken: Either state is wrong.\n";
         let (state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
-        wait_for("listing", || state.borrow().cwd.to_path_string() == dest.to_string_lossy());
+        wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dest.to_string_lossy());
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
         let transfer = |name: &str, is_copy: bool, clear_cut: bool| Transfer {
             srcs: vec![src.join(name)],
@@ -21215,7 +21240,7 @@ Broken: Either state is wrong.\n";
         let (state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
-        wait_for("listing", || state.borrow().cwd.to_path_string() == dest.to_string_lossy());
+        wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dest.to_string_lossy());
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
 
         let no_residue = || {
@@ -21650,7 +21675,7 @@ Broken: Either state is wrong.\n";
         let (state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
-        wait_for("listing", || state.borrow().cwd.to_path_string() == home.to_string_lossy());
+        wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == home.to_string_lossy());
         assert!(state.borrow().smb_backend.is_none(), "D-186 must cross the real GioSmbBackend, never a fake");
 
         let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -21702,7 +21727,7 @@ Broken: Either state is wrong.\n";
             );
             assert!(!status.contains(TEST_PASS) && !status.contains("wrong-password"));
             assert!(dialog_windows().is_empty(), "no chooser left open");
-            assert_eq!(state.borrow().cwd.to_path_string(), home.to_string_lossy(), "no navigation on a denied credential");
+            assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), home.to_string_lossy(), "no navigation on a denied credential");
             assert!(state.borrow().remembered_networks.is_empty(), "no remembered entry on a denied credential");
             assert!(!smb_flow(&state, &ui).is_busy(), "controls usable again");
             clear_credential();
@@ -21734,7 +21759,7 @@ Broken: Either state is wrong.\n";
                 "unreachable status expected, got {status:?}"
             );
             assert!(dialog_windows().is_empty());
-            assert_eq!(state.borrow().cwd.to_path_string(), home.to_string_lossy(), "no navigation on an unreachable host");
+            assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), home.to_string_lossy(), "no navigation on an unreachable host");
             assert!(state.borrow().remembered_networks.is_empty(), "no remembered entry on an unreachable host");
             assert!(!smb_flow(&state, &ui).is_busy());
             clear_credential();
@@ -21757,7 +21782,7 @@ Broken: Either state is wrong.\n";
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 while ctx.iteration(false) {}
-                if state.borrow().cwd.to_path_string().contains("synthetic") || state.borrow().cwd.to_path_string().to_lowercase().contains("gvfs") {
+                if state.borrow().cwd.real_path_string().unwrap_or_default().contains("synthetic") || state.borrow().cwd.real_path_string().unwrap_or_default().to_lowercase().contains("gvfs") {
                     break;
                 }
                 assert!(Instant::now() < deadline, "direct-share mount/navigate never settled; status={:?}", ui.status.label());
@@ -21765,7 +21790,7 @@ Broken: Either state is wrong.\n";
             }
             pump();
             assert_eq!(drive_scan_count() - scans_before, 1, "exactly one drive refresh");
-            mounted_dir = std::path::PathBuf::from(state.borrow().cwd.to_path_string());
+            mounted_dir = std::path::PathBuf::from(state.borrow().cwd.real_path_string().unwrap_or_default());
             let names: Vec<String> = std::fs::read_dir(&mounted_dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
             assert!(names.iter().any(|n| n == "hello.txt"), "the synthetic file is visible: {names:?}");
             let bytes = std::fs::read(mounted_dir.join("hello.txt")).expect("read the synthetic file through the real mounted path");
@@ -21818,7 +21843,7 @@ Broken: Either state is wrong.\n";
             // before the real remount ran at all.
             navigate_without_history(&state, native_core::Location::real(home.clone()));
             while ctx.iteration(false) {}
-            assert_eq!(state.borrow().cwd.to_path_string(), home.to_string_lossy(), "cwd moved off the unmounted share before reconnecting");
+            assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), home.to_string_lossy(), "cwd moved off the unmounted share before reconnecting");
             clear_credential();
             SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
             set_credential(TEST_USER, TEST_PASS);
@@ -21833,7 +21858,7 @@ Broken: Either state is wrong.\n";
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 while ctx.iteration(false) {}
-                if state.borrow().cwd.to_path_string().contains("synthetic") || state.borrow().cwd.to_path_string().to_lowercase().contains("gvfs") {
+                if state.borrow().cwd.real_path_string().unwrap_or_default().contains("synthetic") || state.borrow().cwd.real_path_string().unwrap_or_default().to_lowercase().contains("gvfs") {
                     break;
                 }
                 if ui.status.label().starts_with("Cannot open") {
@@ -21847,7 +21872,7 @@ Broken: Either state is wrong.\n";
                 std::thread::sleep(Duration::from_millis(10));
             }
             pump();
-            mounted_dir = std::path::PathBuf::from(state.borrow().cwd.to_path_string());
+            mounted_dir = std::path::PathBuf::from(state.borrow().cwd.real_path_string().unwrap_or_default());
             assert!(mounted_dir.join("hello.txt").exists(), "the remount sees the synthetic file again");
             clear_credential();
             SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
@@ -22122,7 +22147,7 @@ Broken: Either state is wrong.\n";
             let (state, ui) = WINDOWS
                 .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
                 .expect("the test window is registered");
-            wait_for("listing", || state.borrow().cwd.to_path_string() == start.to_string_lossy());
+            wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == start.to_string_lossy());
             state.borrow_mut().smb_backend = Some(fake());
             (app, state, ui)
         };
@@ -22168,11 +22193,11 @@ Broken: Either state is wrong.\n";
         assert_eq!(labels, ["smb://nas/docs", "smb://nas/IPC%24", "smb://nas/media"], "sorted, deduplicated, admin share kept, URI from the actual name");
         let shown: Vec<String> = rows.iter().filter_map(|r| r.first_child()).filter_map(|c| c.downcast::<gtk::Label>().ok()).map(|l| l.label().to_string()).collect();
         assert_eq!(shown, ["docs", "IPC$", "Media Files"]);
-        assert_eq!(state.borrow().cwd.to_path_string(), start.to_string_lossy());
+        assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), start.to_string_lossy());
         let scans_before = scans.load(std::sync::atomic::Ordering::SeqCst);
         rows[2].clone().downcast::<gtk::ListBoxRow>().unwrap().emit_by_name::<()>("activate", &[]);
         let media = mounted.join("media");
-        wait_for("navigated", || state.borrow().cwd.to_path_string() == media.to_string_lossy());
+        wait_for("navigated", || state.borrow().cwd.real_path_string().unwrap_or_default() == media.to_string_lossy());
         wait_for("dialog gone", || dialog_windows().is_empty());
         pump();
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst) - scans_before, 1, "exactly one drive refresh");
@@ -22194,7 +22219,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(state.borrow().remembered_networks.len(), 1);
         ui.path_entry.set_text("\\\\NAS\\docs");
         ui.path_entry.emit_activate();
-        wait_for("docs", || state.borrow().cwd.to_path_string() == mounted.join("docs").to_string_lossy());
+        wait_for("docs", || state.borrow().cwd.real_path_string().unwrap_or_default() == mounted.join("docs").to_string_lossy());
         assert_eq!(state.borrow().remembered_networks.len(), 2);
 
         // a rejected address never reaches the backend and keeps the folder
@@ -22301,7 +22326,7 @@ Broken: Either state is wrong.\n";
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
         ui.window.set_title(Some("wf-d157-window"));
-        wait_for("listing", || state.borrow().cwd.to_path_string() == dir.to_string_lossy() && !rows_of(&ui).is_empty());
+        wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dir.to_string_lossy() && !rows_of(&ui).is_empty());
         pump();
 
         let header_button = |name: &str| -> gtk::Button {
@@ -22949,7 +22974,7 @@ Broken: Either state is wrong.\n";
         assert!(!is_new_window_shortcut(true, false, false, gdk::Key::t), "Ctrl+T is New Tab");
         assert!(!is_new_window_shortcut(false, false, false, gdk::Key::n));
         let all = include_str!("native.rs");
-        assert!(all.contains("open_new_window(&ui_for_keys, state_for_keys.borrow().cwd.to_path_string())"));
+        assert!(all.contains("open_new_window(&ui_for_keys, nearest_real_dir(&state_for_keys.borrow().cwd))"));
         assert!(all.contains("\"Open in New Window\""));
     }
 

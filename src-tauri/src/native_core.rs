@@ -126,13 +126,20 @@ impl Location {
         matches!(self, Self::ZipDir { .. })
     }
 
-    /// A string form for display and real-directory comparisons. For a
-    /// `ZipDir` this is `display_string()` — there is no decoder that turns
-    /// it back into a `Location` (REJECT 1 forbids reinterpreting a row's
-    /// identity from a string); callers that need an actual `Location` must
-    /// carry one, never round-trip through this.
-    pub fn to_path_string(&self) -> String {
-        self.display_string()
+    /// The real filesystem path, when this location is a real directory.
+    /// `None` for a `ZipDir`, so a caller that needs an actual on-disk path
+    /// can never get a display string instead (D-188, REJECT 1).
+    pub fn real_path(&self) -> Option<&Path> {
+        match self {
+            Self::RealDir(path) => Some(path),
+            Self::ZipDir { .. } => None,
+        }
+    }
+
+    /// Owned `String` form of `real_path`, for the many call sites that need
+    /// an owned real path rather than a borrow. Still `None` for a `ZipDir`.
+    pub fn real_path_string(&self) -> Option<String> {
+        self.real_path().map(|p| p.to_string_lossy().into_owned())
     }
 
     /// A human-readable form safe for any GTK widget text (status line,
@@ -250,11 +257,10 @@ impl EntrySource {
         }
     }
 
-    /// Encodes this source as the `String` the still-string-typed plumbing
-    /// (GTK drag payloads, the rename/picker/launcher call sites) carries.
-    /// Round-trips exactly through `Location::parse`.
-    pub fn to_path_string(&self) -> String {
-        self.to_location().to_path_string()
+    /// Owned `String` form of `real_path`, for the many call sites that need
+    /// an owned real path rather than a borrow. Still `None` for a `ZipMember`.
+    pub fn real_path_string(&self) -> Option<String> {
+        self.real_path().map(|p| p.to_string_lossy().into_owned())
     }
 
     pub fn display_string(&self) -> String {
@@ -262,9 +268,9 @@ impl EntrySource {
     }
 
     /// The browse-state `Location` this row would navigate to if it is a
-    /// directory. Only `to_path_string`/`display_string`/navigation use
-    /// this; a real-filesystem-only API must match on `EntrySource` itself
-    /// instead, so a ZIP member can't reach it through this conversion.
+    /// directory. Only `display_string`/navigation use this; a
+    /// real-filesystem-only API must match on `EntrySource` itself instead,
+    /// so a ZIP member can't reach it through this conversion.
     pub fn to_location(&self) -> Location {
         match self {
             Self::Real(path) => Location::RealDir(path.clone()),
@@ -276,19 +282,18 @@ impl EntrySource {
 }
 
 /// Where a clipboard row's bytes come from. Only a `Real` source may ever
-/// populate the clipboard (`cut_selection`/`copy_selection` refuse ZIP rows
-/// the same way `zip_read_only_refusal` refuses a direct mutation), but the
-/// type itself is what makes a `ZipMember` unrepresentable here rather than
-/// relying on that check alone.
+/// populate the clipboard (`cut_selection`/`copy_selection` refuse a ZIP row
+/// before it is built), but the type itself is what makes a `ZipMember`
+/// unrepresentable here rather than relying on that check alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardSource {
     Real(PathBuf),
 }
 
 impl ClipboardSource {
-    pub fn to_path_string(&self) -> String {
+    pub fn real_path(&self) -> &Path {
         match self {
-            Self::Real(path) => path.to_string_lossy().into_owned(),
+            Self::Real(path) => path,
         }
     }
 }
@@ -661,10 +666,9 @@ pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String)], d
 
 /// Immediate children of `internal` (the virtual directory being browsed; ""
 /// for the ZIP root), folders-first, matching the real-directory sort
-/// contract in `list_dir_cancellable` (D-188). Each row's `path` is an
-/// encoded `Location` string (see `Location::to_path_string`), so existing
-/// activation/navigation code that reads `Entry.path` keeps working without
-/// having to special-case ZIP rows for navigation.
+/// contract in `list_dir_cancellable` (D-188). Each row's `source` is a typed
+/// `EntrySource::ZipMember`, so navigation/activation code matches on the
+/// type instead of needing a ZIP special case for a path string.
 pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
     let prefix = if internal.is_empty() { String::new() } else { format!("{internal}/") };
     let mut children: HashMap<String, (bool, u64)> = HashMap::new();
