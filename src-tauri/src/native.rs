@@ -14404,6 +14404,93 @@ Broken: Either state is wrong.\n";
         pump();
     }
 
+    /// D-188 ledger #20: a hard-killed transaction (SIGKILL mid-stream, not a
+    /// cooperative cancel) must leave the chosen real folder byte-identical
+    /// and without any owned stage residue. The child branch (selected by
+    /// `WAYFINDER_D188_KILL_CHILD_DEST`) runs no GTK, just the real
+    /// `copy_zip_members_out` streaming one large member slowly; the parent
+    /// branch spawns this same test binary as that child, SIGKILLs it mid-
+    /// stream, then inspects the destination folder itself.
+    #[test]
+    fn zip_copy_out_hard_kill_leaves_folder_untouched_d188() {
+        if let (Ok(archive), Ok(dest)) = (
+            std::env::var("WAYFINDER_D188_KILL_CHILD_ARCHIVE"),
+            std::env::var("WAYFINDER_D188_KILL_CHILD_DEST"),
+        ) {
+            native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(50_000, Ordering::Relaxed);
+            let archive = PathBuf::from(archive);
+            let dest = PathBuf::from(dest);
+            let file = std::fs::File::open(&archive).unwrap();
+            let archive_len = file.metadata().unwrap().len();
+            let entries = native_core::index_zip(file, &native_core::DEFAULT_ZIP_LIMITS, &AtomicBool::new(false)).unwrap();
+            let entry = entries.iter().find(|e| e.logical_path == "big.bin").unwrap();
+            let member = native_core::ZipMemberRef {
+                archive: archive.clone(),
+                internal: entry.logical_path.clone(),
+                size: entry.size,
+                crc32: entry.crc32,
+                archive_len,
+                member_index: entry.physical_index,
+            };
+            let _ = native_core::copy_zip_members_out(&archive, &[(member, "big.bin".to_string())], &dest, &AtomicBool::new(false));
+            return;
+        }
+        if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+
+        const KILL_MEMBER_LEN: usize = 512 * 1024;
+        let root = crate::native_core::scratch_root().join(format!("wf-d188-kill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let archive_path = root.join("big.zip");
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("big.bin", options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![0x5Au8; KILL_MEMBER_LEN]).unwrap();
+            writer.finish().unwrap();
+        }
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("unrelated.txt"), b"unrelated bytes").unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .arg("tests::zip_copy_out_hard_kill_leaves_folder_untouched_d188")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("WAYFINDER_D188_KILL_CHILD_ARCHIVE", &archive_path)
+            .env("WAYFINDER_D188_KILL_CHILD_DEST", &dest)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(child.try_wait().unwrap().is_none(), "the child must still be mid-stream when killed, or this proof is not testing a hard kill");
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGKILL);
+        }
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "a SIGKILLed child must not report success");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-wf-zip-"))
+            .collect();
+        assert!(leftovers.is_empty(), "a hard-killed transaction must leave no owned stage residue, found {leftovers:?}");
+        assert!(!dest.join("big.bin").exists(), "a hard-killed transaction must never publish a partial member under its real name");
+        assert_eq!(
+            std::fs::read(dest.join("unrelated.txt")).unwrap(),
+            b"unrelated bytes",
+            "an unrelated destination object must survive a hard-killed transaction untouched"
+        );
+        assert_eq!(std::fs::read(&archive_path).unwrap().len(), archive_path.metadata().unwrap().len() as usize, "archive untouched");
+    }
+
     fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> native_core::Location {
         let mut loc = state.borrow().cwd.clone();
         while loc.is_zip() {
