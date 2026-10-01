@@ -9112,7 +9112,7 @@ fn reciprocal_rename(
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{verb} refused: bad original name"))?
         .to_string();
-    let result = native_core::rename_path(&to, &old_name)?;
+    let result = native_core::rename_path(&to, &old_name).map_err(|err| format!("{verb} refused: {err}"))?;
     Ok(UndoAction::Renamed { from: to, to: result, fp })
 }
 
@@ -9150,7 +9150,7 @@ fn reciprocal_batch_rename(
             Ok((item.to.clone(), old_name))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let result = native_core::batch_rename(&requests)?;
+    let result = native_core::batch_rename(&requests).map_err(|err| format!("{verb} refused: {err}"))?;
     Ok(UndoAction::BatchRenamed { items: result, fps })
 }
 
@@ -9192,7 +9192,7 @@ fn reciprocal_restore(
             ));
         }
     }
-    native_core::restore_from_trash_exact(&receipts)?;
+    native_core::restore_from_trash_exact(&receipts).map_err(|err| format!("{verb} refused: {err}"))?;
     let paths = receipts.into_iter().map(|receipt| receipt.original).collect();
     Ok(UndoAction::Created { paths })
 }
@@ -13013,6 +13013,8 @@ Broken: Either state is wrong.\n";
         undo_redo_cycle_batch_renamed_d187();
         undo_redo_cycle_pasted_move_d187();
         undo_redo_branching_history_d187();
+        undo_redo_gate_d187();
+        undo_redo_gate_trash_d187();
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
@@ -19658,6 +19660,304 @@ Broken: Either state is wrong.\n";
         }
         std::fs::remove_dir_all(&root).ok();
         drop(win);
+    }
+
+    /// D-187: the named gate. One real GTK window proves, together, everything
+    /// the round's brief asked for beyond the per-kind slices already proven
+    /// elsewhere: toolbar-button and options-popover routing for Redo (not just
+    /// the keyboard shortcuts), the 100-entry bound, empty-stack no-ops,
+    /// in-flight serialization, and the remaining injected-failure categories
+    /// (symlink substitution, occupied destination, missing source, a
+    /// destination appearing only after the fingerprint preflight passed).
+    fn undo_redo_gate_d187() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d187-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "payload a").unwrap();
+        std::fs::write(dir.join("b.txt"), "payload b").unwrap();
+        std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("link")).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d187gatetest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        let win: gtk::Widget = ui.window.clone().upcast();
+        let at = |name: &str| dir.join(name);
+
+        let press = |key: gdk::Key, mods: gdk::ModifierType| {
+            let handled = ui
+                .window
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
+            pump();
+            handled
+        };
+        let record_rename = |state: &Rc<RefCell<AppState>>, from: &str, to: &str| {
+            std::fs::rename(at(from), at(to)).unwrap();
+            let fp = native_core::fingerprint(&at(to).to_string_lossy()).unwrap();
+            push_undo(state, UndoAction::Renamed { from: at(from).to_string_lossy().to_string(), to: at(to).to_string_lossy().to_string(), fp });
+        };
+        let button_tooltipped = |root: &gtk::Widget, tooltip: &str| -> gtk::Button {
+            all_widgets(root)
+                .into_iter()
+                .find(|w| w.is::<gtk::Button>() && w.tooltip_text().as_deref() == Some(tooltip))
+                .and_then(|w| w.downcast::<gtk::Button>().ok())
+                .unwrap_or_else(|| panic!("no button tooltipped {tooltip:?}"))
+        };
+
+        // ---- Toolbar routing: the real Undo/Redo toolbar buttons, not the keyboard.
+        let undo_button = button_tooltipped(&win, "Undo");
+        let redo_button = button_tooltipped(&win, "Redo");
+        record_rename(&state, "a.txt", "a-renamed.txt");
+        undo_button.emit_clicked();
+        pump();
+        wait_for("toolbar undo", || at("a.txt").is_file() && !at("a-renamed.txt").exists());
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+        redo_button.emit_clicked();
+        pump();
+        wait_for("toolbar redo", || at("a-renamed.txt").is_file() && !at("a.txt").exists());
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+
+        // ---- Options-popover routing: the "Redo" row inside the Options popover.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK)); // undo again, to refill redo_stack
+        wait_for("key undo before popover check", || at("a.txt").is_file());
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+        let options_button = button_labelled(&win, "Options").expect("Options button exists");
+        options_button.emit_clicked();
+        pump();
+        let options_widget: gtk::Widget = options_button.upcast();
+        let popover = popovers_of(&options_widget).into_iter().next().expect("options popover is open");
+        let redo_row = button_labelled(popover.upcast_ref(), "Redo").expect("Redo row exists in the options popover");
+        assert!(redo_row.is_mapped() && redo_row.can_target(), "Redo row is reachable, not just present");
+        redo_row.emit_clicked();
+        pump();
+        wait_for("popover redo", || at("a-renamed.txt").is_file() && !at("a.txt").exists());
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+        record_rename(&state, "a-renamed.txt", "a.txt"); // leave the fixture as it started
+
+        // ---- Empty-stack no-ops: both stacks empty, Undo/Redo must not crash
+        // or touch the filesystem. Settle first: the preceding popover Redo's
+        // own async directory refresh can still land a "N items shown" status a
+        // few frames late and would otherwise race these exact-label checks.
+        for _ in 0..30 {
+            pump();
+        }
+        state.borrow_mut().undo_stack.clear();
+        state.borrow_mut().redo_stack.clear();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("\"Nothing to undo\" status", || ui.status.label() == "Nothing to undo");
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("\"Nothing to redo\" status", || ui.status.label() == "Nothing to redo");
+        assert!(at("a.txt").is_file() && at("b.txt").is_file(), "no-op history never touches disk");
+
+        // ---- In-flight serialization: a second Undo while the first is still
+        // running (the worker thread has not reported back yet) must report busy
+        // rather than racing it.
+        record_rename(&state, "a.txt", "a-busy.txt");
+        undo_action(state.clone(), ui.clone());
+        assert!(state.borrow().history_busy, "the in-flight guard is set synchronously before the worker replies");
+        undo_action(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), "A history action is already in progress", "a concurrent activation is refused, not queued or raced");
+        wait_for("the in-flight undo finishes", || !state.borrow().history_busy);
+        wait_for("fixture back to a.txt", || at("a.txt").is_file());
+        assert_eq!(state.borrow().undo_stack.len(), 0);
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+        press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK);
+        wait_for("redo re-applies the rename", || at("a-busy.txt").is_file() && !at("a.txt").exists());
+        std::fs::rename(at("a-busy.txt"), at("a.txt")).unwrap(); // leave the fixture as it started
+        state.borrow_mut().undo_stack.clear();
+        state.borrow_mut().redo_stack.clear();
+
+        // ---- 100-entry bound: push past the cap and confirm the oldest drops.
+        state.borrow_mut().undo_stack.clear();
+        let fp = native_core::fingerprint(&at("a.txt").to_string_lossy()).unwrap();
+        for n in 0..105 {
+            push_undo(&state, UndoAction::Renamed { from: format!("/synthetic/{n}/from"), to: format!("/synthetic/{n}/to"), fp: fp.clone() });
+        }
+        assert_eq!(state.borrow().undo_stack.len(), 100, "the stack is capped at 100");
+        assert!(
+            matches!(state.borrow().undo_stack.first(), Some(UndoAction::Renamed { from, .. }) if from == "/synthetic/5/from"),
+            "the oldest 5 entries were dropped to make room"
+        );
+        state.borrow_mut().undo_stack.clear();
+
+        // ---- Symlink substitution: a symlink is renamed and recorded, then its
+        // target is swapped before Undo runs. The fingerprint is the link's own
+        // target text, so a substituted target must refuse like edited content.
+        record_rename(&state, "link", "link-renamed");
+        std::fs::remove_file(at("link-renamed")).unwrap();
+        std::os::unix::fs::symlink(dir.join("b.txt"), at("link-renamed")).unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("symlink substitution refused", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Undo refused:"), "status was {:?}", ui.status.label());
+        assert!(!at("link").exists(), "a refused Undo must not recreate the original name");
+        assert_eq!(
+            std::fs::read_link(at("link-renamed")).unwrap(),
+            dir.join("b.txt"),
+            "the substituted target is left exactly as the attacker/race left it"
+        );
+        assert_eq!(state.borrow().undo_stack.len(), 1, "a refused Undo is not consumed");
+        state.borrow_mut().undo_stack.clear();
+        std::fs::remove_file(at("link-renamed")).ok();
+
+        // ---- Occupied destination: Undo of a rename refuses, fail-closed and
+        // with the required prefix, when something now occupies the original name.
+        record_rename(&state, "b.txt", "b-renamed.txt");
+        std::fs::write(at("b.txt"), "a different file occupies the original name").unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("occupied destination refused", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Undo refused:"), "status was {:?}", ui.status.label());
+        assert_eq!(std::fs::read_to_string(at("b.txt")).unwrap(), "a different file occupies the original name");
+        assert!(at("b-renamed.txt").is_file(), "the renamed file itself is untouched by the refusal");
+        assert_eq!(state.borrow().undo_stack.len(), 1);
+        std::fs::remove_file(at("b.txt")).unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("rename undo now succeeds", || at("b.txt").is_file() && !at("b-renamed.txt").exists());
+        state.borrow_mut().undo_stack.clear();
+        state.borrow_mut().redo_stack.clear();
+
+        // ---- Missing source: Redo of a move refuses when the destination it
+        // needs to move back from has simply disappeared.
+        let from = at("a.txt").to_string_lossy().to_string();
+        let to = root.join("elsewhere.txt").to_string_lossy().to_string();
+        std::fs::rename(&from, &to).unwrap();
+        let fps = vec![native_core::fingerprint(&to).unwrap()];
+        push_undo(&state, UndoAction::Pasted { items: vec![native_core::ResolvedItem { from: from.clone(), to: to.clone() }], was_copy: false, fps });
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("moved back for the missing-source setup", || at("a.txt").is_file());
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+        std::fs::remove_file(at("a.txt")).unwrap(); // the Redo's source just vanished
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("missing source refused", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Redo refused:"), "status was {:?}", ui.status.label());
+        assert!(!std::path::Path::new(&to).exists(), "a refused Redo must not fabricate the destination");
+        assert_eq!(state.borrow().redo_stack.len(), 1, "a refused Redo is not consumed");
+        std::fs::write(at("a.txt"), "payload a").unwrap();
+        state.borrow_mut().undo_stack.clear();
+        state.borrow_mut().redo_stack.clear();
+
+        // ---- Destination appearing after preflight: the fingerprint check in
+        // reciprocal_rename passes (nothing about `to` changed), but by the time
+        // the rename itself runs, something already occupies the name it is
+        // about to claim. This is the same no-replace primitive as the
+        // occupied-destination case above, proven here as a race rather than a
+        // pre-existing state, closing the gap the brief calls out explicitly.
+        record_rename(&state, "a.txt", "a-raced.txt");
+        // Nothing changes about a-raced.txt itself (fingerprint still matches);
+        // the race is that b.txt reappears at the ORIGINAL name only after this
+        // point, i.e. after the entry was queued and its one guard already run.
+        std::fs::write(at("a.txt"), "appeared after the undo was queued").unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("raced destination refused", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Undo refused:"), "status was {:?}", ui.status.label());
+        assert_eq!(std::fs::read_to_string(at("a.txt")).unwrap(), "appeared after the undo was queued", "the no-replace primitive never overwrites the newcomer");
+        assert!(at("a-raced.txt").is_file(), "the queued entry's own file is untouched by the refusal");
+        assert_eq!(state.borrow().undo_stack.len(), 1);
+        std::fs::remove_file(at("a.txt")).unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("rename undo succeeds once the name is free again", || at("a.txt").is_file());
+        state.borrow_mut().undo_stack.clear();
+        state.borrow_mut().redo_stack.clear();
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        drop(win);
+    }
+
+    /// D-187 gate, trash-touching half: Created/Trashed and Pasted-copy already
+    /// have their own round-trip proofs; this proves the two remaining
+    /// injected-failure categories that need the real Trash — a tree edit on a
+    /// trashed folder, and a destination reappearing between the fingerprint
+    /// check and the no-replace restore.
+    fn undo_redo_gate_trash_d187() {
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let home = std::env::var("HOME").expect("HOME");
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let stem = format!("wf-d187-gate-trash-{}-{nanos}", std::process::id());
+        let dir = std::path::PathBuf::from(&home).join(".cache").join(&stem);
+        std::fs::create_dir_all(&dir).unwrap();
+        let trash_files = std::path::PathBuf::from(&home).join(".local/share/Trash/files");
+        let trash_info = std::path::PathBuf::from(&home).join(".local/share/Trash/info");
+        let mut cleanup: Vec<String> = Vec::new();
+
+        let mut run = || -> Result<(), String> {
+            // ---- Tree edit: a folder is trashed (Undo of its Created), then its
+            // contents change before Redo restores it. The folder's fingerprint
+            // covers the whole tree, so any change inside refuses the restore.
+            let folder = dir.join("tree");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("inside.txt"), "original tree contents").unwrap();
+            let folder_str = folder.to_string_lossy().to_string();
+
+            let trashed = reciprocal_trash(vec![folder_str.clone()])?;
+            let (receipts, fps) = match trashed {
+                UndoAction::Trashed { receipts, fps } => (receipts, fps),
+                other => panic!("expected Trashed, got {other:?}"),
+            };
+            cleanup.push(std::path::Path::new(&receipts[0].selector).file_name().unwrap().to_string_lossy().to_string());
+            assert!(!folder.exists());
+
+            std::fs::write(std::path::Path::new(&receipts[0].selector).join("inside.txt"), "tampered tree contents").unwrap();
+            let refused = reciprocal_restore(receipts.clone(), fps.clone(), "Redo");
+            let err = refused.expect_err("an edited tree inside Trash must refuse restore");
+            assert!(err.starts_with("Redo refused:"), "message was {err:?}");
+            assert!(!folder.exists(), "a refused restore must not recreate the folder");
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&receipts[0].selector).join("inside.txt")).unwrap(),
+                "tampered tree contents",
+                "a refused restore must not touch the trashed payload either"
+            );
+
+            // ---- Destination appearing after preflight, for a restore: fix the
+            // tree back so the fingerprint matches again, but this time something
+            // now occupies the original folder name before the no-replace move runs.
+            std::fs::write(std::path::Path::new(&receipts[0].selector).join("inside.txt"), "original tree contents").unwrap();
+            std::fs::create_dir_all(&folder).unwrap(); // the destination reappeared
+            let raced = reciprocal_restore(receipts.clone(), fps.clone(), "Redo");
+            let err = raced.expect_err("a destination that reappeared must refuse, never replace it");
+            assert!(err.starts_with("Redo refused:"), "message was {err:?}");
+            assert!(folder.is_dir() && std::fs::read_dir(&folder).unwrap().next().is_none(), "the newcomer at the destination is left exactly as it was");
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&receipts[0].selector).join("inside.txt")).unwrap(),
+                "original tree contents",
+                "the trashed payload itself is untouched by the refusal"
+            );
+
+            std::fs::remove_dir_all(&folder).ok();
+            let restored = reciprocal_restore(receipts, fps, "Redo")?;
+            assert!(matches!(restored, UndoAction::Created { paths } if paths == vec![folder_str.clone()]));
+            assert_eq!(std::fs::read_to_string(folder.join("inside.txt")).unwrap(), "original tree contents", "exact tree restored once the race clears");
+            Ok(())
+        };
+
+        let result = run();
+        for stem in &cleanup {
+            fs::remove_file(trash_files.join(stem)).ok();
+            fs::remove_dir_all(trash_files.join(stem)).ok();
+            fs::remove_file(trash_info.join(format!("{stem}.trashinfo"))).ok();
+        }
+        fs::remove_dir_all(&dir).ok();
+        result.expect("tree-edit and raced-destination refusals should hold");
     }
 
     /// D-20: removing the last row of a folder while focus sat on a file row
