@@ -592,15 +592,18 @@ pub fn index_zip<R: Read + std::io::Seek>(
 /// name — then decompresses to a sibling temp file under the same limits
 /// used at index time and renames into place so a reader never observes a
 /// partial file. Never touches any other member.
-pub fn extract_zip_member(
-    archive_path: &Path,
+/// Finds `internal` by the same encrypted/disallowed-mode-skipping,
+/// fresh-namespace scan every ZIP read uses, then checks the decoded entry
+/// against the same claimed-size/ratio/method rules applied at listing time
+/// plus the caller's expected size/CRC (D-188 REJECT 5: catches an archive
+/// changed since it was listed). Returns the entry's index so the caller can
+/// stream it without a second scan.
+fn locate_and_validate_zip_member(
+    archive: &mut zip::ZipArchive<std::fs::File>,
     internal: &str,
     expected_size: u64,
     expected_crc32: u32,
-    dest_file: &Path,
-) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
+) -> Result<usize, String> {
     let mut found = None;
     for i in 0..archive.len() {
         let raw = archive.by_index_raw(i).map_err(|e| format!("archive is corrupt: {e}"))?;
@@ -618,7 +621,7 @@ pub fn extract_zip_member(
         }
     }
     let index = found.ok_or_else(|| format!("\"{internal}\" was not found in the archive"))?;
-    let mut entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
+    let entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
     if entry.size() > DEFAULT_ZIP_LIMITS.max_entry_claimed_bytes {
         return Err(format!("\"{internal}\" is too large"));
     }
@@ -635,20 +638,51 @@ pub fn extract_zip_member(
             "\"{internal}\" no longer matches what was listed — the archive changed since it was browsed"
         ));
     }
+    Ok(index)
+}
+
+/// Validates `internal` against the live archive without writing anything
+/// (D-188 REJECT 4 preflight pass: every requested member is checked before
+/// any is staged).
+fn validate_zip_member_matches(archive_path: &Path, internal: &str, expected_size: u64, expected_crc32: u32) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
+    locate_and_validate_zip_member(&mut archive, internal, expected_size, expected_crc32)?;
+    Ok(())
+}
+
+/// Revalidates and streams `internal`'s exact bytes to `out_path` (a path
+/// this call owns outright — never the final destination). Separated from
+/// publishing so a caller can stage several members before committing any of
+/// them (D-188 REJECT 4).
+fn stream_zip_member_to(archive_path: &Path, internal: &str, expected_size: u64, expected_crc32: u32, out_path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
+    let index = locate_and_validate_zip_member(&mut archive, internal, expected_size, expected_crc32)?;
+    let mut entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
+    let mut out = std::fs::File::create(out_path).map_err(|e| format!("could not write {}: {e}", out_path.display()))?;
+    std::io::copy(&mut entry, &mut out).map_err(|e| {
+        let _ = std::fs::remove_file(out_path);
+        format!("could not extract \"{internal}\": {e}")
+    })?;
+    Ok(())
+}
+
+pub fn extract_zip_member(
+    archive_path: &Path,
+    internal: &str,
+    expected_size: u64,
+    expected_crc32: u32,
+    dest_file: &Path,
+) -> Result<(), String> {
     let tmp_name = format!(
         ".{}.wf-zip-tmp-{}",
         dest_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
         std::process::id()
     );
     let tmp = dest_file.with_file_name(tmp_name);
-    {
-        let mut out = std::fs::File::create(&tmp).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("could not extract \"{internal}\": {e}")
-        })?;
-    }
-    std::fs::rename(&tmp, dest_file).map_err(|e| {
+    stream_zip_member_to(archive_path, internal, expected_size, expected_crc32, &tmp)?;
+    rename_no_replace(&tmp, dest_file).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("could not publish {}: {e}", dest_file.display())
     })
@@ -702,21 +736,44 @@ impl Drop for ZipOpenCacheRoot {
 /// Returns the path of every file actually created, for the caller to build
 /// a reciprocal `Created` undo entry from, or rolls every created file back
 /// and returns the first error.
+/// D-188 REJECT 4: a validate-then-stage-then-publish transaction, so a
+/// destination created after preflight (the old check-then-extract race) or
+/// a predictable staging name (the old truncating-`File::create` temp) can
+/// never be overwritten. Every member is revalidated against the live
+/// archive first; only once all pass is anything written, each under its own
+/// collision-proof stage name in `dest_dir`; only once every stage streamed
+/// clean is anything published, each via the existing atomic no-replace
+/// rename. A failure at any point removes only the stages and outputs this
+/// call itself created — never a raced or unrelated object — and the
+/// returned paths are exact receipts for Undo/Redo.
 pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String, u64, u32)], dest_dir: &Path) -> Result<Vec<String>, String> {
-    let mut created = Vec::new();
-    for (internal, file_name, size, crc32) in members {
-        let dest = dest_dir.join(file_name);
-        if dest.exists() {
-            for path in &created {
-                let _: Result<(), _> = std::fs::remove_file(path);
+    for (internal, _file_name, size, crc32) in members {
+        validate_zip_member_matches(archive_path, internal, *size, *crc32)?;
+    }
+
+    let mut stages: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (i, (internal, file_name, size, crc32)) in members.iter().enumerate() {
+        let stage = dest_dir.join(format!(".wf-zip-stage-{}-{i}", std::process::id()));
+        if let Err(e) = stream_zip_member_to(archive_path, internal, *size, *crc32, &stage) {
+            for (s, _) in &stages {
+                let _ = std::fs::remove_file(s);
             }
-            return Err(format!("\"{file_name}\" already exists in the destination"));
-        }
-        if let Err(e) = extract_zip_member(archive_path, internal, *size, *crc32, &dest) {
-            for path in &created {
-                let _: Result<(), _> = std::fs::remove_file(path);
-            }
+            let _ = std::fs::remove_file(&stage);
             return Err(e);
+        }
+        stages.push((stage, dest_dir.join(file_name)));
+    }
+
+    let mut created = Vec::new();
+    for (stage, dest) in &stages {
+        if let Err(e) = rename_no_replace(stage, dest) {
+            for (s, _) in &stages {
+                let _ = std::fs::remove_file(s);
+            }
+            for path in &created {
+                let _: Result<(), _> = std::fs::remove_file(path);
+            }
+            return Err(format!("could not publish {}: {e}", dest.display()));
         }
         created.push(dest.to_string_lossy().into_owned());
     }
@@ -6566,5 +6623,43 @@ mod zip_extraction_tests_d188 {
         assert!(result.is_err());
         assert!(!dest.join("x.txt").exists());
         assert_eq!(std::fs::read(dest.join("y.txt")).unwrap(), b"already here");
+    }
+
+    #[test]
+    fn copy_zip_members_out_refuses_destination_created_after_preflight_d188() {
+        // D-188 REJECT 4: the old check-then-extract race could overwrite a
+        // destination that appeared after the `exists()` preflight check but
+        // before the write. There is no production hook to land a file mid-call
+        // here, but this proves the publish step itself (not a preflight
+        // snapshot) is what refuses the conflict, and that a raced object the
+        // transaction did not create is left untouched.
+        let dir = scratch("race");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("x.txt", b"one"), ("y.txt", b"two")], &archive);
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (x_size, x_crc32) = indexed_meta(&archive, "x.txt");
+        let (y_size, y_crc32) = indexed_meta(&archive, "y.txt");
+        // Nothing exists yet, so preflight (if any existed) would pass for both.
+        // Land the conflicting file now, simulating it appearing mid-transaction.
+        std::fs::write(dest.join("y.txt"), b"raced in").unwrap();
+        let result = copy_zip_members_out(
+            &archive,
+            &[
+                ("x.txt".to_string(), "x.txt".to_string(), x_size, x_crc32),
+                ("y.txt".to_string(), "y.txt".to_string(), y_size, y_crc32),
+            ],
+            &dest,
+        );
+        assert!(result.is_err());
+        assert!(!dest.join("x.txt").exists(), "owned output from this transaction must be rolled back");
+        assert_eq!(std::fs::read(dest.join("y.txt")).unwrap(), b"raced in", "the raced object must be left untouched, not overwritten");
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".wf-zip-stage-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no owned stage may survive a failed transaction, found {leftovers:?}");
     }
 }
