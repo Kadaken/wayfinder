@@ -6468,6 +6468,14 @@ fn unregister_window(state: &Rc<RefCell<AppState>>) {
             monitor.cancel();
         }
     }
+    // D-188 REJECT 3: clear this window's private ZIP-open cache roots here,
+    // explicitly, on window close. AppState stays alive beyond this point —
+    // GTK keeps its own strong Rc<RefCell<AppState>> clones inside every
+    // action/signal closure bound to this window's widgets until the
+    // application itself quits — so relying on ZipOpenCacheRoot's Drop firing
+    // only when the last Rc<RefCell<AppState>> clone goes away would leak
+    // every cache root for the rest of the process's life.
+    state.borrow_mut().zip_open_cache_roots.borrow_mut().clear();
     let removed = WINDOWS.with(|windows| windows.borrow_mut().unregister(state));
     drop(removed);
 }
@@ -8131,7 +8139,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
             return;
         }
         eprintln!("wf-event: open {real_path}");
-        match native_core::open_path(&real_path) {
+        match launch_path(&real_path) {
             Err(err) => ui.status.set_label(&format!("Open failed: {err}")),
             // D-75: only a launch that succeeded clears the tutorial.
             #[cfg(feature = "guide")]
@@ -8182,11 +8190,13 @@ fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, member: &native_core:
 
     let state = state.clone();
     let ui = ui.clone();
-    glib::timeout_add_local(JOB_POLL_INTERVAL, move || match rx.try_recv() {
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || {
+        note_open_poll_tick();
+        match rx.try_recv() {
         Ok(Ok((root, dest))) => {
             eprintln!("wf-event: open zip member {internal_for_log}");
             state.borrow().zip_open_cache_roots.borrow_mut().push(root);
-            if let Err(err) = native_core::open_path(&dest.to_string_lossy()) {
+            if let Err(err) = launch_path(&dest.to_string_lossy()) {
                 ui.status.set_label(&format!("Open failed: {err}"));
             }
             glib::ControlFlow::Break
@@ -8200,8 +8210,36 @@ fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, member: &native_core:
             ui.status.set_label("Open failed");
             glib::ControlFlow::Break
         }
+        }
     });
 }
+
+/// Hands `path` to the external launcher the same way for an ordinary real
+/// file and a ZIP member's cached copy (D-188 REJECT 3: Open's one shared
+/// launch point). A test never starts a real application: it records the
+/// call instead, so a named gate can prove exactly one launch with the exact
+/// owned path.
+#[cfg(not(test))]
+fn launch_path(path: &str) -> Result<(), String> {
+    native_core::open_path(path)
+}
+
+#[cfg(test)]
+fn launch_path(path: &str) -> Result<(), String> {
+    TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().push(path.to_string()));
+    Ok(())
+}
+
+/// Counts every `open_zip_member` poll tick (D-188 REJECT 3): a test proves
+/// GTK main-loop ticks actually advance while an allowed large member streams
+/// on its own thread, not just that the final result eventually arrives.
+#[cfg(test)]
+fn note_open_poll_tick() {
+    TEST_OPEN_POLL_TICKS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_open_poll_tick() {}
 
 /// The one New Folder path (background menu, toolbar, options menu, Ctrl+Shift+N):
 /// create a real numbered folder, then open the shared inline editor on it with
@@ -11764,6 +11802,15 @@ thread_local! {
     /// Cancel, consumed (taken) by the one call that reads it.
     #[cfg(test)]
     static TEST_COPY_OUT_DESTINATION: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// D-188 REJECT 3: every path `launch_path` would have handed the real
+    /// external launcher, in call order, instead of ever starting one.
+    #[cfg(test)]
+    static TEST_LAUNCHER_CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// D-188 REJECT 3: counts `open_zip_member`'s poll ticks, so a test can
+    /// prove the GTK main loop keeps advancing while a large member streams
+    /// on its own thread instead of merely waiting for the final result.
+    #[cfg(test)]
+    static TEST_OPEN_POLL_TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The real scan, or in tests a synthetic one; tests never touch a real drive.
@@ -13428,6 +13475,7 @@ Broken: Either state is wrong.\n";
     /// working Undo/Redo — while the archive's own bytes and mtime never
     /// change and no residue is left behind.
     fn zip_read_only_browse_open_copy_out_d188() {
+        const BIG_MEMBER_LEN: usize = 512 * 1024;
         // D-188: Copy Out's Undo goes through the real GIO trash, whose
         // on-disk location GLib resolves from `$HOME` and caches for the rest
         // of the process — so, unlike every other path this test touches,
@@ -13458,6 +13506,8 @@ Broken: Either state is wrong.\n";
             std::io::Write::write_all(&mut writer, b"second file").unwrap();
             writer.start_file("docs/sub dir/\u{1F600} emoji.txt", options).unwrap();
             std::io::Write::write_all(&mut writer, b"unicode and spaces").unwrap();
+            writer.start_file("docs/big.bin", options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![0x5Au8; BIG_MEMBER_LEN]).unwrap();
             writer.add_directory("empty-dir/", options).unwrap();
             writer.start_file("zero.bin", options).unwrap();
             writer.finish().unwrap();
@@ -13565,8 +13615,8 @@ Broken: Either state is wrong.\n";
         // ---- Descend into a nested dir with a space in its name; verify Up pops one segment.
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
-        wait_for("docs children", || names(&state) == vec!["readme.txt", "second.txt", "sub dir"]);
-        assert_eq!(names(&state), vec!["readme.txt", "second.txt", "sub dir"]);
+        wait_for("docs children", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
+        assert_eq!(names(&state), vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
         let sub_entry = state.borrow().visible_entries.iter().find(|e| e.name == "sub dir").cloned().unwrap();
         open_entry(&state, &ui, sub_entry);
         wait_for("sub dir children", || state.borrow().visible_entries.len() == 1 && state.borrow().visible_entries[0].name == "\u{1F600} emoji.txt");
@@ -13578,8 +13628,8 @@ Broken: Either state is wrong.\n";
 
         let up_to = state.borrow().cwd.parent();
         navigate(&state, up_to);
-        wait_for("up one level", || names(&state) == vec!["readme.txt", "second.txt", "sub dir"]);
-        assert_eq!(names(&state), vec!["readme.txt", "second.txt", "sub dir"]);
+        wait_for("up one level", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
+        assert_eq!(names(&state), vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
 
         // ---- Every mutation surface refuses with the exact message, fail-closed.
         select_entry_by_source(&state, &ui, &state.borrow().visible_entries[0].source.clone());
@@ -13607,6 +13657,7 @@ Broken: Either state is wrong.\n";
         }
 
         // ---- Open: streams the exact member to a private per-session cache.
+        TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
         let readme_entry = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").cloned().unwrap();
         open_entry(&state, &ui, readme_entry);
         pump();
@@ -13614,6 +13665,27 @@ Broken: Either state is wrong.\n";
         wait_for("the cache folder exists", || cache_root.is_dir());
         let cached_file = walk_find_file(&cache_root, "readme.txt").expect("cached readme.txt");
         assert_eq!(std::fs::read(&cached_file).unwrap(), b"read me");
+
+        // D-188 REJECT 3: exactly one launcher call, for the exact owned cache path.
+        let calls = TEST_LAUNCHER_CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, vec![cached_file.to_string_lossy().to_string()], "Open must launch the owned cache path exactly once");
+
+        // D-188 REJECT 3: GTK keeps ticking while a large allowed member streams,
+        // instead of blocking until the background thread finishes.
+        TEST_OPEN_POLL_TICKS.with(|c| c.set(0));
+        TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
+        native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(20_000, Ordering::Relaxed);
+        let big_entry = state.borrow().visible_entries.iter().find(|e| e.name == "big.bin").cloned().unwrap();
+        open_entry(&state, &ui, big_entry);
+        pump();
+        wait_for("big.bin is cached", || walk_find_file(&cache_root, "big.bin").is_some());
+        native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(0, Ordering::Relaxed);
+        let ticks = TEST_OPEN_POLL_TICKS.with(|c| c.get());
+        assert!(ticks > 1, "main loop must tick more than once while a large member streams, got {ticks}");
+        let big_cached = walk_find_file(&cache_root, "big.bin").expect("cached big.bin");
+        assert_eq!(std::fs::metadata(&big_cached).unwrap().len(), BIG_MEMBER_LEN as u64);
+        let calls = TEST_LAUNCHER_CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, vec![big_cached.to_string_lossy().to_string()], "Open of the large member must also launch exactly once");
 
         // ---- Copy Out, through the real entry point: the "Copy Out..." item
         // menu action, with a destination injected in place of a physical
@@ -13623,7 +13695,7 @@ Broken: Either state is wrong.\n";
         wait_for("back at zip root", || names(&state) == vec!["docs", "empty-dir", "zero.bin"]);
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
-        wait_for("docs children again", || names(&state) == vec!["readme.txt", "second.txt", "sub dir"]);
+        wait_for("docs children again", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
 
         // ---- Cancelling the chooser starts no job and changes no history or bytes.
         let readme_index = state.borrow().visible_entries.iter().position(|e| e.name == "readme.txt").unwrap();
@@ -13701,8 +13773,25 @@ Broken: Either state is wrong.\n";
             assert!(button.is_sensitive() && button.is_visible(), "toolbar {label} must be restored outside a ZIP");
         }
 
+        // D-188 REJECT 3: closing the window must remove the private cache
+        // root through production ownership alone (window close ->
+        // connect_close_request -> unregister_window), not through this
+        // fixture's own `_cleanup` (ScratchCleanup only fires on this
+        // function's return/drop, which has not happened yet, so it cannot
+        // be what makes this assertion pass).
+        // `cache_root` is the shared `wayfinder-zip-cache` parent, not a single
+        // transaction's own slot — it is never owned/removed by any one
+        // `ZipOpenCacheRoot`, so the real per-Open slot folders are what must
+        // go, not the shared parent itself.
+        let readme_slot_root = cached_file.parent().expect("readme's own cache slot folder").to_path_buf();
+        let big_slot_root = big_cached.parent().expect("big.bin's own cache slot folder").to_path_buf();
+        assert!(readme_slot_root.is_dir() && big_slot_root.is_dir(), "both cache slots must still exist before the window closes");
         ui.window.close();
         pump();
+        assert!(
+            !readme_slot_root.exists() && !big_slot_root.exists(),
+            "closing the window must remove every cache slot it owns"
+        );
     }
 
     /// D-188 bad-ZIP oracles: every rejection the archive-loading path (and,
