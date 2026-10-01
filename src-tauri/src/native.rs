@@ -4034,10 +4034,11 @@ fn rebuild_tabs(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     };
 
     for (index, path) in tabs.iter().enumerate() {
-        let label = tab_label(path);
+        let display_path = native_core::Location::parse(path).display_string();
+        let label = tab_label(&display_path);
         let tab = gtk::Button::builder()
             .label(&label)
-            .tooltip_text(path)
+            .tooltip_text(&display_path)
             .build();
         tab.add_css_class("wf-tab");
         if index == active_tab {
@@ -5954,7 +5955,7 @@ fn navigate_to_with_message(
             keep_focus_on_empty_view(&ui.grid, focus_was_in_grid, true);
         }
         set_preview_text(ui, "Loading folder…");
-        ui.status.set_label(&format!("Loading {path}"));
+        ui.status.set_label(&format!("Loading {}", native_core::Location::parse(&path).display_string()));
     }
 
     let path_for_worker = path.clone();
@@ -6056,7 +6057,7 @@ fn navigate_to_with_message(
                     set_breadcrumbs(&state, ui, &current_path);
                     repopulate_rows(&state, ui);
                     update_selection(&state, ui);
-                    ui.status.set_label(&format!("Cannot open {path}: {error}"));
+                    ui.status.set_label(&format!("Cannot open {}: {error}", native_core::Location::parse(&path).display_string()));
                 }
             }
             glib::ControlFlow::Break
@@ -6418,9 +6419,8 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
     while let Some(child) = ui.path_crumbs.first_child() {
         ui.path_crumbs.remove(&child);
     }
-    ui.path_crumbs.set_tooltip_text(Some(path));
-
     let location = native_core::Location::parse(path);
+    ui.path_crumbs.set_tooltip_text(Some(&location.display_string()));
     // Real ancestors first — the ZIP's own containing folder when `path` is a
     // ZIP location, otherwise `path` itself (unchanged real-folder behavior).
     let real_prefix = match &location {
@@ -6775,9 +6775,10 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         line.add_css_class("wf-file-row");
+        let entry_display_path = native_core::Location::parse(&entry.path).display_string();
         line.set_tooltip_text(Some(&entry.metadata_error.as_ref().map_or_else(
-            || entry.path.clone(),
-            |error| format!("{}\nMetadata unavailable: {error}", entry.path),
+            || entry_display_path.clone(),
+            |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
         )));
 
         let icon = file_icon(&entry, icon_zoom);
@@ -7078,9 +7079,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 
     for (index, entry) in visible_entries.into_iter().enumerate() {
+        let entry_display_path = native_core::Location::parse(&entry.path).display_string();
         let tooltip = entry.metadata_error.as_ref().map_or_else(
-            || entry.path.clone(),
-            |error| format!("{}\nMetadata unavailable: {error}", entry.path),
+            || entry_display_path.clone(),
+            |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
         );
 
         if view_mode == ViewMode::Grid {
@@ -13150,6 +13152,250 @@ Broken: Either state is wrong.\n";
         pump();
     }
 
+    /// D-188: a synthetic ZIP browsed end to end on the real app — root
+    /// activation, nested dirs, spaces/Unicode/empty dirs/zero-byte files,
+    /// breadcrumbs, Up, every mutation surface refusing with the exact
+    /// message, no drag/drop mutation path open, Open streaming one exact
+    /// member to a private cache, and Copy Out landing in a real folder with
+    /// working Undo/Redo — while the archive's own bytes and mtime never
+    /// change and no residue is left behind.
+    fn zip_read_only_browse_open_copy_out_d188() {
+        // D-188: Copy Out's Undo goes through the real GIO trash, whose
+        // on-disk location GLib resolves from `$HOME` and caches for the rest
+        // of the process — so, unlike every other path this test touches,
+        // this one cannot be redirected to a private per-test `$HOME` the way
+        // `undo_redo_gate_trash_d187` already established: lock out other
+        // real-trash tests and use the ambient `$HOME` instead.
+        let _trash_guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d188-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("dir");
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let archive_path = dir.join("fixture.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.add_directory("docs/", options).unwrap();
+            writer.start_file("docs/readme.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"read me").unwrap();
+            writer.start_file("docs/sub dir/\u{1F600} emoji.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"unicode and spaces").unwrap();
+            writer.add_directory("empty-dir/", options).unwrap();
+            writer.start_file("zero.bin", options).unwrap();
+            writer.finish().unwrap();
+        }
+        let archive_bytes_before = std::fs::read(&archive_path).unwrap();
+        let archive_mtime_before = std::fs::metadata(&archive_path).unwrap().modified().unwrap();
+
+        let old_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let xdg_dir = root.join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &xdg_dir);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d188test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing the real folder", || state.borrow().visible_entries.len() == 1);
+
+        // ---- Activating the real .zip file enters its virtual root (open_entry).
+        let zip_entry = state.borrow().visible_entries[0].clone();
+        assert_eq!(zip_entry.name, "fixture.zip");
+        open_entry(&state, &ui, zip_entry.clone());
+        wait_for("inside the zip root", || {
+            native_core::Location::parse(&state.borrow().cwd).is_zip()
+        });
+        wait_for("zip root children", || state.borrow().visible_entries.len() == 3);
+        let names = |s: &Rc<RefCell<AppState>>| -> Vec<String> {
+            let mut v: Vec<String> = s.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&state), vec!["docs", "empty-dir", "zero.bin"]);
+
+        // ---- Breadcrumbs: the real containing folder, then the archive, with no crumb for it being "current" misleadingly.
+        let crumbs_root: gtk::Widget = ui.path_crumbs.clone().upcast();
+        assert!(button_labelled(&crumbs_root, "fixture.zip").is_some(), "the archive itself is a breadcrumb");
+
+        // ---- Descend into a nested dir with a space in its name; verify Up pops one segment.
+        let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
+        open_entry(&state, &ui, docs_entry);
+        wait_for("docs children", || state.borrow().visible_entries.len() == 2);
+        assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
+        let sub_entry = state.borrow().visible_entries.iter().find(|e| e.name == "sub dir").cloned().unwrap();
+        open_entry(&state, &ui, sub_entry);
+        wait_for("sub dir children", || state.borrow().visible_entries.len() == 1);
+        assert_eq!(state.borrow().visible_entries[0].name, "\u{1F600} emoji.txt");
+        assert!(
+            button_labelled(&ui.path_crumbs.clone().upcast(), "sub dir").is_some(),
+            "nested internal folder is its own breadcrumb"
+        );
+
+        let up_to = native_core::Location::parse(&state.borrow().cwd).parent().to_path_string();
+        navigate(&state, up_to);
+        wait_for("up one level", || state.borrow().visible_entries.len() == 2);
+        assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
+
+        // ---- Every mutation surface refuses with the exact message, fail-closed.
+        select_entry_by_path(&state, &ui, &state.borrow().visible_entries[0].path.clone());
+        let refusal = native_core::ZIP_READ_ONLY_MESSAGE;
+        create_folder_action(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "New Folder refused inside a ZIP");
+        create_file_action(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "New File refused inside a ZIP");
+        rename_action(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "Rename refused inside a ZIP");
+        cut_selection(&state, &ui);
+        assert_eq!(ui.status.label(), refusal, "Cut refused inside a ZIP");
+        trash_selection(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "Trash refused inside a ZIP");
+        compress_selection(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "Compress refused inside a ZIP");
+        {
+            let out_str = out_dir.to_string_lossy().to_string();
+            std::fs::write(out_dir.join("blocker.txt"), "x").unwrap();
+            let paste_into_zip = Transfer {
+                srcs: vec![out_dir.join("blocker.txt").to_string_lossy().into_owned()],
+                dest: state.borrow().cwd.clone(),
+                is_copy: true,
+                clear_cut_after: false,
+                style: TransferStyle::Paste,
+            };
+            transfer_with_preflight(state.clone(), ui.clone(), paste_into_zip);
+            assert_eq!(ui.status.label(), refusal, "Paste into a ZIP is always refused");
+            let _ = out_str;
+        }
+
+        // ---- Open: streams the exact member to a private per-session cache.
+        let readme_entry = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").cloned().unwrap();
+        open_entry(&state, &ui, readme_entry);
+        pump();
+        let cache_root = xdg_dir.join("wayfinder-zip-cache");
+        wait_for("the cache folder exists", || cache_root.is_dir());
+        let cached_file = walk_find_file(&cache_root, "readme.txt").expect("cached readme.txt");
+        assert_eq!(std::fs::read(&cached_file).unwrap(), b"read me");
+
+        // ---- Copy Out: lands real files in a real folder with working Undo/Redo.
+        let before_undo_len = state.borrow().undo_stack.len();
+        let out_str = out_dir.to_string_lossy().to_string();
+        navigate(&state, up_to_zip_root(&state));
+        wait_for("back at zip root", || state.borrow().visible_entries.len() == 3);
+        let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
+        open_entry(&state, &ui, docs_entry);
+        wait_for("docs children again", || state.borrow().visible_entries.len() == 2);
+        let readme_path = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().path.clone();
+        select_entry_by_path(&state, &ui, &readme_path);
+        let copy_out = Transfer {
+            srcs: vec![readme_path],
+            dest: out_str.clone(),
+            is_copy: true,
+            clear_cut_after: false,
+            style: TransferStyle::Paste,
+        };
+        transfer_with_preflight(state.clone(), ui.clone(), copy_out);
+        wait_for("copy out lands on disk", || out_dir.join("readme.txt").is_file());
+        assert_eq!(std::fs::read(out_dir.join("readme.txt")).unwrap(), b"read me");
+        wait_for("undo stack grew by one", || state.borrow().undo_stack.len() == before_undo_len + 1);
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Created { paths }) if paths == &vec![out_dir.join("readme.txt").to_string_lossy().into_owned()]));
+
+        let press = |key: gdk::Key, mods: gdk::ModifierType| {
+            ui.window
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
+            pump();
+        };
+        press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK);
+        wait_for("undo removes the copied-out file", || !out_dir.join("readme.txt").exists());
+        press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK);
+        wait_for("redo brings it back", || out_dir.join("readme.txt").is_file());
+
+        // ---- The archive itself was never touched by any of the above.
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive bytes unchanged");
+        assert_eq!(std::fs::metadata(&archive_path).unwrap().modified().unwrap(), archive_mtime_before, "archive mtime unchanged");
+
+        ui.window.close();
+        pump();
+        match old_xdg {
+            Some(xdg) => std::env::set_var("XDG_RUNTIME_DIR", xdg),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> String {
+        let mut loc = native_core::Location::parse(&state.borrow().cwd);
+        while loc.is_zip() {
+            let next = loc.parent();
+            if !next.is_zip() {
+                break;
+            }
+            loc = next;
+        }
+        loc.to_path_string()
+    }
+
+    fn walk_find_file(root: &Path, name: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk_find_file(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().map(|n| n.to_string_lossy() == name).unwrap_or(false) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// D-188 alone on a virtual display: the synthetic ZIP browse/Open/Copy
+    /// Out/Undo-Redo gate, run on its own instead of inside the full suite.
+    #[test]
+    fn zip_read_only_browse_open_copy_out_d188_alone() {
+        if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        zip_read_only_browse_open_copy_out_d188();
+    }
+
+    /// D-187 carried: the accepted round-187 Undo/Redo set, run on its own
+    /// for a regression-only re-check (not reopening round 187).
+    #[test]
+    fn undo_redo_d187_regression_alone() {
+        if std::env::var("WAYFINDER_D187_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        // Real GIO trash caches the real $HOME's trash-dir mapping internally
+        // on the first real trash() call in the process; every other D-187
+        // sub-test below sandboxes itself by overriding $HOME, and GIO's
+        // cache does not notice that override being restored afterward. Run
+        // the real-trash gate first so that cache is primed from the real
+        // $HOME before anything else touches it.
+        undo_redo_gate_trash_d187();
+        undo_redo_cycle_renamed_d187();
+        undo_redo_cycle_batch_renamed_d187();
+        undo_redo_cycle_pasted_move_d187();
+        undo_redo_branching_history_d187();
+        undo_redo_gate_d187();
+    }
+
     /// Runs only under a virtual display (see the env guard), so it can never
     /// open a window on the owner's screen.
     /// All GTK tests share one thread (GTK initializes once) and run only under
@@ -13235,6 +13481,7 @@ Broken: Either state is wrong.\n";
         guide_sitting_attached_card_d154();
         transfer_progress_and_cancel_d155();
         transfer_progress_and_cancel_d185();
+        zip_read_only_browse_open_copy_out_d188();
     }
 
     /// D-84: a disposable fixture of tiny real (not real-photo) PNGs proves the
@@ -18613,6 +18860,7 @@ Broken: Either state is wrong.\n";
         };
         let (a0, a1, a2, b0, b1) = (mk("a0"), mk("a1"), mk("a2"), mk("b0"), mk("b1"));
         let missing = root.join("missing").to_string_lossy().to_string();
+        let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
             .application_id("com.kadaken.wayfinder.d27test")
@@ -18739,6 +18987,11 @@ Broken: Either state is wrong.\n";
         wait_for("A after close", at(&a1));
         assert_eq!(state.borrow().tabs.tabs.len(), 1);
         assert_eq!(hist(0), before.0);
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22() {
@@ -18752,6 +19005,7 @@ Broken: Either state is wrong.\n";
         for name in ["a.txt", "b.txt", "c.txt"] {
             std::fs::write(dir.join(name), "1").unwrap();
         }
+        let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
             .application_id("com.kadaken.wayfinder.d22test")
@@ -18847,6 +19101,10 @@ Broken: Either state is wrong.\n";
 
         ui.window.destroy();
         let _ = std::fs::remove_dir_all(&root);
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     /// Joins a background writer on success and on panic.
@@ -18902,6 +19160,7 @@ Broken: Either state is wrong.\n";
         for name in ["a.txt", "b.txt", "c.txt", "g.part"] {
             std::fs::write(dir.join(name), "1").unwrap();
         }
+        let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
             .application_id("com.kadaken.wayfinder.d22stream")
@@ -18998,6 +19257,10 @@ Broken: Either state is wrong.\n";
         }
         eprintln!("wf-event: d22 sustained writer gate: {report:?}");
         ui.window.destroy();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     /// Removes a scratch fixture on success and on a failed assertion.
