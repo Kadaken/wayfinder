@@ -8012,8 +8012,14 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         && Path::new(&entry.path)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    let zip_member = match native_core::Location::parse(&entry.path) {
+        native_core::Location::ZipDir { archive, internal } if !entry.is_dir => Some((archive, internal)),
+        _ => None,
+    };
     if is_ordinary_zip_file {
         navigate(state, native_core::Location::zip_root(entry.path).to_path_string());
+    } else if let Some((archive, internal)) = zip_member {
+        open_zip_member(ui, &archive, &internal, &entry.name);
     } else if entry.is_dir {
         navigate(state, entry.path);
     } else if std::fs::symlink_metadata(&entry.path).is_err() {
@@ -8031,6 +8037,39 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
             #[cfg(not(feature = "guide"))]
             Ok(()) => {}
         }
+    }
+}
+
+/// D-188 Open: streams exactly one ZIP member into a private per-session
+/// cache folder under `$XDG_RUNTIME_DIR` (or the process temp dir when that
+/// is unset), then hands the cached real file to the external launcher the
+/// same way an ordinary file open does. Every call gets its own numbered
+/// slot, so two members named the same (from the same or different
+/// archives) never collide, and a stale cached copy from an earlier Open
+/// never gets handed out again.
+fn open_zip_member(ui: &Ui, archive: &Path, internal: &str, display_name: &str) {
+    static SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static NEXT_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let session_id = SESSION_ID.get_or_init(|| std::process::id().to_string());
+    let slot = NEXT_SLOT.fetch_add(1, Ordering::SeqCst);
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let cache_dir = match native_core::ensure_zip_open_cache_dir(&runtime_dir, session_id, slot) {
+        Ok(dir) => dir,
+        Err(err) => {
+            ui.status.set_label(&format!("Open failed: {err}"));
+            return;
+        }
+    };
+    let dest = cache_dir.join(display_name);
+    if let Err(err) = native_core::extract_zip_member(archive, internal, &dest) {
+        ui.status.set_label(&format!("Open failed: {err}"));
+        return;
+    }
+    eprintln!("wf-event: open zip member {internal}");
+    if let Err(err) = native_core::open_path(&dest.to_string_lossy()) {
+        ui.status.set_label(&format!("Open failed: {err}"));
     }
 }
 
@@ -8231,6 +8270,31 @@ struct Transfer {
 fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
     if let Some(msg) = native_core::zip_read_only_refusal(&transfer.dest) {
         ui.status.set_label(msg);
+        return;
+    }
+    let zip_srcs: Vec<(PathBuf, String)> = transfer
+        .srcs
+        .iter()
+        .filter_map(|p| match native_core::Location::parse(p) {
+            native_core::Location::ZipDir { archive, internal } if !internal.is_empty() => Some((archive, internal)),
+            _ => None,
+        })
+        .collect();
+    if !zip_srcs.is_empty() {
+        if zip_srcs.len() != transfer.srcs.len() {
+            ui.status.set_label("Can't mix ZIP members with other items in one transfer");
+            return;
+        }
+        if !transfer.is_copy {
+            ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+            return;
+        }
+        let same_archive = zip_srcs.windows(2).all(|w| w[0].0 == w[1].0);
+        if !same_archive {
+            ui.status.set_label("Can't copy members from more than one ZIP at once");
+            return;
+        }
+        copy_zip_members_out_action(state, ui, zip_srcs, transfer.dest);
         return;
     }
     if state.borrow().active_transfer.is_some() {
@@ -8944,6 +9008,37 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or(created)
             )))
+        },
+        |_, _, _| {},
+    );
+}
+
+/// D-188 Copy Out: streams the selected ZIP members directly into a real
+/// destination folder, each under its own file name, refusing (not
+/// overwriting) on a name clash. The committed copy enters the accepted
+/// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
+/// New Folder/New File — Undo simply deletes the real files it made.
+fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String)>, dest: String) {
+    let archive = zip_srcs[0].0.clone();
+    let count = zip_srcs.len();
+    let members: Vec<(String, String)> = zip_srcs
+        .into_iter()
+        .map(|(_, internal)| {
+            let name = internal.rsplit('/').next().unwrap_or(&internal).to_string();
+            (internal, name)
+        })
+        .collect();
+    let dest_path = PathBuf::from(dest);
+    run_job(
+        state,
+        ui,
+        format!("Copying {count} item{} out of the ZIP", plural(count)),
+        move || {
+            let created = native_core::copy_zip_members_out(&archive, &members, &dest_path)?;
+            Ok(JobOutcome::undo(
+                format!("Copied {count} item{} out of the ZIP", plural(count)),
+                UndoAction::Created { paths: created },
+            ))
         },
         |_, _, _| {},
     );
