@@ -11990,6 +11990,14 @@ fn copy_out_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 /// overwriting) on a name clash. The committed copy enters the accepted
 /// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
 /// New Folder/New File — Undo simply deletes the real files it made.
+/// D-188 ledger #16/#17/#18 test-only race injection: lets a test land a
+/// conflicting file at the exact moment real `run_job` machinery reaches
+/// `copy_zip_members_out_for_test`'s `after_preflight` hook — the real
+/// check-then-stage-then-publish race, through the production action's own
+/// worker thread, not a conflict written before the action is even called.
+#[cfg(test)]
+static TEST_COPY_OUT_RACE_HOOK: std::sync::Mutex<Option<(PathBuf, Vec<u8>)>> = std::sync::Mutex::new(None);
+
 fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<native_core::ZipMemberRef>, dest_path: PathBuf) {
     let archive = zip_srcs[0].archive.clone();
     let count = zip_srcs.len();
@@ -12006,6 +12014,14 @@ fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: V
         format!("Copying {count} item{} out of the ZIP", plural(count)),
         move || {
             let cancelled = AtomicBool::new(false);
+            #[cfg(test)]
+            let created = match TEST_COPY_OUT_RACE_HOOK.lock().unwrap().take() {
+                Some((race_path, race_bytes)) => native_core::copy_zip_members_out_for_test(&archive, &members, &dest_path, &cancelled, &|| {
+                    let _ = std::fs::write(&race_path, &race_bytes);
+                })?,
+                None => native_core::copy_zip_members_out(&archive, &members, &dest_path, &cancelled)?,
+            };
+            #[cfg(not(test))]
             let created = native_core::copy_zip_members_out(&archive, &members, &dest_path, &cancelled)?;
             Ok(JobOutcome::undo(
                 format!("Copied {count} item{} out of the ZIP", plural(count)),
@@ -13954,6 +13970,67 @@ Broken: Either state is wrong.\n";
         pump();
         wait_for("redo brings both back", || out_dir.join("readme.txt").is_file() && out_dir.join("second.txt").is_file());
         assert!(state.borrow().cwd.is_zip(), "Redo must not navigate away from the archive");
+
+        // D-188 ledger #15/#19: a pre-existing destination conflict refuses
+        // without overwrite, and leaves no job/history/stage residue.
+        let conflict_dir = dir.join("conflict-out");
+        std::fs::create_dir_all(&conflict_dir).unwrap();
+        std::fs::write(conflict_dir.join("second.txt"), b"already there").unwrap();
+        select_index(&state, &ui, readme_index);
+        ui.list_selection.select_item(second_index as u32, false);
+        let before_undo_len_15 = state.borrow().undo_stack.len();
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(conflict_dir.clone()));
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        wait_for("conflicting copy out reports failure", || ui.status.label().starts_with("Operation failed"));
+        assert!(!conflict_dir.join("readme.txt").exists(), "a refused transaction publishes nothing, including the non-conflicting member");
+        assert_eq!(std::fs::read(conflict_dir.join("second.txt")).unwrap(), b"already there", "the pre-existing conflicting file must not be overwritten");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len_15, "a refused transaction adds no history");
+        let leftovers15: Vec<_> = std::fs::read_dir(&conflict_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-wf-zip-"))
+            .collect();
+        assert!(leftovers15.is_empty(), "a failed transaction must leave no owned stage residue, found {leftovers15:?}");
+
+        // D-188 ledger #16/#17/#18/#19: a destination created after preflight
+        // (the real check-then-stage-then-publish race, through production's
+        // own worker thread) also refuses without overwrite, rolling back
+        // only the output this transaction itself staged while leaving the
+        // raced file and an unrelated file untouched, with no residue.
+        let race_dir = dir.join("race-out");
+        std::fs::create_dir_all(&race_dir).unwrap();
+        std::fs::write(race_dir.join("unrelated.txt"), b"unrelated bytes").unwrap();
+        select_index(&state, &ui, readme_index);
+        ui.list_selection.select_item(second_index as u32, false);
+        let before_undo_len_16 = state.borrow().undo_stack.len();
+        TEST_COPY_OUT_RACE_HOOK
+            .lock()
+            .unwrap()
+            .replace((race_dir.join("second.txt"), b"raced in after preflight".to_vec()));
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(race_dir.clone()));
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        wait_for("raced copy out reports failure", || ui.status.label().starts_with("Operation failed"));
+        assert!(!race_dir.join("readme.txt").exists(), "the output this transaction itself staged must be rolled back");
+        assert_eq!(
+            std::fs::read(race_dir.join("second.txt")).unwrap(),
+            b"raced in after preflight",
+            "the raced object must be left exactly as the race wrote it, not overwritten"
+        );
+        assert_eq!(std::fs::read(race_dir.join("unrelated.txt")).unwrap(), b"unrelated bytes", "an unrelated destination object must stay untouched");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len_16, "a raced, refused transaction adds no history");
+        let leftovers16: Vec<_> = std::fs::read_dir(&race_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-wf-zip-"))
+            .collect();
+        assert!(leftovers16.is_empty(), "no owned stage may survive a failed transaction, found {leftovers16:?}");
+        TEST_COPY_OUT_RACE_HOOK.lock().unwrap().take();
 
         // ---- The archive itself was never touched by any of the above.
         assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive bytes unchanged");
