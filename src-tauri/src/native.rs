@@ -13983,6 +13983,22 @@ Broken: Either state is wrong.\n";
             "a bad-CRC member leaves no cached file"
         );
 
+        // D-188 REJECT 7: stale-list proof. The archive backing an already-
+        // listed row vanishes from disk after it was indexed; re-activating
+        // that now-stale row must surface a bounded "Cannot open" error, not
+        // hang, panic, or silently present a cached/stale listing as current.
+        let up_from_badcrc = state.borrow().cwd.parent();
+        navigate(&state, up_from_badcrc);
+        wait_for("back at the real folder", || !state.borrow().cwd.is_zip());
+        std::fs::remove_file(root.join("badcrc.zip")).unwrap();
+        wait_for("listing still shows the now-stale row", || {
+            state.borrow().visible_entries.iter().any(|e| e.name == "badcrc.zip")
+        });
+        let stale_entry = state.borrow().visible_entries.iter().find(|e| e.name == "badcrc.zip").cloned().unwrap();
+        open_entry(&state, &ui, stale_entry);
+        wait_for("stale row is refused boundedly", || ui.status.label().starts_with("Cannot open "));
+        assert!(!state.borrow().cwd.is_zip(), "a vanished archive must never be entered");
+
         ui.window.close();
         pump();
     }
