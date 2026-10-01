@@ -14803,6 +14803,8 @@ Broken: Either state is wrong.\n";
     /// `DEFAULT_ZIP_LIMITS`, so one boundary group never trips another.
     /// D-188 ledger #59: actual streamed bytes, below/at/over what the
     /// archive declares, proven through both production Open and Copy Out.
+    /// D-188 ledger #61: a boundary refusal that takes real wall-clock time
+    /// to reach settles within a named bound while GTK keeps ticking.
     #[test]
     fn zip_size_limit_boundaries_d188() {
         if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
@@ -15118,6 +15120,46 @@ Broken: Either state is wrong.\n";
         let up_from_over = state.borrow().cwd.parent();
         navigate(&state, up_from_over);
         wait_for("back out of over.zip", || !state.borrow().cwd.is_zip());
+
+        // ---- #61: a boundary refusal that takes real wall-clock time to
+        // reach (a slow central-directory scan over many members, via
+        // `TEST_INDEX_ENTRY_DELAY_MICROS`) still settles within a named
+        // bound, and the GTK main loop keeps pumping meanwhile rather than
+        // blocking — proved by a plain periodic timeout counter ticking
+        // while `index_zip` runs on its own worker thread.
+        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_members: 50, ..native_core::DEFAULT_ZIP_LIMITS }));
+        native_core::TEST_INDEX_ENTRY_DELAY_MICROS.store(5_000, Ordering::Relaxed);
+        let dir61 = group_dir("g61-slow-refusal");
+        {
+            let file = std::fs::File::create(dir61.join("slowmany.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for i in 0..80 {
+                writer.start_file(format!("m{i}.txt"), stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let mainloop_ticks = Rc::new(std::cell::Cell::new(0u64));
+        let mainloop_ticks_cb = mainloop_ticks.clone();
+        let tick_source = glib::timeout_add_local(Duration::from_millis(5), move || {
+            mainloop_ticks_cb.set(mainloop_ticks_cb.get() + 1);
+            glib::ControlFlow::Continue
+        });
+        let slow_refusal_started = Instant::now();
+        open_and_expect_refused(&state, &ui, &dir61, "slowmany.zip", "archive has too many entries");
+        let slow_refusal_elapsed = slow_refusal_started.elapsed();
+        tick_source.remove();
+        native_core::TEST_INDEX_ENTRY_DELAY_MICROS.store(0, Ordering::Relaxed);
+        native_core::set_test_zip_limits(None);
+        assert!(
+            slow_refusal_elapsed < Duration::from_secs(10),
+            "D-188 #61: the slow boundary refusal exceeded its named 10s bound: {slow_refusal_elapsed:?}"
+        );
+        assert!(
+            mainloop_ticks.get() > 1,
+            "D-188 #61: the GTK main loop must keep ticking while a slow boundary scan runs, got {}",
+            mainloop_ticks.get()
+        );
 
         ui.window.close();
         pump();

@@ -558,6 +558,13 @@ pub fn index_zip<R: Read + std::io::Seek>(
         if cancelled.load(Ordering::Relaxed) {
             return Err(ZipIndexError::Cancelled);
         }
+        #[cfg(test)]
+        {
+            let micros = TEST_INDEX_ENTRY_DELAY_MICROS.load(Ordering::Relaxed);
+            if micros > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(micros));
+            }
+        }
         let entry = archive
             .by_index_raw(i)
             .map_err(|e| ZipIndexError::Corrupt(e.to_string()))?;
@@ -776,6 +783,14 @@ fn validate_zip_member_matches(archive_path: &Path, member: &ZipMemberRef, cance
 /// how long one real streaming extraction takes.
 #[cfg(test)]
 pub static TEST_STREAM_CHUNK_DELAY_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only: an artificial per-entry delay in `index_zip`'s central-directory
+/// scan, used to make a many-member archive's indexing pass measurably slow
+/// without needing a real multi-thousand-entry fixture to scan quickly past a
+/// GTK tick (D-188 #61). Zero in production; `index_zip` never reads it
+/// outside a test build.
+#[cfg(test)]
+pub static TEST_INDEX_ENTRY_DELAY_MICROS: AtomicU64 = AtomicU64::new(0);
 
 fn stream_zip_member_to(archive_path: &Path, member: &ZipMemberRef, out_path: &Path, cancelled: &AtomicBool) -> Result<(), String> {
     let (mut archive, index) = locate_and_validate_zip_member(archive_path, member, cancelled)?;
