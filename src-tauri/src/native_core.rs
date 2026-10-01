@@ -217,6 +217,21 @@ impl Location {
     }
 }
 
+/// Message shown for every refused ZIP mutation attempt (menu, keyboard,
+/// programmatic, drag/drop) — one exact string, never paraphrased.
+pub const ZIP_READ_ONLY_MESSAGE: &str = "ZIP folders are read-only";
+
+/// Fail-closed guard for every mutation entry point: returns the refusal
+/// message when `path` is inside a ZIP location, `None` when the mutation
+/// may proceed.
+pub fn zip_read_only_refusal(path: &str) -> Option<&'static str> {
+    if Location::parse(path).is_zip() {
+        Some(ZIP_READ_ONLY_MESSAGE)
+    } else {
+        None
+    }
+}
+
 /// Where a single row's bytes live, for the same reason: `Entry.path` alone
 /// cannot say whether rename/trash/paste-target code may touch it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5972,6 +5987,28 @@ mod location_tests_d188 {
         let loc = Location::ZipDir { archive: PathBuf::from("/home/zito/a.zip"), internal: "x/y".to_string() };
         let encoded = loc.to_path_string();
         assert_eq!(Location::parse(&encoded), loc);
+    }
+
+    #[test]
+    fn zip_read_only_refusal_refuses_inside_zip_d188() {
+        let loc = Location::ZipDir { archive: PathBuf::from("/home/zito/a.zip"), internal: "x".to_string() };
+        assert_eq!(zip_read_only_refusal(&loc.to_path_string()), Some(ZIP_READ_ONLY_MESSAGE));
+    }
+
+    #[test]
+    fn zip_read_only_refusal_refuses_at_zip_root_d188() {
+        let loc = Location::zip_root(PathBuf::from("/home/zito/a.zip"));
+        assert_eq!(zip_read_only_refusal(&loc.to_path_string()), Some(ZIP_READ_ONLY_MESSAGE));
+    }
+
+    #[test]
+    fn zip_read_only_refusal_allows_real_dir_d188() {
+        assert_eq!(zip_read_only_refusal("/home/zito/Downloads"), None);
+    }
+
+    #[test]
+    fn zip_read_only_message_is_exact_d188() {
+        assert_eq!(ZIP_READ_ONLY_MESSAGE, "ZIP folders are read-only");
     }
 
     #[test]
