@@ -426,6 +426,7 @@ pub enum SmbFail {
     Cancelled,
     Denied,
     Unreachable,
+    NotSupported,
     Other,
 }
 
@@ -435,6 +436,7 @@ impl SmbFail {
             SmbFail::Cancelled => "Connection cancelled.".to_string(),
             SmbFail::Denied => format!("Access to {label} was denied."),
             SmbFail::Unreachable => format!("Could not reach {label}."),
+            SmbFail::NotSupported => "Network-share support (gvfs-smb) is not installed.".to_string(),
             SmbFail::Other => format!("Could not connect to {label}."),
         }
     }
@@ -1117,7 +1119,7 @@ mod tests {
 
     #[test]
     fn failures_never_navigate_and_never_echo_backend_or_raw_text_d156_connect() {
-        for fail in [SmbFail::Cancelled, SmbFail::Denied, SmbFail::Unreachable, SmbFail::Other] {
+        for fail in [SmbFail::Cancelled, SmbFail::Denied, SmbFail::Unreachable, SmbFail::NotSupported, SmbFail::Other] {
             let (flow, fake, rec, root) = rig();
             fake.0.borrow_mut().mount_result = Some(Err(fail));
             flow.connect("smb://nas/Media");

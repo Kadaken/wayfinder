@@ -4566,6 +4566,8 @@ fn smb_fail(error: &glib::Error) -> native_smb::SmbFail {
         SmbFail::Cancelled
     } else if error.matches(gio::IOErrorEnum::PermissionDenied) {
         SmbFail::Denied
+    } else if error.matches(gio::IOErrorEnum::NotSupported) {
+        SmbFail::NotSupported
     } else if error.matches(gio::IOErrorEnum::HostNotFound)
         || error.matches(gio::IOErrorEnum::HostUnreachable)
         || error.matches(gio::IOErrorEnum::NetworkUnreachable)
@@ -4575,6 +4577,30 @@ fn smb_fail(error: &glib::Error) -> native_smb::SmbFail {
         SmbFail::Unreachable
     } else {
         SmbFail::Other
+    }
+}
+
+#[cfg(any(test))]
+thread_local! {
+    /// Test seam: one inline throwaway (username, password) answered to GIO's
+    /// real `ask-password` signal on a real `MountOperation`, so D-186 can
+    /// cross the real `GioSmbBackend` into a test-owned loopback `smbd`
+    /// without a keyring or a typed-in credential. `None` outside the one
+    /// D-186 fixture, and production never constructs this handler at all.
+    static SMB_TEST_CREDENTIAL: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    /// Counts asks and submissions so the fixture can assert exactly one
+    /// submission and abort (never answer) a repeated ask.
+    static SMB_TEST_CREDENTIAL_COUNTS: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
+}
+
+#[cfg(any(test))]
+struct SmbTestCredentialGuard;
+
+#[cfg(any(test))]
+impl Drop for SmbTestCredentialGuard {
+    fn drop(&mut self) {
+        SMB_TEST_CREDENTIAL.with(|c| *c.borrow_mut() = None);
+        SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
     }
 }
 
@@ -4590,7 +4616,37 @@ impl GioSmbBackend {
     }
 
     fn operation(&self) -> gtk::MountOperation {
-        gtk::MountOperation::new(self.window.upgrade().as_ref())
+        let operation = gtk::MountOperation::new(self.window.upgrade().as_ref());
+        #[cfg(any(test))]
+        {
+            let has_seam = SMB_TEST_CREDENTIAL.with(|c| c.borrow().is_some());
+            if has_seam {
+                operation.connect_ask_password(move |op, _message, _default_user, _default_domain, _flags| {
+                    let already_asked = SMB_TEST_CREDENTIAL_COUNTS.with(|c| {
+                        let mut counts = c.borrow_mut();
+                        counts.0 += 1;
+                        counts.0 > 1
+                    });
+                    if already_asked {
+                        // A real repeated ask is explicitly aborted, never answered
+                        // silently and never given the credential a second time.
+                        op.reply(gio::MountOperationResult::Aborted);
+                        return;
+                    }
+                    let cred = SMB_TEST_CREDENTIAL.with(|c| c.borrow().clone());
+                    if let Some((user, pass)) = cred {
+                        SMB_TEST_CREDENTIAL_COUNTS.with(|c| c.borrow_mut().1 += 1);
+                        op.set_username(Some(&user));
+                        op.set_password(Some(&pass));
+                        op.set_password_save(gio::PasswordSave::Never);
+                        op.reply(gio::MountOperationResult::Handled);
+                    } else {
+                        op.reply(gio::MountOperationResult::Aborted);
+                    }
+                });
+            }
+        }
+        operation
     }
 
     fn mount(&self, uri: &str, done: Box<dyn FnOnce(Result<(), native_smb::SmbFail>)>) {
@@ -19366,6 +19422,610 @@ Broken: Either state is wrong.\n";
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-186 alone, inside the wrapper's private user/mount/net namespace
+    /// (own loopback only): real GIO/GVfs against a test-owned, throwaway
+    /// `smbd` on `127.0.0.1:445`. Never runs outside that namespace.
+    #[test]
+    fn smb_real_loopback_d186_alone() {
+        if std::env::var("WAYFINDER_D186_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        smb_real_loopback_d186();
+    }
+
+    /// Every pid currently reporting `pgid` as its process group, read from
+    /// `/proc/*/stat` field 5. Used to find Samba's own forked descendants
+    /// (`samba-dcerpcd`, `rpcd_*`), which `smbd` does not reap for us and
+    /// which do not become children of this test process.
+    fn pids_in_pgid(pgid: i32) -> Vec<i32> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else { return out };
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+            // Field 5 (pgrp) follows the `comm` field, which is parenthesized
+            // and may itself contain spaces/parens, so split after the last `)`.
+            let Some(after) = stat.rsplit_once(')').map(|(_, rest)| rest) else { continue };
+            if let Some(pgrp) = after.split_whitespace().nth(2) {
+                if pgrp.parse::<i32>() == Ok(pgid) {
+                    out.push(pid);
+                }
+            }
+        }
+        out
+    }
+
+    /// Kills the test-owned Samba process GROUP (`smbd` plus every
+    /// descendant it forks: `samba-dcerpcd`, `rpcd_classic`, `rpcd_winreg`,
+    /// ...), TERM-then-KILL with a bound each, and waits for the whole group
+    /// to be gone — not just `smbd`'s own pid — on every exit path including
+    /// a panic unwind mid-assertion. Killing only the `Child` from
+    /// `Command::spawn` leaves these descendants running against a deleted
+    /// scratch root.
+    struct SmbdGuard {
+        child: std::process::Child,
+        pgid: i32,
+    }
+    impl Drop for SmbdGuard {
+        fn drop(&mut self) {
+            let wait_until_gone = |deadline: Instant| {
+                while !pids_in_pgid(self.pgid).is_empty() {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                true
+            };
+            unsafe { libc::kill(-self.pgid, libc::SIGTERM) };
+            if !wait_until_gone(Instant::now() + Duration::from_secs(5)) {
+                unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+                wait_until_gone(Instant::now() + Duration::from_secs(5));
+            }
+            // Reap smbd itself so it never lingers as a zombie.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            // Never assert from inside Drop: this guard also runs during a
+            // panic unwind, and a second panic there would abort the
+            // process instead of reporting the first failure. The test body
+            // re-checks `pids_in_pgid` explicitly after each drop instead.
+            let remaining = pids_in_pgid(self.pgid);
+            if !remaining.is_empty() {
+                eprintln!("D186 WARNING: Samba process group {} still has members after TERM+KILL: {remaining:?}", self.pgid);
+            }
+        }
+    }
+
+    /// Reads `/proc/net/tcp` inside this (already namespaced) process and
+    /// returns every `ip:port` (hex, `/proc/net/tcp` form) currently in
+    /// `LISTEN` state.
+    fn listening_sockets() -> Vec<String> {
+        let text = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+        text.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                (f.len() > 3 && f[3] == "0A").then(|| f[1].to_string())
+            })
+            .collect()
+    }
+
+    /// D-186: the production `GioSmbBackend`/`GtkSmbSink`/`SmbFlow` path, not
+    /// a second design, crossed into one test-owned loopback `smbd`. Every
+    /// path Samba would otherwise touch under `/var` or `/run`, and the unix
+    /// account `tdbsam` resolves through `getpwnam`, live only under this
+    /// run's private root; the wrapper's mount namespace confines the
+    /// `/etc/passwd`/`/etc/group` bind mounts this needs to this process.
+    fn smb_real_loopback_d186() {
+        struct SmbTestSeamGuard;
+        impl Drop for SmbTestSeamGuard {
+            fn drop(&mut self) {
+                SMB_TEST_CREDENTIAL.with(|c| *c.borrow_mut() = None);
+                SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
+            }
+        }
+        let _seams = SmbTestSeamGuard;
+
+        let host_mounts_before = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+
+        let root = crate::native_core::scratch_root().join(format!("wf-d186-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, priv_dir, lock_dir, cache_dir, run_dir, log_dir, share_dir, usershare_dir) = (
+            root.join("home"),
+            root.join("private"),
+            root.join("lock"),
+            root.join("cache"),
+            root.join("run"),
+            root.join("log"),
+            root.join("share"),
+            root.join("usershare"),
+        );
+        for d in [&home, &priv_dir, &lock_dir, &cache_dir, &run_dir, &log_dir, &share_dir, &usershare_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(run_dir.join("ncalrpc")).unwrap();
+        std::fs::create_dir_all(run_dir.join("winbindd")).unwrap();
+        std::fs::create_dir_all(lock_dir.join("dns")).unwrap();
+        // The one synthetic file D-186's mounted-and-listed case must see,
+        // never a real filename beyond this throwaway fixture.
+        std::fs::write(share_dir.join("hello.txt"), b"d186 synthetic file\n").unwrap();
+
+        // A private unix account for `tdbsam`'s `getpwnam` lookup, bind
+        // mounted over `/etc/passwd`/`/etc/group` inside this process's own
+        // mount namespace only; the host's real files are never touched.
+        const TEST_USER: &str = "wftestuser";
+        const TEST_PASS: &str = "wf-d186-throwaway-pw";
+        let passwd = format!("{}\nwftestuser:x:0:0:wftestuser:{}:/bin/false\n", std::fs::read_to_string("/etc/passwd").unwrap_or_default(), home.display());
+        let group = format!("{}\nwftestuser:x:0:\n", std::fs::read_to_string("/etc/group").unwrap_or_default());
+        let (passwd_ov, group_ov) = (root.join("passwd"), root.join("group"));
+        std::fs::write(&passwd_ov, &passwd).unwrap();
+        std::fs::write(&group_ov, &group).unwrap();
+        for (src, dst) in [(&passwd_ov, "/etc/passwd"), (&group_ov, "/etc/group")] {
+            let status = std::process::Command::new("mount").args(["--bind", &src.to_string_lossy(), dst]).status().unwrap();
+            assert!(status.success(), "bind mount {dst} over the private copy");
+        }
+
+        let conf = root.join("smb.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[global]\n\
+                 workgroup = WORKGROUP\n\
+                 security = user\n\
+                 passdb backend = tdbsam:{priv}/passdb.tdb\n\
+                 smb ports = 445\n\
+                 server min protocol = SMB2\n\
+                 server max protocol = SMB3\n\
+                 bind interfaces only = yes\n\
+                 interfaces = 127.0.0.1\n\
+                 disable netbios = yes\n\
+                 load printers = no\n\
+                 printcap name = /dev/null\n\
+                 disable spoolss = yes\n\
+                 guest ok = no\n\
+                 map to guest = never\n\
+                 lock directory = {lock}\n\
+                 state directory = {lock}\n\
+                 cache directory = {cache}\n\
+                 private dir = {priv}\n\
+                 pid directory = {run}\n\
+                 ncalrpc dir = {run}/ncalrpc\n\
+                 winbindd socket directory = {run}/winbindd\n\
+                 binddns dir = {lock}/dns\n\
+                 ntp signd socket directory = {run}/ncalrpc\n\
+                 usershare path = {usershare}\n\
+                 smb passwd file = {priv}/smbpasswd\n\
+                 log file = {log}/log.smbd\n\
+                 max log size = 0\n\
+                 syslog = 0\n\
+                 panic action = \n\
+                 \n\
+                 [synthetic]\n\
+                 path = {share}\n\
+                 read only = no\n\
+                 guest ok = no\n",
+                priv = priv_dir.display(),
+                lock = lock_dir.display(),
+                cache = cache_dir.display(),
+                run = run_dir.display(),
+                usershare = usershare_dir.display(),
+                log = log_dir.display(),
+                share = share_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        // `tdbsam` needs a unix account (the private-`/etc/passwd` entry
+        // above); the password reaches `smbpasswd` only via stdin, never
+        // argv or an env var.
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new("smbpasswd")
+                .args(["-c", &conf.to_string_lossy(), "-s", "-a", TEST_USER])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn smbpasswd");
+            child.stdin.take().unwrap().write_all(format!("{TEST_PASS}\n{TEST_PASS}\n").as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "smbpasswd -a failed");
+        }
+
+        let mut smbd_cmd = std::process::Command::new("smbd");
+        smbd_cmd
+            .args(["-F", "--no-process-group", "-s"])
+            .arg(&conf)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // `smbd` forks `samba-dcerpcd`/`rpcd_*` workers that inherit this
+        // process group unless they call setsid themselves; giving `smbd`
+        // its own fresh group (pgid == its own pid) lets the guard reach
+        // every descendant with one `killpg`, without touching the test
+        // process's or the wrapper's own group.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            smbd_cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let smbd = smbd_cmd.spawn().expect("spawn smbd");
+        let smbd_pgid = smbd.id() as i32;
+        let _smbd_guard = SmbdGuard { child: smbd, pgid: smbd_pgid };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let listener = loop {
+            let found = listening_sockets().into_iter().find(|a| a.starts_with("0100007F:01BD"));
+            if let Some(a) = found {
+                break a;
+            }
+            assert!(Instant::now() < deadline, "smbd never reached LISTEN on 127.0.0.1:445 within bound");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(listener, "0100007F:01BD", "the listener is exactly 127.0.0.1:445, nothing else");
+        for other in listening_sockets() {
+            assert!(other == listener || !other.ends_with(":01BD"), "an extra 445 listener exists: {other}");
+        }
+
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::set_var("HOME", &home);
+        // D-Bus activates `gvfsd-smb`/`gvfsd-fuse` with the dbus-daemon's OWN
+        // environment, inherited from the wrapper at launch — never from
+        // this test process. If this process then pointed `XDG_RUNTIME_DIR`
+        // somewhere else, GVfs's local FUSE mount (`$XDG_RUNTIME_DIR/gvfs`)
+        // and this process's own `resolve()`/path lookups would disagree on
+        // where it lives, and every mount would silently fail to resolve.
+        // Honour whatever the wrapper already exported; only invent one
+        // (for a direct, non-wrapper invocation of this test function) when
+        // nothing is set yet.
+        match &old_xdg {
+            Some(x) if !x.is_empty() => {
+                std::fs::create_dir_all(x).unwrap();
+            }
+            _ => {
+                let dir = run_dir.join("xdg");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::env::set_var("XDG_RUNTIME_DIR", &dir);
+            }
+        }
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d186test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(home.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().cwd == home.to_string_lossy());
+        assert!(state.borrow().smb_backend.is_none(), "D-186 must cross the real GioSmbBackend, never a fake");
+
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let scans = scans.clone();
+            let real = state.borrow().drive_scan.clone();
+            state.borrow_mut().drive_scan = Arc::new(move || {
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                real()
+            });
+        }
+        let drive_scan_count = || scans.load(std::sync::atomic::Ordering::SeqCst);
+
+        let dialog_windows = || -> Vec<gtk::Window> {
+            gtk::Window::list_toplevels().into_iter().filter_map(|w| w.downcast::<gtk::Window>().ok()).filter(|w| w.widget_name() == "wf-connect-dialog").collect()
+        };
+        let set_credential = |user: &str, pass: &str| {
+            SMB_TEST_CREDENTIAL.with(|c| *c.borrow_mut() = Some((user.to_string(), pass.to_string())));
+        };
+        let clear_credential = || SMB_TEST_CREDENTIAL.with(|c| *c.borrow_mut() = None);
+        let ask_submit_counts = || SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow());
+
+        // Case 1: direct synthetic share, wrong password.
+        {
+            let scans_before = ask_submit_counts();
+            set_credential(TEST_USER, "wrong-password");
+            let clicked = Instant::now();
+            ui.path_entry.set_text("smb://127.0.0.1/synthetic");
+            ui.path_entry.emit_activate();
+            let ctx = glib::MainContext::default();
+            loop {
+                while ctx.iteration(false) {}
+                if !smb_flow(&state, &ui).is_busy() && ui.status.label() != "Connecting\u{2026}" {
+                    break;
+                }
+                assert!(clicked.elapsed() < Duration::from_secs(10), "wrong-password case never settled: {}", ui.status.label());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let latency = clicked.elapsed();
+            println!("D186 MEASURE wrong-password terminal UI: {} ms", latency.as_millis());
+            let (asks, submits) = ask_submit_counts();
+            assert_eq!(submits, 1, "exactly one credential submission");
+            assert!(asks >= submits, "every submission came from a real ask");
+            let status = ui.status.label().to_string();
+            let lower = status.to_lowercase();
+            assert!(
+                lower.contains("denied") || lower.contains("cancel"),
+                "denied/cancelled status expected, got {status:?}"
+            );
+            assert!(!status.contains(TEST_PASS) && !status.contains("wrong-password"));
+            assert!(dialog_windows().is_empty(), "no chooser left open");
+            assert_eq!(state.borrow().cwd, home.to_string_lossy(), "no navigation on a denied credential");
+            assert!(state.borrow().remembered_networks.is_empty(), "no remembered entry on a denied credential");
+            assert!(!smb_flow(&state, &ui).is_busy(), "controls usable again");
+            clear_credential();
+            let (asks_after, _) = ask_submit_counts();
+            SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
+            let _ = (scans_before, asks_after);
+        }
+
+        // Case 2: wrong loopback host, nothing listening there.
+        {
+            set_credential(TEST_USER, TEST_PASS);
+            let clicked = Instant::now();
+            ui.path_entry.set_text("smb://127.0.0.2/synthetic");
+            ui.path_entry.emit_activate();
+            let ctx = glib::MainContext::default();
+            loop {
+                while ctx.iteration(false) {}
+                if !smb_flow(&state, &ui).is_busy() && ui.status.label() != "Connecting\u{2026}" {
+                    break;
+                }
+                assert!(clicked.elapsed() < Duration::from_secs(10), "wrong-host case never settled: {}", ui.status.label());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let latency = clicked.elapsed();
+            println!("D186 MEASURE wrong-host terminal UI: {} ms", latency.as_millis());
+            let status = ui.status.label().to_string();
+            assert!(
+                status.to_lowercase().contains("reach") || status.to_lowercase().contains("connect"),
+                "unreachable status expected, got {status:?}"
+            );
+            assert!(dialog_windows().is_empty());
+            assert_eq!(state.borrow().cwd, home.to_string_lossy(), "no navigation on an unreachable host");
+            assert!(state.borrow().remembered_networks.is_empty(), "no remembered entry on an unreachable host");
+            assert!(!smb_flow(&state, &ui).is_busy());
+            clear_credential();
+            SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
+        }
+
+        // Case 3: correct credential, direct share lifecycle. This goes
+        // straight at `smb://127.0.0.1/synthetic` (`mount_share`), never the
+        // bare server root (`list_shares`'s enumeration): GVfs's own
+        // bare-server-root browse against this NetBIOS-less config is a
+        // separate, carried, real-but-unrelated finding (see the round's
+        // [NOT COVERED]), not this fixture's path to prove.
+        let mut mounted_dir;
+        {
+            let ctx = glib::MainContext::default();
+            set_credential(TEST_USER, TEST_PASS);
+            let scans_before = drive_scan_count();
+            ui.path_entry.set_text("smb://127.0.0.1/synthetic");
+            ui.path_entry.emit_activate();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                while ctx.iteration(false) {}
+                if state.borrow().cwd.contains("synthetic") || state.borrow().cwd.to_lowercase().contains("gvfs") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "direct-share mount/navigate never settled; status={:?}", ui.status.label());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pump();
+            assert_eq!(drive_scan_count() - scans_before, 1, "exactly one drive refresh");
+            mounted_dir = std::path::PathBuf::from(state.borrow().cwd.clone());
+            let names: Vec<String> = std::fs::read_dir(&mounted_dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+            assert!(names.iter().any(|n| n == "hello.txt"), "the synthetic file is visible: {names:?}");
+            let bytes = std::fs::read(mounted_dir.join("hello.txt")).expect("read the synthetic file through the real mounted path");
+            assert_eq!(bytes, b"d186 synthetic file\n".to_vec(), "exact synthetic bytes read through the real mount");
+            let remembered = state.borrow().remembered_networks.clone();
+            assert_eq!(remembered.len(), 1, "exactly one remembered entry");
+            assert_eq!(remembered[0].uri, "smb://127.0.0.1/synthetic");
+            assert!(!remembered[0].uri.contains(TEST_USER) && !remembered[0].uri.contains(TEST_PASS), "credential-free remembered URI");
+            let (_asks, submits) = ask_submit_counts();
+            assert_eq!(submits, 1, "exactly one credential submission for the correct path");
+
+            // Explicitly unmount through the real GIO mount API, wait
+            // boundedly, and prove the private mount is gone.
+            let file = gio::File::for_uri("smb://127.0.0.1/synthetic");
+            let mount = file.find_enclosing_mount(gio::Cancellable::NONE).expect("GIO reports the real mount for the synthetic share");
+            let unmount_done: Rc<RefCell<Option<Result<(), glib::Error>>>> = Rc::new(RefCell::new(None));
+            {
+                let unmount_done = unmount_done.clone();
+                mount.unmount_with_operation(gio::MountUnmountFlags::NONE, gio::MountOperation::NONE, gio::Cancellable::NONE, move |result| {
+                    *unmount_done.borrow_mut() = Some(result);
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                while ctx.iteration(false) {}
+                if unmount_done.borrow().is_some() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "unmount never completed within bound");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            unmount_done.borrow_mut().take().unwrap().expect("the real GVfs unmount succeeded");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::path::Path::new(&mounted_dir).exists() {
+                assert!(Instant::now() < deadline, "the private mount point never disappeared after unmount");
+                while ctx.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                gio::File::for_uri("smb://127.0.0.1/synthetic").find_enclosing_mount(gio::Cancellable::NONE).is_err(),
+                "GIO no longer reports a mount for the synthetic share"
+            );
+
+            // Reconnect the same direct share so Case 4's disappearance
+            // begins from a fresh, proven mount, not the one just unmounted.
+            // The explicit GIO unmount above bypassed app navigation, so
+            // `state.cwd` is still the just-torn-down share path; without
+            // moving it away first, the settle loop below would match that
+            // stale string on its very first iteration and read `mounted_dir`
+            // before the real remount ran at all.
+            navigate_without_history(&state, home.to_string_lossy().to_string());
+            while ctx.iteration(false) {}
+            assert_eq!(state.borrow().cwd, home.to_string_lossy(), "cwd moved off the unmounted share before reconnecting");
+            clear_credential();
+            SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
+            set_credential(TEST_USER, TEST_PASS);
+            // A fresh mount of the exact same URI, this soon after GVfs tore
+            // the prior one down, can hit a transient FUSE channel race (seen
+            // in practice as "Input/output error" on the first listing) that
+            // the app surfaces as a status error and does not itself retry.
+            // A real user facing that would just activate the path again, so
+            // the test does the same, bounded by the same overall deadline.
+            ui.path_entry.set_text("smb://127.0.0.1/synthetic");
+            ui.path_entry.emit_activate();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                while ctx.iteration(false) {}
+                if state.borrow().cwd.contains("synthetic") || state.borrow().cwd.to_lowercase().contains("gvfs") {
+                    break;
+                }
+                if ui.status.label().starts_with("Cannot open") {
+                    assert!(Instant::now() < deadline, "remount never settled; status={:?}", ui.status.label());
+                    std::thread::sleep(Duration::from_millis(200));
+                    ui.path_entry.set_text("smb://127.0.0.1/synthetic");
+                    ui.path_entry.emit_activate();
+                    continue;
+                }
+                assert!(Instant::now() < deadline, "remount never settled; status={:?}", ui.status.label());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pump();
+            mounted_dir = std::path::PathBuf::from(state.borrow().cwd.clone());
+            assert!(mounted_dir.join("hello.txt").exists(), "the remount sees the synthetic file again");
+            clear_credential();
+            SMB_TEST_CREDENTIAL_COUNTS.with(|c| *c.borrow_mut() = (0, 0));
+        }
+
+        // Case 4: the live share disappears mid-use: bounded, visible,
+        // non-freezing, no secret leak, no stale listing accepted.
+        {
+            drop(_smbd_guard);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !listening_sockets().is_empty() {
+                assert!(Instant::now() < deadline, "smbd never fully stopped within bound");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let remaining = pids_in_pgid(smbd_pgid);
+            assert!(remaining.is_empty(), "the whole D-186 Samba process group must be gone, found: {remaining:?}");
+            let before = state.borrow().remembered_networks.clone();
+            request_drive_refresh(&state);
+            let clicked = Instant::now();
+            let ctx = glib::MainContext::default();
+            loop {
+                while ctx.iteration(false) {}
+                if ui.status.label().to_lowercase().contains("reach")
+                    || ui.status.label().to_lowercase().contains("fail")
+                    || ui.status.label().to_lowercase().contains("connect")
+                    || ui.status.label().to_lowercase().contains("lost")
+                    || !std::path::Path::new(&mounted_dir).exists()
+                {
+                    break;
+                }
+                assert!(clicked.elapsed() < Duration::from_secs(10), "share disappearance never surfaced within bound");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ui.window.is_visible(), "GTK did not freeze");
+            assert_eq!(state.borrow().remembered_networks, before, "history not corrupted by a disappearance");
+
+            // Close the private GVfs mount after the loss too, even when
+            // that cleanup itself reports an error (a dead server commonly
+            // makes a clean unmount fail) — this must never panic.
+            let file = gio::File::for_uri("smb://127.0.0.1/synthetic");
+            if let Ok(mount) = file.find_enclosing_mount(gio::Cancellable::NONE) {
+                let done: Rc<RefCell<Option<Result<(), glib::Error>>>> = Rc::new(RefCell::new(None));
+                {
+                    let done = done.clone();
+                    mount.unmount_with_operation(gio::MountUnmountFlags::FORCE, gio::MountOperation::NONE, gio::Cancellable::NONE, move |result| {
+                        *done.borrow_mut() = Some(result);
+                    });
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    while ctx.iteration(false) {}
+                    if done.borrow().is_some() || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let outcome = done.borrow_mut().take();
+                if let Some(Err(error)) = outcome {
+                    eprintln!("D186 NOTE: post-disappearance unmount reported (expected on a dead server): {error}");
+                }
+                // A forced unmount against an already-dead server can still
+                // report success/failure, and the mount point directory can
+                // stop answering (so `exists()` already reads false) before
+                // the backing FUSE mount is actually gone from this
+                // process's mount table; without waiting for the table
+                // itself to settle, the zero-residue check below sees extra
+                // leftover `mountinfo` lines even though cleanup "succeeded".
+                let settle_deadline = Instant::now() + Duration::from_secs(10);
+                while std::fs::read_to_string("/proc/self/mountinfo").map(|m| m.lines().count()).unwrap_or(0)
+                    != host_mounts_before.lines().count()
+                    && Instant::now() < settle_deadline
+                {
+                    while ctx.iteration(false) {}
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+
+        // Zero-residue and privacy oracles before this function returns:
+        // the seam guard resets state, `_cleanup` removes the run root, and
+        // the caller (the wrapper) compares the host mount table.
+        for (src, dst) in [(&passwd_ov, "/etc/passwd"), (&group_ov, "/etc/group")] {
+            let _ = std::process::Command::new("umount").arg(dst).status();
+            let _ = src;
+        }
+        // Real `gvfsd-fuse` (and `xdg-desktop-portal`'s own `doc` FUSE mount)
+        // are D-Bus-activated once anything in this private session resolves
+        // a GVfs mount; they are session-scoped, not SMB-scoped, so they
+        // outlive the explicit share unmounts above and would otherwise
+        // still be mounted under this run's own `XDG_RUNTIME_DIR` right up
+        // until the whole private D-Bus session tears down after this
+        // process exits. This test owns that private session for its own
+        // lifetime, so it tears these down itself rather than letting the
+        // zero-residue check below run before they are gone.
+        let still_mounted = |dir: &std::path::Path| {
+            let dir = dir.to_string_lossy().to_string();
+            std::fs::read_to_string("/proc/self/mountinfo").map(|m| m.lines().any(|l| l.contains(&dir))).unwrap_or(false)
+        };
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            for name in ["gvfs", "doc"] {
+                let dir = std::path::Path::new(&xdg).join(name);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while still_mounted(&dir) && Instant::now() < deadline {
+                    let _ = std::process::Command::new("fusermount3").args(["-u", "-z"]).arg(&dir).status()
+                        .or_else(|_| std::process::Command::new("fusermount").args(["-u", "-z"]).arg(&dir).status());
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        let host_mounts_after = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert_eq!(host_mounts_before.lines().count(), host_mounts_after.lines().count(), "this process's own mount table is restored");
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_xdg {
+            Some(x) => std::env::set_var("XDG_RUNTIME_DIR", x),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
     }
 
