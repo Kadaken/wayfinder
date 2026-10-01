@@ -928,7 +928,7 @@ fn entry_from_dirent(ent: &fs::DirEntry) -> (Entry, bool) {
 }
 
 pub fn list_dir_cancellable(
-    path: &str,
+    path: &Path,
     show_hidden: bool,
     cancelled: &AtomicBool,
 ) -> Result<DirectoryListing, ListDirError> {
@@ -1006,18 +1006,19 @@ pub fn list_dir_cancellable(
 
 /// Same contract as `list_dir_cancellable`, for a ZIP virtual location:
 /// re-indexes the archive's central directory (no extraction) and returns
-/// that directory's immediate children. `path` must be a `Location::ZipDir`
-/// string; callers dispatch on `Location::parse(path).is_zip()` before using
-/// this. Shares the generation/tab-id staleness guard applied by the caller,
-/// same as a real folder (D-188).
-pub fn list_zip_dir_cancellable(path: &str, cancelled: &AtomicBool) -> Result<DirectoryListing, ListDirError> {
+/// that directory's immediate children. Callers dispatch on
+/// `Location::ZipDir { archive, internal }` directly, never a re-parsed
+/// sentinel string. Shares the generation/tab-id staleness guard applied by
+/// the caller, same as a real folder (D-188).
+pub fn list_zip_dir_cancellable(
+    archive: &Path,
+    internal: &str,
+    cancelled: &AtomicBool,
+) -> Result<DirectoryListing, ListDirError> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(ListDirError::Cancelled);
     }
-    let Location::ZipDir { archive, internal } = Location::parse(path) else {
-        return Err(ListDirError::Open("not a ZIP location".to_string()));
-    };
-    let file = fs::File::open(&archive).map_err(|e| ListDirError::Open(e.to_string()))?;
+    let file = fs::File::open(archive).map_err(|e| ListDirError::Open(e.to_string()))?;
     let index = index_zip(file, &DEFAULT_ZIP_LIMITS, cancelled).map_err(|e| match e {
         ZipIndexError::Cancelled => ListDirError::Cancelled,
         other => ListDirError::Open(other.to_string()),
@@ -1025,7 +1026,7 @@ pub fn list_zip_dir_cancellable(path: &str, cancelled: &AtomicBool) -> Result<Di
     if cancelled.load(Ordering::Relaxed) {
         return Err(ListDirError::Cancelled);
     }
-    let entries = zip_dir_children(&archive, &index, &internal);
+    let entries = zip_dir_children(archive, &index, internal);
     Ok(DirectoryListing { entries, metadata_unavailable: 0, unreadable_entries: 0 })
 }
 
@@ -4633,7 +4634,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("does-not-exist"), &link).unwrap();
 
         let cancelled = AtomicBool::new(false);
-        let listing = list_dir_cancellable(dir.to_str().unwrap(), false, &cancelled).unwrap();
+        let listing = list_dir_cancellable(&dir, false, &cancelled).unwrap();
         let entry = listing
             .entries
             .iter()
@@ -4661,7 +4662,7 @@ mod tests {
             std::os::unix::fs::symlink(dir.join("nope"), dir.join(format!("broken{i}"))).unwrap();
         }
         let cancelled = AtomicBool::new(false);
-        let listing = list_dir_cancellable(dir.to_str().unwrap(), false, &cancelled).unwrap();
+        let listing = list_dir_cancellable(&dir, false, &cancelled).unwrap();
         assert_eq!(listing.entries.len(), total + 1 + 3, "files, the folder and the broken links; not .hidden");
         assert_eq!(listing.metadata_unavailable, 3);
         assert_eq!(listing.unreadable_entries, 0);
@@ -4672,11 +4673,11 @@ mod tests {
         assert_eq!(names.len(), listing.entries.len(), "no entry lost or doubled across chunks");
         let f = listing.entries.iter().find(|e| e.name == "f00006.txt").unwrap();
         assert_eq!((f.size, f.is_dir, f.metadata_error.is_none()), (6, false, true));
-        let with_hidden = list_dir_cancellable(dir.to_str().unwrap(), true, &cancelled).unwrap();
+        let with_hidden = list_dir_cancellable(&dir, true, &cancelled).unwrap();
         assert_eq!(with_hidden.entries.len(), listing.entries.len() + 1);
         cancelled.store(true, Ordering::Relaxed);
         assert!(matches!(
-            list_dir_cancellable(dir.to_str().unwrap(), false, &cancelled),
+            list_dir_cancellable(&dir, false, &cancelled),
             Err(ListDirError::Cancelled)
         ));
         fs::remove_dir_all(dir).unwrap();
@@ -4687,7 +4688,7 @@ mod tests {
         let dir = test_dir("cancelled-listing");
         let cancelled = AtomicBool::new(true);
         assert!(matches!(
-            list_dir_cancellable(dir.to_str().unwrap(), false, &cancelled),
+            list_dir_cancellable(&dir, false, &cancelled),
             Err(ListDirError::Cancelled)
         ));
         fs::remove_dir_all(dir).unwrap();

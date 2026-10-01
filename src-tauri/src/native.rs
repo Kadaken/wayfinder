@@ -1256,15 +1256,13 @@ struct TabState {
 }
 
 impl TabState {
-    fn new(id: u64, path: String) -> Self {
-        let path = native_core::Location::parse(&path);
+    fn new(id: u64, path: native_core::Location) -> Self {
         Self { id, history: vec![path.clone()], path, index: 0 }
     }
 
     /// Ordinary navigation: drop only this tab's forward branch, then append if
     /// the target differs from the current entry.
-    fn record(&mut self, path: &str) {
-        let path = native_core::Location::parse(path);
+    fn record(&mut self, path: native_core::Location) {
         self.path = path.clone();
         if self.history.get(self.index).map(|c| c != &path).unwrap_or(true) {
             self.history.truncate(self.index + 1);
@@ -1291,7 +1289,7 @@ struct TabSet {
 }
 
 impl TabSet {
-    fn new(path: String) -> Self {
+    fn new(path: native_core::Location) -> Self {
         Self { tabs: vec![TabState::new(0, path)], active: 0, next_id: 1 }
     }
 
@@ -1304,22 +1302,22 @@ impl TabSet {
     }
 
     /// Adds a tab with one history entry and makes it active.
-    fn open(&mut self, path: String) {
+    fn open(&mut self, path: native_core::Location) {
         self.tabs.push(TabState::new(self.next_id, path));
         self.next_id += 1;
         self.active = self.tabs.len() - 1;
     }
 
-    fn switch(&mut self, index: usize) -> Option<String> {
+    fn switch(&mut self, index: usize) -> Option<native_core::Location> {
         if index >= self.tabs.len() {
             return None;
         }
         self.active = index;
-        Some(self.active().path.to_path_string())
+        Some(self.active().path.clone())
     }
 
     /// Closes the active tab; returns the surviving active tab's path.
-    fn close_active(&mut self) -> Option<String> {
+    fn close_active(&mut self) -> Option<native_core::Location> {
         if self.tabs.len() <= 1 {
             return None;
         }
@@ -1327,19 +1325,19 @@ impl TabSet {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
-        Some(self.active().path.to_path_string())
+        Some(self.active().path.clone())
     }
 
     /// Target index and path one step back / forward in the active tab. The
     /// cursor only moves when that listing succeeds.
-    fn back_target(&self) -> Option<(usize, String)> {
+    fn back_target(&self) -> Option<(usize, native_core::Location)> {
         let tab = self.active();
-        tab.can_back().then(|| (tab.index - 1, tab.history[tab.index - 1].to_path_string()))
+        tab.can_back().then(|| (tab.index - 1, tab.history[tab.index - 1].clone()))
     }
 
-    fn forward_target(&self) -> Option<(usize, String)> {
+    fn forward_target(&self) -> Option<(usize, native_core::Location)> {
         let tab = self.active();
-        tab.can_forward().then(|| (tab.index + 1, tab.history[tab.index + 1].to_path_string()))
+        tab.can_forward().then(|| (tab.index + 1, tab.history[tab.index + 1].clone()))
     }
 }
 
@@ -2689,10 +2687,10 @@ fn main() {
                     .parent()
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| state.borrow().cwd.to_path_string());
-                navigate(&state, parent);
+                navigate(&state, native_core::Location::parse(&parent));
                 select_entry_by_path(&state, &ui, &target);
             } else if let Some(path) = initial_path {
-                navigate(&state, path);
+                navigate(&state, native_core::Location::parse(&path));
             }
             ui.window.present();
         } else {
@@ -2799,7 +2797,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: native_core::Location::parse(&initial_cwd),
-        tabs: TabSet::new(initial_cwd),
+        tabs: TabSet::new(native_core::Location::parse(&initial_cwd)),
         entries: Vec::new(),
         visible_entries: Vec::new(),
         pinned_top: select_path.clone(),
@@ -3457,7 +3455,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
             if native_smb::looks_like_smb(&path) {
                 smb_flow(&state, &ui).connect(&path);
             } else if !path.is_empty() {
-                navigate(&state, path);
+                navigate(&state, native_core::Location::parse(&path));
             }
         });
     }
@@ -3542,7 +3540,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         });
     }
 
-    let initial = state.borrow().cwd.to_path_string();
+    let initial = state.borrow().cwd.clone();
     navigate(&state, initial);
     let initial_view = state.borrow().view_mode;
     set_view_mode(&state, &ui, initial_view);
@@ -4105,7 +4103,7 @@ fn switch_tab_action(state: Rc<RefCell<AppState>>, index: usize) {
 
 /// Open `path` in a new tab and switch to it, the way a middle-click or
 /// "Open in New Tab" is expected to behave.
-fn open_path_in_new_tab(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
+fn open_path_in_new_tab(state: &Rc<RefCell<AppState>>, ui: &Ui, path: native_core::Location) {
     state.borrow_mut().tabs.open(path.clone());
     rebuild_tabs(state, ui);
     update_nav_buttons(state, ui);
@@ -4113,7 +4111,7 @@ fn open_path_in_new_tab(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
 }
 
 fn new_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let path = state.borrow().cwd.to_path_string();
+    let path = state.borrow().cwd.clone();
     state.borrow_mut().tabs.open(path.clone());
     rebuild_tabs(&state, &ui);
     update_nav_buttons(&state, &ui);
@@ -4334,7 +4332,7 @@ fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListB
     if let Some(drive) = cached {
         open_drive_action(state.clone(), ui.clone(), drive);
     } else {
-        navigate(state, path);
+        navigate(state, native_core::Location::parse(&path));
     }
 }
 
@@ -4449,7 +4447,7 @@ impl native_smb::SmbSink for GtkSmbSink {
         }
         request_drive_refresh(&state);
         rebuild_sidebar(&state, &ui);
-        navigate(&state, local.to_string_lossy().to_string());
+        navigate(&state, native_core::Location::real(local.to_path_buf()));
     }
 }
 
@@ -4876,7 +4874,7 @@ fn toggle_tree_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
             state_ref.tree_expanded.insert(path.to_string());
         }
     }
-    navigate(state, path.to_string());
+    navigate(state, native_core::Location::real(path));
     rebuild_sidebar(state, ui);
 }
 
@@ -5154,7 +5152,7 @@ fn connect_actions(
     {
         let state = state.clone();
         up.connect_clicked(move |_| {
-            let parent = native_core::parent_dir(&state.borrow().cwd.to_path_string());
+            let parent = state.borrow().cwd.parent();
             navigate(&state, parent);
         });
     }
@@ -5162,7 +5160,7 @@ fn connect_actions(
         let state = state.clone();
         home.connect_clicked(move |_| {
             if let Some((_, path)) = native_core::standard_dirs().into_iter().next() {
-                navigate(&state, path);
+                navigate(&state, native_core::Location::real(path));
             }
         });
     }
@@ -5170,7 +5168,7 @@ fn connect_actions(
         let state = state.clone();
         let ui = ui.clone();
         refresh.connect_clicked(move |_| {
-            let cwd = state.borrow().cwd.to_path_string();
+            let cwd = state.borrow().cwd.clone();
             rebuild_sidebar(&state, &ui);
             navigate_without_history(&state, cwd);
         });
@@ -5348,7 +5346,7 @@ fn set_show_hidden(state: &Rc<RefCell<AppState>>, value: bool) {
             ui.hidden.set_active(value);
         }
     }
-    let cwd = state.borrow().cwd.to_path_string();
+    let cwd = state.borrow().cwd.clone();
     navigate_without_history(state, cwd);
 }
 
@@ -5587,7 +5585,7 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("view-refresh-symbolic", "Refresh", "F5", &popover, move || {
-            let cwd = state.borrow().cwd.to_path_string();
+            let cwd = state.borrow().cwd.clone();
             rebuild_sidebar(&state, &ui);
             navigate_without_history(&state, cwd);
         }));
@@ -5765,7 +5763,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Up {
-            let parent = native_core::parent_dir(&state_for_keys.borrow().cwd.to_path_string());
+            let parent = state_for_keys.borrow().cwd.parent();
             navigate(&state_for_keys, parent);
             return glib::Propagation::Stop;
         }
@@ -5857,7 +5855,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F5 {
-            let cwd = state_for_keys.borrow().cwd.to_path_string();
+            let cwd = state_for_keys.borrow().cwd.clone();
             navigate(&state_for_keys, cwd);
             return glib::Propagation::Stop;
         }
@@ -5873,11 +5871,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
     window.add_controller(key);
 }
 
-fn navigate(state: &Rc<RefCell<AppState>>, path: String) {
+fn navigate(state: &Rc<RefCell<AppState>>, path: native_core::Location) {
     navigate_to(state, path, NavMode::Record);
 }
 
-fn navigate_without_history(state: &Rc<RefCell<AppState>>, path: String) {
+fn navigate_without_history(state: &Rc<RefCell<AppState>>, path: native_core::Location) {
     navigate_to(state, path, NavMode::Keep);
 }
 
@@ -5893,7 +5891,7 @@ fn history_step(state: &Rc<RefCell<AppState>>, forward: bool) {
     }
 }
 
-fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, mode: NavMode) {
+fn navigate_to(state: &Rc<RefCell<AppState>>, path: native_core::Location, mode: NavMode) {
     navigate_to_with_message(state, path, mode, None);
 }
 
@@ -5903,7 +5901,7 @@ fn navigate_to(state: &Rc<RefCell<AppState>>, path: String, mode: NavMode) {
 /// request, or any newer navigation never shows it.
 fn navigate_to_with_message(
     state: &Rc<RefCell<AppState>>,
-    path: String,
+    path: native_core::Location,
     mode: NavMode,
     done_message: Option<String>,
 ) {
@@ -5913,7 +5911,7 @@ fn navigate_to_with_message(
     let ui = ui_for_state(state);
     // Refreshing the SAME folder (e.g. after a delete) should keep the scroll
     // position; only real navigation to a different folder resets to the top.
-    let same_folder = state.borrow().cwd.to_path_string() == path;
+    let same_folder = state.borrow().cwd == path;
     // A pending reveal (e.g. the just-renamed row) owns the scroll position for
     // this reload via `apply_pending_reveal`; restoring the pre-reload scroll
     // 16ms later would silently drag the view back off the revealed row.
@@ -5958,7 +5956,7 @@ fn navigate_to_with_message(
             keep_focus_on_empty_view(&ui.grid, focus_was_in_grid, true);
         }
         set_preview_text(ui, "Loading folder…");
-        ui.status.set_label(&format!("Loading {}", native_core::Location::parse(&path).display_string()));
+        ui.status.set_label(&format!("Loading {}", path.display_string()));
     }
 
     let path_for_worker = path.clone();
@@ -5977,34 +5975,34 @@ fn navigate_to_with_message(
             let item_count = listing.entries.len();
             let metadata_unavailable = listing.metadata_unavailable;
             let unreadable_entries = listing.unreadable_entries;
+            let path_str = path.to_path_string();
             {
                 let mut state = state.borrow_mut();
                 state.listing_cancel = None;
                 // Downloads is a chronological inbox. New files belong at the
                 // top every time it is opened; clicking a column header still
                 // immediately switches to that requested ordering.
-                if is_downloads_dir(&path) {
+                if is_downloads_dir(&path_str) {
                     state.sort_key = SortKey::Modified;
                     state.sort_ascending = false;
                 }
-                state.cwd = native_core::Location::parse(&path);
+                state.cwd = path.clone();
                 let tab = state.tabs.active_mut();
-                let path_location = native_core::Location::parse(&path);
                 match mode {
-                    NavMode::Record => tab.record(&path),
-                    NavMode::Keep => tab.path = path_location,
+                    NavMode::Record => tab.record(path.clone()),
+                    NavMode::Keep => tab.path = path.clone(),
                     NavMode::Cursor(index) => {
-                        if tab.history.get(index) == Some(&path_location) {
+                        if tab.history.get(index) == Some(&path) {
                             tab.index = index;
                         }
-                        tab.path = path_location;
+                        tab.path = path.clone();
                     }
                 }
                 if state
                     .sidebar_active_key
                     .as_deref()
                     .and_then(|key| key.split_once('\n').map(|(_, active_path)| active_path))
-                    .is_some_and(|active_path| active_path != path)
+                    .is_some_and(|active_path| active_path != path_str)
                 {
                     state.sidebar_active_key = None;
                 }
@@ -6012,10 +6010,10 @@ fn navigate_to_with_message(
                 state.visible_entries.clear();
                 state.filter_text.clear();
                 // A virtual ZIP location never enters persistent Recent config (D-188).
-                if !native_core::Location::parse(&path).is_zip() {
-                    match update_config(|config| push_recent(&mut config.recents, &path)) {
+                if !path.is_zip() {
+                    match update_config(|config| push_recent(&mut config.recents, &path_str)) {
                         Some(config) => state.recents = config.recents,
-                        None => push_recent(&mut state.recents, &path),
+                        None => push_recent(&mut state.recents, &path_str),
                     }
                 }
             }
@@ -6029,7 +6027,7 @@ fn navigate_to_with_message(
                 update_selection(&state, ui);
                 update_nav_buttons(&state, ui);
                 update_sidebar_active_rows(&state, ui);
-                install_directory_monitor(&state, ui, &path);
+                install_directory_monitor(&state, ui, &path_str);
                 if let Some(target) = state.borrow().pinned_top.clone() {
                     select_entry_by_path(&state, ui, &target);
                 }
@@ -6057,11 +6055,11 @@ fn navigate_to_with_message(
             if state.borrow().listing_generation == generation {
                 state.borrow_mut().listing_cancel = None;
                 if let Some(ui) = &ui {
-                    let current_path = state.borrow().cwd.to_path_string();
+                    let current_path = state.borrow().cwd.clone();
                     set_breadcrumbs(&state, ui, &current_path);
                     repopulate_rows(&state, ui);
                     update_selection(&state, ui);
-                    ui.status.set_label(&format!("Cannot open {}: {error}", native_core::Location::parse(&path).display_string()));
+                    ui.status.set_label(&format!("Cannot open {}: {error}", path.display_string()));
                 }
             }
             glib::ControlFlow::Break
@@ -6078,12 +6076,12 @@ fn navigate_to_with_message(
         }
     };
     glib::spawn_future_local(async move {
-        let is_zip = native_core::Location::parse(&path_for_worker).is_zip();
-        let received = gio::spawn_blocking(move || {
-            if is_zip {
-                native_core::list_zip_dir_cancellable(&path_for_worker, &cancelled)
-            } else {
-                native_core::list_dir_cancellable(&path_for_worker, show_hidden, &cancelled)
+        let received = gio::spawn_blocking(move || match &path_for_worker {
+            native_core::Location::ZipDir { archive, internal } => {
+                native_core::list_zip_dir_cancellable(archive, internal, &cancelled)
+            }
+            native_core::Location::RealDir(real) => {
+                native_core::list_dir_cancellable(real, show_hidden, &cancelled)
             }
         })
         .await
@@ -6211,7 +6209,7 @@ fn start_monitor_scan(
     let path_for_worker = path.clone();
     std::thread::spawn(move || {
         let _ = tx.send(native_core::list_dir_cancellable(
-            &path_for_worker,
+            Path::new(&path_for_worker),
             show_hidden,
             &cancelled,
         ));
@@ -6419,38 +6417,36 @@ fn active_window() -> Option<(Rc<RefCell<AppState>>, Ui)> {
 
 /// Rebuild the address bar as one clickable button per path segment.
 /// Clicking "home" from /home/zito/Downloads jumps straight to /home.
-fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::Location) {
     while let Some(child) = ui.path_crumbs.first_child() {
         ui.path_crumbs.remove(&child);
     }
-    let location = native_core::Location::parse(path);
+    let location = path;
     ui.path_crumbs.set_tooltip_text(Some(&location.display_string()));
     // Real ancestors first — the ZIP's own containing folder when `path` is a
     // ZIP location, otherwise `path` itself (unchanged real-folder behavior).
-    let real_prefix = match &location {
+    let real_prefix = match location {
         native_core::Location::ZipDir { archive, .. } => {
             archive.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
         }
         native_core::Location::RealDir(real) => real.to_string_lossy().into_owned(),
     };
 
-    // (label, path-to-navigate-to). "Computer" is the filesystem root.
-    let mut crumbs: Vec<(String, String)> = vec![("Computer".to_string(), "/".to_string())];
+    // (label, location-to-navigate-to). "Computer" is the filesystem root.
+    let mut crumbs: Vec<(String, native_core::Location)> =
+        vec![("Computer".to_string(), native_core::Location::real("/"))];
     let mut accumulated = PathBuf::from("/");
     for component in PathBuf::from(&real_prefix).components() {
         if let std::path::Component::Normal(value) = component {
             accumulated.push(value);
-            crumbs.push((
-                value.to_string_lossy().to_string(),
-                accumulated.to_string_lossy().to_string(),
-            ));
+            crumbs.push((value.to_string_lossy().to_string(), native_core::Location::real(accumulated.clone())));
         }
     }
     // The archive's own name, then each internal folder, each clickable to
     // that exact ZIP location (D-188).
     if let Some(tail) = location.zip_breadcrumb_tail() {
         for (label, target) in tail {
-            crumbs.push((label, target.to_path_string()));
+            crumbs.push((label, target));
         }
     }
 
@@ -6546,7 +6542,7 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
             // and scrolls to the renamed row, at its natural sorted position
             // (never pinned_top, which would jump it out of sort order).
             state.borrow_mut().reveal_path = Some(to);
-            let cwd = state.borrow().cwd.to_path_string();
+            let cwd = state.borrow().cwd.clone();
             navigate(state, cwd);
             ui.status.set_label(&format!("Renamed {old_name} to {typed}"));
         }
@@ -6887,7 +6883,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             middle.set_button(2);
             let state_for_middle = state.clone();
             let ui_for_middle = ui.clone();
-            let path = entry.source.to_path_string();
+            let path = entry.source.to_location();
             middle.connect_pressed(move |gesture, _, _, _| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 open_path_in_new_tab(&state_for_middle, &ui_for_middle, path.clone());
@@ -8013,7 +8009,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
             picker_write_and_exit(&picker, vec![entry.source.to_path_string()], 0);
         }
         if entry.is_dir {
-            navigate(state, entry.source.to_path_string());
+            navigate(state, entry.source.to_location());
         } else {
             ui.status.set_label("Select a supported file to open");
         }
@@ -8031,11 +8027,12 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         _ => None,
     };
     if is_ordinary_zip_file {
-        navigate(state, native_core::Location::zip_root(entry.source.to_path_string()).to_path_string());
+        let native_core::EntrySource::Real(archive) = &entry.source else { unreachable!() };
+        navigate(state, native_core::Location::zip_root(archive.clone()));
     } else if let Some(member) = zip_member {
         open_zip_member(ui, &member.archive, &member.internal, &entry.name);
     } else if entry.is_dir {
-        navigate(state, entry.source.to_path_string());
+        navigate(state, entry.source.to_location());
     } else if std::fs::symlink_metadata(entry.source.to_path_string()).is_err() {
         // A stale row must never hand a vanished path to an external app: some
         // of them create the missing file.
@@ -8672,7 +8669,7 @@ fn run_transfer(
         cancelling: false,
         committed: false,
     });
-    let refresh_path = state.borrow().cwd.to_path_string();
+    let refresh_path = state.borrow().cwd.clone();
     ui.status.set_label(&label);
     show_transfer_strip(&ui, &transfer_strip(is_copy, native_core::TransferEvent::Preparing));
 
@@ -8890,7 +8887,7 @@ fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
 
 fn open_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
     if !drive.mountpoint.is_empty() {
-        navigate(&state, drive.mountpoint);
+        navigate(&state, native_core::Location::real(drive.mountpoint));
         return;
     }
 
@@ -9221,7 +9218,7 @@ where
     F: FnOnce() -> Result<JobOutcome, String> + Send + 'static,
     A: Fn(&Rc<RefCell<AppState>>, &JobOutcome) + 'static,
 {
-    let refresh_path = state.borrow().cwd.to_path_string();
+    let refresh_path = state.borrow().cwd.clone();
     ui.status.set_label(&label);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -9231,7 +9228,11 @@ where
         Ok(Ok(outcome)) => {
             on_success(&state, &outcome);
             state.borrow_mut().history_busy = false;
-            let target = outcome.refresh_to.clone().unwrap_or_else(|| refresh_path.clone());
+            let target = outcome
+                .refresh_to
+                .clone()
+                .map(|p| native_core::Location::parse(&p))
+                .unwrap_or_else(|| refresh_path.clone());
             navigate_to_with_message(&state, target, NavMode::Record, Some(outcome.message.clone()));
             glib::ControlFlow::Break
         }
@@ -9541,7 +9542,7 @@ where
     F: FnOnce() -> Result<JobOutcome, String> + Send + 'static,
     A: Fn(&Rc<RefCell<AppState>>, &Ui, &JobOutcome) + 'static,
 {
-    let refresh_path = state.borrow().cwd.to_path_string();
+    let refresh_path = state.borrow().cwd.clone();
     ui.status.set_label(&label);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -9571,14 +9572,18 @@ fn complete_job(
     state: &Rc<RefCell<AppState>>,
     ui: &Ui,
     outcome: JobOutcome,
-    refresh_path: &str,
+    refresh_path: &native_core::Location,
     after_success: &dyn Fn(&Rc<RefCell<AppState>>, &Ui, &JobOutcome),
 ) {
     after_success(state, ui, &outcome);
     if let Some(undo) = outcome.undo.clone() {
         push_undo(state, undo);
     }
-    let target = outcome.refresh_to.clone().unwrap_or_else(|| refresh_path.to_string());
+    let target = outcome
+        .refresh_to
+        .clone()
+        .map(|p| native_core::Location::parse(&p))
+        .unwrap_or_else(|| refresh_path.clone());
     navigate_to_with_message(state, target, NavMode::Record, Some(outcome.message.clone()));
 }
 
@@ -10346,7 +10351,7 @@ fn show_item_context_menu(
     if entry.is_dir {
         let state = state.clone();
         let ui = ui.clone();
-        let path = entry.source.to_path_string();
+        let path = entry.source.to_location();
         menu.append(&context_item("tab-new-symbolic", "Open in New Tab", "", &popover, move || {
             open_path_in_new_tab(&state, &ui, path.clone())
         }));
@@ -13291,7 +13296,7 @@ Broken: Either state is wrong.\n";
             "nested internal folder is its own breadcrumb"
         );
 
-        let up_to = state.borrow().cwd.parent().to_path_string();
+        let up_to = state.borrow().cwd.parent();
         navigate(&state, up_to);
         wait_for("up one level", || state.borrow().visible_entries.len() == 2);
         assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
@@ -13538,7 +13543,7 @@ Broken: Either state is wrong.\n";
         std::fs::remove_dir_all(&root).ok();
     }
 
-    fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> String {
+    fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> native_core::Location {
         let mut loc = state.borrow().cwd.clone();
         while loc.is_zip() {
             let next = loc.parent();
@@ -13547,7 +13552,7 @@ Broken: Either state is wrong.\n";
             }
             loc = next;
         }
-        loc.to_path_string()
+        loc
     }
 
     fn walk_find_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -14942,7 +14947,7 @@ Broken: Either state is wrong.\n";
             pump();
         };
         let nav = |path: &std::path::Path| {
-            navigate(&state, path.to_string_lossy().to_string());
+            navigate(&state, native_core::Location::real(path));
             wait_for("navigated", || state.borrow().cwd.to_path_string() == path.to_string_lossy() && !state.borrow().visible_entries.is_empty());
             pump();
         };
@@ -15187,7 +15192,7 @@ Broken: Either state is wrong.\n";
         assert!(by_name(GUIDE_OPEN_FILE).is_empty(), "no item is named before Throwaways opens");
 
         // Navigate: exactly one real mapped row, one circle, exact label.
-        navigate(&state, throwaways.to_string_lossy().to_string());
+        navigate(&state, native_core::Location::real(throwaways.clone()));
         wait_for("Throwaways listing", || state.borrow().visible_entries.len() == 2 && by_name(GUIDE_OPEN_FILE).len() == 1);
         wait_for("the circle", || rings().len() == 1 && label_pops().len() == 1);
         let target = by_name(GUIDE_OPEN_FILE).pop().unwrap();
@@ -15234,7 +15239,7 @@ Broken: Either state is wrong.\n";
         // Same request again: rebinds at once; leaving the folder removes the stale visual.
         put(GUIDE_OPEN_FILE, "Again");
         assert_eq!(rings().len(), 1);
-        navigate(&state, elsewhere.to_string_lossy().to_string());
+        navigate(&state, native_core::Location::real(elsewhere.clone()));
         wait_for("Elsewhere listing", || state.borrow().cwd.to_path_string() == elsewhere.to_string_lossy());
         wait_for("stale visual gone", || rings().is_empty() && label_pops().is_empty());
         assert!(by_name(GUIDE_OPEN_FILE).is_empty(), "an open-me.txt outside Throwaways is never named");
@@ -15242,7 +15247,7 @@ Broken: Either state is wrong.\n";
         assert!(state.borrow().guide_visual.is_none());
 
         // Return: one fresh target.
-        navigate(&state, throwaways.to_string_lossy().to_string());
+        navigate(&state, native_core::Location::real(throwaways.clone()));
         wait_for("back in Throwaways", || by_name(GUIDE_OPEN_FILE).len() == 1 && rings().len() == 1 && label_pops().len() == 1);
 
         // Filter: the item unbinds, the visual goes; clearing the filter reacquires exactly one.
@@ -17612,7 +17617,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.status.label(), "D32 job finished", "the result survives its own refresh");
 
         // Ordinary navigation replaces it with the normal listing status.
-        navigate(&state, other_str.clone());
+        navigate(&state, native_core::Location::parse(&other_str));
         wait_for("ordinary status", || ui.status.label() == "1 item shown");
         assert_eq!(state.borrow().cwd.to_path_string(), other_str);
 
@@ -17633,8 +17638,13 @@ Broken: Either state is wrong.\n";
         assert!(!ui.status.label().contains("D32 ghost success"));
 
         // An overtaken request cannot put its old message on the newer path.
-        navigate_to_with_message(&state, other_str.clone(), NavMode::Keep, Some("D32 stale".to_string()));
-        navigate(&state, dir_str.clone());
+        navigate_to_with_message(
+            &state,
+            native_core::Location::parse(&other_str),
+            NavMode::Keep,
+            Some("D32 stale".to_string()),
+        );
+        navigate(&state, native_core::Location::parse(&dir_str));
         wait_for("newer path", || {
             state.borrow().cwd.to_path_string() == dir_str && ui.status.label() == "1 item shown"
         });
@@ -17676,7 +17686,7 @@ Broken: Either state is wrong.\n";
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
         let back_to_dir = |mode: ViewMode| {
-            navigate(&state, dir_str.clone());
+            navigate(&state, native_core::Location::parse(&dir_str));
             wait_for("listing", || state.borrow().cwd.to_path_string() == dir_str && state.borrow().visible_entries.len() == 3);
             set_view_mode(&state, &ui, mode);
             pump();
@@ -18221,7 +18231,7 @@ Broken: Either state is wrong.\n";
         ui.window.present();
         let focus = || gtk::prelude::GtkWindowExt::focus(&ui.window);
         let back_to_dir = |mode: ViewMode| {
-            navigate(&state, dir_str.clone());
+            navigate(&state, native_core::Location::parse(&dir_str));
             wait_for("listing", || state.borrow().cwd.to_path_string() == dir_str && state.borrow().visible_entries.len() == 3);
             set_view_mode(&state, &ui, mode);
             pump();
@@ -18244,7 +18254,7 @@ Broken: Either state is wrong.\n";
             };
             pump();
             assert!(focus_within(&ui.window, &root_widget) && focus().as_ref() != Some(&root_widget), "focus is on a row");
-            navigate(&state, sub_str.clone());
+            navigate(&state, native_core::Location::parse(&sub_str));
             assert_eq!(rows(), 0, "the old rows are removed synchronously");
             assert_eq!(focus(), Some(root_widget.clone()), "the view root owns focus before the next frame");
             wait_for("sub listing", || state.borrow().cwd.to_path_string() == sub_str && state.borrow().visible_entries.len() == 1);
@@ -18258,7 +18268,7 @@ Broken: Either state is wrong.\n";
         pump();
         let outside = focus();
         assert!(outside.is_some() && !focus_within(&ui.window, &ui.list) && !focus_within(&ui.window, &ui.grid));
-        navigate(&state, sub_str.clone());
+        navigate(&state, native_core::Location::parse(&sub_str));
         assert_eq!(focus(), outside, "focus outside the file view is not stolen");
         wait_for("sub listing", || state.borrow().cwd.to_path_string() == sub_str && state.borrow().visible_entries.len() == 1);
         pump();
@@ -18442,7 +18452,7 @@ Broken: Either state is wrong.\n";
         pop.popdown();
 
         // Stale window B navigates: only its new visit appears.
-        navigate(&sb, p(5));
+        navigate(&sb, native_core::Location::parse(&p(5)));
         wait_for("new visit", || sb.borrow().cwd.to_path_string() == p(5) && sb.borrow().visible_entries.len() == 1);
         assert_eq!(disk_recents(), vec![p(5)], "only the new visit is on disk");
         assert_eq!(sb.borrow().recents.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), vec![p(5)]);
@@ -19087,18 +19097,18 @@ Broken: Either state is wrong.\n";
         let v = |x: &[&String]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         wait_for("a0", at(&a0));
         for p in [&a1, &a2] {
-            navigate(&state, p.clone());
+            navigate(&state, native_core::Location::parse(p));
             wait_for("nav", at(p));
         }
         assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2));
 
         // a new tab and Open in New Tab each start with exactly one entry
         assert!(ui.back.is_sensitive(), "A at its end has Back");
-        open_path_in_new_tab(&state, &ui, b0.clone());
+        open_path_in_new_tab(&state, &ui, native_core::Location::parse(&b0));
         assert!(!ui.back.is_sensitive() && !ui.forward.is_sensitive(), "one-entry tab, before the listing");
         wait_for("b0", at(&b0));
         assert_eq!(hist(1), (v(&[&b0]), 0));
-        navigate(&state, b1.clone());
+        navigate(&state, native_core::Location::parse(&b1));
         wait_for("b1", at(&b1));
         assert_eq!(hist(1), (v(&[&b0, &b1]), 1));
         assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2), "A untouched by B");
@@ -19145,25 +19155,25 @@ Broken: Either state is wrong.\n";
         assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 0));
         history_step(&state, true);
         wait_for("a1 again", at(&a1));
-        navigate(&state, b0.clone());
+        navigate(&state, native_core::Location::parse(&b0));
         wait_for("branch", at(&b0));
         assert_eq!(hist(0), (v(&[&a0, &a1, &b0]), 2));
         assert_eq!(hist(1), (v(&[&b0, &b1]), 1), "B unchanged by A's branch");
 
         // a failed listing and a superseded one write to no tab
         let before = (hist(0), hist(1));
-        navigate(&state, missing.clone());
+        navigate(&state, native_core::Location::parse(&missing));
         wait_for("failure reported", || ui.status.label().contains("Cannot open"));
         assert_eq!((hist(0), hist(1)), before);
         assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's own state after a failed listing");
-        navigate(&state, a2.clone());
-        navigate(&state, a1.clone());
+        navigate(&state, native_core::Location::parse(&a2));
+        navigate(&state, native_core::Location::parse(&a1));
         wait_for("superseding load", at(&a1));
         pump();
         assert_eq!(hist(0), (v(&[&a0, &a1, &b0, &a1]), 3), "only the newest load recorded");
         // a load pending while the tab changes lands nowhere
         let before = (hist(0), hist(1));
-        navigate(&state, a2.clone());
+        navigate(&state, native_core::Location::parse(&a2));
         switch_tab_action(state.clone(), 1);
         wait_for("B shown", at(&b1));
         pump();
@@ -19176,7 +19186,7 @@ Broken: Either state is wrong.\n";
         switch_tab_action(state.clone(), 0);
         wait_for("A shown", at(&a1));
         assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive());
-        navigate(&state, missing.clone());
+        navigate(&state, native_core::Location::parse(&missing));
         wait_for("second failure", || ui.status.label().contains("Cannot open"));
         assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's state, not B's");
         switch_tab_action(state.clone(), 1);
@@ -19499,26 +19509,27 @@ Broken: Either state is wrong.\n";
 
     #[test]
     fn tab_history_model_is_per_tab_d27() {
-        let mut set = TabSet::new("/a0".into());
-        set.active_mut().record("/a1");
-        set.active_mut().record("/a1");
+        let loc = |p: &str| native_core::Location::real(p);
+        let mut set = TabSet::new(loc("/a0"));
+        set.active_mut().record(loc("/a1"));
+        set.active_mut().record(loc("/a1"));
         let hist_strs = |t: &TabState| -> Vec<String> {
             t.history.iter().map(|l| l.to_path_string()).collect()
         };
         assert_eq!(hist_strs(set.active()), ["/a0", "/a1"], "same path is not appended twice");
-        set.open("/b0".into());
+        set.open(loc("/b0"));
         assert_eq!(hist_strs(set.active()), ["/b0"]);
         assert_eq!(set.active().id, 1);
         assert!(set.back_target().is_none() && set.forward_target().is_none());
-        assert_eq!(set.switch(0).as_deref(), Some("/a1"));
-        assert_eq!(set.back_target(), Some((0, "/a0".into())));
+        assert_eq!(set.switch(0), Some(loc("/a1")));
+        assert_eq!(set.back_target(), Some((0, loc("/a0"))));
         assert_eq!(set.switch(9), None);
-        set.open("/c0".into());
+        set.open(loc("/c0"));
         assert_eq!(set.active().id, 2);
         set.switch(0);
-        assert_eq!(set.close_active().as_deref(), Some("/b0"), "closing keeps the next tab's history");
+        assert_eq!(set.close_active(), Some(loc("/b0")), "closing keeps the next tab's history");
         assert_eq!(hist_strs(set.active()), ["/b0"]);
-        assert_eq!(set.close_active().as_deref(), Some("/c0"));
+        assert_eq!(set.close_active(), Some(loc("/c0")));
         assert_eq!(set.close_active(), None, "the last tab stays");
     }
 
@@ -19731,7 +19742,7 @@ Broken: Either state is wrong.\n";
         ui.grid.unselect_all();
         update_selection(&state, &ui);
         assert!(selected_paths(&state, &ui).is_empty(), "{tag}: selection cleared for the refresh check");
-        let listing = crate::native_core::list_dir_cancellable(&dir_str, false, &AtomicBool::new(false))
+        let listing = crate::native_core::list_dir_cancellable(Path::new(&dir_str), false, &AtomicBool::new(false))
             .expect("relist for the unrelated-refresh check");
         apply_monitor_scan(&state, &ui, listing);
         assert!(
@@ -21770,7 +21781,7 @@ Broken: Either state is wrong.\n";
             // moving it away first, the settle loop below would match that
             // stale string on its very first iteration and read `mounted_dir`
             // before the real remount ran at all.
-            navigate_without_history(&state, home.to_string_lossy().to_string());
+            navigate_without_history(&state, native_core::Location::real(home.clone()));
             while ctx.iteration(false) {}
             assert_eq!(state.borrow().cwd.to_path_string(), home.to_string_lossy(), "cwd moved off the unmounted share before reconnecting");
             clear_credential();
