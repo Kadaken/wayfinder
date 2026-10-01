@@ -1410,6 +1410,13 @@ struct AppState {
     meta_labels: HashMap<native_core::EntrySource, (glib::WeakRef<gtk::Label>, glib::WeakRef<gtk::Label>)>,
     thumbnail_queue: Option<Rc<RefCell<ThumbnailQueue>>>,
     video_poster_queue: Option<Rc<RefCell<VideoPosterQueue>>>,
+    /// D-188 REJECT 3: one owner per Open'd ZIP member, so each cache root is
+    /// removed (via `Drop`) when the app or test tears this state down, never
+    /// before — and never a sibling slot's root. `Rc<RefCell<..>>` so cloning
+    /// `AppState` (an existing, unrelated need) shares the same owners rather
+    /// than requiring `ZipOpenCacheRoot` itself to be `Clone`, which would let
+    /// two owners race to remove the same root.
+    zip_open_cache_roots: Rc<RefCell<Vec<native_core::ZipOpenCacheRoot>>>,
     /// Last drive scan (with space), filled off the window thread. The sidebar and
     /// row activation read only this, never a fresh scan.
     drives: Vec<Drive>,
@@ -2834,6 +2841,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         meta_labels: HashMap::new(),
         thumbnail_queue: None,
         video_poster_queue: None,
+        zip_open_cache_roots: Rc::new(RefCell::new(Vec::new())),
         drives: Vec::new(),
         drive_refresh_in_flight: false,
         drive_refresh_again: false,
@@ -8066,7 +8074,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         let native_core::EntrySource::Real(archive) = &entry.source else { unreachable!() };
         navigate(state, native_core::Location::zip_root(archive.clone()));
     } else if let Some(member) = zip_member {
-        open_zip_member(ui, &member.archive, &member.internal, &entry.name);
+        open_zip_member(state, ui, &member.archive, &member.internal, &entry.name);
     } else if entry.is_dir {
         navigate(state, entry.source.to_location());
     } else {
@@ -8093,37 +8101,65 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
     }
 }
 
-/// D-188 Open: streams exactly one ZIP member into a private per-session
-/// cache folder under `$XDG_RUNTIME_DIR` (or the process temp dir when that
-/// is unset), then hands the cached real file to the external launcher the
-/// same way an ordinary file open does. Every call gets its own numbered
-/// slot, so two members named the same (from the same or different
-/// archives) never collide, and a stale cached copy from an earlier Open
-/// never gets handed out again.
-fn open_zip_member(ui: &Ui, archive: &Path, internal: &str, display_name: &str) {
+/// D-188 Open (REJECT 3): streams exactly one ZIP member into a private
+/// per-session cache folder under `$XDG_RUNTIME_DIR`, off the GTK thread so
+/// decompressing a large allowed member never blocks a tick, then hands the
+/// cached real file to the external launcher the same way an ordinary file
+/// open does. Every call gets its own numbered slot, so two members named
+/// the same (from the same or different archives) never collide, and a
+/// stale cached copy from an earlier Open never gets handed out again.
+/// `XDG_RUNTIME_DIR` must be a real private runtime directory — unlike the
+/// old code, this never falls back to the shared, world-readable process
+/// temp dir. The cache root's owner lives in `AppState` so its `Drop` removes
+/// only that one root, at app teardown.
+fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, archive: &Path, internal: &str, display_name: &str) {
     static SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static NEXT_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let session_id = SESSION_ID.get_or_init(|| std::process::id().to_string());
+    let session_id = SESSION_ID.get_or_init(|| std::process::id().to_string()).clone();
     let slot = NEXT_SLOT.fetch_add(1, Ordering::SeqCst);
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let cache_dir = match native_core::ensure_zip_open_cache_dir(&runtime_dir, session_id, slot) {
-        Ok(dir) => dir,
-        Err(err) => {
-            ui.status.set_label(&format!("Open failed: {err}"));
+    let runtime_dir = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            ui.status.set_label("Open failed: no private XDG_RUNTIME_DIR is set");
             return;
         }
     };
-    let dest = cache_dir.join(display_name);
-    if let Err(err) = native_core::extract_zip_member(archive, internal, &dest) {
-        ui.status.set_label(&format!("Open failed: {err}"));
-        return;
-    }
-    eprintln!("wf-event: open zip member {internal}");
-    if let Err(err) = native_core::open_path(&dest.to_string_lossy()) {
-        ui.status.set_label(&format!("Open failed: {err}"));
-    }
+    let archive = archive.to_path_buf();
+    let internal = internal.to_string();
+    let internal_for_log = internal.clone();
+    let display_name = display_name.to_string();
+    ui.status.set_label(&format!("Opening {display_name}"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = native_core::ZipOpenCacheRoot::create(&runtime_dir, &session_id, slot).and_then(|root| {
+            let dest = root.path().join(&display_name);
+            native_core::extract_zip_member(&archive, &internal, &dest)?;
+            Ok((root, dest))
+        });
+        let _ = tx.send(result);
+    });
+
+    let state = state.clone();
+    let ui = ui.clone();
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || match rx.try_recv() {
+        Ok(Ok((root, dest))) => {
+            eprintln!("wf-event: open zip member {internal_for_log}");
+            state.borrow().zip_open_cache_roots.borrow_mut().push(root);
+            if let Err(err) = native_core::open_path(&dest.to_string_lossy()) {
+                ui.status.set_label(&format!("Open failed: {err}"));
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Err(err)) => {
+            ui.status.set_label(&format!("Open failed: {err}"));
+            glib::ControlFlow::Break
+        }
+        Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(TryRecvError::Disconnected) => {
+            ui.status.set_label("Open failed");
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 /// The one New Folder path (background menu, toolbar, options menu, Ctrl+Shift+N):
