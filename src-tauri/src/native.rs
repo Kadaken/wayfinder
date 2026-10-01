@@ -13762,6 +13762,38 @@ Broken: Either state is wrong.\n";
             paste_clipboard(state.clone(), ui.clone());
             assert_eq!(ui.status.label(), refusal, "Paste into a ZIP is always refused");
         }
+        // D-188 ledger #29: the remaining named mutation routes — Copy,
+        // Delete Permanently, Terminal, and picker submission of a ZIP
+        // member — also refuse at the typed handler boundary, fail-closed,
+        // with no clipboard state, process launch or picker exit.
+        let clipboard_before_zip_copy = state.borrow().clipboard.clone();
+        copy_selection(&state, &ui);
+        assert_eq!(ui.status.label(), refusal, "Copy refused inside a ZIP");
+        assert_eq!(
+            state.borrow().clipboard.is_some(),
+            clipboard_before_zip_copy.is_some(),
+            "D-188 #29: a refused Copy inside a ZIP must not change clipboard presence"
+        );
+        ui.status.set_label("");
+        permanent_delete_selection(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "Delete Permanently refused inside a ZIP");
+        ui.status.set_label("");
+        terminal_here(state.clone(), ui.clone());
+        assert_eq!(ui.status.label(), refusal, "Terminal refused inside a ZIP");
+        {
+            state.borrow_mut().picker = Some(PickerState {
+                config: PickerConfig { multiple: false, directory: false, starting_dir: None, filter: None, window: None },
+                out_file: dir.join("picker-zip.out").to_string_lossy().to_string(),
+            });
+            let picker_entry = state.borrow().visible_entries.iter().find(|e| !e.is_dir).cloned().unwrap();
+            assert!(
+                !picker_entry_can_submit(state.borrow().picker.as_ref().unwrap(), &picker_entry),
+                "D-188 #29: a ZIP member must never be an eligible picker submission"
+            );
+            open_entry(&state, &ui, picker_entry);
+            assert!(!dir.join("picker-zip.out").exists(), "D-188 #29: opening a ZIP member in picker mode must not write a picker exit file");
+            state.borrow_mut().picker = None;
+        }
 
         // ---- Open: streams the exact member to a private per-session cache.
         TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
