@@ -146,6 +146,20 @@ Media opened from Wayfinder uses your desktop's default application. Playback vo
 
 ---
 
+### ZIP Browsing
+
+Double-clicking a `.zip` opens it as a read-only folder in place — no extraction, no temp copy of the whole archive. Browse nested folders, see breadcrumbs for the archive and each internal folder, and navigate Up back out to the real folder that holds it.
+
+| Operation | What happens |
+|-----------|--------------|
+| **Open** (double-click a file inside) | Streams just that one file to a private cache folder and opens it with its normal app |
+| **Copy Out** (`Ctrl+C`/`Ctrl+V`, drag, or right-click → Copy) | Streams the selected file(s) to a real destination folder; Undo/Redo works like any other copy |
+| **New Folder / New File / Rename / Cut / Trash / Compress / Paste-into-ZIP** | Refused with "ZIP folders are read-only" — nothing inside a ZIP is ever written, renamed, or deleted |
+
+A corrupt, truncated, or otherwise unsafe archive (bad entry names, a decompression-bomb-shaped entry, too many entries, an encrypted or unsupported member) is refused with one plain-language error and leaves you exactly where you were — it never half-opens or crashes. This is separate from **Extract archive** above, which still unpacks a whole archive onto disk when that's what you actually want.
+
+---
+
 ### Drag & Drop
 
 | Feature | Details |
