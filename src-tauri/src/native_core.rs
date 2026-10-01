@@ -222,6 +222,12 @@ pub const ZIP_READ_ONLY_MESSAGE: &str = "ZIP folders are read-only";
 pub struct ZipMemberRef {
     pub archive: PathBuf,
     pub internal: String,
+    /// Size and CRC-32 captured from the archive at listing time (D-188
+    /// REJECT 5), so Open/Copy can reject a changed or replaced archive
+    /// instead of silently streaming whatever the current file now has at
+    /// that name. 0/0 for a directory row, which never reaches extraction.
+    pub size: u64,
+    pub crc32: u32,
 }
 
 /// Where a row's bytes actually come from, carried instead of a serialized
@@ -239,8 +245,8 @@ impl EntrySource {
         Self::Real(path.into())
     }
 
-    pub fn zip_member(archive: impl Into<PathBuf>, internal: impl Into<String>) -> Self {
-        Self::ZipMember(ZipMemberRef { archive: archive.into(), internal: internal.into() })
+    pub fn zip_member(archive: impl Into<PathBuf>, internal: impl Into<String>, size: u64, crc32: u32) -> Self {
+        Self::ZipMember(ZipMemberRef { archive: archive.into(), internal: internal.into(), size, crc32 })
     }
 
     pub fn is_zip(&self) -> bool {
@@ -274,7 +280,7 @@ impl EntrySource {
     pub fn to_location(&self) -> Location {
         match self {
             Self::Real(path) => Location::RealDir(path.clone()),
-            Self::ZipMember(ZipMemberRef { archive, internal }) => {
+            Self::ZipMember(ZipMemberRef { archive, internal, .. }) => {
                 Location::ZipDir { archive: archive.clone(), internal: internal.clone() }
             }
         }
@@ -450,6 +456,10 @@ pub struct ZipIndexEntry {
     pub logical_path: String,
     pub is_dir: bool,
     pub size: u64,
+    /// CRC-32 of the uncompressed bytes, from the central directory at list
+    /// time (D-188 REJECT 5). 0 for a directory (real or synthesized) — never
+    /// read back for one.
+    pub crc32: u32,
 }
 
 /// Reads only the ZIP central directory (no member bytes) and returns every
@@ -470,7 +480,7 @@ pub fn index_zip<R: Read + std::io::Seek>(
     // directory (explicit or an ancestor of something else), `false` =
     // reserved as a file.
     let mut namespace: HashMap<String, bool> = HashMap::new();
-    let mut explicit_entries: Vec<(String, bool, u64)> = Vec::with_capacity(archive.len());
+    let mut explicit_entries: Vec<(String, bool, u64, u32)> = Vec::with_capacity(archive.len());
     let mut seen_explicit_dirs: HashSet<String> = HashSet::new();
     let mut total_claimed: u64 = 0;
 
@@ -504,6 +514,7 @@ pub fn index_zip<R: Read + std::io::Seek>(
             .map_err(|why| ZipIndexError::BadName(raw_name.clone(), why))?;
 
         let size = entry.size();
+        let crc32 = entry.crc32();
         let compressed = entry.compressed_size().max(1);
         if !is_dir {
             if size > limits.max_entry_claimed_bytes {
@@ -557,37 +568,46 @@ pub fn index_zip<R: Read + std::io::Seek>(
             seen_explicit_dirs.insert(normalized.clone());
         }
 
-        explicit_entries.push((normalized, is_dir, size));
+        explicit_entries.push((normalized, is_dir, size, crc32));
     }
 
     let mut out: Vec<ZipIndexEntry> = Vec::with_capacity(namespace.len());
-    let explicit_paths: HashSet<&str> = explicit_entries.iter().map(|(p, _, _)| p.as_str()).collect();
-    for (path, is_dir, size) in &explicit_entries {
-        out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: *is_dir, size: *size });
+    let explicit_paths: HashSet<&str> = explicit_entries.iter().map(|(p, _, _, _)| p.as_str()).collect();
+    for (path, is_dir, size, crc32) in &explicit_entries {
+        out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: *is_dir, size: *size, crc32: *crc32 });
     }
     for (path, is_dir) in &namespace {
         if *is_dir && !explicit_paths.contains(path.as_str()) {
-            out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: true, size: 0 });
+            out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: true, size: 0, crc32: 0 });
         }
     }
     Ok(out)
 }
 
-/// Streams exactly one ZIP member's bytes to `dest_file` (D-188): opens the
-/// archive, locates the member by its normalized logical path, decompresses
-/// it to a sibling temp file under the same limits used at index time, then
-/// renames into place so a reader never observes a partial file. Never
-/// touches any other member.
-pub fn extract_zip_member(archive_path: &Path, internal: &str, dest_file: &Path) -> Result<(), String> {
+/// Streams exactly one ZIP member's bytes to `dest_file` (D-188 REJECT 5):
+/// opens the archive, locates the member by its normalized logical path,
+/// revalidates it against the size and CRC-32 captured at listing time —
+/// rejecting a changed or replaced archive before a single byte streams
+/// rather than silently extracting whatever current member now has that
+/// name — then decompresses to a sibling temp file under the same limits
+/// used at index time and renames into place so a reader never observes a
+/// partial file. Never touches any other member.
+pub fn extract_zip_member(
+    archive_path: &Path,
+    internal: &str,
+    expected_size: u64,
+    expected_crc32: u32,
+    dest_file: &Path,
+) -> Result<(), String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
     let mut found = None;
     for i in 0..archive.len() {
-        let raw_name = archive
-            .by_index_raw(i)
-            .map_err(|e| format!("archive is corrupt: {e}"))?
-            .name()
-            .to_string();
+        let raw = archive.by_index_raw(i).map_err(|e| format!("archive is corrupt: {e}"))?;
+        let raw_name = raw.name().to_string();
+        if raw.encrypted() || raw.unix_mode().is_some_and(is_disallowed_unix_mode) {
+            continue;
+        }
         let seen_files = HashSet::new();
         let seen_dirs = HashSet::new();
         if let Ok(normalized) = validate_zip_member_name(&raw_name, &seen_files, &seen_dirs, false) {
@@ -601,6 +621,19 @@ pub fn extract_zip_member(archive_path: &Path, internal: &str, dest_file: &Path)
     let mut entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
     if entry.size() > DEFAULT_ZIP_LIMITS.max_entry_claimed_bytes {
         return Err(format!("\"{internal}\" is too large"));
+    }
+    let compressed = entry.compressed_size().max(1);
+    if entry.size() / compressed > DEFAULT_ZIP_LIMITS.max_compression_ratio {
+        return Err(format!("\"{internal}\" has a suspicious compression ratio"));
+    }
+    #[allow(deprecated)]
+    if matches!(entry.compression(), zip::CompressionMethod::Unsupported(_)) {
+        return Err(format!("\"{internal}\" uses an unsupported compression method"));
+    }
+    if entry.size() != expected_size || entry.crc32() != expected_crc32 {
+        return Err(format!(
+            "\"{internal}\" no longer matches what was listed — the archive changed since it was browsed"
+        ));
     }
     let tmp_name = format!(
         ".{}.wf-zip-tmp-{}",
@@ -669,9 +702,9 @@ impl Drop for ZipOpenCacheRoot {
 /// Returns the path of every file actually created, for the caller to build
 /// a reciprocal `Created` undo entry from, or rolls every created file back
 /// and returns the first error.
-pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String)], dest_dir: &Path) -> Result<Vec<String>, String> {
+pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String, u64, u32)], dest_dir: &Path) -> Result<Vec<String>, String> {
     let mut created = Vec::new();
-    for (internal, file_name) in members {
+    for (internal, file_name, size, crc32) in members {
         let dest = dest_dir.join(file_name);
         if dest.exists() {
             for path in &created {
@@ -679,7 +712,7 @@ pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String)], d
             }
             return Err(format!("\"{file_name}\" already exists in the destination"));
         }
-        if let Err(e) = extract_zip_member(archive_path, internal, &dest) {
+        if let Err(e) = extract_zip_member(archive_path, internal, *size, *crc32, &dest) {
             for path in &created {
                 let _: Result<(), _> = std::fs::remove_file(path);
             }
@@ -697,7 +730,7 @@ pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String)], d
 /// type instead of needing a ZIP special case for a path string.
 pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
     let prefix = if internal.is_empty() { String::new() } else { format!("{internal}/") };
-    let mut children: HashMap<String, (bool, u64)> = HashMap::new();
+    let mut children: HashMap<String, (bool, u64, u32)> = HashMap::new();
     for item in index {
         let Some(rest) = item.logical_path.strip_prefix(prefix.as_str()) else { continue };
         if rest.is_empty() {
@@ -707,18 +740,19 @@ pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str)
             Some((first, _)) => (first.to_string(), true),
             None => (rest.to_string(), item.is_dir),
         };
-        let existing = children.entry(name).or_insert((is_direct_dir, 0));
+        let existing = children.entry(name).or_insert((is_direct_dir, 0, 0));
         if !is_direct_dir {
             existing.1 = item.size;
+            existing.2 = item.crc32;
         }
         existing.0 = existing.0 || is_direct_dir;
     }
     let mut out: Vec<Entry> = children
         .into_iter()
-        .map(|(name, (is_dir, size))| {
+        .map(|(name, (is_dir, size, crc32))| {
             let fake_path = Path::new(&name);
             let child_internal = if internal.is_empty() { name.clone() } else { format!("{internal}/{name}") };
-            let source = EntrySource::zip_member(archive.to_path_buf(), child_internal);
+            let source = EntrySource::zip_member(archive.to_path_buf(), child_internal, size, crc32);
             Entry {
                 icon: icon_name(fake_path, is_dir).to_string(),
                 is_image: is_image(fake_path),
@@ -6416,6 +6450,16 @@ mod zip_extraction_tests_d188 {
         writer.finish().unwrap();
     }
 
+    /// Size and CRC-32 for one logical path, as `index_zip` would list it —
+    /// the metadata these tests pass to `extract_zip_member`/
+    /// `copy_zip_members_out` for revalidation (D-188 REJECT 5).
+    fn indexed_meta(archive: &Path, internal: &str) -> (u64, u32) {
+        let file = std::fs::File::open(archive).unwrap();
+        let entries = index_zip(file, &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false)).unwrap();
+        let entry = entries.iter().find(|e| e.logical_path == internal).expect("member must be indexed");
+        (entry.size, entry.crc32)
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "wf-zip-extract-test-{tag}-{}-{}",
@@ -6432,7 +6476,8 @@ mod zip_extraction_tests_d188 {
         let archive = dir.join("a.zip");
         write_zip_file(&[("notes/todo.txt", b"buy milk")], &archive);
         let dest = dir.join("todo.txt");
-        extract_zip_member(&archive, "notes/todo.txt", &dest).unwrap();
+        let (size, crc32) = indexed_meta(&archive, "notes/todo.txt");
+        extract_zip_member(&archive, "notes/todo.txt", size, crc32, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"buy milk");
     }
 
@@ -6442,7 +6487,21 @@ mod zip_extraction_tests_d188 {
         let archive = dir.join("a.zip");
         write_zip_file(&[("a.txt", b"x")], &archive);
         let dest = dir.join("out.txt");
-        assert!(extract_zip_member(&archive, "not-there.txt", &dest).is_err());
+        assert!(extract_zip_member(&archive, "not-there.txt", 0, 0, &dest).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn extract_zip_member_rejects_a_changed_member_d188() {
+        let dir = scratch("changed");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("a.txt", b"original")], &archive);
+        let (size, crc32) = indexed_meta(&archive, "a.txt");
+        // Replace the archive's bytes for the same logical name after listing.
+        write_zip_file(&[("a.txt", b"replaced bytes, different length")], &archive);
+        let dest = dir.join("out.txt");
+        let err = extract_zip_member(&archive, "a.txt", size, crc32, &dest).unwrap_err();
+        assert!(err.contains("no longer matches what was listed"), "got: {err}");
         assert!(!dest.exists());
     }
 
@@ -6470,9 +6529,14 @@ mod zip_extraction_tests_d188 {
         write_zip_file(&[("x.txt", b"one"), ("y.txt", b"two")], &archive);
         let dest = dir.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
+        let (x_size, x_crc32) = indexed_meta(&archive, "x.txt");
+        let (y_size, y_crc32) = indexed_meta(&archive, "y.txt");
         let created = copy_zip_members_out(
             &archive,
-            &[("x.txt".to_string(), "x.txt".to_string()), ("y.txt".to_string(), "y.txt".to_string())],
+            &[
+                ("x.txt".to_string(), "x.txt".to_string(), x_size, x_crc32),
+                ("y.txt".to_string(), "y.txt".to_string(), y_size, y_crc32),
+            ],
             &dest,
         )
         .unwrap();
@@ -6489,9 +6553,14 @@ mod zip_extraction_tests_d188 {
         let dest = dir.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("y.txt"), b"already here").unwrap();
+        let (x_size, x_crc32) = indexed_meta(&archive, "x.txt");
+        let (y_size, y_crc32) = indexed_meta(&archive, "y.txt");
         let result = copy_zip_members_out(
             &archive,
-            &[("x.txt".to_string(), "x.txt".to_string()), ("y.txt".to_string(), "y.txt".to_string())],
+            &[
+                ("x.txt".to_string(), "x.txt".to_string(), x_size, x_crc32),
+                ("y.txt".to_string(), "y.txt".to_string(), y_size, y_crc32),
+            ],
             &dest,
         );
         assert!(result.is_err());

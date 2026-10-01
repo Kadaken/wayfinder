@@ -8074,7 +8074,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         let native_core::EntrySource::Real(archive) = &entry.source else { unreachable!() };
         navigate(state, native_core::Location::zip_root(archive.clone()));
     } else if let Some(member) = zip_member {
-        open_zip_member(state, ui, &member.archive, &member.internal, &entry.name);
+        open_zip_member(state, ui, &member.archive, &member.internal, member.size, member.crc32, &entry.name);
     } else if entry.is_dir {
         navigate(state, entry.source.to_location());
     } else {
@@ -8112,7 +8112,7 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
 /// old code, this never falls back to the shared, world-readable process
 /// temp dir. The cache root's owner lives in `AppState` so its `Drop` removes
 /// only that one root, at app teardown.
-fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, archive: &Path, internal: &str, display_name: &str) {
+fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, archive: &Path, internal: &str, expected_size: u64, expected_crc32: u32, display_name: &str) {
     static SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static NEXT_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let session_id = SESSION_ID.get_or_init(|| std::process::id().to_string()).clone();
@@ -8133,7 +8133,7 @@ fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, archive: &Path, inter
     std::thread::spawn(move || {
         let result = native_core::ZipOpenCacheRoot::create(&runtime_dir, &session_id, slot).and_then(|root| {
             let dest = root.path().join(&display_name);
-            native_core::extract_zip_member(&archive, &internal, &dest)?;
+            native_core::extract_zip_member(&archive, &internal, expected_size, expected_crc32, &dest)?;
             Ok((root, dest))
         });
         let _ = tx.send(result);
@@ -9126,14 +9126,14 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
 /// overwriting) on a name clash. The committed copy enters the accepted
 /// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
 /// New Folder/New File — Undo simply deletes the real files it made.
-fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String)>, dest_path: PathBuf) {
+fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String, u64, u32)>, dest_path: PathBuf) {
     let archive = zip_srcs[0].0.clone();
     let count = zip_srcs.len();
-    let members: Vec<(String, String)> = zip_srcs
+    let members: Vec<(String, String, u64, u32)> = zip_srcs
         .into_iter()
-        .map(|(_, internal)| {
+        .map(|(_, internal, size, crc32)| {
             let name = internal.rsplit('/').next().unwrap_or(&internal).to_string();
-            (internal, name)
+            (internal, name, size, crc32)
         })
         .collect();
     run_job(
@@ -13496,10 +13496,10 @@ Broken: Either state is wrong.\n";
         wait_for("docs children again", || state.borrow().visible_entries.len() == 2);
         let readme_source = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().source.clone();
         select_entry_by_source(&state, &ui, &readme_source);
-        let native_core::EntrySource::ZipMember(native_core::ZipMemberRef { archive, internal }) = readme_source else {
+        let native_core::EntrySource::ZipMember(native_core::ZipMemberRef { archive, internal, size, crc32 }) = readme_source else {
             panic!("readme.txt must be a ZipMember row");
         };
-        copy_zip_members_out_action(state.clone(), ui.clone(), vec![(archive, internal)], out_dir.clone());
+        copy_zip_members_out_action(state.clone(), ui.clone(), vec![(archive, internal, size, crc32)], out_dir.clone());
         let _ = &out_str;
         wait_for("copy out lands on disk", || out_dir.join("readme.txt").is_file());
         assert_eq!(std::fs::read(out_dir.join("readme.txt")).unwrap(), b"read me");
