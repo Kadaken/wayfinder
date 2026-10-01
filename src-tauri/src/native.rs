@@ -13949,6 +13949,26 @@ Broken: Either state is wrong.\n";
             writer.finish().unwrap();
         }
 
+        // ---- Symlink (ledger #50): the writer's own `add_symlink` sets
+        // S_IFLNK correctly (plain `start_file` with `unix_permissions`
+        // cannot — `FileOptions::normalize()` unconditionally ORs in
+        // S_IFREG for every `start_file` entry, confirmed by probing
+        // `unix_mode()` directly against a crate-written archive, which
+        // came back as a regular file no matter what type bits were passed).
+        {
+            let file = std::fs::File::create(root.join("symlink.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.add_symlink("evil-link", "/etc/passwd", stored_options).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Device (#51) and FIFO/socket (#52) entries have no equivalent
+        // writer-API method — only `start_file` (always forces S_IFREG) and
+        // `add_symlink` (always forces S_IFLNK) exist; the lower-level entry
+        // builder that could set an arbitrary unix mode is private to the
+        // `zip` crate. Left OPEN: not forgeable through this crate's public
+        // writer API, same wall as the duplicate-filename case (#44).
+
         // ---- Duplicate regular-file logical path (ledger #44): the `zip`
         // crate's reader collapses two central-directory records sharing an
         // identical raw name down to one entry at parse time — confirmed
@@ -14054,6 +14074,7 @@ Broken: Either state is wrong.\n";
         assert_refused("collision-reverse.zip", Some("collides as a file and a directory"));
         assert_refused("implicit-collision-file-first.zip", Some("collides as a file and a directory"));
         assert_refused("implicit-collision-dir-first.zip", Some("collides as a file and a directory"));
+        assert_refused("symlink.zip", Some("is a symlink or special entry"));
         assert_refused("backslash.zip", Some("uses an unsafe separator"));
         assert_refused("nul.zip", Some("contains a NUL byte"));
         assert_refused("drive.zip", Some("names an absolute path"));
