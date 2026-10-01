@@ -1407,7 +1407,7 @@ struct AppState {
     monitor_generation: u64,
     /// Realized Size/Modified labels by path, kept by the list bind/unbind so a
     /// metadata-only refresh can update text without touching the rows.
-    meta_labels: HashMap<String, (glib::WeakRef<gtk::Label>, glib::WeakRef<gtk::Label>)>,
+    meta_labels: HashMap<native_core::EntrySource, (glib::WeakRef<gtk::Label>, glib::WeakRef<gtk::Label>)>,
     thumbnail_queue: Option<Rc<RefCell<ThumbnailQueue>>>,
     video_poster_queue: Option<Rc<RefCell<VideoPosterQueue>>>,
     /// Last drive scan (with space), filled off the window thread. The sidebar and
@@ -6285,7 +6285,7 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         }
         let labels = state.borrow().meta_labels.clone();
         for entry in changed_paths {
-            if let Some((size, modified)) = labels.get(&entry.source.to_path_string()) {
+            if let Some((size, modified)) = labels.get(&entry.source) {
                 if let Some(size) = size.upgrade() {
                     size.set_label(&row_size_text(&entry));
                 }
@@ -6844,7 +6844,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         state
             .borrow_mut()
             .meta_labels
-            .insert(entry.source.to_path_string(), (size.downgrade(), modified.downgrade()));
+            .insert(entry.source.clone(), (size.downgrade(), modified.downgrade()));
 
         line.append(&icon);
         line.append(&name);
@@ -6916,17 +6916,17 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             }
             // Order matches the bind above: icon, name, size, kind, modified.
             if children.len() >= 5 {
-                if let Some(path) = item
+                if let Some(source) = item
                     .item()
                     .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
-                    .map(|b| b.borrow::<Entry>().source.to_path_string())
+                    .map(|b| b.borrow::<Entry>().source.clone())
                 {
                     let mut state = state_for_unbind.borrow_mut();
-                    let ours = state.meta_labels.get(&path).is_some_and(|(size, _)| {
+                    let ours = state.meta_labels.get(&source).is_some_and(|(size, _)| {
                         size.upgrade().is_some_and(|l| l.upcast_ref::<gtk::Widget>() == &children[2])
                     });
                     if ours {
-                        state.meta_labels.remove(&path);
+                        state.meta_labels.remove(&source);
                     }
                 }
                 ui_for_unbind.columns.size.remove_widget(&children[2]);
@@ -19247,11 +19247,12 @@ Broken: Either state is wrong.\n";
             .expect("the test window is registered");
         wait_for("listing", || state.borrow().visible_entries.len() == 3);
         let b_path = dir.join("b.txt").to_string_lossy().to_string();
+        let b_source = native_core::EntrySource::real(dir.join("b.txt"));
         let b_labels = |state: &Rc<RefCell<AppState>>| {
             state
                 .borrow()
                 .meta_labels
-                .get(&b_path)
+                .get(&b_source)
                 .and_then(|(size, modified)| Some((size.upgrade()?, modified.upgrade()?)))
         };
 
@@ -19404,7 +19405,10 @@ Broken: Either state is wrong.\n";
         wait_for("listing", || state.borrow().visible_entries.len() == 4);
         let a_path = dir.join("a.txt").to_string_lossy().to_string();
         let b_path = dir.join("b.txt").to_string_lossy().to_string();
-        let index_of = |path: &str| state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == path).unwrap();
+        let index_of = |path: &str| {
+            let source = native_core::EntrySource::real(path);
+            state.borrow().visible_entries.iter().position(|e| e.source == source).unwrap()
+        };
         let row_widget = |mode: ViewMode, path: &str| -> Option<gtk::Widget> {
             if mode == ViewMode::Grid {
                 ui.grid.child_at_index(index_of(path) as i32).map(|c| c.upcast())
@@ -19412,7 +19416,7 @@ Broken: Either state is wrong.\n";
                 state
                     .borrow()
                     .meta_labels
-                    .get(path)
+                    .get(&native_core::EntrySource::real(path))
                     .and_then(|(size, _)| size.upgrade())
                     .and_then(|l| l.parent())
             }
