@@ -286,6 +286,17 @@ impl std::fmt::Display for ZipNameError {
     }
 }
 
+/// True when a Unix mode's file-type bits (S_IFMT) name anything other than
+/// a regular file or a directory — a symlink, device, FIFO or socket — which
+/// D-188 must reject at index time, not just symlinks (REJECT 6).
+pub fn is_disallowed_unix_mode(mode: u32) -> bool {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    let file_type = mode & S_IFMT;
+    file_type != 0 && file_type != S_IFREG && file_type != S_IFDIR
+}
+
 /// Normalizes and validates one ZIP member name against every unsafe form
 /// this round must reject before indexing or streaming it (D-188). Returns
 /// the normalized logical path (forward-slash, no leading/trailing slash)
@@ -414,10 +425,14 @@ pub fn index_zip<R: Read + std::io::Seek>(
     if archive.len() > limits.max_members {
         return Err(ZipIndexError::TooManyMembers);
     }
-    let mut seen_files: HashSet<String> = HashSet::new();
-    let mut seen_dirs: HashSet<String> = HashSet::new();
-    let mut implicit_dirs: HashSet<String> = HashSet::new();
-    let mut out: Vec<ZipIndexEntry> = Vec::with_capacity(archive.len());
+    // One logical namespace map, built incrementally as entries are read, so
+    // a collision is rejected regardless of which order the two colliding
+    // entries appear in the archive (D-188 REJECT 6). `true` = reserved as a
+    // directory (explicit or an ancestor of something else), `false` =
+    // reserved as a file.
+    let mut namespace: HashMap<String, bool> = HashMap::new();
+    let mut explicit_entries: Vec<(String, bool, u64)> = Vec::with_capacity(archive.len());
+    let mut seen_explicit_dirs: HashSet<String> = HashSet::new();
     let mut total_claimed: u64 = 0;
 
     for i in 0..archive.len() {
@@ -431,51 +446,89 @@ pub fn index_zip<R: Read + std::io::Seek>(
         if raw_name.len() > limits.max_name_len {
             return Err(ZipIndexError::NameTooLong(raw_name));
         }
-        if entry.is_symlink() {
-            return Err(ZipIndexError::BadName(raw_name, ZipNameError::SpecialEntry));
-        }
         if entry.encrypted() {
             return Err(ZipIndexError::Encrypted(raw_name));
         }
         let is_dir = entry.is_dir();
-        let normalized = validate_zip_member_name(&raw_name, &seen_files, &seen_dirs, is_dir)
+        // Reject every non-regular/non-directory Unix mode (symlinks,
+        // devices, FIFOs, sockets), not symlinks alone.
+        if entry.unix_mode().is_some_and(is_disallowed_unix_mode) {
+            return Err(ZipIndexError::BadName(raw_name, ZipNameError::SpecialEntry));
+        }
+        #[allow(deprecated)]
+        let is_unsupported_method = matches!(entry.compression(), zip::CompressionMethod::Unsupported(_));
+        if !is_dir && is_unsupported_method {
+            return Err(ZipIndexError::Unsupported(raw_name));
+        }
+
+        let normalized = validate_zip_member_name(&raw_name, &HashSet::new(), &HashSet::new(), is_dir)
             .map_err(|why| ZipIndexError::BadName(raw_name.clone(), why))?;
 
         let size = entry.size();
         let compressed = entry.compressed_size().max(1);
-        if size > limits.max_entry_claimed_bytes {
-            return Err(ZipIndexError::EntryTooLarge(raw_name));
-        }
-        if size / compressed > limits.max_compression_ratio {
-            return Err(ZipIndexError::SuspiciousCompressionRatio(raw_name));
-        }
-        total_claimed = total_claimed.saturating_add(size);
-        if total_claimed > limits.max_total_claimed_bytes {
-            return Err(ZipIndexError::ArchiveTooLarge);
+        if !is_dir {
+            if size > limits.max_entry_claimed_bytes {
+                return Err(ZipIndexError::EntryTooLarge(raw_name));
+            }
+            if size / compressed > limits.max_compression_ratio {
+                return Err(ZipIndexError::SuspiciousCompressionRatio(raw_name));
+            }
+            total_claimed = total_claimed.saturating_add(size);
+            if total_claimed > limits.max_total_claimed_bytes {
+                return Err(ZipIndexError::ArchiveTooLarge);
+            }
         }
 
-        if is_dir {
-            seen_dirs.insert(normalized.clone());
-            out.push(ZipIndexEntry { logical_path: normalized, is_dir: true, size: 0 });
-        } else {
-            seen_files.insert(normalized.clone());
-            // Every ancestor directory must exist even if the archive never
-            // wrote an explicit directory entry for it.
-            let mut parent = normalized.rsplit_once('/').map(|(p, _)| p);
-            while let Some(p) = parent {
-                if !p.is_empty() && !seen_dirs.contains(p) {
-                    implicit_dirs.insert(p.to_string());
+        // Reserve every ancestor as a directory immediately, rejecting an
+        // ancestor already reserved as a file, independent of archive order.
+        let mut parent = normalized.rsplit_once('/').map(|(p, _)| p);
+        while let Some(p) = parent {
+            if !p.is_empty() {
+                match namespace.get(p) {
+                    Some(false) => return Err(ZipIndexError::BadName(raw_name, ZipNameError::FileDirectoryCollision)),
+                    Some(true) => break,
+                    None => {
+                        namespace.insert(p.to_string(), true);
+                    }
                 }
-                parent = p.rsplit_once('/').map(|(p, _)| p);
             }
-            out.push(ZipIndexEntry { logical_path: normalized, is_dir: false, size });
+            parent = p.rsplit_once('/').map(|(p, _)| p);
         }
+
+        match namespace.get(&normalized) {
+            Some(existing_is_dir) => {
+                if is_dir && *existing_is_dir {
+                    // A prior *explicit* directory entry with this exact
+                    // path is a true duplicate; an ancestor reservation
+                    // alone is not.
+                    if seen_explicit_dirs.contains(&normalized) {
+                        return Err(ZipIndexError::BadName(raw_name, ZipNameError::DuplicatePath));
+                    }
+                } else if *existing_is_dir != is_dir {
+                    return Err(ZipIndexError::BadName(raw_name, ZipNameError::FileDirectoryCollision));
+                } else {
+                    return Err(ZipIndexError::BadName(raw_name, ZipNameError::DuplicatePath));
+                }
+            }
+            None => {
+                namespace.insert(normalized.clone(), is_dir);
+            }
+        }
+        if is_dir {
+            seen_explicit_dirs.insert(normalized.clone());
+        }
+
+        explicit_entries.push((normalized, is_dir, size));
     }
 
-    for dir in implicit_dirs {
-        if !seen_dirs.contains(&dir) {
-            seen_dirs.insert(dir.clone());
-            out.push(ZipIndexEntry { logical_path: dir, is_dir: true, size: 0 });
+    let mut out: Vec<ZipIndexEntry> = Vec::with_capacity(namespace.len());
+    let explicit_paths: HashSet<&str> = explicit_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+    for (path, is_dir, size) in &explicit_entries {
+        out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: *is_dir, size: *size });
+    }
+    for (path, is_dir) in &namespace {
+        if *is_dir && !explicit_paths.contains(path.as_str()) {
+            out.push(ZipIndexEntry { logical_path: path.clone(), is_dir: true, size: 0 });
         }
     }
     Ok(out)
@@ -6235,6 +6288,65 @@ mod zip_index_tests_d188 {
         let bytes = build_zip(&[("a.txt", b"a"), ("b.txt", b"b")]);
         let result = index_zip(Cursor::new(bytes), &tight, &AtomicBool::new(false));
         assert_eq!(result, Err(ZipIndexError::TooManyMembers));
+    }
+
+    #[test]
+    fn rejects_implicit_file_directory_collision_file_first_d188() {
+        // "a" is a file; "a/b" later implies "a" must also be a directory.
+        let bytes = build_zip(&[("a", b"x"), ("a/b", b"y")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::FileDirectoryCollision))), "{result:?}");
+    }
+
+    #[test]
+    fn rejects_implicit_file_directory_collision_dir_first_d188() {
+        // "a/b" is seen first, reserving "a" as a directory; "a" as a file
+        // later must still be rejected (order-independent, REJECT 6).
+        let bytes = build_zip(&[("a/b", b"y"), ("a", b"x")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::FileDirectoryCollision))), "{result:?}");
+    }
+
+
+    #[test]
+    fn explicit_directory_matching_an_implicit_ancestor_is_not_a_duplicate_d188() {
+        // "a/b.txt" implicitly reserves "a" as a directory; a later explicit
+        // "a/" entry for the same path is the normal archive form, not a
+        // duplicate of itself.
+        let entries = idx(&[("a/b.txt", b"x"), ("a/", b"")]);
+        let paths: HashSet<_> = entries.iter().map(|e| (e.logical_path.clone(), e.is_dir)).collect();
+        assert!(paths.contains(&("a".to_string(), true)));
+    }
+
+    #[test]
+    fn disallowed_unix_mode_rejects_every_special_file_type_d188() {
+        const S_IFLNK: u32 = 0o120000; // symlink
+        const S_IFCHR: u32 = 0o020000; // character device
+        const S_IFBLK: u32 = 0o060000; // block device
+        const S_IFIFO: u32 = 0o010000; // FIFO
+        const S_IFSOCK: u32 = 0o140000; // socket
+        for special in [S_IFLNK, S_IFCHR, S_IFBLK, S_IFIFO, S_IFSOCK] {
+            assert!(is_disallowed_unix_mode(special | 0o644), "mode {special:o} must be rejected");
+        }
+    }
+
+    #[test]
+    fn disallowed_unix_mode_allows_regular_files_directories_and_absent_mode_d188() {
+        assert!(!is_disallowed_unix_mode(0o100644)); // S_IFREG
+        assert!(!is_disallowed_unix_mode(0o040755)); // S_IFDIR
+        assert!(!is_disallowed_unix_mode(0o644)); // no file-type bits at all
+    }
+
+    #[test]
+    fn rejects_symlink_entries_through_the_real_archive_path_d188() {
+        let buf = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buf);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.add_symlink("link", "/etc/passwd", options).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::SpecialEntry))), "{result:?}");
     }
 
     #[test]
