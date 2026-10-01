@@ -13900,12 +13900,71 @@ Broken: Either state is wrong.\n";
             writer.finish().unwrap();
         }
 
-        // ---- File/directory collision: "a/" declared as a directory, then "a" as a file.
+        // ---- File/directory collision, directory-then-file order: "a/" then "a".
         {
             let file = std::fs::File::create(root.join("collision.zip")).unwrap();
             let mut writer = zip::ZipWriter::new(file);
             writer.add_directory("a/", stored_options).unwrap();
             writer.start_file("a", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- File/directory collision, file-then-directory order (REJECT 7:
+        // the same refusal must not depend on which entry the archive lists
+        // first).
+        {
+            let file = std::fs::File::create(root.join("collision-reverse.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("b", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.add_directory("b/", stored_options).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Duplicate regular-file logical path (ledger #44): the `zip`
+        // crate's reader collapses two central-directory records sharing an
+        // identical raw name down to one entry at parse time — confirmed
+        // both for a post-write byte patch of a crate-written archive AND
+        // for a hand-built raw-bytes archive with two complete, distinct
+        // local-file-header + central-directory-record pairs. `index_zip`
+        // (via `zip::ZipArchive::new`) can never observe two same-named
+        // entries through this crate, so this fixture cannot be forged at
+        // this layer; see the D-188 ledger report for #44 (OPEN, with this
+        // finding as the reason).
+
+        // ---- Unsafe separator: a raw name carrying a backslash.
+        {
+            let file = std::fs::File::create(root.join("backslash.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a\\evil.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Embedded NUL byte in a raw name.
+        {
+            let file = std::fs::File::create(root.join("nul.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a\0evil.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Windows drive-letter form, a second absolute-path escape shape.
+        {
+            let file = std::fs::File::create(root.join("drive.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("C:/evil.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Ambiguous normalization: a "." path segment.
+        {
+            let file = std::fs::File::create(root.join("ambiguous.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a/./evil.txt", stored_options).unwrap();
             std::io::Write::write_all(&mut writer, b"x").unwrap();
             writer.finish().unwrap();
         }
@@ -13965,6 +14024,11 @@ Broken: Either state is wrong.\n";
         assert_refused("absolute.zip", Some("names an absolute path"));
         assert_refused("duplicate.zip", Some("duplicates another entry's path"));
         assert_refused("collision.zip", Some("collides as a file and a directory"));
+        assert_refused("collision-reverse.zip", Some("collides as a file and a directory"));
+        assert_refused("backslash.zip", Some("uses an unsafe separator"));
+        assert_refused("nul.zip", Some("contains a NUL byte"));
+        assert_refused("drive.zip", Some("names an absolute path"));
+        assert_refused("ambiguous.zip", Some("normalizes ambiguously"));
 
         wait_for("listing shows badcrc.zip", || {
             state.borrow().visible_entries.iter().any(|e| e.name == "badcrc.zip")
