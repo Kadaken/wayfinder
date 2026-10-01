@@ -39,6 +39,8 @@ For a local native build, see [Build from Source](#build-from-source).
 - `xdg-utils` — for opening files with default apps
 - `gio` / `glib2` — for Trash support
 - `udisks2` — for mounting and ejecting drives
+- `gvfs-smb` — SMB/CIFS network share protocol support
+- `gvfs-fuse` — the local filesystem bridge GVfs mounts (SMB and other network/virtual shares) onto; without it, mounted shares have no local path Wayfinder can browse
 - A freedesktop icon theme (`breeze-icons`, `papirus-icon-theme`, etc.)
 - GTK 4 and libadwaita runtime libraries — required by the native app
 
