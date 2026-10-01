@@ -14328,6 +14328,24 @@ Broken: Either state is wrong.\n";
         let full_bytes = std::fs::read(root.join("truncated.zip")).unwrap();
         std::fs::write(root.join("truncated.zip"), &full_bytes[..full_bytes.len() / 2]).unwrap();
 
+        // ---- Local header corrupted: the central directory is intact, so
+        // the archive opens, but the first member's own local header
+        // signature is overwritten, which only surfaces when ordinary
+        // activation walks every member to index it (D-188 ledger #34).
+        {
+            let file = std::fs::File::create(root.join("localhdr.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"hello world").unwrap();
+            writer.finish().unwrap();
+        }
+        {
+            let mut bytes = std::fs::read(root.join("localhdr.zip")).unwrap();
+            assert_eq!(&bytes[0..4], b"PK\x03\x04", "the local file header must start where expected");
+            bytes[0..4].copy_from_slice(b"XXXX");
+            std::fs::write(root.join("localhdr.zip"), &bytes).unwrap();
+        }
+
         // ---- Unsafe names: traversal and an absolute path.
         {
             let file = std::fs::File::create(root.join("traversal.zip")).unwrap();
@@ -14598,6 +14616,7 @@ Broken: Either state is wrong.\n";
 
         assert_refused("garbage.zip", Some("could not open archive"));
         assert_refused("truncated.zip", None);
+        assert_refused("localhdr.zip", None);
         assert_refused("traversal.zip", Some("escapes the archive"));
         assert_refused("absolute.zip", Some("names an absolute path"));
         assert_refused("duplicate.zip", Some("duplicates another entry's path"));
