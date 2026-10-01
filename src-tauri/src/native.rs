@@ -6006,9 +6006,12 @@ fn navigate_to_with_message(
                 state.entries = listing.entries;
                 state.visible_entries.clear();
                 state.filter_text.clear();
-                match update_config(|config| push_recent(&mut config.recents, &path)) {
-                    Some(config) => state.recents = config.recents,
-                    None => push_recent(&mut state.recents, &path),
+                // A virtual ZIP location never enters persistent Recent config (D-188).
+                if !native_core::Location::parse(&path).is_zip() {
+                    match update_config(|config| push_recent(&mut config.recents, &path)) {
+                        Some(config) => state.recents = config.recents,
+                        None => push_recent(&mut state.recents, &path),
+                    }
                 }
             }
             if let Some(ui) = &ui {
@@ -6070,8 +6073,13 @@ fn navigate_to_with_message(
         }
     };
     glib::spawn_future_local(async move {
+        let is_zip = native_core::Location::parse(&path_for_worker).is_zip();
         let received = gio::spawn_blocking(move || {
-            native_core::list_dir_cancellable(&path_for_worker, show_hidden, &cancelled)
+            if is_zip {
+                native_core::list_zip_dir_cancellable(&path_for_worker, &cancelled)
+            } else {
+                native_core::list_dir_cancellable(&path_for_worker, show_hidden, &cancelled)
+            }
         })
         .await
         .map_err(|_| ());
@@ -6093,6 +6101,11 @@ fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str)
         state.monitor_generation = state.monitor_generation.wrapping_add(1);
         state.monitor_generation
     };
+    // A ZIP virtual location is not a real inode gio can watch, and the
+    // brief forbids installing one anyway (D-188).
+    if native_core::Location::parse(path).is_zip() {
+        return;
+    }
     let file = gio::File::for_path(path);
     let Ok(monitor) = file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
     else {
@@ -6407,16 +6420,33 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
     }
     ui.path_crumbs.set_tooltip_text(Some(path));
 
+    let location = native_core::Location::parse(path);
+    // Real ancestors first — the ZIP's own containing folder when `path` is a
+    // ZIP location, otherwise `path` itself (unchanged real-folder behavior).
+    let real_prefix = match &location {
+        native_core::Location::ZipDir { archive, .. } => {
+            archive.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+        }
+        native_core::Location::RealDir(real) => real.to_string_lossy().into_owned(),
+    };
+
     // (label, path-to-navigate-to). "Computer" is the filesystem root.
     let mut crumbs: Vec<(String, String)> = vec![("Computer".to_string(), "/".to_string())];
     let mut accumulated = PathBuf::from("/");
-    for component in PathBuf::from(path).components() {
+    for component in PathBuf::from(&real_prefix).components() {
         if let std::path::Component::Normal(value) = component {
             accumulated.push(value);
             crumbs.push((
                 value.to_string_lossy().to_string(),
                 accumulated.to_string_lossy().to_string(),
             ));
+        }
+    }
+    // The archive's own name, then each internal folder, each clickable to
+    // that exact ZIP location (D-188).
+    if let Some(tail) = location.zip_breadcrumb_tail() {
+        for (label, target) in tail {
+            crumbs.push((label, target.to_path_string()));
         }
     }
 
@@ -7973,7 +8003,18 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         }
         return;
     }
-    if entry.is_dir {
+    // D-188: activating a real .zip file in the ordinary browser enters its
+    // virtual root instead of handing it to an external application. A row
+    // already inside a ZIP (its path is a ZipDir location) is unaffected —
+    // its own is_dir already routes it through the branch below.
+    let is_ordinary_zip_file = !entry.is_dir
+        && !native_core::Location::parse(&entry.path).is_zip()
+        && Path::new(&entry.path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    if is_ordinary_zip_file {
+        navigate(state, native_core::Location::zip_root(entry.path).to_path_string());
+    } else if entry.is_dir {
         navigate(state, entry.path);
     } else if std::fs::symlink_metadata(&entry.path).is_err() {
         // A stale row must never hand a vanished path to an external app: some
