@@ -1511,6 +1511,15 @@ struct Ui {
     transfer_bar: gtk::ProgressBar,
     transfer_cancel: gtk::Button,
     picker_open: Option<gtk::Button>,
+    /// D-188 REJECT 2: the production command bar must itself go ZIP-aware
+    /// (hidden/insensitive inside a ZIP cwd), not just refuse in the handler.
+    new_folder: gtk::Button,
+    new_file: gtk::Button,
+    cut: gtk::Button,
+    paste: gtk::Button,
+    rename: gtk::Button,
+    trash: gtk::Button,
+    terminal: gtk::Button,
 }
 
 /// The interface Chrome, Brave, Firefox and most GTK/Qt apps call to say
@@ -3356,12 +3365,20 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         transfer_bar: transfer_bar.clone(),
         transfer_cancel: transfer_cancel.clone(),
         picker_open: picker_open.clone(),
+        new_folder: new_folder.clone(),
+        new_file: new_file.clone(),
+        cut: cut.clone(),
+        paste: paste.clone(),
+        rename: rename.clone(),
+        trash: trash.clone(),
+        terminal: terminal.clone(),
     };
     // GtkApplication keeps an activation-created window alive automatically,
     // but an initial GApplication `open` request can otherwise return before
     // GTK has taken that hold. Pair an explicit hold with the window lifecycle
     // so folder launches and regular launches behave identically.
     register_window(&state, &ui, app.hold());
+    update_command_bar_zip_state(&state, &ui);
     wire_transfer_cancel(&state, &ui);
     {
         let state = state.clone();
@@ -4105,6 +4122,7 @@ fn switch_tab_action(state: Rc<RefCell<AppState>>, index: usize) {
     // Sensitivity follows the newly active tab now, not when its listing ends.
     if let Some(ui) = ui_for_state(&state) {
         update_nav_buttons(&state, &ui);
+        update_command_bar_zip_state(&state, &ui);
     }
     navigate_without_history(&state, path);
 }
@@ -4115,6 +4133,7 @@ fn open_path_in_new_tab(state: &Rc<RefCell<AppState>>, ui: &Ui, path: native_cor
     state.borrow_mut().tabs.open(path.clone());
     rebuild_tabs(state, ui);
     update_nav_buttons(state, ui);
+    update_command_bar_zip_state(state, ui);
     navigate_without_history(state, path);
 }
 
@@ -4123,6 +4142,7 @@ fn new_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     state.borrow_mut().tabs.open(path.clone());
     rebuild_tabs(&state, &ui);
     update_nav_buttons(&state, &ui);
+    update_command_bar_zip_state(&state, &ui);
     navigate_without_history(&state, path);
 }
 
@@ -4136,6 +4156,7 @@ fn close_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     };
     rebuild_tabs(&state, &ui);
     update_nav_buttons(&state, &ui);
+    update_command_bar_zip_state(&state, &ui);
     navigate_without_history(&state, path);
 }
 
@@ -6054,6 +6075,7 @@ fn navigate_to_with_message(
                 repopulate_rows(&state, ui);
                 update_selection(&state, ui);
                 update_nav_buttons(&state, ui);
+                update_command_bar_zip_state(&state, ui);
                 update_sidebar_active_rows(&state, ui);
                 install_directory_monitor(&state, ui, &path);
                 if let Some(target) = state.borrow().pinned_top.clone() {
@@ -6402,6 +6424,25 @@ fn update_nav_buttons(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.borrow();
     ui.back.set_sensitive(state.tabs.active().can_back());
     ui.forward.set_sensitive(state.tabs.active().can_forward());
+}
+
+/// D-188 REJECT 2: the visible command bar must itself refuse filesystem
+/// mutation inside a ZIP cwd — not just the action handlers behind it. This
+/// is the first (visible) boundary; the handlers stay as the second.
+fn update_command_bar_zip_state(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let cwd_is_zip = state.borrow().cwd.is_zip();
+    for button in [
+        &ui.new_folder,
+        &ui.new_file,
+        &ui.cut,
+        &ui.paste,
+        &ui.rename,
+        &ui.trash,
+        &ui.terminal,
+    ] {
+        button.set_sensitive(!cwd_is_zip);
+        button.set_visible(!cwd_is_zip);
+    }
 }
 
 thread_local! {
@@ -13454,6 +13495,25 @@ Broken: Either state is wrong.\n";
         };
         assert_eq!(names(&state), vec!["docs", "empty-dir", "zero.bin"]);
 
+        // ---- REJECT 2: the visible command bar itself, not just the item
+        // and background menus, goes ZIP-aware: absent or insensitive while
+        // inside a ZIP, for every control that mutates a real path.
+        update_command_bar_zip_state(&state, &ui);
+        for (button, label) in [
+            (&ui.new_folder, "New Folder"),
+            (&ui.new_file, "New File"),
+            (&ui.cut, "Cut"),
+            (&ui.paste, "Paste"),
+            (&ui.rename, "Rename"),
+            (&ui.trash, "Move to Trash"),
+            (&ui.terminal, "Terminal"),
+        ] {
+            assert!(
+                !button.is_sensitive() || !button.is_visible(),
+                "toolbar {label} must be absent or insensitive inside a ZIP"
+            );
+        }
+
         // ---- REJECT 2: item and background menus inside a ZIP expose only
         // navigation/selection/Open, never a real-path mutation action.
         ui.window.present();
@@ -13624,6 +13684,23 @@ Broken: Either state is wrong.\n";
         // ---- The archive itself was never touched by any of the above.
         assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive bytes unchanged");
         assert_eq!(std::fs::metadata(&archive_path).unwrap().modified().unwrap(), archive_mtime_before, "archive mtime unchanged");
+
+        // ---- REJECT 2: leaving the ZIP for a real folder restores the
+        // toolbar's visible, sensitive controls.
+        navigate(&state, native_core::Location::real(&dir));
+        wait_for("back in the real folder", || !state.borrow().cwd.is_zip());
+        update_command_bar_zip_state(&state, &ui);
+        for (button, label) in [
+            (&ui.new_folder, "New Folder"),
+            (&ui.new_file, "New File"),
+            (&ui.cut, "Cut"),
+            (&ui.paste, "Paste"),
+            (&ui.rename, "Rename"),
+            (&ui.trash, "Move to Trash"),
+            (&ui.terminal, "Terminal"),
+        ] {
+            assert!(button.is_sensitive() && button.is_visible(), "toolbar {label} must be restored outside a ZIP");
+        }
 
         ui.window.close();
         pump();
