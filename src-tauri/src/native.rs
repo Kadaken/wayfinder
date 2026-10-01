@@ -14892,16 +14892,47 @@ Broken: Either state is wrong.\n";
             wait_for("back out of the archive", || !state.borrow().cwd.is_zip());
         }
 
+        // D-188 #62: every hostile/boundary refusal — including these
+        // boundary ones — must preserve prior location and history and
+        // leave the archive's own bytes, the Open cache, and any launched
+        // child process untouched. #32 (`zip_bad_oracles_d188::assert_refused`)
+        // proves the same bar for the hostile group; this proves it here for
+        // the #55-61 boundary group.
         fn open_and_expect_refused(state: &Rc<RefCell<AppState>>, ui: &Ui, dir: &std::path::Path, zip_name: &str, fragment: &str) {
             enter_group(state, dir);
             wait_for("listing shows the fixture", || state.borrow().visible_entries.iter().any(|e| e.name == zip_name));
             let entry = state.borrow().visible_entries.iter().find(|e| e.name == zip_name).cloned().unwrap();
+            let before_cwd = state.borrow().cwd.real_path_string().unwrap_or_default();
+            let undo_len_before = state.borrow().undo_stack.len();
+            let fixture_path = dir.join(zip_name);
+            let fixture_bytes_before = std::fs::read(&fixture_path).unwrap();
+            let cache_root = native_core::scratch_root().join("wayfinder-zip-cache");
+            TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
             ui.status.set_label("");
             open_entry(state, ui, entry);
             wait_for("bounded refusal within a named 10s bound", || ui.status.label().starts_with("Cannot open "));
             let label = ui.status.label().to_string();
             assert!(label.contains(fragment), "{zip_name}: status {label:?} should contain {fragment:?}");
             assert!(!state.borrow().cwd.is_zip(), "{zip_name}: a refused archive must never be entered");
+            assert_eq!(
+                state.borrow().cwd.real_path_string().unwrap_or_default(),
+                before_cwd,
+                "{zip_name}: the prior location must be preserved across a refusal"
+            );
+            assert_eq!(state.borrow().undo_stack.len(), undo_len_before, "{zip_name}: a refused action must not add history");
+            assert_eq!(
+                std::fs::read(&fixture_path).unwrap(),
+                fixture_bytes_before,
+                "{zip_name}: the fixture's own bytes must stay untouched by a refused action"
+            );
+            assert!(
+                !cache_root.is_dir() || walk_find_file(&cache_root, zip_name).is_none(),
+                "{zip_name}: a refused action must leave no cache residue"
+            );
+            assert!(
+                TEST_LAUNCHER_CALLS.with(|c| c.borrow().is_empty()),
+                "{zip_name}: a refused action must launch no child process"
+            );
         }
 
         // Held for the whole test: an unwind-safe, serialized override of
