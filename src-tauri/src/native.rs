@@ -11806,6 +11806,13 @@ thread_local! {
     /// external launcher, in call order, instead of ever starting one.
     #[cfg(test)]
     static TEST_LAUNCHER_CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Default false, so `launch_path` under test still performs the real
+    /// `native_core::open_path` side effect by default (the D-75 fake-opener
+    /// proof depends on that). A named D-188 test that must never launch a
+    /// real external application sets this to true for its own duration via
+    /// `TestLaunchRecordOnlyGuard`, which still records the call.
+    #[cfg(test)]
+    static TEST_LAUNCH_RECORD_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// D-188 REJECT 3: counts `open_zip_member`'s poll ticks, so a test can
     /// prove the GTK main loop keeps advancing while a large member streams
     /// on its own thread instead of merely waiting for the final result.
@@ -11834,7 +11841,38 @@ fn launch_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 fn launch_path(path: &str) -> Result<(), String> {
     TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().push(path.to_string()));
-    Ok(())
+    if TEST_LAUNCH_RECORD_ONLY.with(|f| f.get()) {
+        Ok(())
+    } else {
+        native_core::open_path(path)
+    }
+}
+
+/// Unwind-safe RAII opt-in for a named D-188 test that performs an allowed
+/// Open and must never start a real external application: sets
+/// `TEST_LAUNCH_RECORD_ONLY` to true for its duration and restores the exact
+/// prior value in `Drop`, including on panic, so a later test can never
+/// inherit a suppressed launch (the standing seam rule: production side
+/// effect by default, suppressed only through an explicit named opt-in).
+#[cfg(test)]
+struct TestLaunchRecordOnlyGuard {
+    prior: bool,
+}
+
+#[cfg(test)]
+impl TestLaunchRecordOnlyGuard {
+    fn new() -> Self {
+        let prior = TEST_LAUNCH_RECORD_ONLY.with(|f| f.get());
+        TEST_LAUNCH_RECORD_ONLY.with(|f| f.set(true));
+        TestLaunchRecordOnlyGuard { prior }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLaunchRecordOnlyGuard {
+    fn drop(&mut self) {
+        TEST_LAUNCH_RECORD_ONLY.with(|f| f.set(self.prior));
+    }
 }
 
 /// Counts every `open_zip_member` poll tick (D-188 REJECT 3): a test proves
@@ -13552,6 +13590,10 @@ Broken: Either state is wrong.\n";
         // boundary test can race this test's own listing/Open/Copy Out
         // reads of `effective_zip_limits()` (D-188 DEFECT 2).
         let _zip_limits_guard = native_core::TestZipLimitsGuard::new(None);
+        // This test performs several allowed Opens (readme.txt, the emoji
+        // member, big.bin, zero.bin) and must never start a real external
+        // application for any of them (D-188 REJECT: standing seam rule).
+        let _record_only_guard = TestLaunchRecordOnlyGuard::new();
         gtk::init().expect("gtk init on the virtual display");
         let root = crate::native_core::scratch_root().join(format!("wf-d188-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -14941,6 +14983,10 @@ Broken: Either state is wrong.\n";
         // `TEST_ZIP_LIMITS_LOCK` for its entire lifetime so no other test
         // reading `effective_zip_limits()` can race this one.
         let zip_limits_guard = native_core::TestZipLimitsGuard::new(None);
+        // `atlimit.zip`'s member performs one allowed Open (#59's
+        // declared-equals-real case) and must never start a real external
+        // application for it (D-188 REJECT: standing seam rule).
+        let _record_only_guard = TestLaunchRecordOnlyGuard::new();
 
         // ---- #55: member count. max_members tightened to 2.
         zip_limits_guard.set(Some(native_core::ZipLimits { max_members: 2, ..native_core::DEFAULT_ZIP_LIMITS }));
