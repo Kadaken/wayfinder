@@ -102,6 +102,102 @@ pub struct Space {
     pub available: u64,
 }
 
+/// Where a browse location lives: a real directory, or a folder inside a ZIP
+/// being browsed read-only. `internal` is empty at the ZIP's virtual root.
+/// Carried by tabs/history/breadcrumbs instead of an ambiguous path string,
+/// so a ZIP member can never be mistaken for a mutable disk path (D-188).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Location {
+    RealDir(PathBuf),
+    ZipDir { archive: PathBuf, internal: String },
+}
+
+/// Where a single row's bytes live, for the same reason: `Entry.path` alone
+/// cannot say whether rename/trash/paste-target code may touch it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowProvenance {
+    Real(PathBuf),
+    ZipMember { archive: PathBuf, internal: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ZipNameError {
+    Absolute,
+    ParentTraversal,
+    NulByte,
+    BackslashSeparator,
+    AmbiguousNormalization,
+    DuplicatePath,
+    FileDirectoryCollision,
+    SpecialEntry,
+}
+
+impl std::fmt::Display for ZipNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absolute => write!(f, "names an absolute path"),
+            Self::ParentTraversal => write!(f, "escapes the archive with \"..\""),
+            Self::NulByte => write!(f, "contains a NUL byte"),
+            Self::BackslashSeparator => write!(f, "uses an unsafe separator"),
+            Self::AmbiguousNormalization => write!(f, "normalizes ambiguously"),
+            Self::DuplicatePath => write!(f, "duplicates another entry's path"),
+            Self::FileDirectoryCollision => write!(f, "collides as a file and a directory"),
+            Self::SpecialEntry => write!(f, "is a symlink or special entry"),
+        }
+    }
+}
+
+/// Normalizes and validates one ZIP member name against every unsafe form
+/// this round must reject before indexing or streaming it (D-188). Returns
+/// the normalized logical path (forward-slash, no leading/trailing slash)
+/// on success. Caller tracks `seen` paths and `seen_as_dir` across the whole
+/// archive to catch duplicates and file/directory collisions.
+pub fn validate_zip_member_name(
+    raw: &str,
+    seen: &HashSet<String>,
+    seen_as_dir: &HashSet<String>,
+    is_dir: bool,
+) -> Result<String, ZipNameError> {
+    if raw.contains('\0') {
+        return Err(ZipNameError::NulByte);
+    }
+    if raw.contains('\\') {
+        return Err(ZipNameError::BackslashSeparator);
+    }
+    if raw.starts_with('/') || raw.starts_with("//") {
+        return Err(ZipNameError::Absolute);
+    }
+    // A Windows drive-letter form ("C:/x") is also an absolute escape.
+    if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+        return Err(ZipNameError::Absolute);
+    }
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(ZipNameError::ParentTraversal);
+    }
+    let mut normalized_parts: Vec<&str> = Vec::new();
+    for part in trimmed.split('/') {
+        match part {
+            "" => return Err(ZipNameError::AmbiguousNormalization),
+            "." => return Err(ZipNameError::AmbiguousNormalization),
+            ".." => return Err(ZipNameError::ParentTraversal),
+            p => normalized_parts.push(p),
+        }
+    }
+    let normalized = normalized_parts.join("/");
+    if seen.contains(&normalized) {
+        return Err(ZipNameError::DuplicatePath);
+    }
+    if is_dir {
+        if seen.contains(&normalized) {
+            return Err(ZipNameError::FileDirectoryCollision);
+        }
+    } else if seen_as_dir.contains(&normalized) {
+        return Err(ZipNameError::FileDirectoryCollision);
+    }
+    Ok(normalized)
+}
+
 /// What a drive row shows: the words, and the bar fill when there is one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpaceView {
@@ -5469,5 +5565,66 @@ mod gvfs_smb_identity_tests_d156_connect {
             gvfs_smb_shares(mounts, &children),
             vec![("nas".to_string(), "media".to_string(), "/run/user/1000/gvfs/smb-share:server=nas,share=media".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod zip_member_name_safety_tests_d188 {
+    use super::*;
+
+    fn empty() -> (HashSet<String>, HashSet<String>) {
+        (HashSet::new(), HashSet::new())
+    }
+
+    #[test]
+    fn rejects_absolute_paths_d188() {
+        let (seen, seen_dir) = empty();
+        assert_eq!(validate_zip_member_name("/etc/passwd", &seen, &seen_dir, false), Err(ZipNameError::Absolute));
+        assert_eq!(validate_zip_member_name("C:/x", &seen, &seen_dir, false), Err(ZipNameError::Absolute));
+    }
+
+    #[test]
+    fn rejects_parent_traversal_d188() {
+        let (seen, seen_dir) = empty();
+        assert_eq!(validate_zip_member_name("../x", &seen, &seen_dir, false), Err(ZipNameError::ParentTraversal));
+        assert_eq!(validate_zip_member_name("a/../../b", &seen, &seen_dir, false), Err(ZipNameError::ParentTraversal));
+    }
+
+    #[test]
+    fn rejects_nul_and_backslash_d188() {
+        let (seen, seen_dir) = empty();
+        assert_eq!(validate_zip_member_name("a\0b", &seen, &seen_dir, false), Err(ZipNameError::NulByte));
+        assert_eq!(validate_zip_member_name("a\\b", &seen, &seen_dir, false), Err(ZipNameError::BackslashSeparator));
+    }
+
+    #[test]
+    fn rejects_ambiguous_normalization_d188() {
+        let (seen, seen_dir) = empty();
+        assert_eq!(validate_zip_member_name("a//b", &seen, &seen_dir, false), Err(ZipNameError::AmbiguousNormalization));
+        assert_eq!(validate_zip_member_name("./a", &seen, &seen_dir, false), Err(ZipNameError::AmbiguousNormalization));
+    }
+
+    #[test]
+    fn accepts_and_normalizes_a_clean_nested_path_d188() {
+        let (seen, seen_dir) = empty();
+        assert_eq!(validate_zip_member_name("a/b/c.txt", &seen, &seen_dir, false), Ok("a/b/c.txt".to_string()));
+        // A trailing slash marks an explicit directory entry; it normalizes the same way.
+        assert_eq!(validate_zip_member_name("a/b/", &seen, &seen_dir, true), Ok("a/b".to_string()));
+    }
+
+    #[test]
+    fn rejects_duplicate_normalized_paths_d188() {
+        let mut seen = HashSet::new();
+        seen.insert("a/b.txt".to_string());
+        let seen_dir = HashSet::new();
+        assert_eq!(validate_zip_member_name("a/b.txt", &seen, &seen_dir, false), Err(ZipNameError::DuplicatePath));
+    }
+
+    #[test]
+    fn rejects_file_directory_collision_d188() {
+        let seen = HashSet::new();
+        let mut seen_dir = HashSet::new();
+        seen_dir.insert("a/b".to_string());
+        assert_eq!(validate_zip_member_name("a/b", &seen, &seen_dir, false), Err(ZipNameError::FileDirectoryCollision));
     }
 }
