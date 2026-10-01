@@ -9687,17 +9687,6 @@ where
     });
 }
 
-/// Counts every `run_job` poll tick (D-188 ledger #9): a test proves GTK
-/// main-loop ticks actually advance while an allowed large Copy Out streams
-/// on its own thread, not just that the final result eventually arrives.
-#[cfg(test)]
-fn note_job_poll_tick() {
-    TEST_JOB_POLL_TICKS.with(|c| c.set(c.get() + 1));
-}
-
-#[cfg(not(test))]
-fn note_job_poll_tick() {}
-
 /// A successful job's shared ending: after-success work, Undo, then the refresh
 /// that carries the outcome message.
 fn complete_job(
@@ -11858,6 +11847,17 @@ fn note_open_poll_tick() {
 
 #[cfg(not(test))]
 fn note_open_poll_tick() {}
+
+/// Counts every `run_job` poll tick (D-188 ledger #9): a test proves GTK
+/// main-loop ticks actually advance while an allowed large Copy Out streams
+/// on its own thread, not just that the final result eventually arrives.
+#[cfg(test)]
+fn note_job_poll_tick() {
+    TEST_JOB_POLL_TICKS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_job_poll_tick() {}
 
 /// The real scan, or in tests a synthetic one; tests never touch a real drive.
 #[cfg(not(test))]
