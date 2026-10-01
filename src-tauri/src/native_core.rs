@@ -251,12 +251,48 @@ pub fn zip_read_only_refusal(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Where a single row's bytes live, for the same reason: `Entry.path` alone
-/// cannot say whether rename/trash/paste-target code may touch it.
+/// A single indexed member of a specific archive, carrying enough identity
+/// to revalidate the archive before Open/Copy act on it (D-188): a stale or
+/// changed archive must be caught before a row from it reaches the
+/// filesystem, not after.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RowProvenance {
+pub struct ZipMemberRef {
+    pub archive: PathBuf,
+    pub internal: String,
+}
+
+/// Where a row's bytes actually come from, carried instead of a serialized
+/// pseudo-path so a ZIP member can never reach a real-filesystem-only API
+/// (picker, preview, launcher, drag, rename, trash) by accident: `Real`
+/// converts explicitly to `PathBuf`, `ZipMember` never does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntrySource {
     Real(PathBuf),
-    ZipMember { archive: PathBuf, internal: String },
+    ZipMember(ZipMemberRef),
+}
+
+impl EntrySource {
+    pub fn is_zip(&self) -> bool {
+        matches!(self, Self::ZipMember(_))
+    }
+}
+
+/// Where a clipboard row's bytes come from. Only a `Real` source may ever
+/// populate the clipboard (`cut_selection`/`copy_selection` refuse ZIP rows
+/// the same way `zip_read_only_refusal` refuses a direct mutation), but the
+/// type itself is what makes a `ZipMember` unrepresentable here rather than
+/// relying on that check alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardSource {
+    Real(PathBuf),
+}
+
+impl ClipboardSource {
+    pub fn to_path_string(&self) -> String {
+        match self {
+            Self::Real(path) => path.to_string_lossy().into_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
