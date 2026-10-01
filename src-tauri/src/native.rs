@@ -11503,8 +11503,17 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
-    if native_core::is_image_path(&entry.source.to_path_string()) {
-        set_preview_image(ui, &entry.source.to_path_string());
+    // A ZIP member never reaches the GIO/filesystem path boundary: it has no
+    // real path to read through, so it gets the safe summary, not an attempt
+    // to decode a member path as a real one (D-188 REJECT 1).
+    let native_core::EntrySource::Real(path) = &entry.source else {
+        set_preview_text(ui, &native_core::entry_summary(entry));
+        return;
+    };
+    let path_str = path.to_string_lossy().into_owned();
+
+    if native_core::is_image_path(&path_str) {
+        set_preview_image(ui, &path_str);
         return;
     }
 
@@ -11512,17 +11521,17 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     // playback pipeline that aborts (SIGABRT, multiqueue assertion in
     // libgstplayback while parsing MP3), which crashes the whole app. Show file
     // info instead — safe, no GStreamer. (Open the song in a real player to play.)
-    if native_core::is_audio_path(&entry.source.to_path_string()) {
+    if native_core::is_audio_path(&path_str) {
         set_preview_text(ui, &native_core::entry_summary(entry));
         return;
     }
 
-    if native_core::is_video_path(&entry.source.to_path_string()) {
-        set_preview_media(ui, &entry.source.to_path_string());
+    if native_core::is_video_path(&path_str) {
+        set_preview_media(ui, &path_str);
         return;
     }
 
-    match native_core::read_text_preview(&entry.source.to_path_string()) {
+    match native_core::read_text_preview(&path_str) {
         Ok(text) => set_preview_text(ui, &text),
         Err(_) => set_preview_text(ui, &native_core::entry_summary(entry)),
     }
