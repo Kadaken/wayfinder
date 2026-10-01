@@ -15379,6 +15379,240 @@ Broken: Either state is wrong.\n";
         None
     }
 
+    /// D-188 #63-#66: back/forward navigation reproduces the exact ZIP
+    /// location and rows at every step of a mixed real/ZIP history, a
+    /// refresh at a ZIP location re-lists without extracting the whole
+    /// archive, and two tabs keep independent real/ZIP locations and
+    /// histories across switching and closure.
+    #[test]
+    fn zip_navigation_history_tabs_d188() {
+        if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d188nav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let archive_path = dir.join("nav.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.add_directory("a/", options).unwrap();
+            writer.start_file("a/one.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"one").unwrap();
+            writer.add_directory("b/", options).unwrap();
+            writer.start_file("b/two.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"two").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let xdg_dir = root.join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d188navtest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing the real folder", || state.borrow().visible_entries.len() == 1);
+
+        let names = |s: &Rc<RefCell<AppState>>| -> Vec<String> {
+            let mut v: Vec<String> = s.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+            v.sort();
+            v
+        };
+
+        // history[0]: real dir. Enter the archive (history[1]: zip root).
+        let zip_entry = state.borrow().visible_entries[0].clone();
+        assert_eq!(zip_entry.name, "nav.zip");
+        open_entry(&state, &ui, zip_entry);
+        wait_for("inside the zip root", || state.borrow().cwd.is_zip());
+        wait_for("zip root children", || names(&state) == vec!["a", "b"]);
+        let archive = match state.borrow().cwd.clone() {
+            native_core::Location::ZipDir { archive, .. } => archive,
+            _ => panic!("expected a ZipDir location"),
+        };
+        let loc_root = native_core::Location::ZipDir { archive: archive.clone(), internal: String::new() };
+        let loc_a = native_core::Location::ZipDir { archive: archive.clone(), internal: "a".to_string() };
+        let loc_b = native_core::Location::ZipDir { archive: archive.clone(), internal: "b".to_string() };
+
+        // history[2]: zip "a".
+        let a_entry = state.borrow().visible_entries.iter().find(|e| e.name == "a").cloned().unwrap();
+        open_entry(&state, &ui, a_entry);
+        wait_for("inside a", || state.borrow().cwd == loc_a);
+        assert_eq!(names(&state), vec!["one.txt"]);
+
+        // history[3]: zip "b", reached directly (not via Up) to build a real
+        // mixed-location history for back/forward to retrace.
+        navigate(&state, loc_b.clone());
+        wait_for("inside b", || state.borrow().cwd == loc_b);
+        assert_eq!(names(&state), vec!["two.txt"]);
+
+        // ---- #63: back reproduces each prior ZIP location and its exact rows, in order.
+        history_step(&state, false);
+        wait_for("back to a", || state.borrow().cwd == loc_a);
+        assert_eq!(names(&state), vec!["one.txt"], "back to \"a\" must reproduce its exact rows");
+
+        history_step(&state, false);
+        wait_for("back to zip root", || state.borrow().cwd == loc_root);
+        assert_eq!(names(&state), vec!["a", "b"], "back to the zip root must reproduce its exact rows");
+
+        history_step(&state, false);
+        wait_for("back to the real dir", || !state.borrow().cwd.is_zip());
+        assert_eq!(state.borrow().cwd.real_path_string().as_deref(), Some(dir_str.as_str()));
+
+        // ---- #64: forward reproduces each later ZIP location and its exact rows, in order.
+        history_step(&state, true);
+        wait_for("forward to zip root", || state.borrow().cwd == loc_root);
+        assert_eq!(names(&state), vec!["a", "b"], "forward to the zip root must reproduce its exact rows");
+
+        history_step(&state, true);
+        wait_for("forward to a", || state.borrow().cwd == loc_a);
+        assert_eq!(names(&state), vec!["one.txt"], "forward to \"a\" must reproduce its exact rows");
+
+        history_step(&state, true);
+        wait_for("forward to b", || state.borrow().cwd == loc_b);
+        assert_eq!(names(&state), vec!["two.txt"], "forward to \"b\" must reproduce its exact rows");
+
+        // ---- #65: refresh at a ZIP location re-lists the same exact rows
+        // without ever extracting the whole archive onto disk.
+        let generation_before_refresh = state.borrow().listing_generation;
+        let cwd_before_refresh = state.borrow().cwd.clone();
+        navigate(&state, cwd_before_refresh.clone());
+        wait_for("refresh settled", || state.borrow().listing_generation != generation_before_refresh);
+        assert_eq!(state.borrow().cwd, loc_b, "refresh must reproduce the exact same ZIP location");
+        assert_eq!(names(&state), vec!["two.txt"], "refresh must reproduce the exact same rows");
+        let cache_root = native_core::scratch_root().join("wayfinder-zip-cache");
+        assert!(
+            !cache_root.is_dir() || walk_find_file(&cache_root, "nav.zip").is_none(),
+            "a refresh (no Open) must never extract the whole archive to a cache"
+        );
+
+        // ---- #66: two tabs keep independent real/ZIP locations and histories.
+        new_tab_action(state.clone(), ui.clone());
+        assert_eq!(state.borrow().tabs.active, 1, "a new tab must become the active tab");
+        assert_eq!(state.borrow().tabs.tabs.len(), 2);
+        assert_eq!(state.borrow().cwd, loc_b, "a new tab starts at the location it was opened from");
+
+        navigate(&state, native_core::Location::real(dir.clone()));
+        wait_for("tab 1 at the real dir", || state.borrow().cwd.real_path_string().as_deref() == Some(dir_str.as_str()));
+
+        switch_tab_action(state.clone(), 0);
+        wait_for("back on tab 0, still at b", || state.borrow().cwd == loc_b);
+        assert_eq!(names(&state), vec!["two.txt"], "switching tabs must not disturb the other tab's location");
+
+        switch_tab_action(state.clone(), 1);
+        wait_for("back on tab 1, still at the real dir", || {
+            !state.borrow().cwd.is_zip() && state.borrow().cwd.real_path_string().as_deref() == Some(dir_str.as_str())
+        });
+
+        close_tab_action(state.clone(), ui.clone());
+        assert_eq!(state.borrow().tabs.tabs.len(), 1, "closing the active tab must leave exactly the surviving tab");
+        wait_for("surviving tab keeps its own ZIP location", || state.borrow().cwd == loc_b);
+        assert_eq!(names(&state), vec!["two.txt"], "the surviving tab's own history must be untouched by the closed tab");
+    }
+
+    /// D-188 #67: a deliberately slow older listing must lose to a newer
+    /// navigation generation and never land stale rows or a stale status,
+    /// inside a ZIP the same way the real-folder case already requires.
+    #[test]
+    fn zip_stale_listing_generation_race_d188() {
+        if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d188race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let archive_path = dir.join("race.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.add_directory("slow/", options).unwrap();
+            for i in 0..20 {
+                writer.start_file(format!("slow/member-{i:02}.txt"), options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+            }
+            writer.add_directory("fast/", options).unwrap();
+            writer.start_file("fast/only.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"y").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let xdg_dir = root.join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d188racetest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing the real folder", || state.borrow().visible_entries.len() == 1);
+
+        let zip_entry = state.borrow().visible_entries[0].clone();
+        open_entry(&state, &ui, zip_entry);
+        wait_for("inside the zip root", || state.borrow().cwd.is_zip());
+        let archive = match state.borrow().cwd.clone() {
+            native_core::Location::ZipDir { archive, .. } => archive,
+            _ => panic!("expected a ZipDir location"),
+        };
+        let loc_slow = native_core::Location::ZipDir { archive: archive.clone(), internal: "slow".to_string() };
+        let loc_fast = native_core::Location::ZipDir { archive: archive.clone(), internal: "fast".to_string() };
+
+        // Delay every indexed entry so the "slow" listing is still running
+        // when the newer "fast" navigation starts and finishes first.
+        let _delay_guard = native_core::TestIndexEntryDelayGuard::new(5_000);
+        navigate(&state, loc_slow.clone());
+        let slow_generation = state.borrow().listing_generation;
+        std::thread::sleep(Duration::from_millis(20));
+
+        navigate(&state, loc_fast.clone());
+        wait_for("the newer, fast navigation settles within a named 10s bound", || {
+            state.borrow().cwd == loc_fast && state.borrow().visible_entries.iter().any(|e| e.name == "only.txt")
+        });
+        assert_eq!(
+            state.borrow().visible_entries.len(),
+            1,
+            "the newer navigation's own rows must land, not a mix with the slow listing's rows"
+        );
+        assert_ne!(state.borrow().listing_generation, slow_generation, "a newer navigation must advance the generation");
+
+        // Give the slow listing time to actually finish in the background,
+        // then confirm its late result never overwrote the newer location or rows.
+        drop(_delay_guard);
+        std::thread::sleep(Duration::from_millis(400));
+        pump();
+        assert_eq!(state.borrow().cwd, loc_fast, "a late-arriving stale listing must never replace the newer location");
+        assert_eq!(
+            state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+            vec!["only.txt".to_string()],
+            "a late-arriving stale listing must never land its own rows over the newer ones"
+        );
+        assert!(!ui.status.label().contains("slow"), "no stale status from the slow listing must surface");
+    }
+
     /// D-188 alone on a virtual display: the synthetic ZIP browse/Open/Copy
     /// Out/Undo-Redo gate, run on its own instead of inside the full suite.
     #[test]
