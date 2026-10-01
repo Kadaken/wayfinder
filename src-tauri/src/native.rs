@@ -13337,6 +13337,160 @@ Broken: Either state is wrong.\n";
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// D-188 bad-ZIP oracles: every rejection the archive-loading path (and,
+    /// for a bad CRC, member extraction on Open) must surface through the
+    /// real UI as one bounded, actionable error — never a hang, a panic, or
+    /// a lost location — and leave no cache residue behind.
+    fn zip_bad_oracles_d188() {
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d188bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+
+        let old_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let xdg_dir = root.join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &xdg_dir);
+
+        let stored_options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // ---- Not a zip at all: garbage bytes.
+        std::fs::write(root.join("garbage.zip"), b"this is not a zip file at all, just text").unwrap();
+
+        // ---- Truncated: a real archive with its tail (central directory) cut off.
+        {
+            let file = std::fs::File::create(root.join("truncated.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"hello world").unwrap();
+            writer.finish().unwrap();
+        }
+        let full_bytes = std::fs::read(root.join("truncated.zip")).unwrap();
+        std::fs::write(root.join("truncated.zip"), &full_bytes[..full_bytes.len() / 2]).unwrap();
+
+        // ---- Unsafe names: traversal and an absolute path.
+        {
+            let file = std::fs::File::create(root.join("traversal.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("../evil.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+        {
+            let file = std::fs::File::create(root.join("absolute.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("/evil.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Duplicate normalized paths: two distinct raw names (the zip
+        // writer itself refuses a literal duplicate) that normalize to the
+        // same logical path — "a.txt" and, read as a directory entry
+        // because of its trailing slash, "a.txt/".
+        {
+            let file = std::fs::File::create(root.join("duplicate.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"one").unwrap();
+            writer.add_directory("a.txt/", stored_options).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- File/directory collision: "a/" declared as a directory, then "a" as a file.
+        {
+            let file = std::fs::File::create(root.join("collision.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.add_directory("a/", stored_options).unwrap();
+            writer.start_file("a", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Bad CRC: a valid-looking archive whose member bytes were
+        // flipped after writing, so indexing succeeds (the central directory
+        // is intact) but extraction on Open must fail boundedly, never hang,
+        // panic, or leave a cached file behind.
+        {
+            let file = std::fs::File::create(root.join("badcrc.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("member.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"original bytes").unwrap();
+            writer.finish().unwrap();
+        }
+        {
+            let mut bytes = std::fs::read(root.join("badcrc.zip")).unwrap();
+            let needle = b"original bytes";
+            let at = bytes.windows(needle.len()).position(|w| w == needle).expect("find the stored member bytes");
+            bytes[at] = b'X';
+            std::fs::write(root.join("badcrc.zip"), &bytes).unwrap();
+        }
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d188badtest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = root.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        let before_cwd = state.borrow().cwd.clone();
+
+        let assert_refused = |zip_name: &str, expect_fragment: Option<&str>| {
+            wait_for("listing shows the fixture", || {
+                state.borrow().visible_entries.iter().any(|e| e.name == zip_name)
+            });
+            let entry = state.borrow().visible_entries.iter().find(|e| e.name == zip_name).cloned().unwrap();
+            open_entry(&state, &ui, entry);
+            wait_for("a bounded status appears", || ui.status.label().starts_with("Cannot open "));
+            let label = ui.status.label().to_string();
+            if let Some(fragment) = expect_fragment {
+                assert!(label.contains(fragment), "{zip_name}: status {label:?} should contain {fragment:?}");
+            }
+            assert_eq!(state.borrow().cwd, before_cwd, "{zip_name}: cwd is preserved after a bad zip");
+            assert!(
+                !native_core::Location::parse(&state.borrow().cwd).is_zip(),
+                "{zip_name}: never left sitting inside a bad archive"
+            );
+        };
+
+        assert_refused("garbage.zip", Some("could not open archive"));
+        assert_refused("truncated.zip", None);
+        assert_refused("traversal.zip", Some("escapes the archive"));
+        assert_refused("absolute.zip", Some("names an absolute path"));
+        assert_refused("duplicate.zip", Some("duplicates another entry's path"));
+        assert_refused("collision.zip", Some("collides as a file and a directory"));
+
+        wait_for("listing shows badcrc.zip", || {
+            state.borrow().visible_entries.iter().any(|e| e.name == "badcrc.zip")
+        });
+        let badcrc_entry = state.borrow().visible_entries.iter().find(|e| e.name == "badcrc.zip").cloned().unwrap();
+        open_entry(&state, &ui, badcrc_entry);
+        wait_for("inside the badcrc zip root", || native_core::Location::parse(&state.borrow().cwd).is_zip());
+        wait_for("badcrc member listed", || state.borrow().visible_entries.len() == 1);
+        let member_entry = state.borrow().visible_entries[0].clone();
+        assert_eq!(member_entry.name, "member.txt");
+        open_entry(&state, &ui, member_entry);
+        wait_for("open failed boundedly", || ui.status.label().starts_with("Open failed:"));
+        let cache_root = xdg_dir.join("wayfinder-zip-cache");
+        assert!(
+            !cache_root.is_dir() || walk_find_file(&cache_root, "member.txt").is_none(),
+            "a bad-CRC member leaves no cached file"
+        );
+
+        ui.window.close();
+        pump();
+        match old_xdg {
+            Some(xdg) => std::env::set_var("XDG_RUNTIME_DIR", xdg),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> String {
         let mut loc = native_core::Location::parse(&state.borrow().cwd);
         while loc.is_zip() {
@@ -13372,6 +13526,7 @@ Broken: Either state is wrong.\n";
             return;
         }
         zip_read_only_browse_open_copy_out_d188();
+        zip_bad_oracles_d188();
     }
 
     /// D-187 carried: the accepted round-187 Undo/Redo set, run on its own
@@ -13482,6 +13637,7 @@ Broken: Either state is wrong.\n";
         transfer_progress_and_cancel_d155();
         transfer_progress_and_cancel_d185();
         zip_read_only_browse_open_copy_out_d188();
+        zip_bad_oracles_d188();
     }
 
     /// D-84: a disposable fixture of tiny real (not real-photo) PNGs proves the
