@@ -13012,6 +13012,7 @@ Broken: Either state is wrong.\n";
         undo_redo_cycle_renamed_d187();
         undo_redo_cycle_batch_renamed_d187();
         undo_redo_cycle_pasted_move_d187();
+        undo_redo_branching_history_d187();
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
@@ -19550,6 +19551,104 @@ Broken: Either state is wrong.\n";
         );
         assert!(!std::path::Path::new(&from).exists(), "refused Undo must not recreate the source");
         assert_eq!(state.borrow().undo_stack.last().is_some(), true, "a refused Undo must not be consumed");
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        drop(win);
+    }
+
+    /// D-187: multi-level ordered history (A, B, Undo B, Undo A, Redo A) and
+    /// the branching-clear rule — a new successful action (C) after a partial
+    /// Redo clears the ENTIRE remaining Redo chain, so B can never come back.
+    fn undo_redo_branching_history_d187() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d187-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("one.txt"), "payload one").unwrap();
+        std::fs::write(dir.join("two.txt"), "payload two").unwrap();
+        std::fs::write(dir.join("three.txt"), "payload three").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d187branchtest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        let win: gtk::Widget = ui.window.clone().upcast();
+        let created = |name: &str| dir.join(name);
+
+        let press = |key: gdk::Key, mods: gdk::ModifierType| {
+            let handled = ui
+                .window
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
+            pump();
+            handled
+        };
+        let record_rename = |state: &Rc<RefCell<AppState>>, from: &str, to: &str| {
+            std::fs::rename(created(from), created(to)).unwrap();
+            let fp = native_core::fingerprint(&created(to).to_string_lossy()).unwrap();
+            push_undo(
+                state,
+                UndoAction::Renamed { from: created(from).to_string_lossy().to_string(), to: created(to).to_string_lossy().to_string(), fp },
+            );
+        };
+
+        // ---- A, then B: two ordinary forward actions.
+        record_rename(&state, "one.txt", "one-renamed.txt");
+        record_rename(&state, "two.txt", "two-renamed.txt");
+        assert_eq!(state.borrow().undo_stack.len(), 2);
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+
+        // ---- Undo B, then Undo A: LIFO order.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("B undone", || created("two.txt").is_file() && !created("two-renamed.txt").exists());
+        assert!(created("one-renamed.txt").is_file(), "A must still be applied");
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("A undone", || created("one.txt").is_file() && !created("one-renamed.txt").exists());
+        assert_eq!(state.borrow().undo_stack.len(), 0, "both forward entries consumed");
+        assert_eq!(state.borrow().redo_stack.len(), 2, "both reciprocals waiting on Redo");
+
+        // ---- Redo A (the most recently undone comes back first).
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("A redone", || created("one-renamed.txt").is_file() && !created("one.txt").exists());
+        assert!(created("two.txt").is_file(), "B must still be undone — only A was redone");
+        assert_eq!(state.borrow().undo_stack.len(), 1);
+        assert_eq!(state.borrow().redo_stack.len(), 1, "B's reciprocal still waits on Redo");
+
+        // ---- A brand new action (C) must clear the ENTIRE remaining Redo chain.
+        record_rename(&state, "three.txt", "three-renamed.txt");
+        assert_eq!(state.borrow().redo_stack.len(), 0, "a new action clears Redo even though it never touched B");
+
+        // ---- B can never come back: Ctrl+Y is now a no-op.
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        assert!(created("two.txt").is_file(), "no-op Redo must not touch B");
+        assert!(!created("two-renamed.txt").exists(), "B's redo chain is gone for good");
+
+        // ---- Undo stack is still coherent: Undo C, then Undo A.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("C undone", || created("three.txt").is_file() && !created("three-renamed.txt").exists());
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("A undone again", || created("one.txt").is_file() && !created("one-renamed.txt").exists());
+        assert_eq!(state.borrow().undo_stack.len(), 0);
 
         ui.window.close();
         pump();
