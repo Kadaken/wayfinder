@@ -2,7 +2,8 @@ use adw::gtk::gio;
 use adw::gtk::gio::prelude::FileExt;
 use adw::gtk::glib;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,6 +197,195 @@ pub fn validate_zip_member_name(
         return Err(ZipNameError::FileDirectoryCollision);
     }
     Ok(normalized)
+}
+
+/// Resource bounds enforced while indexing and streaming a ZIP (D-188). Kept
+/// as one named place so a limit is never silently re-chosen at a call site.
+#[derive(Clone, Copy, Debug)]
+pub struct ZipLimits {
+    pub max_members: usize,
+    pub max_name_len: usize,
+    pub max_total_claimed_bytes: u64,
+    pub max_entry_claimed_bytes: u64,
+    /// Reject an entry whose claimed uncompressed size is more than this many
+    /// times its compressed size — a cheap guard against a decompression bomb
+    /// before a single byte of that member is ever read.
+    pub max_compression_ratio: u64,
+}
+
+pub const DEFAULT_ZIP_LIMITS: ZipLimits = ZipLimits {
+    max_members: 200_000,
+    max_name_len: 1024,
+    max_total_claimed_bytes: 20 * 1024 * 1024 * 1024,
+    max_entry_claimed_bytes: 4 * 1024 * 1024 * 1024,
+    max_compression_ratio: 1200,
+};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ZipIndexError {
+    Cancelled,
+    Open(String),
+    Encrypted(String),
+    Unsupported(String),
+    BadName(String, ZipNameError),
+    TooManyMembers,
+    NameTooLong(String),
+    EntryTooLarge(String),
+    ArchiveTooLarge,
+    SuspiciousCompressionRatio(String),
+    Corrupt(String),
+}
+
+impl std::fmt::Display for ZipIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "archive loading was cancelled"),
+            Self::Open(e) => write!(f, "could not open archive: {e}"),
+            Self::Encrypted(name) => write!(f, "\"{name}\" is encrypted and cannot be browsed"),
+            Self::Unsupported(name) => write!(f, "\"{name}\" uses an unsupported format"),
+            Self::BadName(name, why) => write!(f, "\"{name}\" {why}"),
+            Self::TooManyMembers => write!(f, "archive has too many entries"),
+            Self::NameTooLong(name) => write!(f, "\"{name}\" has too long a name"),
+            Self::EntryTooLarge(name) => write!(f, "\"{name}\" is too large"),
+            Self::ArchiveTooLarge => write!(f, "archive's claimed total size is too large"),
+            Self::SuspiciousCompressionRatio(name) => {
+                write!(f, "\"{name}\" has a suspicious compression ratio")
+            }
+            Self::Corrupt(e) => write!(f, "archive is corrupt or truncated: {e}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZipIndexEntry {
+    /// Normalized logical path, forward-slash, no leading/trailing slash.
+    pub logical_path: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Reads only the ZIP central directory (no member bytes) and returns every
+/// real entry plus implicit parent directories synthesized from the paths,
+/// validated and limit-checked (D-188). Never extracts file content.
+pub fn index_zip<R: Read + std::io::Seek>(
+    reader: R,
+    limits: &ZipLimits,
+    cancelled: &AtomicBool,
+) -> Result<Vec<ZipIndexEntry>, ZipIndexError> {
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| ZipIndexError::Open(e.to_string()))?;
+    if archive.len() > limits.max_members {
+        return Err(ZipIndexError::TooManyMembers);
+    }
+    let mut seen_files: HashSet<String> = HashSet::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
+    let mut implicit_dirs: HashSet<String> = HashSet::new();
+    let mut out: Vec<ZipIndexEntry> = Vec::with_capacity(archive.len());
+    let mut total_claimed: u64 = 0;
+
+    for i in 0..archive.len() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ZipIndexError::Cancelled);
+        }
+        let entry = archive
+            .by_index_raw(i)
+            .map_err(|e| ZipIndexError::Corrupt(e.to_string()))?;
+        let raw_name = entry.name().to_string();
+        if raw_name.len() > limits.max_name_len {
+            return Err(ZipIndexError::NameTooLong(raw_name));
+        }
+        if entry.is_symlink() {
+            return Err(ZipIndexError::BadName(raw_name, ZipNameError::SpecialEntry));
+        }
+        if entry.encrypted() {
+            return Err(ZipIndexError::Encrypted(raw_name));
+        }
+        let is_dir = entry.is_dir();
+        let normalized = validate_zip_member_name(&raw_name, &seen_files, &seen_dirs, is_dir)
+            .map_err(|why| ZipIndexError::BadName(raw_name.clone(), why))?;
+
+        let size = entry.size();
+        let compressed = entry.compressed_size().max(1);
+        if size > limits.max_entry_claimed_bytes {
+            return Err(ZipIndexError::EntryTooLarge(raw_name));
+        }
+        if size / compressed > limits.max_compression_ratio {
+            return Err(ZipIndexError::SuspiciousCompressionRatio(raw_name));
+        }
+        total_claimed = total_claimed.saturating_add(size);
+        if total_claimed > limits.max_total_claimed_bytes {
+            return Err(ZipIndexError::ArchiveTooLarge);
+        }
+
+        if is_dir {
+            seen_dirs.insert(normalized.clone());
+            out.push(ZipIndexEntry { logical_path: normalized, is_dir: true, size: 0 });
+        } else {
+            seen_files.insert(normalized.clone());
+            // Every ancestor directory must exist even if the archive never
+            // wrote an explicit directory entry for it.
+            let mut parent = normalized.rsplit_once('/').map(|(p, _)| p);
+            while let Some(p) = parent {
+                if !p.is_empty() && !seen_dirs.contains(p) {
+                    implicit_dirs.insert(p.to_string());
+                }
+                parent = p.rsplit_once('/').map(|(p, _)| p);
+            }
+            out.push(ZipIndexEntry { logical_path: normalized, is_dir: false, size });
+        }
+    }
+
+    for dir in implicit_dirs {
+        if !seen_dirs.contains(&dir) {
+            seen_dirs.insert(dir.clone());
+            out.push(ZipIndexEntry { logical_path: dir, is_dir: true, size: 0 });
+        }
+    }
+    Ok(out)
+}
+
+/// Immediate children of `internal` (the virtual directory being browsed; ""
+/// for the ZIP root), folders-first, matching the real-directory sort
+/// contract in `list_dir_cancellable` (D-188).
+pub fn zip_dir_children(index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
+    let prefix = if internal.is_empty() { String::new() } else { format!("{internal}/") };
+    let mut children: HashMap<String, (bool, u64)> = HashMap::new();
+    for item in index {
+        let Some(rest) = item.logical_path.strip_prefix(prefix.as_str()) else { continue };
+        if rest.is_empty() {
+            continue;
+        }
+        let (name, is_direct_dir) = match rest.split_once('/') {
+            Some((first, _)) => (first.to_string(), true),
+            None => (rest.to_string(), item.is_dir),
+        };
+        let existing = children.entry(name).or_insert((is_direct_dir, 0));
+        if !is_direct_dir {
+            existing.1 = item.size;
+        }
+        existing.0 = existing.0 || is_direct_dir;
+    }
+    let mut out: Vec<Entry> = children
+        .into_iter()
+        .map(|(name, (is_dir, size))| {
+            let fake_path = Path::new(&name);
+            Entry {
+                icon: icon_name(fake_path, is_dir).to_string(),
+                is_image: is_image(fake_path),
+                name,
+                path: String::new(),
+                is_dir,
+                size,
+                modified: 0,
+                metadata_error: None,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
 }
 
 /// What a drive row shows: the words, and the bar fill when there is one.
@@ -5626,5 +5816,100 @@ mod zip_member_name_safety_tests_d188 {
         let mut seen_dir = HashSet::new();
         seen_dir.insert("a/b".to_string());
         assert_eq!(validate_zip_member_name("a/b", &seen, &seen_dir, false), Err(ZipNameError::FileDirectoryCollision));
+    }
+}
+
+#[cfg(test)]
+mod zip_index_tests_d188 {
+    use super::*;
+    use std::io::Cursor;
+
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buf);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in entries {
+            if name.ends_with('/') {
+                writer.add_directory(*name, options).unwrap();
+            } else {
+                writer.start_file(*name, options).unwrap();
+                std::io::Write::write_all(&mut writer, content).unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn idx(entries: &[(&str, &[u8])]) -> Vec<ZipIndexEntry> {
+        let bytes = build_zip(entries);
+        index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false)).unwrap()
+    }
+
+    #[test]
+    fn indexes_explicit_and_implicit_directories_d188() {
+        let entries = idx(&[("a/b/c.txt", b"hi"), ("a/d.txt", b"bye")]);
+        let paths: HashSet<_> = entries.iter().map(|e| (e.logical_path.clone(), e.is_dir)).collect();
+        assert!(paths.contains(&("a".to_string(), true)), "implicit dir a/");
+        assert!(paths.contains(&("a/b".to_string(), true)), "implicit dir a/b/");
+        assert!(paths.contains(&("a/b/c.txt".to_string(), false)));
+        assert!(paths.contains(&("a/d.txt".to_string(), false)));
+    }
+
+    #[test]
+    fn zip_root_children_are_folders_first_then_alphabetical_d188() {
+        let entries = idx(&[("zeta.txt", b"z"), ("alpha/", b""), ("mid.txt", b"m")]);
+        let children = zip_dir_children(&entries, "");
+        let names: Vec<_> = children.iter().map(|e| (e.name.clone(), e.is_dir)).collect();
+        assert_eq!(names, vec![
+            ("alpha".to_string(), true),
+            ("mid.txt".to_string(), false),
+            ("zeta.txt".to_string(), false),
+        ]);
+    }
+
+    #[test]
+    fn nested_children_only_show_one_level_d188() {
+        let entries = idx(&[("a/b/c.txt", b"x"), ("a/d.txt", b"y")]);
+        let root_children = zip_dir_children(&entries, "");
+        assert_eq!(root_children.len(), 1, "only 'a' at the root");
+        let a_children = zip_dir_children(&entries, "a");
+        let names: HashSet<_> = a_children.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, HashSet::from(["b".to_string(), "d.txt".to_string()]));
+    }
+
+    #[test]
+    fn rejects_traversal_name_inside_the_archive_d188() {
+        let bytes = build_zip(&[("../escape.txt", b"x")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::ParentTraversal))));
+    }
+
+    #[test]
+    fn rejects_entry_over_the_claimed_size_limit_d188() {
+        let tight = ZipLimits { max_entry_claimed_bytes: 1, ..DEFAULT_ZIP_LIMITS };
+        let bytes = build_zip(&[("big.txt", b"way more than one byte")]);
+        let result = index_zip(Cursor::new(bytes), &tight, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::EntryTooLarge(_))));
+    }
+
+    #[test]
+    fn rejects_too_many_members_d188() {
+        let tight = ZipLimits { max_members: 1, ..DEFAULT_ZIP_LIMITS };
+        let bytes = build_zip(&[("a.txt", b"a"), ("b.txt", b"b")]);
+        let result = index_zip(Cursor::new(bytes), &tight, &AtomicBool::new(false));
+        assert_eq!(result, Err(ZipIndexError::TooManyMembers));
+    }
+
+    #[test]
+    fn honors_cancellation_before_touching_the_archive_d188() {
+        let bytes = build_zip(&[("a.txt", b"a")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(true));
+        assert_eq!(result, Err(ZipIndexError::Cancelled));
+    }
+
+    #[test]
+    fn rejects_corrupt_bytes_boundedly_d188() {
+        let result = index_zip(Cursor::new(b"not a zip file at all".to_vec()), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::Open(_))));
     }
 }
