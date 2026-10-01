@@ -14020,6 +14020,107 @@ Broken: Either state is wrong.\n";
             "D-188 #25: archive mtime unchanged after Undo/Redo/branch clearing"
         );
 
+        // D-188 ledger #26/#27: replacing the archive after listing — even
+        // when the replacement preserves the target member's exact name,
+        // size, CRC and total archive length — is refused through
+        // production Open and Copy Out, because locate_and_validate_zip_member
+        // also re-checks the member's own physical central-directory
+        // position, not name/size/CRC/archive-length alone. Two members of
+        // equal footprint are reordered: readme.txt moves from physical
+        // index 0 to physical index 1, with every other listed field held
+        // byte-identical.
+        let docs_location_before_swap = state.borrow().cwd.clone();
+        let swap_dir = dir.join("swap");
+        std::fs::create_dir_all(&swap_dir).unwrap();
+        let swap_archive = swap_dir.join("swap.zip");
+        let write_swap_archive = |first: &str, second: &str| {
+            let file = std::fs::File::create(&swap_archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for name in [first, second] {
+                writer.start_file(name, options).unwrap();
+                let content: &[u8] = if name == "readme.txt" { b"read me" } else { b"AAAAAAA" };
+                std::io::Write::write_all(&mut writer, content).unwrap();
+            }
+            writer.finish().unwrap();
+        };
+        write_swap_archive("readme.txt", "a.txt");
+        let swap_len_before = std::fs::metadata(&swap_archive).unwrap().len();
+
+        let real_dir_entry = state.borrow().visible_entries.iter().find(|e| e.name == "swap").cloned();
+        let real_dir_entry = match real_dir_entry {
+            Some(e) => e,
+            None => {
+                navigate(&state, native_core::Location::real(dir.clone()));
+                wait_for("back at the real folder for swap setup", || state.borrow().visible_entries.iter().any(|e| e.name == "swap"));
+                state.borrow().visible_entries.iter().find(|e| e.name == "swap").cloned().unwrap()
+            }
+        };
+        open_entry(&state, &ui, real_dir_entry);
+        wait_for("inside the swap real folder", || state.borrow().visible_entries.iter().any(|e| e.name == "swap.zip"));
+        let swap_zip_entry = state.borrow().visible_entries.iter().find(|e| e.name == "swap.zip").cloned().unwrap();
+        open_entry(&state, &ui, swap_zip_entry);
+        wait_for("inside the swap zip root", || state.borrow().cwd.is_zip() && state.borrow().visible_entries.len() == 2);
+        let stale_readme_entry = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").cloned().unwrap();
+        let native_core::EntrySource::ZipMember(stale_member) = &stale_readme_entry.source else {
+            panic!("swap readme.txt must be a ZipMember entry");
+        };
+        assert_eq!(stale_member.member_index, 0, "readme.txt must be listed first (physical index 0) before the swap");
+
+        // Replace the archive on disk with a reordered version: readme.txt's
+        // name, size, CRC and the archive's total byte length are all
+        // preserved; only its physical central-directory position changes.
+        write_swap_archive("a.txt", "readme.txt");
+        let swap_len_after = std::fs::metadata(&swap_archive).unwrap().len();
+        assert_eq!(swap_len_after, swap_len_before, "the reordered replacement archive must be byte-length identical");
+        {
+            let file = std::fs::File::open(&swap_archive).unwrap();
+            let index = native_core::index_zip(file, &native_core::DEFAULT_ZIP_LIMITS, &AtomicBool::new(false)).unwrap();
+            let readme_after = index.iter().find(|e| e.logical_path == "readme.txt").unwrap();
+            assert_eq!(readme_after.size, stale_member.size, "readme.txt size must be preserved by the replacement");
+            assert_eq!(readme_after.crc32, stale_member.crc32, "readme.txt CRC must be preserved by the replacement");
+            assert_eq!(readme_after.physical_index, 1, "the replacement must actually move readme.txt to physical index 1");
+        }
+
+        // D-188 ledger #26: Open refuses the stale, now-mismatched member.
+        ui.status.set_label("");
+        open_entry(&state, &ui, stale_readme_entry.clone());
+        wait_for("swapped-archive Open refuses", || ui.status.label().starts_with("Open failed"));
+        assert!(
+            ui.status.label().contains("no longer matches what was listed"),
+            "D-188 #26: Open of a stale member after a preserving-name/size/CRC archive swap must name the mismatch, got {:?}",
+            ui.status.label()
+        );
+
+        // D-188 ledger #27: Copy Out refuses the same stale member, through
+        // the real production transaction path, leaving no output.
+        let swap_out_dir = dir.join("swap-out");
+        std::fs::create_dir_all(&swap_out_dir).unwrap();
+        select_index(
+            &state,
+            &ui,
+            state.borrow().visible_entries.iter().position(|e| e.name == "readme.txt").unwrap(),
+        );
+        let before_undo_len_27 = state.borrow().undo_stack.len();
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(swap_out_dir.clone()));
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        wait_for("swapped-archive Copy Out refuses", || ui.status.label().starts_with("Operation failed"));
+        assert!(!swap_out_dir.join("readme.txt").exists(), "D-188 #27: a refused swapped-archive Copy Out must publish nothing");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len_27, "D-188 #27: a refused swapped-archive Copy Out adds no history");
+        let swap_leftovers: Vec<_> = std::fs::read_dir(&swap_out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-wf-zip-"))
+            .collect();
+        assert!(swap_leftovers.is_empty(), "D-188 #27: no owned stage residue may survive a refused swapped-archive Copy Out, found {swap_leftovers:?}");
+
+        navigate(&state, docs_location_before_swap);
+        wait_for("back inside docs after the swap proofs", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
+
         // D-188 ledger #15/#19: a pre-existing destination conflict refuses
         // without overwrite, and leaves no job/history/stage residue.
         let conflict_dir = dir.join("conflict-out");
