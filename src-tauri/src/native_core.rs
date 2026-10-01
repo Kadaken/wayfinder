@@ -1323,6 +1323,79 @@ pub fn restore_from_trash(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// D-187: the exact `.trashinfo`/payload identity a single `trash_paths_exact`
+/// call created for one source. Restoring by this selector (a direct
+/// `files/<stem>` path) can never pick the wrong entry when two items shared
+/// one original path and were trashed separately — unlike `restore_from_trash`,
+/// which picks "newest `.trashinfo` for this original path" and is therefore
+/// wrong once a second item with the same original path lands in Trash after
+/// the first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrashReceipt {
+    pub original: String,
+    pub selector: String,
+}
+
+fn trash_files_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    Ok(Path::new(&home).join(".local/share/Trash/files"))
+}
+
+fn files_dir_stems(files_dir: &Path) -> HashSet<std::ffi::OsString> {
+    fs::read_dir(files_dir)
+        .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default()
+}
+
+/// Trashes each path one at a time, diffing `Trash/files` before and after
+/// each individual move to capture the exact stem GIO gave it. Fails closed
+/// (and trashes nothing further) if a single trash call does not yield
+/// exactly one new entry, rather than guessing.
+pub fn trash_paths_exact(paths: &[String]) -> Result<Vec<TrashReceipt>, String> {
+    let files_dir = trash_files_dir()?;
+    let mut receipts = Vec::with_capacity(paths.len());
+    for path in paths {
+        let before = files_dir_stems(&files_dir);
+        gio::File::for_path(path)
+            .trash(gio::Cancellable::NONE)
+            .map_err(|err| format!("{path}: {err}"))?;
+        let after = files_dir_stems(&files_dir);
+        let mut new: Vec<_> = after.difference(&before).collect();
+        if new.len() != 1 {
+            return Err(format!(
+                "{path}: trashed, but could not identify its exact Trash entry ({} new, expected 1)",
+                new.len()
+            ));
+        }
+        let stem = new.remove(0);
+        let selector = files_dir.join(stem).to_string_lossy().to_string();
+        receipts.push(TrashReceipt { original: path.clone(), selector });
+    }
+    Ok(receipts)
+}
+
+/// Restores each receipt's exact payload, never "the newest item for this
+/// original path". All-or-nothing: on a mid-batch failure, every receipt
+/// already restored in this call is put back in Trash under the same
+/// selector before returning the error.
+pub fn restore_from_trash_exact(receipts: &[TrashReceipt]) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let trash = Path::new(&home).join(".local/share/Trash");
+    let mut restored = Vec::new();
+    for receipt in receipts {
+        match restore_from_trash_in(&trash, &receipt.selector) {
+            Ok(()) => restored.push(receipt),
+            Err(err) => {
+                for done in restored.into_iter().rev() {
+                    let _ = trash_paths_exact(std::slice::from_ref(&done.original));
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
 struct TrashEntry {
     info: PathBuf,
     payload: PathBuf,
@@ -4007,6 +4080,83 @@ mod tests {
             "batch trash of 25 files took {elapsed:?} — too slow, is it spawning processes again?"
         );
         eprintln!("trashed 25 files in {elapsed:?}");
+    }
+
+    #[test]
+    fn trash_paths_exact_restores_the_right_one_of_two_same_original_path_entries() {
+        // D-187: two items trashed separately that shared one original path must
+        // each restore to their own exact payload, never "newest by original
+        // path" (that heuristic is what `restore_from_trash` uses and is exactly
+        // the bug this gate exists to prove fixed for Redo).
+        let home = std::env::var("HOME").expect("HOME");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = format!("wf-trashexact-{}-{nanos}", std::process::id());
+        let dir = PathBuf::from(&home).join(".cache").join(&stem);
+        fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("same-name.txt");
+        let trash_files = PathBuf::from(&home).join(".local/share/Trash/files");
+        let trash_info = PathBuf::from(&home).join(".local/share/Trash/info");
+        let mut cleanup: Vec<String> = Vec::new();
+
+        let mut run = || -> Result<(), String> {
+            fs::write(&original, b"first").unwrap();
+            let first = trash_paths_exact(&[original.to_string_lossy().to_string()])?;
+            assert_eq!(first.len(), 1);
+            cleanup.push(
+                Path::new(&first[0].selector)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+            fs::write(&original, b"second").unwrap();
+            let second = trash_paths_exact(&[original.to_string_lossy().to_string()])?;
+            assert_eq!(second.len(), 1);
+            cleanup.push(
+                Path::new(&second[0].selector)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+            assert_ne!(first[0].selector, second[0].selector, "distinct payloads");
+
+            // Restore the SECOND one by its exact receipt; the first must stay in Trash.
+            restore_from_trash_exact(&second)?;
+            assert_eq!(
+                fs::read(&original).unwrap(),
+                b"second",
+                "restored the exact payload this receipt names, not the oldest/newest"
+            );
+            assert!(
+                Path::new(&first[0].selector).exists(),
+                "the other same-original-path entry must still be in Trash, untouched"
+            );
+
+            // Now restore the first — but the original path is occupied again (by
+            // the restored "second"); it must refuse without overwriting.
+            restore_from_trash_exact(&first).expect_err("destination is occupied; must refuse");
+            assert_eq!(
+                fs::read(&original).unwrap(),
+                b"second",
+                "a refused restore must not overwrite"
+            );
+            Ok(())
+        };
+
+        let result = run();
+        fs::remove_file(&original).ok();
+        for stem in &cleanup {
+            fs::remove_file(trash_files.join(stem)).ok();
+            fs::remove_file(trash_info.join(format!("{stem}.trashinfo"))).ok();
+        }
+        fs::remove_dir_all(&dir).ok();
+        result.expect("exact trash/restore round trip should succeed");
     }
 
     #[test]
