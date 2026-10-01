@@ -13940,6 +13940,9 @@ Broken: Either state is wrong.\n";
         let readme_entry = state.borrow().visible_entries[readme_index].clone();
         show_item_context_menu(&readme_row, state.clone(), ui.clone(), readme_entry, 5.0, 5.0);
         pump();
+        // D-188 ledger #22: an unrelated object already sitting in the
+        // destination must never be touched by Undo of this transaction.
+        std::fs::write(out_dir.join("unrelated.txt"), b"unrelated, pre-existing").unwrap();
         TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(out_dir.clone()));
         {
             let menu = popovers_of(&readme_row).pop().expect("the zip item menu");
@@ -13965,11 +13968,57 @@ Broken: Either state is wrong.\n";
         pump();
         wait_for("undo removes both copied-out files", || !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists());
         assert!(state.borrow().cwd.is_zip(), "Undo must not navigate away from the archive");
+        assert_eq!(
+            std::fs::read(out_dir.join("unrelated.txt")).unwrap(),
+            b"unrelated, pre-existing",
+            "D-188 #22: Undo of a multi-member Copy Out must remove exactly its own receipts and no unrelated object"
+        );
         assert!(redo_button.is_sensitive(), "Redo must be enabled inside a ZIP after an Undo");
         redo_button.emit_clicked();
         pump();
         wait_for("redo brings both back", || out_dir.join("readme.txt").is_file() && out_dir.join("second.txt").is_file());
         assert!(state.borrow().cwd.is_zip(), "Redo must not navigate away from the archive");
+        assert_eq!(std::fs::read(out_dir.join("readme.txt")).unwrap(), b"read me", "D-188 #23: Redo restores exact bytes");
+        assert_eq!(std::fs::read(out_dir.join("second.txt")).unwrap(), b"second file", "D-188 #23: Redo restores exact bytes");
+        assert_eq!(
+            std::fs::read(out_dir.join("unrelated.txt")).unwrap(),
+            b"unrelated, pre-existing",
+            "D-188 #23: Redo must not touch an unrelated object either"
+        );
+
+        // D-188 ledger #24: a new successful action after Undo clears the
+        // Copy Out redo branch. Undo the two-member transaction again, then
+        // perform a fresh single-member Copy Out — Redo must then be
+        // unavailable, because the branch it would have replayed is gone.
+        undo_button.emit_clicked();
+        pump();
+        wait_for("undo removes both copied-out files again", || !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists());
+        assert!(redo_button.is_sensitive(), "Redo is available right after this second Undo");
+        let branch_dir = dir.join("branch-out");
+        std::fs::create_dir_all(&branch_dir).unwrap();
+        select_index(&state, &ui, readme_index);
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(branch_dir.clone()));
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        wait_for("the fresh single-member copy lands", || branch_dir.join("readme.txt").is_file());
+        assert!(
+            state.borrow().redo_stack.is_empty(),
+            "D-188 #24: a new successful action after Undo must clear the stale Copy Out redo branch"
+        );
+        ui.status.set_label("");
+        redo_button.emit_clicked();
+        pump();
+        assert_eq!(ui.status.label(), "Nothing to redo", "the cleared redo branch must never silently replay");
+        assert!(!out_dir.join("second.txt").exists(), "the cleared redo branch must never silently replay");
+
+        // D-188 ledger #25: archive bytes and mtime stay unchanged across all
+        // of the above — Open, Copy Out, Undo, Redo and branch clearing.
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "D-188 #25: archive bytes unchanged after Undo/Redo/branch clearing");
+        assert_eq!(
+            std::fs::metadata(&archive_path).unwrap().modified().unwrap(),
+            archive_mtime_before,
+            "D-188 #25: archive mtime unchanged after Undo/Redo/branch clearing"
+        );
 
         // D-188 ledger #15/#19: a pre-existing destination conflict refuses
         // without overwrite, and leaves no job/history/stage residue.
