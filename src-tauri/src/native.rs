@@ -2067,7 +2067,8 @@ const GUIDE_OPEN_FILE: &str = "open-file-other-app";
 
 #[cfg(feature = "guide")]
 fn guide_is_open_file_fixture(entry: &Entry) -> bool {
-    let path = Path::new(&entry.path);
+    let owned = entry.location.to_path_string();
+    let path = Path::new(&owned);
     !entry.is_dir
         && path.file_name().is_some_and(|n| n == "open-me.txt")
         && path.parent().and_then(Path::file_name).is_some_and(|n| n == "Throwaways")
@@ -3506,13 +3507,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         let paths = {
             let state = state.clone();
             Rc::new(move |position: u32| {
-                state.borrow().visible_entries.get(position as usize).map(|e| e.path.clone())
+                state.borrow().visible_entries.get(position as usize).map(|e| e.location.to_path_string())
             }) as Rc<dyn Fn(u32) -> Option<String>>
         };
         let open = {
             let (state, ui) = (state.clone(), ui.clone());
             Rc::new(move |path: String| {
-                let entry = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned();
+                let entry = state.borrow().visible_entries.iter().find(|e| e.location.to_path_string() == path).cloned();
                 if let Some(entry) = entry {
                     let (state, ui) = (state.clone(), ui.clone());
                     defer_after_signal(move || open_entry(&state, &ui, entry));
@@ -3558,7 +3559,7 @@ fn select_entry_by_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
         .borrow()
         .visible_entries
         .iter()
-        .position(|entry| entry.path == path);
+        .position(|entry| entry.location.to_path_string() == path);
     if let Some(index) = index {
         select_index(state, ui, index);
     }
@@ -5756,7 +5757,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             let selection = selected_entries(&state_for_keys, &ui_for_keys);
             let path = selection
                 .first()
-                .map(|entry| entry.path.clone())
+                .map(|entry| entry.location.to_path_string())
                 .unwrap_or_else(|| state_for_keys.borrow().cwd.clone());
             show_properties_for_path(ui_for_keys.clone(), path);
             return glib::Propagation::Stop;
@@ -6249,10 +6250,10 @@ fn start_monitor_scan(
 fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_core::DirectoryListing) {
     let kind = native_core::classify_refresh(&state.borrow().entries, &listing.entries);
     if kind == native_core::RefreshKind::MetadataOnly {
-        let fresh: HashMap<&str, &Entry> =
-            listing.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+        let fresh: HashMap<&native_core::Location, &Entry> =
+            listing.entries.iter().map(|e| (&e.location, e)).collect();
         let merge = |entry: &mut Entry| -> bool {
-            let Some(new) = fresh.get(entry.path.as_str()) else {
+            let Some(new) = fresh.get(&entry.location) else {
                 return false;
             };
             let changed = entry.size != new.size || entry.modified != new.modified;
@@ -6283,7 +6284,7 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         }
         let labels = state.borrow().meta_labels.clone();
         for entry in changed_paths {
-            if let Some((size, modified)) = labels.get(&entry.path) {
+            if let Some((size, modified)) = labels.get(&entry.location.to_path_string()) {
                 if let Some(size) = size.upgrade() {
                     size.set_label(&row_size_text(&entry));
                 }
@@ -6323,7 +6324,7 @@ fn restore_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, paths: &[String]) {
             state.view_mode,
             paths
                 .iter()
-                .filter_map(|path| state.visible_entries.iter().position(|e| &e.path == path))
+                .filter_map(|path| state.visible_entries.iter().position(|e| &e.location.to_path_string() == path))
                 .collect(),
         )
     };
@@ -6483,10 +6484,10 @@ fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
         select_entry_by_path(state, ui, path);
         return;
     }
-    let Some(entry) = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned() else {
+    let Some(entry) = state.borrow().visible_entries.iter().find(|e| e.location.to_path_string() == path).cloned() else {
         return;
     };
-    let pos = state.borrow().visible_entries.iter().position(|e| e.path == path).unwrap_or(0);
+    let pos = state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == path).unwrap_or(0);
     // A real replace, not items_changed: ListView only rebinds a row when the
     // model reports a different item there.
     ui.list_store.splice(pos as u32, 1, &[glib::BoxedAnyObject::new(entry)]);
@@ -6494,9 +6495,9 @@ fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
 }
 
 fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
-    state.borrow_mut().inline_rename = Some(InlineRename::new(&entry.path, &entry.name));
+    state.borrow_mut().inline_rename = Some(InlineRename::new(&entry.location.to_path_string(), &entry.name));
     state.borrow_mut().last_name_click = None;
-    refresh_row(state, ui, &entry.path);
+    refresh_row(state, ui, &entry.location.to_path_string());
 }
 
 fn cancel_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui) {
@@ -6730,7 +6731,7 @@ fn connect_name_slow_click(
         let only_this = selected_paths(&state, &ui) == vec![path.clone()];
         state.borrow_mut().last_name_click = Some((path.clone(), std::time::Instant::now()));
         if slow_click_starts_rename(prior, n_press, only_this) {
-            let entry = state.borrow().visible_entries.iter().find(|e| e.path == path).cloned();
+            let entry = state.borrow().visible_entries.iter().find(|e| e.location.to_path_string() == path).cloned();
             if let Some(entry) = entry {
                 begin_inline_rename(&state, &ui, &entry);
             }
@@ -6775,7 +6776,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         line.add_css_class("wf-file-row");
-        let entry_display_path = native_core::Location::parse(&entry.path).display_string();
+        let entry_display_path = entry.location.display_string();
         line.set_tooltip_text(Some(&entry.metadata_error.as_ref().map_or_else(
             || entry_display_path.clone(),
             |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
@@ -6799,12 +6800,12 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .borrow()
             .inline_rename
             .as_ref()
-            .filter(|edit| edit.path == entry.path)
+            .filter(|edit| edit.path == entry.location.to_path_string())
             .cloned();
         let name: gtk::Widget = match editing {
             Some(edit) => build_inline_editor(&state, &ui, &entry, &edit).upcast(),
             None => {
-                connect_name_slow_click(&name, &state, &ui, &entry.path);
+                connect_name_slow_click(&name, &state, &ui, &entry.location.to_path_string());
                 name.upcast()
             }
         };
@@ -6844,7 +6845,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         state
             .borrow_mut()
             .meta_labels
-            .insert(entry.path.clone(), (size.downgrade(), modified.downgrade()));
+            .insert(entry.location.to_path_string(), (size.downgrade(), modified.downgrade()));
 
         line.append(&icon);
         line.append(&name);
@@ -6859,7 +6860,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             press.set_button(1);
             press.set_propagation_phase(gtk::PropagationPhase::Capture);
             let gate = state.borrow().activation_gate.clone();
-            let path = entry.path.clone();
+            let path = entry.location.to_path_string();
             press.connect_pressed(move |g, _, _, _| {
                 let plain = !g.current_event_state().intersects(
                     gdk::ModifierType::CONTROL_MASK
@@ -6872,9 +6873,9 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             });
             line.add_controller(press);
         }
-        connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone(), Some(&size));
+        connect_file_drag(&line, state.clone(), ui.clone(), entry.location.to_path_string(), Some(&size));
         if entry.is_dir {
-            connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.path.clone());
+            connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.location.to_path_string());
         }
         connect_row_context(&line, item.position(), state.clone(), ui.clone(), entry.clone());
         if entry.is_dir {
@@ -6883,7 +6884,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             middle.set_button(2);
             let state_for_middle = state.clone();
             let ui_for_middle = ui.clone();
-            let path = entry.path.clone();
+            let path = entry.location.to_path_string();
             middle.connect_pressed(move |gesture, _, _, _| {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 open_path_in_new_tab(&state_for_middle, &ui_for_middle, path.clone());
@@ -6919,7 +6920,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 if let Some(path) = item
                     .item()
                     .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
-                    .map(|b| b.borrow::<Entry>().path.clone())
+                    .map(|b| b.borrow::<Entry>().location.to_path_string())
                 {
                     let mut state = state_for_unbind.borrow_mut();
                     let ours = state.meta_labels.get(&path).is_some_and(|(size, _)| {
@@ -6998,7 +6999,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // ahead of folders and every sort key.
     let pinned = state.borrow().pinned_top.clone();
     if let Some(pin) = pinned {
-        if let Some(pos) = visible_entries.iter().position(|entry| entry.path == pin) {
+        if let Some(pos) = visible_entries.iter().position(|entry| entry.location.to_path_string() == pin) {
             let entry = visible_entries.remove(pos);
             visible_entries.insert(0, entry);
         }
@@ -7079,7 +7080,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 
     for (index, entry) in visible_entries.into_iter().enumerate() {
-        let entry_display_path = native_core::Location::parse(&entry.path).display_string();
+        let entry_display_path = entry.location.display_string();
         let tooltip = entry.metadata_error.as_ref().map_or_else(
             || entry_display_path.clone(),
             |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
@@ -7115,7 +7116,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 .borrow()
                 .inline_rename
                 .as_ref()
-                .filter(|edit| edit.path == entry.path)
+                .filter(|edit| edit.path == entry.location.to_path_string())
                 .cloned();
             match editing {
                 Some(edit) => {
@@ -7128,27 +7129,27 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 None => grid_item.append(&name),
             }
             grid_child.set_child(Some(&grid_item));
-            connect_file_drag(&grid_child, state.clone(), ui.clone(), entry.path.clone(), None);
+            connect_file_drag(&grid_child, state.clone(), ui.clone(), entry.location.to_path_string(), None);
             if entry.is_dir {
                 connect_file_drop_to_dir(
                     &grid_child,
                     state.clone(),
                     ui.clone(),
-                    entry.path.clone(),
+                    entry.location.to_path_string(),
                 );
             }
             ui.grid.append(&grid_child);
             if let Some(picture) = thumbnail {
-                if native_core::is_video_path(&entry.path) {
+                if native_core::is_video_path(&entry.location.to_path_string()) {
                     if let Some(queue) = &video_poster_queue {
                         queue.borrow_mut().pending.push_back(VideoPosterJob {
-                            path: entry.path.clone(),
+                            path: entry.location.to_path_string(),
                             picture,
                         });
                     }
                 } else if let Some(queue) = &thumbnail_queue {
                     queue.borrow_mut().pending.push_back(ThumbnailJob {
-                        path: entry.path.clone(),
+                        path: entry.location.to_path_string(),
                         picture,
                         width: thumbnail_size.0,
                         height: thumbnail_size.1,
@@ -7172,7 +7173,7 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let Some(path) = state.borrow_mut().reveal_path.take() else {
         return;
     };
-    let index = state.borrow().visible_entries.iter().position(|e| e.path == path);
+    let index = state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == path);
     let Some(index) = index else {
         return;
     };
@@ -7353,7 +7354,7 @@ fn grid_file_icon(
     slot.set_halign(gtk::Align::Center);
     slot.set_valign(gtk::Align::Center);
 
-    if (entry.is_image || native_core::is_video_path(&entry.path)) && wants_thumbnail {
+    if (entry.is_image || native_core::is_video_path(&entry.location.to_path_string())) && wants_thumbnail {
         // Keep a normal file-type icon visible while the thumbnail/poster is
         // decoded asynchronously. Each queue is bounded and cancelled as soon
         // as the user changes folder or view.
@@ -7728,7 +7729,7 @@ fn selected_entries(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<Entry> {
 fn selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> {
     selected_entries(state, ui)
         .into_iter()
-        .map(|entry| entry.path)
+        .map(|entry| entry.location.to_path_string())
         .collect()
 }
 
@@ -7747,7 +7748,7 @@ fn picker_selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> 
     let mut paths = selected_entries(state, ui)
         .into_iter()
         .filter(|entry| picker_entry_can_submit(&picker, entry))
-        .map(|entry| entry.path)
+        .map(|entry| entry.location.to_path_string())
         .collect::<Vec<_>>();
     if !picker.config.multiple {
         paths.truncate(1);
@@ -7996,10 +7997,10 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
 fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
     if let Some(picker) = state.borrow().picker.clone() {
         if !entry.is_dir && picker_entry_can_submit(&picker, &entry) {
-            picker_write_and_exit(&picker, vec![entry.path], 0);
+            picker_write_and_exit(&picker, vec![entry.location.to_path_string()], 0);
         }
         if entry.is_dir {
-            navigate(state, entry.path);
+            navigate(state, entry.location.to_path_string());
         } else {
             ui.status.set_label("Select a supported file to open");
         }
@@ -8010,28 +8011,26 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
     // already inside a ZIP (its path is a ZipDir location) is unaffected —
     // its own is_dir already routes it through the branch below.
     let is_ordinary_zip_file = !entry.is_dir
-        && !native_core::Location::parse(&entry.path).is_zip()
-        && Path::new(&entry.path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
-    let zip_member = match native_core::Location::parse(&entry.path) {
-        native_core::Location::ZipDir { archive, internal } if !entry.is_dir => Some((archive, internal)),
+        && !entry.location.is_zip()
+        && matches!(&entry.location, native_core::Location::RealDir(p) if p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")));
+    let zip_member = match &entry.location {
+        native_core::Location::ZipDir { archive, internal } if !entry.is_dir => Some((archive.clone(), internal.clone())),
         _ => None,
     };
     if is_ordinary_zip_file {
-        navigate(state, native_core::Location::zip_root(entry.path).to_path_string());
+        navigate(state, native_core::Location::zip_root(entry.location.to_path_string()).to_path_string());
     } else if let Some((archive, internal)) = zip_member {
         open_zip_member(ui, &archive, &internal, &entry.name);
     } else if entry.is_dir {
-        navigate(state, entry.path);
-    } else if std::fs::symlink_metadata(&entry.path).is_err() {
+        navigate(state, entry.location.to_path_string());
+    } else if std::fs::symlink_metadata(entry.location.to_path_string()).is_err() {
         // A stale row must never hand a vanished path to an external app: some
         // of them create the missing file.
-        eprintln!("wf-event: open refused, path is gone: {}", entry.path);
+        eprintln!("wf-event: open refused, path is gone: {}", entry.location.to_path_string());
         ui.status.set_label(&format!("{} no longer exists", entry.name));
     } else {
-        eprintln!("wf-event: open {}", entry.path);
-        match native_core::open_path(&entry.path) {
+        eprintln!("wf-event: open {}", entry.location.to_path_string());
+        match native_core::open_path(entry.location.to_path_string().as_str()) {
             Err(err) => ui.status.set_label(&format!("Open failed: {err}")),
             // D-75: only a launch that succeeded clears the tutorial.
             #[cfg(feature = "guide")]
@@ -8141,7 +8140,7 @@ fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let entries = selected_entries(&state, &ui);
-    if entries.iter().any(|e| native_core::zip_read_only_refusal(&e.path).is_some()) {
+    if entries.iter().any(|e| native_core::zip_read_only_refusal(&e.location.to_path_string()).is_some()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
@@ -8153,7 +8152,7 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Select one item to rename");
         return;
     };
-    if let Some(msg) = native_core::zip_read_only_refusal(&entry.path) {
+    if let Some(msg) = native_core::zip_read_only_refusal(&entry.location.to_path_string()) {
         ui.status.set_label(msg);
         return;
     }
@@ -8162,7 +8161,7 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         return;
     }
     let old_name = entry.name.clone();
-    let old_path = entry.path.clone();
+    let old_path = entry.location.to_path_string();
     let default_name = old_name.clone();
     let ui_for_action = ui.clone();
     show_name_dialog(
@@ -10001,7 +10000,7 @@ fn batch_rename_requests(
         .enumerate()
         .map(|(index, entry)| {
             (
-                entry.path.clone(),
+                entry.location.to_path_string(),
                 entry.name.clone(),
                 batch_new_name(&entry.name, find, replace, pattern, start, index),
             )
@@ -10315,28 +10314,28 @@ fn show_item_context_menu(
     if entry.is_dir {
         let state = state.clone();
         let ui = ui.clone();
-        let path = entry.path.clone();
+        let path = entry.location.to_path_string();
         menu.append(&context_item("tab-new-symbolic", "Open in New Tab", "", &popover, move || {
             open_path_in_new_tab(&state, &ui, path.clone())
         }));
     }
     if entry.is_dir {
         let ui = ui.clone();
-        let path = entry.path.clone();
+        let path = entry.location.to_path_string();
         menu.append(&context_item("window-new-symbolic", "Open in New Window", "", &popover, move || {
             open_new_window(&ui, path.clone())
         }));
     }
     if !entry.is_dir {
         let ui = ui.clone();
-        let path = entry.path.clone();
+        let path = entry.location.to_path_string();
         menu.append(&context_open_with(&popover, ui.clone(), path.clone()));
     }
     if entry.is_dir {
-        let favorite = is_favorite(&state.borrow(), &entry.path);
+        let favorite = is_favorite(&state.borrow(), &entry.location.to_path_string());
         let state_for_fav = state.clone();
         let ui_for_fav = ui.clone();
-        let path = entry.path.clone();
+        let path = entry.location.to_path_string();
         let label = if favorite {
             "Remove from Favorites"
         } else {
@@ -10399,21 +10398,21 @@ fn show_item_context_menu(
             compress_selection(state.clone(), ui.clone())
         }));
     }
-    if native_core::is_archive_path(&entry.path) {
+    if native_core::is_archive_path(&entry.location.to_path_string()) {
         {
             // Default action: a new folder named after the archive, so a badly
             // packed archive cannot scatter loose files over the current folder.
             let state = state.clone();
             let ui = ui.clone();
-            let path = entry.path.clone();
-            let label = format!("Extract to \"{}\"", native_core::archive_stem(&entry.path));
+            let path = entry.location.to_path_string();
+            let label = format!("Extract to \"{}\"", native_core::archive_stem(&entry.location.to_path_string()));
             menu.append(&context_button(&label, &popover, move || {
                 extract_archive_to_folder_action(state.clone(), ui.clone(), path.clone())
             }));
         }
         let state = state.clone();
         let ui = ui.clone();
-        let path = entry.path.clone();
+        let path = entry.location.to_path_string();
         menu.append(&context_item("archive-extract-symbolic", "Extract Here", "", &popover, move || {
             extract_archive_action(state.clone(), ui.clone(), path.clone())
         }));
@@ -10438,7 +10437,7 @@ fn show_item_context_menu(
     menu.append(&context_separator());
     {
         let ui = ui.clone();
-        let path = entry.path.clone();
+        let path = entry.location.to_path_string();
         menu.append(&context_item("document-properties-symbolic", "Properties", "Alt+Enter", &popover, move || {
             show_properties_for_path(ui.clone(), path.clone())
         }));
@@ -10446,9 +10445,9 @@ fn show_item_context_menu(
     {
         let ui = ui.clone();
         let terminal_path = if entry.is_dir {
-            entry.path.clone()
+            entry.location.to_path_string()
         } else {
-            native_core::parent_dir(&entry.path)
+            native_core::parent_dir(&entry.location.to_path_string())
         };
         menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
             launch_terminal(&ui, &terminal_path);
@@ -11449,8 +11448,8 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
-    if native_core::is_image_path(&entry.path) {
-        set_preview_image(ui, &entry.path);
+    if native_core::is_image_path(&entry.location.to_path_string()) {
+        set_preview_image(ui, &entry.location.to_path_string());
         return;
     }
 
@@ -11458,17 +11457,17 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     // playback pipeline that aborts (SIGABRT, multiqueue assertion in
     // libgstplayback while parsing MP3), which crashes the whole app. Show file
     // info instead — safe, no GStreamer. (Open the song in a real player to play.)
-    if native_core::is_audio_path(&entry.path) {
+    if native_core::is_audio_path(&entry.location.to_path_string()) {
         set_preview_text(ui, &native_core::entry_summary(entry));
         return;
     }
 
-    if native_core::is_video_path(&entry.path) {
-        set_preview_media(ui, &entry.path);
+    if native_core::is_video_path(&entry.location.to_path_string()) {
+        set_preview_media(ui, &entry.location.to_path_string());
         return;
     }
 
-    match native_core::read_text_preview(&entry.path) {
+    match native_core::read_text_preview(&entry.location.to_path_string()) {
         Ok(text) => set_preview_text(ui, &text),
         Err(_) => set_preview_text(ui, &native_core::entry_summary(entry)),
     }
@@ -12151,7 +12150,7 @@ mod tests {
     fn entry(name: &str, is_dir: bool, modified: i64) -> Entry {
         Entry {
             name: name.to_string(),
-            path: format!("/tmp/{name}"),
+            location: native_core::Location::real(format!("/tmp/{name}")),
             is_dir,
             size: 0,
             modified,
@@ -13250,7 +13249,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
 
         // ---- Every mutation surface refuses with the exact message, fail-closed.
-        select_entry_by_path(&state, &ui, &state.borrow().visible_entries[0].path.clone());
+        select_entry_by_path(&state, &ui, &state.borrow().visible_entries[0].location.to_path_string());
         let refusal = native_core::ZIP_READ_ONLY_MESSAGE;
         create_folder_action(state.clone(), ui.clone());
         assert_eq!(ui.status.label(), refusal, "New Folder refused inside a ZIP");
@@ -13296,7 +13295,7 @@ Broken: Either state is wrong.\n";
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
         wait_for("docs children again", || state.borrow().visible_entries.len() == 2);
-        let readme_path = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().path.clone();
+        let readme_path = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().location.to_path_string();
         select_entry_by_path(&state, &ui, &readme_path);
         let copy_out = Transfer {
             srcs: vec![readme_path],
@@ -15118,7 +15117,7 @@ Broken: Either state is wrong.\n";
         let item_for = |path: &str| -> gtk::Widget {
             let mode = state.borrow().view_mode;
             if mode == ViewMode::Grid {
-                let entry_ix = state.borrow().visible_entries.iter().position(|e| e.path == path).expect("entry");
+                let entry_ix = state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == path).expect("entry");
                 ui.grid.child_at_index(entry_ix as i32).expect("grid child").upcast()
             } else {
                 tree().into_iter().find(|w| w.has_css_class("wf-file-row") && w.tooltip_text().as_deref() == Some(path)).expect("list row")
@@ -15246,7 +15245,7 @@ Broken: Either state is wrong.\n";
 
         // Negatives at the external-open success boundary: none of these opens anything, so none
         // may clear. Each calls the real open route directly.
-        let entry = state.borrow().visible_entries.iter().find(|e| e.path == open_me).cloned().expect("fixture entry");
+        let entry = state.borrow().visible_entries.iter().find(|e| e.location.to_path_string() == open_me).cloned().expect("fixture entry");
         let still_pending = |why: &str| {
             assert_eq!(pending(), known(GUIDE_OPEN_FILE, "Back"), "{why}: request kept");
             assert_eq!(rings().len(), 1, "{why}: circle kept");
@@ -18103,7 +18102,7 @@ Broken: Either state is wrong.\n";
         ui.list_selection.select_item(0, true);
         update_selection(&state, &ui);
         let entry = state.borrow().visible_entries[0].clone();
-        let file_path = entry.path.clone();
+        let file_path = entry.location.to_path_string();
         show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
         pump();
         pump();
@@ -18782,7 +18781,7 @@ Broken: Either state is wrong.\n";
         let rest_of = |chosen: &[&str]| -> Vec<&str> {
             all_names.iter().copied().filter(|n| !chosen.contains(n)).collect()
         };
-        let index_of = |n: &str| state.borrow().visible_entries.iter().position(|e| e.path == path(n)).unwrap();
+        let index_of = |n: &str| state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == path(n)).unwrap();
         let grid = |ui: &Ui| ui.grid.clone();
         let pick = |mode: ViewMode, n: &str, extend: bool| {
             let i = index_of(n);
@@ -18850,7 +18849,7 @@ Broken: Either state is wrong.\n";
         // a filter limits invert to visible rows; no filtered-out path is selected
         ui.search.set_text("a.txt");
         wait_for("filtered", || state.borrow().visible_entries.len() == 4);
-        let visible: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.path.clone()).collect();
+        let visible: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.location.to_path_string()).collect();
         assert_eq!(visible.len(), 4, "{visible:?}");
         assert!(visible.iter().all(|p| p.ends_with("a.txt")), "{visible:?}");
         pick(ViewMode::Details, "alpha.txt", false);
@@ -19200,7 +19199,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(size_after.label(), native_core::fmt_size(2048));
         assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()], "selection kept");
         assert_eq!(state.borrow().visible_entries[1].size, 2048);
-        assert_eq!(state.borrow().entries.iter().find(|e| e.path == b_path).unwrap().size, 2048);
+        assert_eq!(state.borrow().entries.iter().find(|e| e.location.to_path_string() == b_path).unwrap().size, 2048);
         assert_eq!(object_before.downcast::<glib::BoxedAnyObject>().unwrap().borrow::<Entry>().size, 2048);
 
         // ---- Structural: a created file rebuilds, the selection survives.
@@ -19218,7 +19217,7 @@ Broken: Either state is wrong.\n";
         select_entry_by_path(&state, &ui, &b_path);
         let (c_size, c_modified) = b_labels(&state).unwrap();
         let c_row = c_size.parent().unwrap();
-        let b_index = state.borrow().visible_entries.iter().position(|e| e.path == b_path).unwrap() as u32;
+        let b_index = state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == b_path).unwrap() as u32;
         let c_object = ui.list_store.item(b_index).unwrap();
         let c_text = c_size.label();
         std::fs::write(dir.join("b.txt"), vec![b'z'; 8192]).unwrap();
@@ -19240,7 +19239,7 @@ Broken: Either state is wrong.\n";
             .collect();
         std::fs::write(dir.join("b.txt"), vec![b'y'; 4096]).unwrap();
         wait_for("grid state merged", || {
-            state.borrow().visible_entries.iter().any(|e| e.path == b_path && e.size == 4096)
+            state.borrow().visible_entries.iter().any(|e| e.location.to_path_string() == b_path && e.size == 4096)
         });
         for _ in 0..40 {
             pump();
@@ -19332,7 +19331,7 @@ Broken: Either state is wrong.\n";
         wait_for("listing", || state.borrow().visible_entries.len() == 4);
         let a_path = dir.join("a.txt").to_string_lossy().to_string();
         let b_path = dir.join("b.txt").to_string_lossy().to_string();
-        let index_of = |path: &str| state.borrow().visible_entries.iter().position(|e| e.path == path).unwrap();
+        let index_of = |path: &str| state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == path).unwrap();
         let row_widget = |mode: ViewMode, path: &str| -> Option<gtk::Widget> {
             if mode == ViewMode::Grid {
                 ui.grid.child_at_index(index_of(path) as i32).map(|c| c.upcast())
@@ -19583,7 +19582,7 @@ Broken: Either state is wrong.\n";
         let pinned_before = state.borrow().pinned_top.clone();
 
         let index_of = |st: &Rc<RefCell<AppState>>, path: &str| {
-            st.borrow().visible_entries.iter().position(|e| e.path == path)
+            st.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == path)
         };
         let start_index = index_of(&state, &old_path).expect("target present before rename");
         match view {
@@ -19606,7 +19605,7 @@ Broken: Either state is wrong.\n";
         // which calls this same production function directly.
         match view {
             ViewMode::Grid => {
-                let entry = state.borrow().visible_entries.iter().find(|e| e.path == old_path).cloned();
+                let entry = state.borrow().visible_entries.iter().find(|e| e.location.to_path_string() == old_path).cloned();
                 begin_inline_rename(&state, &ui, &entry.expect("target entry"));
             }
             ViewMode::Details | ViewMode::Compact => rename_action(state.clone(), ui.clone()),
@@ -19922,7 +19921,7 @@ Broken: Either state is wrong.\n";
 
         // ---- Seed one real rename so there is a reciprocal Undo entry.
         let old_path = created("original.txt").to_string_lossy().to_string();
-        let start_index = state.borrow().visible_entries.iter().position(|e| e.path == old_path).expect("target listed");
+        let start_index = state.borrow().visible_entries.iter().position(|e| e.location.to_path_string() == old_path).expect("target listed");
         ui.list_selection.select_item(start_index as u32, true);
         update_selection(&state, &ui);
         assert_eq!(selected_paths(&state, &ui), vec![old_path.clone()], "target selected before rename");
@@ -22806,7 +22805,7 @@ Broken: Either state is wrong.\n";
     #[test]
     fn sort_entries_keeps_folders_first_and_natural_names_d82() {
         let entry = |name: &str, is_dir: bool, size: u64| Entry {
-            name: name.to_string(), path: format!("/t/{name}"), is_dir, size, modified: 0,
+            name: name.to_string(), location: native_core::Location::real(format!("/t/{name}")), is_dir, size, modified: 0,
             is_image: false, icon: String::new(), metadata_error: None,
         };
         let mut v = vec![entry("f10", false, 1), entry("F2", false, 3), entry("d2", true, 0), entry("d10", true, 0), entry("f1", false, 2)];
@@ -22914,7 +22913,7 @@ Broken: Either state is wrong.\n";
             "gesture.set_state(gtk::EventSequenceState::Claimed);",
             "if strip_for_prepare(x) {",
             "drag.set_propagation_phase(gtk::PropagationPhase::Capture);",
-            "connect_file_drag(&line, state.clone(), ui.clone(), entry.path.clone(), Some(&size));",
+            "connect_file_drag(&line, state.clone(), ui.clone(), entry.location.to_path_string(), Some(&size));",
             "const BOX_SELECT_STRIP_W: f64 = 24.0;",
             "padding: 4px 12px;",
         ] {

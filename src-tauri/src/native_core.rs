@@ -19,10 +19,10 @@ const VIDEO_EXT: [&str; 12] = [
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "ts", "3gp", "ogv", "mpeg",
 ];
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
-    pub path: String,
+    pub location: Location,
     pub is_dir: bool,
     pub size: u64,
     pub modified: i64,
@@ -107,7 +107,7 @@ pub struct Space {
 /// being browsed read-only. `internal` is empty at the ZIP's virtual root.
 /// Carried by tabs/history/breadcrumbs instead of an ambiguous path string,
 /// so a ZIP member can never be mistaken for a mutable disk path (D-188).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Location {
     RealDir(PathBuf),
     ZipDir { archive: PathBuf, internal: String },
@@ -659,7 +659,7 @@ pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str)
                 icon: icon_name(fake_path, is_dir).to_string(),
                 is_image: is_image(fake_path),
                 name,
-                path: location.to_path_string(),
+                location,
                 is_dir,
                 size,
                 modified: 0,
@@ -847,7 +847,7 @@ fn entry_from_dirent(ent: &fs::DirEntry) -> (Entry, bool) {
     (
         Entry {
             name,
-            path: path_buf.to_string_lossy().to_string(),
+            location: Location::real(path_buf.clone()),
             is_dir,
             size,
             modified,
@@ -1006,7 +1006,7 @@ pub fn search_dir(
             if matched {
                 out.push(Entry {
                     name,
-                    path: path.to_string_lossy().to_string(),
+                    location: Location::real(path.clone()),
                     is_dir,
                     size: md.len(),
                     modified: md
@@ -3244,7 +3244,7 @@ pub fn properties(path: &str) -> Result<FileProperties, String> {
 }
 
 pub fn entry_summary(entry: &Entry) -> String {
-    let display_path = Location::parse(&entry.path).display_string();
+    let display_path = entry.location.display_string();
     if entry.is_dir {
         return format!("Folder\n{display_path}");
     }
@@ -3644,13 +3644,13 @@ pub fn classify_refresh(current: &[Entry], scanned: &[Entry]) -> RefreshKind {
     if current.len() != scanned.len() {
         return RefreshKind::Structural;
     }
-    let by_path: std::collections::HashMap<&str, &Entry> =
-        current.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+    let by_path: std::collections::HashMap<&Location, &Entry> =
+        current.iter().map(|entry| (&entry.location, entry)).collect();
     if by_path.len() != current.len() {
         return RefreshKind::Structural;
     }
     for new in scanned {
-        let Some(old) = by_path.get(new.path.as_str()) else {
+        let Some(old) = by_path.get(&new.location) else {
             return RefreshKind::Structural;
         };
         if old.name != new.name
@@ -3747,7 +3747,7 @@ mod tests {
     fn refresh_entry(path: &str, size: u64, modified: i64) -> Entry {
         Entry {
             name: path.rsplit('/').next().unwrap().to_string(),
-            path: path.to_string(),
+            location: Location::real(path),
             is_dir: false,
             size,
             modified,
@@ -5373,11 +5373,11 @@ mod tests {
 
         let name_hits = search_dir(dir.to_str().unwrap(), "needle", false, false).unwrap();
         assert_eq!(name_hits.len(), 1);
-        assert_eq!(name_hits[0].path, hit.to_string_lossy());
+        assert_eq!(name_hits[0].location, Location::real(&hit));
 
         let content_hits = search_dir(dir.to_str().unwrap(), "content only", true, false).unwrap();
         assert_eq!(content_hits.len(), 1);
-        assert_eq!(content_hits[0].path, miss.to_string_lossy());
+        assert_eq!(content_hits[0].location, Location::real(&miss));
 
         fs::remove_dir_all(dir).unwrap();
     }
