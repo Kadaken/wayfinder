@@ -145,6 +145,25 @@ impl Location {
         }
     }
 
+    /// A human-readable form safe for any GTK widget text (status line,
+    /// error message, window title): never contains the NUL-byte encoding
+    /// marker that `to_path_string` embeds for a `ZipDir`, which a raw
+    /// `to_path_string()` would hand straight to glib and crash on
+    /// (`GStrInteriorNulError`, D-188).
+    pub fn display_string(&self) -> String {
+        match self {
+            Self::RealDir(path) => path.to_string_lossy().into_owned(),
+            Self::ZipDir { archive, internal } => {
+                let archive = archive.to_string_lossy();
+                if internal.is_empty() {
+                    archive.into_owned()
+                } else {
+                    format!("{archive} » {internal}")
+                }
+            }
+        }
+    }
+
     /// Parses a path string produced by `to_path_string`, or treats any
     /// ordinary string (one without the marker) as a real directory path.
     pub fn parse(path: &str) -> Self {
@@ -3172,13 +3191,13 @@ pub fn properties(path: &str) -> Result<FileProperties, String> {
 }
 
 pub fn entry_summary(entry: &Entry) -> String {
+    let display_path = Location::parse(&entry.path).display_string();
     if entry.is_dir {
-        return format!("Folder\n{}", entry.path);
+        return format!("Folder\n{display_path}");
     }
     let kind = kind_label(entry);
     format!(
-        "{kind}\n{}\n{}\nModified: {}",
-        entry.path,
+        "{kind}\n{display_path}\n{}\nModified: {}",
         fmt_size(entry.size),
         fmt_modified(entry.modified)
     )
