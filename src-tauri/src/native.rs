@@ -13742,6 +13742,12 @@ Broken: Either state is wrong.\n";
         let calls = TEST_LAUNCHER_CALLS.with(|c| c.borrow().clone());
         assert_eq!(calls, vec![cached_file.to_string_lossy().to_string()], "Open must launch the owned cache path exactly once");
 
+        // D-188 ledger #6: Open of readme.txt streams exactly that member —
+        // its sibling second.txt must not appear in the cache, and the
+        // archive's on-disk bytes must stay untouched.
+        assert!(walk_find_file(&cache_root, "second.txt").is_none(), "Open of readme.txt must not also cache its sibling");
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "Open must not touch the archive's bytes on disk");
+
         // D-188 REJECT 3: GTK keeps ticking while a large allowed member streams,
         // instead of blocking until the background thread finishes.
         TEST_OPEN_POLL_TICKS.with(|c| c.set(0));
