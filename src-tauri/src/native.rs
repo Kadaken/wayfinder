@@ -714,7 +714,7 @@ struct FileClipboard {
     paths: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum UndoAction {
     Created {
         paths: Vec<String>,
@@ -741,7 +741,11 @@ enum UndoAction {
         was_copy: bool,
     },
     Trashed {
-        paths: Vec<String>,
+        receipts: Vec<native_core::TrashReceipt>,
+        /// D-187: one content fingerprint per `receipts[i]`'s exact payload, so
+        /// a direct edit of the Trash payload between record and replay is
+        /// refused instead of silently restoring changed bytes.
+        fps: Vec<native_core::Fingerprint>,
     },
 }
 
@@ -8581,10 +8585,10 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui,
         format!("Moving {count} item{} to Trash", plural(count)),
         move || {
-            native_core::trash_paths(&paths)?;
+            let trashed = reciprocal_trash(paths)?;
             Ok(JobOutcome::undo(
                 format!("Moved {count} item{} to Trash", plural(count)),
-                UndoAction::Trashed { paths },
+                trashed,
             ))
         },
         |_, _, _| {},
@@ -9038,8 +9042,8 @@ fn undo_label(action: &UndoAction) -> String {
             let verb = if *was_copy { "copy" } else { "move" };
             format!("{verb} of {} item{}", items.len(), plural(items.len()))
         }
-        UndoAction::Trashed { paths } => {
-            format!("Trash move of {} item{}", paths.len(), plural(paths.len()))
+        UndoAction::Trashed { receipts, .. } => {
+            format!("Trash move of {} item{}", receipts.len(), plural(receipts.len()))
         }
     }
 }
@@ -9047,12 +9051,8 @@ fn undo_label(action: &UndoAction) -> String {
 fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
     match action {
         UndoAction::Created { paths } => {
-            let count = paths.len();
-            native_core::trash_paths(&paths)?;
-            Ok(JobOutcome::message(format!(
-                "Undid create/copy: moved {count} item{} to Trash",
-                plural(count)
-            )))
+            let reciprocal = reciprocal_trash(paths).map_err(|err| format!("Undo refused: {err}"))?;
+            Ok(JobOutcome::reciprocal("Undid create/copy: moved to Trash", reciprocal))
         }
         UndoAction::Renamed { from, to, fp } => {
             let reciprocal = reciprocal_rename(from, to, fp, "Undo")?;
@@ -9079,13 +9079,9 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
                 )))
             }
         }
-        UndoAction::Trashed { paths } => {
-            let count = paths.len();
-            native_core::restore_from_trash(&paths)?;
-            Ok(JobOutcome::message(format!(
-                "Restored {count} item{} from Trash",
-                plural(count)
-            )))
+        UndoAction::Trashed { receipts, fps } => {
+            let reciprocal = reciprocal_restore(receipts, fps, "Undo")?;
+            Ok(JobOutcome::reciprocal("Restored from Trash", reciprocal))
         }
     }
 }
@@ -9157,6 +9153,49 @@ fn reciprocal_batch_rename(
     Ok(UndoAction::BatchRenamed { items: result, fps })
 }
 
+/// D-187: trashes exactly `paths`, by exact receipt (never "newest for this
+/// original path"), and records a fingerprint of each payload so the opposite
+/// restore can detect a direct edit to the Trash payload. Shared by Undo of a
+/// real creation and Redo of a real Trash-restore: both need "trash these
+/// paths again" and the reciprocal either direction leaves for the other
+/// stack is the same `Trashed` shape.
+fn reciprocal_trash(paths: Vec<String>) -> Result<UndoAction, String> {
+    let receipts = native_core::trash_paths_exact(&paths)?;
+    let fps = receipts
+        .iter()
+        .map(|receipt| native_core::fingerprint(&receipt.selector))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(UndoAction::Trashed { receipts, fps })
+}
+
+/// D-187: the reciprocal of `reciprocal_trash` — restores exactly `receipts`
+/// by exact payload identity, refusing fail-closed if any payload is missing
+/// or has changed since this entry was recorded (checked for every receipt
+/// before any is restored, so one bad entry refuses the whole batch). Shared
+/// by Undo of a real Trash action and Redo of a real creation's undo.
+fn reciprocal_restore(
+    receipts: Vec<native_core::TrashReceipt>,
+    fps: Vec<native_core::Fingerprint>,
+    verb: &str,
+) -> Result<UndoAction, String> {
+    if receipts.len() != fps.len() {
+        return Err(format!("{verb} refused: history entry is malformed"));
+    }
+    for (receipt, fp) in receipts.iter().zip(fps.iter()) {
+        let now = native_core::fingerprint(&receipt.selector).map_err(|err| {
+            format!("{verb} refused: a trashed item is missing or unreadable ({err})")
+        })?;
+        if &now != fp {
+            return Err(format!(
+                "{verb} refused: a trashed item changed since this history entry was recorded"
+            ));
+        }
+    }
+    native_core::restore_from_trash_exact(&receipts)?;
+    let paths = receipts.into_iter().map(|receipt| receipt.original).collect();
+    Ok(UndoAction::Created { paths })
+}
+
 fn redo_label(action: &UndoAction) -> String {
     match action {
         UndoAction::Created { paths } => {
@@ -9174,8 +9213,8 @@ fn redo_label(action: &UndoAction) -> String {
             let verb = if *was_copy { "copy" } else { "move" };
             format!("{verb} of {} item{}", items.len(), plural(items.len()))
         }
-        UndoAction::Trashed { paths } => {
-            format!("Trash move of {} item{}", paths.len(), plural(paths.len()))
+        UndoAction::Trashed { receipts, .. } => {
+            format!("Trash move of {} item{}", receipts.len(), plural(receipts.len()))
         }
     }
 }
@@ -9193,7 +9232,15 @@ fn perform_redo(action: UndoAction) -> Result<JobOutcome, String> {
             let reciprocal = reciprocal_batch_rename(items, fps, "Redo")?;
             Ok(JobOutcome::reciprocal("Redid batch rename", reciprocal))
         }
-        UndoAction::Created { .. } | UndoAction::Pasted { .. } | UndoAction::Trashed { .. } => {
+        UndoAction::Created { paths } => {
+            let reciprocal = reciprocal_trash(paths).map_err(|err| format!("Redo refused: {err}"))?;
+            Ok(JobOutcome::reciprocal("Redid create/copy: moved to Trash", reciprocal))
+        }
+        UndoAction::Trashed { receipts, fps } => {
+            let reciprocal = reciprocal_restore(receipts, fps, "Redo")?;
+            Ok(JobOutcome::reciprocal("Redid restore from Trash", reciprocal))
+        }
+        UndoAction::Pasted { .. } => {
             Err("Redo not yet implemented for this action (D-187 in progress)".to_string())
         }
     }
@@ -11368,6 +11415,98 @@ mod tests {
         // directory size (Round 150 measurement). Never let it drift back up.
         assert_eq!(super::JOB_POLL_INTERVAL, std::time::Duration::from_millis(16));
         assert!(super::JOB_POLL_INTERVAL < std::time::Duration::from_millis(50));
+    }
+
+    /// D-187: Created and Trashed are an exact reciprocal pair. Undo of a real
+    /// creation trashes it by exact receipt (reciprocal_trash); Redo restores it
+    /// by that same exact receipt (reciprocal_restore), and a second Undo trashes
+    /// it again. Also proves the fail-closed refusal: editing the Trash payload
+    /// between recording and replay refuses restore without touching anything or
+    /// consuming the stack entry. Uses the real $HOME, like the native_core-level
+    /// exact-trash tests, because gio's trash destination is resolved from the
+    /// process's real user data dir and is not redirected by a test's fake HOME.
+    #[test]
+    fn created_trashed_reciprocal_round_trip_and_fail_closed() {
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let home = std::env::var("HOME").expect("HOME");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = format!("wf-d187-createdtrash-{}-{nanos}", std::process::id());
+        let dir = std::path::PathBuf::from(&home).join(".cache").join(&stem);
+        fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("fresh.txt");
+        let trash_files = std::path::PathBuf::from(&home).join(".local/share/Trash/files");
+        let trash_info = std::path::PathBuf::from(&home).join(".local/share/Trash/info");
+        let mut cleanup: Vec<String> = Vec::new();
+
+        let mut run = || -> Result<(), String> {
+            fs::write(&original, b"newly created payload").unwrap();
+            let original_str = original.to_string_lossy().to_string();
+
+            // ---- Undo of Created: trash it by exact receipt.
+            let trashed = reciprocal_trash(vec![original_str.clone()])?;
+            let (receipts, fps) = match trashed {
+                UndoAction::Trashed { receipts, fps } => (receipts, fps),
+                other => panic!("expected Trashed, got {other:?}"),
+            };
+            assert_eq!(receipts.len(), 1);
+            cleanup.push(
+                std::path::Path::new(&receipts[0].selector)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            assert!(!original.exists(), "Undo of Created must move it to Trash");
+
+            // ---- Redo of Created (== Undo of Trashed): restore by exact receipt.
+            let restored = reciprocal_restore(receipts.clone(), fps.clone(), "Redo")?;
+            match &restored {
+                UndoAction::Created { paths } => assert_eq!(paths, &vec![original_str.clone()]),
+                other => panic!("expected Created, got {other:?}"),
+            }
+            assert_eq!(fs::read(&original).unwrap(), b"newly created payload", "restored exact bytes");
+
+            // ---- Undo again: trash it a second time.
+            let trashed_again = reciprocal_trash(vec![original_str.clone()])?;
+            let (receipts2, fps2) = match trashed_again {
+                UndoAction::Trashed { receipts, fps } => (receipts, fps),
+                other => panic!("expected Trashed, got {other:?}"),
+            };
+            cleanup.push(
+                std::path::Path::new(&receipts2[0].selector)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            assert!(!original.exists());
+
+            // ---- Fail-closed: edit the Trash payload directly, then try to restore.
+            fs::write(&receipts2[0].selector, b"payload edited directly in Trash").unwrap();
+            let refused = reciprocal_restore(receipts2.clone(), fps2.clone(), "Undo");
+            let err = refused.expect_err("a changed Trash payload must refuse restore");
+            assert!(err.starts_with("Undo refused:"), "message was {err:?}");
+            assert!(!original.exists(), "a refused restore must not recreate the original");
+            assert_eq!(
+                fs::read(&receipts2[0].selector).unwrap(),
+                b"payload edited directly in Trash",
+                "a refused restore must not touch the Trash payload either"
+            );
+
+            Ok(())
+        };
+
+        let result = run();
+        fs::remove_file(&original).ok();
+        for stem in &cleanup {
+            fs::remove_file(trash_files.join(stem)).ok();
+            fs::remove_file(trash_info.join(format!("{stem}.trashinfo"))).ok();
+        }
+        fs::remove_dir_all(&dir).ok();
+        result.expect("Created/Trashed reciprocal round trip and fail-closed refusal should hold");
     }
 
     #[test]
