@@ -13678,16 +13678,15 @@ Broken: Either state is wrong.\n";
             writer.finish().unwrap();
         }
 
-        // ---- Duplicate normalized paths: two distinct raw names (the zip
-        // writer itself refuses a literal duplicate) that normalize to the
-        // same logical path — "a.txt" and, read as a directory entry
-        // because of its trailing slash, "a.txt/".
+        // ---- Duplicate normalized paths: two distinct raw names, both read
+        // as directories by the archive format, that normalize to the same
+        // logical path — "a/" and "a//" (REJECT 7: a genuine duplicate, not
+        // a file/directory collision like the fixture below).
         {
             let file = std::fs::File::create(root.join("duplicate.zip")).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            writer.start_file("a.txt", stored_options).unwrap();
-            std::io::Write::write_all(&mut writer, b"one").unwrap();
-            writer.add_directory("a.txt/", stored_options).unwrap();
+            writer.add_directory("a/", stored_options).unwrap();
+            writer.add_directory("a//", stored_options).unwrap();
             writer.finish().unwrap();
         }
 
