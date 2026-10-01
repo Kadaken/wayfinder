@@ -440,6 +440,32 @@ pub const DEFAULT_ZIP_LIMITS: ZipLimits = ZipLimits {
     max_compression_ratio: 1200,
 };
 
+/// The limits every production ZIP read actually enforces. Identical to
+/// `DEFAULT_ZIP_LIMITS` outside tests; a test may inject a tighter set
+/// through `TEST_ZIP_LIMITS` to exercise a boundary without needing a
+/// real multi-gigabyte fixture on disk (D-188 #55-#60). A process-wide
+/// `Mutex`, not a thread-local: the real listing path runs the indexing
+/// call inside `gio::spawn_blocking`, a worker thread distinct from the
+/// test thread that sets the override, so a thread-local override would
+/// never be seen there.
+#[cfg(not(test))]
+fn effective_zip_limits() -> ZipLimits {
+    DEFAULT_ZIP_LIMITS
+}
+
+#[cfg(test)]
+static TEST_ZIP_LIMITS: std::sync::Mutex<Option<ZipLimits>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn effective_zip_limits() -> ZipLimits {
+    TEST_ZIP_LIMITS.lock().unwrap().unwrap_or(DEFAULT_ZIP_LIMITS)
+}
+
+#[cfg(test)]
+pub fn set_test_zip_limits(limits: Option<ZipLimits>) {
+    *TEST_ZIP_LIMITS.lock().unwrap() = limits;
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ZipIndexError {
     Cancelled,
@@ -689,7 +715,7 @@ fn locate_and_validate_zip_member(
             member.internal
         ));
     }
-    let index = index_zip(file, &DEFAULT_ZIP_LIMITS, cancelled)
+    let index = index_zip(file, &effective_zip_limits(), cancelled)
         .map_err(|e| format!("could not re-read the archive: {e}"))?;
     let entry = index
         .iter()
@@ -1363,7 +1389,7 @@ pub fn list_zip_dir_cancellable(
     }
     let file = fs::File::open(archive).map_err(|e| ListDirError::Open(e.to_string()))?;
     let archive_len = file.metadata().map_err(|e| ListDirError::Open(e.to_string()))?.len();
-    let index = index_zip(file, &DEFAULT_ZIP_LIMITS, cancelled).map_err(|e| match e {
+    let index = index_zip(file, &effective_zip_limits(), cancelled).map_err(|e| match e {
         ZipIndexError::Cancelled => ListDirError::Cancelled,
         other => ListDirError::Open(other.to_string()),
     })?;

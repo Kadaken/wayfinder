@@ -14791,6 +14791,338 @@ Broken: Either state is wrong.\n";
         pump();
     }
 
+    /// D-188 ledger #55, #56, #57, #58, #60: every size-style ZIP resource
+    /// limit (member count, total claimed bytes, name length, per-entry
+    /// claimed bytes, compression ratio) is proven at a below-limit,
+    /// exactly-at-limit and over-limit fixture through the real production
+    /// listing path (`list_zip_dir_cancellable`, reached by ordinary
+    /// `open_entry`/`navigate`), using `native_core::set_test_zip_limits` to
+    /// hold each limit down to a size a fixture can cheaply exercise without
+    /// a real multi-gigabyte archive on disk. Only the one field under test
+    /// is tightened at a time; every other field stays at
+    /// `DEFAULT_ZIP_LIMITS`, so one boundary group never trips another.
+    /// D-188 ledger #59: actual streamed bytes, below/at/over what the
+    /// archive declares, proven through both production Open and Copy Out.
+    #[test]
+    fn zip_size_limit_boundaries_d188() {
+        if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d188lim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let _xdg_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
+        let xdg_dir = root.join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
+
+        let stored_options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // Same scan-and-match technique as `patch_cd_u16`/`patch_unix_mode`
+        // elsewhere in this module, widened to a 4-byte central-directory
+        // field (claimed uncompressed or compressed size).
+        fn patch_cd_u32(bytes: &mut [u8], name: &[u8], field_offset: usize, new_value: u32) {
+            let sig = [0x50u8, 0x4B, 0x01, 0x02]; // "PK\x01\x02" central directory signature
+            let mut i = 0;
+            while i + 46 <= bytes.len() {
+                if bytes[i..i + 4] == sig {
+                    let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+                    let name_start = i + 46;
+                    if name_start + name_len <= bytes.len() && &bytes[name_start..name_start + name_len] == name {
+                        let at = i + field_offset;
+                        bytes[at..at + 4].copy_from_slice(&new_value.to_le_bytes());
+                        return;
+                    }
+                }
+                i += 1;
+            }
+            panic!("central directory record for {:?} not found", String::from_utf8_lossy(name));
+        }
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d188limtest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let root_str = root.to_string_lossy().to_string();
+        build_ui(&app, Some(root_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+
+        // A fresh subdirectory per boundary group keeps one group's fixtures
+        // out of another group's listing, so a limit change only ever
+        // affects the group being proved right now.
+        let group_dir = |name: &str| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+
+        fn enter_group(state: &Rc<RefCell<AppState>>, dir: &std::path::Path) {
+            navigate(state, native_core::Location::real(dir.to_path_buf()));
+            let want = dir.to_string_lossy().into_owned();
+            wait_for("listing the group folder", || {
+                !state.borrow().cwd.is_zip() && state.borrow().cwd.real_path_string().as_deref() == Some(want.as_str())
+            });
+        }
+
+        fn open_and_expect_ok(state: &Rc<RefCell<AppState>>, ui: &Ui, dir: &std::path::Path, zip_name: &str) {
+            enter_group(state, dir);
+            wait_for("listing shows the fixture", || state.borrow().visible_entries.iter().any(|e| e.name == zip_name));
+            let entry = state.borrow().visible_entries.iter().find(|e| e.name == zip_name).cloned().unwrap();
+            open_entry(state, ui, entry);
+            wait_for("entered the archive within a named 10s bound", || state.borrow().cwd.is_zip());
+            let up = state.borrow().cwd.parent();
+            navigate(state, up);
+            wait_for("back out of the archive", || !state.borrow().cwd.is_zip());
+        }
+
+        fn open_and_expect_refused(state: &Rc<RefCell<AppState>>, ui: &Ui, dir: &std::path::Path, zip_name: &str, fragment: &str) {
+            enter_group(state, dir);
+            wait_for("listing shows the fixture", || state.borrow().visible_entries.iter().any(|e| e.name == zip_name));
+            let entry = state.borrow().visible_entries.iter().find(|e| e.name == zip_name).cloned().unwrap();
+            ui.status.set_label("");
+            open_entry(state, ui, entry);
+            wait_for("bounded refusal within a named 10s bound", || ui.status.label().starts_with("Cannot open "));
+            let label = ui.status.label().to_string();
+            assert!(label.contains(fragment), "{zip_name}: status {label:?} should contain {fragment:?}");
+            assert!(!state.borrow().cwd.is_zip(), "{zip_name}: a refused archive must never be entered");
+        }
+
+        // ---- #55: member count. max_members tightened to 2.
+        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_members: 2, ..native_core::DEFAULT_ZIP_LIMITS }));
+        let dir55 = group_dir("g55-members");
+        for (fixture, n) in [("below.zip", 1usize), ("atlimit.zip", 2), ("over.zip", 3)] {
+            let file = std::fs::File::create(dir55.join(fixture)).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for i in 0..n {
+                writer.start_file(format!("m{i}.txt"), stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        open_and_expect_ok(&state, &ui, &dir55, "below.zip");
+        open_and_expect_ok(&state, &ui, &dir55, "atlimit.zip");
+        open_and_expect_refused(&state, &ui, &dir55, "over.zip", "archive has too many entries");
+
+        // ---- #57: name length. max_name_len tightened to 8.
+        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_name_len: 8, ..native_core::DEFAULT_ZIP_LIMITS }));
+        let dir57 = group_dir("g57-namelen");
+        for (fixture, name) in [("below.zip", "a.txt"), ("atlimit.zip", "abcde.tx"), ("over.zip", "abcdef.txt")] {
+            assert!(matches!(name.len(), 5 | 8 | 10), "fixture names must stay at their named, exact lengths");
+            let file = std::fs::File::create(dir57.join(fixture)).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file(name, stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+        open_and_expect_ok(&state, &ui, &dir57, "below.zip");
+        open_and_expect_ok(&state, &ui, &dir57, "atlimit.zip");
+        open_and_expect_refused(&state, &ui, &dir57, "over.zip", "has too long a name");
+
+        // ---- #58: per-entry claimed bytes. max_entry_claimed_bytes
+        // tightened to 50; the fixture's declared and real content lengths
+        // are the same actual bytes (no field patch needed), so this group
+        // never also exercises #59's streamed-bytes check.
+        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_entry_claimed_bytes: 50, ..native_core::DEFAULT_ZIP_LIMITS }));
+        let dir58 = group_dir("g58-entrybytes");
+        for (fixture, declared) in [("below.zip", 10usize), ("atlimit.zip", 50), ("over.zip", 51)] {
+            let path = dir58.join(fixture);
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("m.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![b'x'; declared]).unwrap();
+            writer.finish().unwrap();
+        }
+        open_and_expect_ok(&state, &ui, &dir58, "below.zip");
+        open_and_expect_ok(&state, &ui, &dir58, "atlimit.zip");
+        open_and_expect_refused(&state, &ui, &dir58, "over.zip", "is too large");
+
+        // ---- #56: total claimed bytes across the whole archive.
+        // max_total_claimed_bytes tightened to 100, each fixture carrying
+        // two equal-size members so their declared sum lands exactly
+        // below/at/over.
+        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_total_claimed_bytes: 100, ..native_core::DEFAULT_ZIP_LIMITS }));
+        let dir56 = group_dir("g56-totalbytes");
+        for (fixture, each) in [("below.zip", 40usize), ("atlimit.zip", 50), ("over.zip", 51)] {
+            let path = dir56.join(fixture);
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("a.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![b'x'; each]).unwrap();
+            writer.start_file("b.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![b'x'; each]).unwrap();
+            writer.finish().unwrap();
+        }
+        open_and_expect_ok(&state, &ui, &dir56, "below.zip");
+        open_and_expect_ok(&state, &ui, &dir56, "atlimit.zip");
+        open_and_expect_refused(&state, &ui, &dir56, "over.zip", "archive's claimed total size is too large");
+
+        // ---- #60: compression ratio (claimed uncompressed / claimed
+        // compressed). max_compression_ratio tightened to 5. A single
+        // Stored 100-byte member's own declared compressed-size field is
+        // byte-patched to a chosen value, so the ratio lands on an exact
+        // integer boundary — real Deflate output cannot be relied on to
+        // land exactly on one.
+        native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_compression_ratio: 5, ..native_core::DEFAULT_ZIP_LIMITS }));
+        let dir60 = group_dir("g60-ratio");
+        for (fixture, fake_compressed) in [("below.zip", 34u32), ("atlimit.zip", 20u32), ("over.zip", 16u32)] {
+            let path = dir60.join(fixture);
+            {
+                let file = std::fs::File::create(&path).unwrap();
+                let mut writer = zip::ZipWriter::new(file);
+                writer.start_file("a.bin", stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, &vec![b'x'; 100]).unwrap();
+                writer.finish().unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            patch_cd_u32(&mut bytes, b"a.bin", 20, fake_compressed);
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        open_and_expect_ok(&state, &ui, &dir60, "below.zip");
+        open_and_expect_ok(&state, &ui, &dir60, "atlimit.zip");
+        open_and_expect_refused(&state, &ui, &dir60, "over.zip", "has a suspicious compression ratio");
+
+        native_core::set_test_zip_limits(None);
+
+        // ---- #59: actual streamed bytes, below/at/over the archive's own
+        // declared size, through production Open and Copy Out. Each
+        // fixture's real stored content is 50 bytes; `below.zip` and
+        // `over.zip` have only their declared uncompressed-size field
+        // patched (CD offset 24), so the real bytes the production streamer
+        // reads never change — only what it was told to expect.
+        let dir59 = group_dir("g59-streamed");
+        let real_len = 50usize;
+        for (fixture, declared) in [("below.zip", real_len + 10), ("atlimit.zip", real_len), ("over.zip", real_len - 20)] {
+            let path = dir59.join(fixture);
+            {
+                let file = std::fs::File::create(&path).unwrap();
+                let mut writer = zip::ZipWriter::new(file);
+                writer.start_file("m.bin", stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, &vec![b'x'; real_len]).unwrap();
+                writer.finish().unwrap();
+            }
+            if declared != real_len {
+                let mut bytes = std::fs::read(&path).unwrap();
+                patch_cd_u32(&mut bytes, b"m.bin", 24, declared as u32);
+                std::fs::write(&path, &bytes).unwrap();
+            }
+        }
+
+        // `atlimit.zip`: declared equals real — an ordinary successful Open.
+        enter_group(&state, &dir59);
+        wait_for("listing shows atlimit.zip", || state.borrow().visible_entries.iter().any(|e| e.name == "atlimit.zip"));
+        let atlimit_entry = state.borrow().visible_entries.iter().find(|e| e.name == "atlimit.zip").cloned().unwrap();
+        open_entry(&state, &ui, atlimit_entry);
+        wait_for("inside atlimit.zip", || state.borrow().cwd.is_zip());
+        wait_for("atlimit member listed", || state.borrow().visible_entries.len() == 1);
+        let atlimit_member = state.borrow().visible_entries[0].clone();
+        assert_eq!(atlimit_member.name, "m.bin");
+        ui.status.set_label("");
+        open_entry(&state, &ui, atlimit_member);
+        wait_for("atlimit member opens cleanly within a named 10s bound", || !ui.status.label().is_empty());
+        assert!(!ui.status.label().starts_with("Open failed"), "atlimit.zip: a declared-equals-real member must open cleanly, got {:?}", ui.status.label());
+        let up_from_atlimit = state.borrow().cwd.parent();
+        navigate(&state, up_from_atlimit);
+        wait_for("back out of atlimit.zip", || !state.borrow().cwd.is_zip());
+
+        // `below.zip` and `over.zip`: both refuse through Open, named and
+        // bounded, with no cached bytes published. `atlimit.zip` (above)
+        // legitimately left its own cached `m.bin` behind in its own slot
+        // folder, so residue here is checked by a before/after snapshot of
+        // the whole `wayfinder-zip-cache` tree, not by searching it for the
+        // name `m.bin`, which that unrelated, correct leftover would match.
+        let streamed_cache_root = xdg_dir.join("wayfinder-zip-cache");
+        fn list_cache_tree(root: &std::path::Path) -> std::collections::BTreeSet<PathBuf> {
+            fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<PathBuf>) {
+                let Ok(entries) = std::fs::read_dir(dir) else { return };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else {
+                        out.insert(path);
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeSet::new();
+            if root.is_dir() {
+                walk(root, &mut out);
+            }
+            out
+        }
+        for (fixture, fragment) in [
+            ("below.zip", "streamed fewer bytes than the archive claimed"),
+            ("over.zip", "streamed more bytes than the archive claimed"),
+        ] {
+            let before_files = list_cache_tree(&streamed_cache_root);
+            enter_group(&state, &dir59);
+            wait_for("listing shows the fixture", || state.borrow().visible_entries.iter().any(|e| e.name == fixture));
+            let zip_entry = state.borrow().visible_entries.iter().find(|e| e.name == fixture).cloned().unwrap();
+            open_entry(&state, &ui, zip_entry);
+            wait_for("inside the streamed fixture", || state.borrow().cwd.is_zip());
+            wait_for("streamed member listed", || state.borrow().visible_entries.len() == 1);
+            let member_entry = state.borrow().visible_entries[0].clone();
+            ui.status.set_label("");
+            open_entry(&state, &ui, member_entry);
+            wait_for("streamed-bytes Open refuses within a named 10s bound", || ui.status.label().starts_with("Open failed:"));
+            assert!(
+                ui.status.label().contains(fragment),
+                "{fixture}: status {:?} should contain {fragment:?}",
+                ui.status.label()
+            );
+            let after_files = list_cache_tree(&streamed_cache_root);
+            let new_files: Vec<_> = after_files.difference(&before_files).collect();
+            assert!(
+                new_files.is_empty(),
+                "{fixture}: a refused streamed-bytes Open must leave no new cached file, found {new_files:?}"
+            );
+            let up = state.borrow().cwd.parent();
+            navigate(&state, up);
+            wait_for("back out of the streamed fixture", || !state.borrow().cwd.is_zip());
+        }
+
+        // `over.zip` again, this time through Copy Out, the second
+        // production path #59 must cover — no bytes published, no history,
+        // no owned stage residue.
+        enter_group(&state, &dir59);
+        wait_for("listing shows over.zip", || state.borrow().visible_entries.iter().any(|e| e.name == "over.zip"));
+        let over_zip_entry = state.borrow().visible_entries.iter().find(|e| e.name == "over.zip").cloned().unwrap();
+        open_entry(&state, &ui, over_zip_entry);
+        wait_for("inside over.zip", || state.borrow().cwd.is_zip());
+        wait_for("over member listed", || state.borrow().visible_entries.len() == 1);
+        let streamed_out_dir = dir59.join("streamed-out");
+        std::fs::create_dir_all(&streamed_out_dir).unwrap();
+        select_index(&state, &ui, 0);
+        let before_undo_len_59 = state.borrow().undo_stack.len();
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(streamed_out_dir.clone()));
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        wait_for("streamed-bytes Copy Out refuses within a named 10s bound", || {
+            ui.status.label().starts_with("Copy Out failed:") || ui.status.label().starts_with("Operation failed")
+        });
+        assert!(!streamed_out_dir.join("m.bin").exists(), "D-188 #59: a refused streamed-bytes Copy Out must publish nothing");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len_59, "D-188 #59: a refused streamed-bytes Copy Out adds no history");
+        let streamed_leftovers: Vec<_> = std::fs::read_dir(&streamed_out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-wf-zip-"))
+            .collect();
+        assert!(streamed_leftovers.is_empty(), "D-188 #59: no owned stage residue may survive a refused streamed-bytes Copy Out, found {streamed_leftovers:?}");
+        let up_from_over = state.borrow().cwd.parent();
+        navigate(&state, up_from_over);
+        wait_for("back out of over.zip", || !state.borrow().cwd.is_zip());
+
+        ui.window.close();
+        pump();
+    }
+
     /// D-188 ledger #20: a hard-killed transaction (SIGKILL mid-stream, not a
     /// cooperative cancel) must leave the chosen real folder byte-identical
     /// and without any owned stage residue. The child branch (selected by
