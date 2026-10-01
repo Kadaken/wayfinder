@@ -8153,7 +8153,7 @@ fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let entries = selected_entries(&state, &ui);
-    if entries.iter().any(|e| native_core::zip_read_only_refusal(&e.source.to_path_string()).is_some()) {
+    if entries.iter().any(|e| e.source.is_zip()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
@@ -8165,8 +8165,8 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Select one item to rename");
         return;
     };
-    if let Some(msg) = native_core::zip_read_only_refusal(&entry.source.to_path_string()) {
-        ui.status.set_label(msg);
+    if entry.source.is_zip() {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
     if f2_starts_inline_rename(entries.len(), state.borrow().view_mode) {
@@ -8209,17 +8209,31 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     });
 }
 
+fn clipboard_sources_from_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Result<Vec<native_core::ClipboardSource>, &'static str> {
+    let entries = selected_entries(state, ui);
+    if entries.is_empty() {
+        return Err("Nothing selected");
+    }
+    if entries.iter().any(|e| e.source.is_zip()) {
+        return Err(native_core::ZIP_READ_ONLY_MESSAGE);
+    }
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| match e.source {
+            native_core::EntrySource::Real(path) => Some(native_core::ClipboardSource::Real(path)),
+            native_core::EntrySource::ZipMember(_) => None,
+        })
+        .collect())
+}
+
 fn copy_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let paths = selected_paths(state, ui);
-    if paths.is_empty() {
-        ui.status.set_label("Nothing selected");
-        return;
-    }
-    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
-        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
-        return;
-    }
-    let paths = paths.into_iter().map(|p| native_core::ClipboardSource::Real(p.into())).collect();
+    let paths = match clipboard_sources_from_selection(state, ui) {
+        Ok(paths) => paths,
+        Err(msg) => {
+            ui.status.set_label(msg);
+            return;
+        }
+    };
     state.borrow_mut().clipboard = Some(FileClipboard {
         mode: ClipboardMode::Copy,
         paths,
@@ -8228,16 +8242,13 @@ fn copy_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 fn cut_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let paths = selected_paths(state, ui);
-    if paths.is_empty() {
-        ui.status.set_label("Nothing selected");
-        return;
-    }
-    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
-        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
-        return;
-    }
-    let paths = paths.into_iter().map(|p| native_core::ClipboardSource::Real(p.into())).collect();
+    let paths = match clipboard_sources_from_selection(state, ui) {
+        Ok(paths) => paths,
+        Err(msg) => {
+            ui.status.set_label(msg);
+            return;
+        }
+    };
     state.borrow_mut().clipboard = Some(FileClipboard {
         mode: ClipboardMode::Cut,
         paths,
@@ -8733,15 +8744,16 @@ fn run_transfer(
 }
 
 fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let paths = selected_paths(&state, &ui);
-    if paths.is_empty() {
+    let entries = selected_entries(&state, &ui);
+    if entries.is_empty() {
         ui.status.set_label("Nothing selected");
         return;
     }
-    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
+    if entries.iter().any(|e| e.source.is_zip()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
     let count = paths.len();
     run_job(
         state,
@@ -8759,15 +8771,16 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let paths = selected_paths(&state, &ui);
-    if paths.is_empty() {
+    let entries = selected_entries(&state, &ui);
+    if entries.is_empty() {
         ui.status.set_label("Nothing selected");
         return;
     }
-    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
+    if entries.iter().any(|e| e.source.is_zip()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
     let count = paths.len();
     show_confirm_dialog(
         &ui,
@@ -8980,18 +8993,17 @@ fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) 
 }
 
 fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let paths = selected_paths(&state, &ui);
-    if paths.is_empty() {
+    let entries = selected_entries(&state, &ui);
+    if entries.is_empty() {
         ui.status.set_label("Nothing selected");
         return;
     }
     let cwd = state.borrow().cwd.to_path_string();
-    if native_core::zip_read_only_refusal(&cwd).is_some()
-        || paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some())
-    {
+    if native_core::zip_read_only_refusal(&cwd).is_some() || entries.iter().any(|e| e.source.is_zip()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
     let count = paths.len();
     run_job(
         state,
