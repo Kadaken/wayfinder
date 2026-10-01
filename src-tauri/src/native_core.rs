@@ -638,6 +638,32 @@ pub fn ensure_zip_open_cache_dir(runtime_dir: &Path, session_id: &str, slot: u64
     Ok(root)
 }
 
+/// Owns exactly one `ensure_zip_open_cache_dir` slot (D-188 REJECT 3): no
+/// production caller removed these roots before, so a long session leaked one
+/// mode-0700 folder per Open forever. Dropping this value — on app shutdown
+/// or in a test's own teardown — removes only the one root it created, never
+/// a sibling slot or the shared `wayfinder-zip-cache` parent.
+pub struct ZipOpenCacheRoot {
+    path: PathBuf,
+}
+
+impl ZipOpenCacheRoot {
+    pub fn create(runtime_dir: &Path, session_id: &str, slot: u64) -> Result<Self, String> {
+        let path = ensure_zip_open_cache_dir(runtime_dir, session_id, slot)?;
+        Ok(Self { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ZipOpenCacheRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Streams one ZIP member out to a real destination folder (D-188 Copy Out):
 /// the member's own file name, refusing (not overwriting) on a name clash.
 /// Returns the path of every file actually created, for the caller to build
