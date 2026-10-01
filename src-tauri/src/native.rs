@@ -1516,6 +1516,7 @@ struct Ui {
     new_folder: gtk::Button,
     new_file: gtk::Button,
     cut: gtk::Button,
+    copy: gtk::Button,
     paste: gtk::Button,
     rename: gtk::Button,
     trash: gtk::Button,
@@ -3368,6 +3369,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         new_folder: new_folder.clone(),
         new_file: new_file.clone(),
         cut: cut.clone(),
+        copy: copy.clone(),
         paste: paste.clone(),
         rename: rename.clone(),
         trash: trash.clone(),
@@ -6435,6 +6437,7 @@ fn update_command_bar_zip_state(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         &ui.new_folder,
         &ui.new_file,
         &ui.cut,
+        &ui.copy,
         &ui.paste,
         &ui.rename,
         &ui.trash,
@@ -6443,6 +6446,11 @@ fn update_command_bar_zip_state(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         button.set_sensitive(!cwd_is_zip);
         button.set_visible(!cwd_is_zip);
     }
+    // D-188 REJECT 2: Undo/Redo stay visible and enabled inside a ZIP — they
+    // operate on already-recorded real-filesystem transactions, and Copy Out
+    // is the one allowed in-ZIP action that creates one. Their own sensitivity
+    // still tracks whether there is anything to undo/redo (set elsewhere);
+    // this function only guarantees a ZIP cwd never forces them off.
 }
 
 thread_local! {
@@ -13552,6 +13560,7 @@ Broken: Either state is wrong.\n";
             (&ui.new_folder, "New Folder"),
             (&ui.new_file, "New File"),
             (&ui.cut, "Cut"),
+            (&ui.copy, "Copy"),
             (&ui.paste, "Paste"),
             (&ui.rename, "Rename"),
             (&ui.trash, "Move to Trash"),
@@ -13562,6 +13571,20 @@ Broken: Either state is wrong.\n";
                 "toolbar {label} must be absent or insensitive inside a ZIP"
             );
         }
+        // D-188 REJECT 2: Undo/Redo are not real-path mutation controls — they
+        // replay already-recorded transactions — so a ZIP cwd must never hide
+        // or force them insensitive the way the controls above are.
+        let toolbar_button = |tip: &str| -> gtk::Button {
+            all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.tooltip_text().as_deref() == Some(tip))
+                .unwrap_or_else(|| panic!("toolbar button {tip}"))
+        };
+        let undo_button = toolbar_button("Undo");
+        let redo_button = toolbar_button("Redo");
+        assert!(undo_button.is_visible(), "Undo must stay visible inside a ZIP");
+        assert!(redo_button.is_visible(), "Redo must stay visible inside a ZIP");
 
         // ---- REJECT 2: item and background menus inside a ZIP expose only
         // navigation/selection/Open, never a real-path mutation action.
@@ -13739,18 +13762,18 @@ Broken: Either state is wrong.\n";
         expected_paths.sort();
         assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Created { paths }) if { let mut p = paths.clone(); p.sort(); p == expected_paths }));
 
-        let press = |key: gdk::Key, mods: gdk::ModifierType| {
-            ui.window
-                .observe_controllers()
-                .into_iter()
-                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
-                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
-            pump();
-        };
-        press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK);
+        // D-188 REJECT 2: activate the real toolbar Undo/Redo controls
+        // themselves, still inside the archive, without navigating away.
+        assert!(undo_button.is_sensitive(), "Undo must be enabled inside a ZIP once Copy Out recorded a transaction");
+        undo_button.emit_clicked();
+        pump();
         wait_for("undo removes both copied-out files", || !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists());
-        press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK);
+        assert!(state.borrow().cwd.is_zip(), "Undo must not navigate away from the archive");
+        assert!(redo_button.is_sensitive(), "Redo must be enabled inside a ZIP after an Undo");
+        redo_button.emit_clicked();
+        pump();
         wait_for("redo brings both back", || out_dir.join("readme.txt").is_file() && out_dir.join("second.txt").is_file());
+        assert!(state.borrow().cwd.is_zip(), "Redo must not navigate away from the archive");
 
         // ---- The archive itself was never touched by any of the above.
         assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive bytes unchanged");
@@ -13765,6 +13788,7 @@ Broken: Either state is wrong.\n";
             (&ui.new_folder, "New Folder"),
             (&ui.new_file, "New File"),
             (&ui.cut, "Cut"),
+            (&ui.copy, "Copy"),
             (&ui.paste, "Paste"),
             (&ui.rename, "Rename"),
             (&ui.trash, "Move to Trash"),
@@ -13772,6 +13796,8 @@ Broken: Either state is wrong.\n";
         ] {
             assert!(button.is_sensitive() && button.is_visible(), "toolbar {label} must be restored outside a ZIP");
         }
+        assert!(undo_button.is_visible(), "Undo stays visible outside a ZIP too");
+        assert!(redo_button.is_visible(), "Redo stays visible outside a ZIP too");
 
         // D-188 REJECT 3: closing the window must remove the private cache
         // root through production ownership alone (window close ->
