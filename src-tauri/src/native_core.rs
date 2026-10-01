@@ -455,20 +455,33 @@ pub enum ZipIndexError {
     Corrupt(String),
 }
 
+/// A raw ZIP member name may legally contain control bytes, including an
+/// embedded NUL — but a status message built from one is later handed to a
+/// GTK label, whose GLib FFI layer converts the whole string to a C string
+/// and panics on an interior NUL. Every name interpolated into a
+/// `ZipIndexError`/`ZipNameError` message must go through this escape first.
+fn escape_zip_name_for_display(name: &str) -> String {
+    name.escape_default().to_string()
+}
+
 impl std::fmt::Display for ZipIndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled => write!(f, "archive loading was cancelled"),
             Self::Open(e) => write!(f, "could not open archive: {e}"),
-            Self::Encrypted(name) => write!(f, "\"{name}\" is encrypted and cannot be browsed"),
-            Self::Unsupported(name) => write!(f, "\"{name}\" uses an unsupported format"),
-            Self::BadName(name, why) => write!(f, "\"{name}\" {why}"),
+            Self::Encrypted(name) => {
+                write!(f, "\"{}\" is encrypted and cannot be browsed", escape_zip_name_for_display(name))
+            }
+            Self::Unsupported(name) => {
+                write!(f, "\"{}\" uses an unsupported format", escape_zip_name_for_display(name))
+            }
+            Self::BadName(name, why) => write!(f, "\"{}\" {why}", escape_zip_name_for_display(name)),
             Self::TooManyMembers => write!(f, "archive has too many entries"),
-            Self::NameTooLong(name) => write!(f, "\"{name}\" has too long a name"),
-            Self::EntryTooLarge(name) => write!(f, "\"{name}\" is too large"),
+            Self::NameTooLong(name) => write!(f, "\"{}\" has too long a name", escape_zip_name_for_display(name)),
+            Self::EntryTooLarge(name) => write!(f, "\"{}\" is too large", escape_zip_name_for_display(name)),
             Self::ArchiveTooLarge => write!(f, "archive's claimed total size is too large"),
             Self::SuspiciousCompressionRatio(name) => {
-                write!(f, "\"{name}\" has a suspicious compression ratio")
+                write!(f, "\"{}\" has a suspicious compression ratio", escape_zip_name_for_display(name))
             }
             Self::Corrupt(e) => write!(f, "archive is corrupt or truncated: {e}"),
         }
