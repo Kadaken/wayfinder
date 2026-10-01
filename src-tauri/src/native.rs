@@ -2685,12 +2685,12 @@ fn main() {
                 state.borrow_mut().pinned_top = Some(target.clone());
                 let parent = Path::new(&target)
                     .parent()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_else(|| state.borrow().cwd.to_path_string());
-                navigate(&state, native_core::Location::parse(&parent));
+                    .map(|path| native_core::Location::real(path))
+                    .unwrap_or_else(|| state.borrow().cwd.clone());
+                navigate(&state, parent);
                 select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&target));
             } else if let Some(path) = initial_path {
-                navigate(&state, native_core::Location::parse(&path));
+                navigate(&state, native_core::Location::real(path));
             }
             ui.window.present();
         } else {
@@ -2796,8 +2796,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         reveal_path: None,
         last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
-        cwd: native_core::Location::parse(&initial_cwd),
-        tabs: TabSet::new(native_core::Location::parse(&initial_cwd)),
+        cwd: native_core::Location::real(&initial_cwd),
+        tabs: TabSet::new(native_core::Location::real(&initial_cwd)),
         entries: Vec::new(),
         visible_entries: Vec::new(),
         pinned_top: select_path.clone(),
@@ -3455,7 +3455,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
             if native_smb::looks_like_smb(&path) {
                 smb_flow(&state, &ui).connect(&path);
             } else if !path.is_empty() {
-                navigate(&state, native_core::Location::parse(&path));
+                navigate(&state, native_core::Location::real(&path));
             }
         });
     }
@@ -4332,7 +4332,7 @@ fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListB
     if let Some(drive) = cached {
         open_drive_action(state.clone(), ui.clone(), drive);
     } else {
-        navigate(state, native_core::Location::parse(&path));
+        navigate(state, native_core::Location::real(&path));
     }
 }
 
@@ -6027,7 +6027,7 @@ fn navigate_to_with_message(
                 update_selection(&state, ui);
                 update_nav_buttons(&state, ui);
                 update_sidebar_active_rows(&state, ui);
-                install_directory_monitor(&state, ui, &path_str);
+                install_directory_monitor(&state, ui, &path);
                 if let Some(target) = state.borrow().pinned_top.clone() {
                     select_entry_by_source(&state, ui, &native_core::EntrySource::real(&target));
                 }
@@ -6097,7 +6097,7 @@ fn clear_file_views(ui: &Ui) {
     }
 }
 
-fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::Location) {
     let monitor_generation = {
         let mut state = state.borrow_mut();
         state.directory_monitor = None;
@@ -6106,10 +6106,10 @@ fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str)
     };
     // A ZIP virtual location is not a real inode gio can watch, and the
     // brief forbids installing one anyway (D-188).
-    if native_core::Location::parse(path).is_zip() {
+    let native_core::Location::RealDir(real_path) = path else {
         return;
-    }
-    let file = gio::File::for_path(path);
+    };
+    let file = gio::File::for_path(real_path);
     let Ok(monitor) = file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
     else {
         // Some network/FUSE mounts do not implement file-change notifications.
@@ -6117,7 +6117,7 @@ fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str)
         return;
     };
 
-    let watched_path = path.to_string();
+    let watched = path.clone();
     let coalescer = Rc::new(RefCell::new(native_core::RefreshCoalescer::default()));
     let state_weak = Rc::downgrade(state);
     let ui = ui.clone();
@@ -6140,15 +6140,13 @@ fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str)
         let Some(state) = state_weak.upgrade() else {
             return;
         };
-        if state.borrow().monitor_generation != monitor_generation
-            || state.borrow().cwd.to_path_string() != watched_path
-        {
+        if state.borrow().monitor_generation != monitor_generation || state.borrow().cwd != watched {
             return;
         }
         let Some(delay) = coalescer.borrow_mut().on_event(monotonic_ms()) else {
             return;
         };
-        arm_monitor_scan(&state, &ui, &coalescer, monitor_generation, &watched_path, delay);
+        arm_monitor_scan(&state, &ui, &coalescer, monitor_generation, &watched, delay);
     });
     state.borrow_mut().directory_monitor = Some(monitor);
 }
@@ -6170,25 +6168,25 @@ fn arm_monitor_scan(
     ui: &Ui,
     coalescer: &Rc<RefCell<native_core::RefreshCoalescer>>,
     monitor_generation: u64,
-    watched_path: &str,
+    watched: &native_core::Location,
     delay_ms: u64,
 ) {
     let state_weak = Rc::downgrade(state);
     let ui = ui.clone();
     let coalescer = coalescer.clone();
-    let watched_path = watched_path.to_string();
+    let watched = watched.clone();
     glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
         let Some(state) = state_weak.upgrade() else {
             return;
         };
         {
             let state_ref = state.borrow();
-            if state_ref.monitor_generation != monitor_generation || state_ref.cwd.to_path_string() != watched_path {
+            if state_ref.monitor_generation != monitor_generation || state_ref.cwd != watched {
                 return;
             }
         }
         coalescer.borrow_mut().on_timer(monotonic_ms());
-        start_monitor_scan(&state, &ui, &coalescer, monitor_generation, watched_path);
+        start_monitor_scan(&state, &ui, &coalescer, monitor_generation, watched);
     });
 }
 
@@ -6199,17 +6197,19 @@ fn start_monitor_scan(
     ui: &Ui,
     coalescer: &Rc<RefCell<native_core::RefreshCoalescer>>,
     monitor_generation: u64,
-    path: String,
+    path: native_core::Location,
 ) {
     let show_hidden = state.borrow().show_hidden;
     #[cfg(any(test))]
     SCAN_LOG.with(|log| log.borrow_mut().push((monotonic_ms(), 0)));
     let (tx, rx) = std::sync::mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let path_for_worker = path.clone();
+    let native_core::Location::RealDir(path_for_worker) = path.clone() else {
+        return;
+    };
     std::thread::spawn(move || {
         let _ = tx.send(native_core::list_dir_cancellable(
-            Path::new(&path_for_worker),
+            &path_for_worker,
             show_hidden,
             &cancelled,
         ));
@@ -6225,7 +6225,7 @@ fn start_monitor_scan(
         };
         let current = {
             let state_ref = state.borrow();
-            state_ref.monitor_generation == monitor_generation && state_ref.cwd.to_path_string() == path
+            state_ref.monitor_generation == monitor_generation && state_ref.cwd == path
         };
         if current {
             if let Some(Ok(listing)) = result {
@@ -6881,8 +6881,8 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         connect_file_drag(&line, state.clone(), ui.clone(), &entry.source, Some(&size));
         // D-188: a ZIP directory row has no real path to drop onto; skip the
         // drop controller entirely rather than converting one (REJECT 1).
-        if entry.is_dir && !entry.source.is_zip() {
-            connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.source.to_path_string());
+        if let Some(path) = entry.is_dir.then(|| entry.source.real_path()).flatten() {
+            connect_file_drop_to_dir(&line, state.clone(), ui.clone(), path.to_path_buf());
         }
         connect_row_context(&line, item.position(), state.clone(), ui.clone(), entry.clone());
         if entry.is_dir {
@@ -7139,13 +7139,8 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             connect_file_drag(&grid_child, state.clone(), ui.clone(), &entry.source, None);
             // D-188: a ZIP directory row has no real path to drop onto; skip the
             // drop controller entirely rather than converting one (REJECT 1).
-            if entry.is_dir && !entry.source.is_zip() {
-                connect_file_drop_to_dir(
-                    &grid_child,
-                    state.clone(),
-                    ui.clone(),
-                    entry.source.to_path_string(),
-                );
+            if let Some(path) = entry.is_dir.then(|| entry.source.real_path()).flatten() {
+                connect_file_drop_to_dir(&grid_child, state.clone(), ui.clone(), path.to_path_buf());
             }
             ui.grid.append(&grid_child);
             if let Some(picture) = thumbnail {
@@ -8276,16 +8271,28 @@ fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Nothing to paste");
         return;
     };
-    let cwd = state.borrow().cwd.to_path_string();
+    let dest = match state.borrow().cwd.clone() {
+        native_core::Location::RealDir(path) => path,
+        native_core::Location::ZipDir { .. } => {
+            ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+            return;
+        }
+    };
     let is_copy = clipboard.mode == ClipboardMode::Copy;
     let clear_after = clipboard.mode == ClipboardMode::Cut;
-    let srcs = clipboard.paths.iter().map(|p| p.to_path_string()).collect();
+    let srcs = clipboard
+        .paths
+        .iter()
+        .map(|p| match p {
+            native_core::ClipboardSource::Real(path) => path.clone(),
+        })
+        .collect();
     transfer_with_preflight(
         state,
         ui,
         Transfer {
             srcs,
-            dest: cwd,
+            dest,
             is_copy,
             clear_cut_after: clear_after,
             style: TransferStyle::Paste,
@@ -8304,46 +8311,21 @@ enum TransferStyle {
 
 #[derive(Clone)]
 struct Transfer {
-    srcs: Vec<String>,
-    dest: String,
+    srcs: Vec<PathBuf>,
+    dest: PathBuf,
     is_copy: bool,
     clear_cut_after: bool,
     style: TransferStyle,
 }
 
-/// The one gate for clipboard copy/cut and both drop targets. No clash runs
-/// straight away; a clash asks Replace / Duplicate / Cancel once for the whole
-/// operation, and Cancel starts nothing.
+/// The one gate for clipboard copy/cut and both drop targets. Both `srcs` and
+/// `dest` are already typed `PathBuf`, so neither can hold a ZIP member or a
+/// ZIP-dir marker string; a ZIP source or destination is refused at its own
+/// construction site (`paste_clipboard`, `build_drop_target`) before a
+/// `Transfer` can even be built, not rediscovered here from a string (D-188).
+/// No clash runs straight away; a clash asks Replace / Duplicate / Cancel once
+/// for the whole operation, and Cancel starts nothing.
 fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
-    if let Some(msg) = native_core::zip_read_only_refusal(&transfer.dest) {
-        ui.status.set_label(msg);
-        return;
-    }
-    let zip_srcs: Vec<(PathBuf, String)> = transfer
-        .srcs
-        .iter()
-        .filter_map(|p| match native_core::Location::parse(p) {
-            native_core::Location::ZipDir { archive, internal } if !internal.is_empty() => Some((archive, internal)),
-            _ => None,
-        })
-        .collect();
-    if !zip_srcs.is_empty() {
-        if zip_srcs.len() != transfer.srcs.len() {
-            ui.status.set_label("Can't mix ZIP members with other items in one transfer");
-            return;
-        }
-        if !transfer.is_copy {
-            ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
-            return;
-        }
-        let same_archive = zip_srcs.windows(2).all(|w| w[0].0 == w[1].0);
-        if !same_archive {
-            ui.status.set_label("Can't copy members from more than one ZIP at once");
-            return;
-        }
-        copy_zip_members_out_action(state, ui, zip_srcs, transfer.dest);
-        return;
-    }
     if state.borrow().active_transfer.is_some() {
         ui.status.set_label("A transfer is already running");
         return;
@@ -8444,12 +8426,14 @@ where
 /// against the disk before it is committed.
 #[cfg(any(test))]
 fn perform_transfer(
-    srcs: &[String],
-    dest: &str,
+    srcs: &[PathBuf],
+    dest: &Path,
     is_copy: bool,
     on_conflict: native_core::PasteConflict,
 ) -> Result<native_core::TransferResult, String> {
-    native_core::transfer_batch(srcs, dest, is_copy, on_conflict, &|_| Ok(()), false)
+    let str_srcs: Vec<String> = srcs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let str_dest = dest.to_string_lossy().into_owned();
+    native_core::transfer_batch(&str_srcs, &str_dest, is_copy, on_conflict, &|_| Ok(()), false)
 }
 
 /// A committed transfer always yields Undo, even with cleanup warnings; an error
@@ -8671,7 +8655,7 @@ fn run_transfer(
         TransferStyle::Paste => format!("{ing} {count}"),
         TransferStyle::Drop => format!("{ing} {count} dropped item{}", plural(count)),
         TransferStyle::DropOnRow => {
-            format!("{ing} {count} item{} to {}", plural(count), tab_label(&dest))
+            format!("{ing} {count} item{} to {}", plural(count), tab_label(&dest.to_string_lossy()))
         }
     };
     if on_conflict == native_core::PasteConflict::Replace {
@@ -8701,9 +8685,14 @@ fn run_transfer(
         };
         let ctl = native_core::TransferCtl { cancel: &cancel, on_event: &on_event, copy_program: &program };
         // A failed MOVE is reported as a failure and never retried as COPY.
+        // `srcs`/`dest` are already typed real `PathBuf`s; this is a plain OS
+        // path format for the copy engine's own string-keyed plan, not a
+        // round-trip through the ZIP-dir marker (D-188).
+        let str_srcs: Vec<String> = srcs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let str_dest = dest.to_string_lossy().into_owned();
         let result = native_core::transfer_batch_ctl(
-            &srcs,
-            &dest,
+            &str_srcs,
+            &str_dest,
             is_copy,
             on_conflict,
             &|_| Ok(()),
@@ -9066,7 +9055,7 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
 /// overwriting) on a name clash. The committed copy enters the accepted
 /// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
 /// New Folder/New File — Undo simply deletes the real files it made.
-fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String)>, dest: String) {
+fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String)>, dest_path: PathBuf) {
     let archive = zip_srcs[0].0.clone();
     let count = zip_srcs.len();
     let members: Vec<(String, String)> = zip_srcs
@@ -9076,7 +9065,6 @@ fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: V
             (internal, name)
         })
         .collect();
-    let dest_path = PathBuf::from(dest);
     run_job(
         state,
         ui,
@@ -9249,7 +9237,7 @@ where
             let target = outcome
                 .refresh_to
                 .clone()
-                .map(|p| native_core::Location::parse(&p))
+                .map(|p| native_core::Location::real(&p))
                 .unwrap_or_else(|| refresh_path.clone());
             navigate_to_with_message(&state, target, NavMode::Record, Some(outcome.message.clone()));
             glib::ControlFlow::Break
@@ -9600,7 +9588,7 @@ fn complete_job(
     let target = outcome
         .refresh_to
         .clone()
-        .map(|p| native_core::Location::parse(&p))
+        .map(|p| native_core::Location::real(&p))
         .unwrap_or_else(|| refresh_path.clone());
     navigate_to_with_message(state, target, NavMode::Record, Some(outcome.message.clone()));
 }
@@ -11306,7 +11294,7 @@ fn connect_file_drag_with<W: IsA<gtk::Widget>>(
 }
 
 /// Paths offered by a drag, minus the destination folder itself.
-fn dragged_paths(value: &glib::Value, exclude: Option<&str>) -> Vec<String> {
+fn dragged_paths(value: &glib::Value, exclude: Option<&Path>) -> Vec<PathBuf> {
     let Ok(files) = value.get::<gdk::FileList>() else {
         return Vec::new();
     };
@@ -11314,8 +11302,7 @@ fn dragged_paths(value: &glib::Value, exclude: Option<&str>) -> Vec<String> {
         .files()
         .into_iter()
         .filter_map(|file| file.path())
-        .map(|path| path.to_string_lossy().to_string())
-        .filter(|path| Some(path.as_str()) != exclude)
+        .filter(|path| Some(path.as_path()) != exclude)
         .collect()
 }
 
@@ -11325,16 +11312,16 @@ fn dragged_paths(value: &glib::Value, exclude: Option<&str>) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq)]
 struct DropTxn {
     to_row: bool,
-    dest: String,
-    srcs: Vec<String>,
+    dest: PathBuf,
+    srcs: Vec<PathBuf>,
     is_copy: bool,
 }
 
 impl DropTxn {
-    fn negotiate(to_row: bool, dest: &str, srcs: &[String], ctrl: bool, shift: bool) -> Self {
+    fn negotiate(to_row: bool, dest: &Path, srcs: &[PathBuf], ctrl: bool, shift: bool) -> Self {
         DropTxn {
             to_row,
-            dest: dest.to_string(),
+            dest: dest.to_path_buf(),
             srcs: srcs.to_vec(),
             is_copy: native_core::drag_is_copy(srcs, dest, ctrl, shift),
         }
@@ -11360,8 +11347,8 @@ impl DropTxn {
 fn take_drop_txn(
     slot: &RefCell<Option<DropTxn>>,
     to_row: bool,
-    dest: &str,
-    srcs: &[String],
+    dest: &Path,
+    srcs: &[PathBuf],
 ) -> Option<DropTxn> {
     let txn = slot.borrow_mut().take()?;
     (txn.to_row == to_row && txn.dest == dest && txn.srcs == srcs).then_some(txn)
@@ -11389,7 +11376,7 @@ fn current_drop_modifiers(target: &gtk::DropTarget) -> (bool, bool) {
 fn build_drop_target(
     state: Rc<RefCell<AppState>>,
     ui: Ui,
-    fixed_dest: Option<String>,
+    fixed_dest: Option<PathBuf>,
 ) -> gtk::DropTarget {
     let drop = gtk::DropTarget::new(
         gdk::FileList::static_type(),
@@ -11398,15 +11385,30 @@ fn build_drop_target(
     // Preload so the offered paths are known while the pointer is still moving.
     drop.set_preload(true);
     let to_row = fixed_dest.is_some();
+    // `None` means the background drop target's own folder (never a fixed
+    // row) is currently a ZIP: there is no real destination to negotiate
+    // against, so every drop over it is refused rather than reaching for a
+    // marker-encoded path (D-188).
     let dest_of = {
         let state = state.clone();
-        move || fixed_dest.clone().unwrap_or_else(|| state.borrow().cwd.to_path_string())
+        move || -> Option<PathBuf> {
+            if let Some(dest) = &fixed_dest {
+                return Some(dest.clone());
+            }
+            match state.borrow().cwd.clone() {
+                native_core::Location::RealDir(path) => Some(path),
+                native_core::Location::ZipDir { .. } => None,
+            }
+        }
     };
     let slot: Rc<RefCell<Option<DropTxn>>> = Rc::new(RefCell::new(None));
     drop.connect_motion({
         let (dest_of, slot) = (dest_of.clone(), slot.clone());
         move |target, _, _| {
-            let dest = dest_of();
+            let Some(dest) = dest_of() else {
+                *slot.borrow_mut() = None;
+                return gdk::DragAction::empty();
+            };
             let srcs = target
                 .value()
                 .map(|v| dragged_paths(&v, Some(&dest)))
@@ -11436,20 +11438,24 @@ fn build_drop_target(
         }
     });
     drop.connect_drop(move |_, value, _, _| {
-        let dest = dest_of();
+        let Some(dest) = dest_of() else {
+            slot.borrow_mut().take();
+            ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+            return false;
+        };
         let srcs = dragged_paths(value, Some(&dest));
         if srcs.is_empty() {
             slot.borrow_mut().take();
             return false;
         }
         let Some(txn) = take_drop_txn(&slot, to_row, &dest, &srcs) else {
-            eprintln!("wf-event: drop REFUSED, no matching negotiated tuple for {dest}");
+            eprintln!("wf-event: drop REFUSED, no matching negotiated tuple for {}", dest.display());
             ui.status.set_label("Drop refused: the drag action was not settled");
             return false;
         };
         eprintln!(
             "wf-event: drop to_row={} dest={} copy={} srcs={:?}",
-            txn.to_row, txn.dest, txn.is_copy, txn.srcs
+            txn.to_row, txn.dest.display(), txn.is_copy, txn.srcs
         );
         transfer_with_preflight(state.clone(), ui.clone(), txn.into_transfer());
         true
@@ -11465,7 +11471,7 @@ fn connect_file_drop_to_dir<W: IsA<gtk::Widget>>(
     widget: &W,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
-    dest_dir: String,
+    dest_dir: PathBuf,
 ) {
     widget.add_controller(build_drop_target(state, ui, Some(dest_dir)));
 }
@@ -11952,9 +11958,9 @@ mod tests {
         }
         let _cleanup = Cleanup(root.clone());
         std::fs::create_dir_all(root.join("Inbox/Target")).unwrap();
-        let inbox = root.join("Inbox").to_string_lossy().to_string();
-        let target = root.join("Inbox/Target").to_string_lossy().to_string();
-        let s = |p: &str| root.join("Inbox").join(p).to_string_lossy().to_string();
+        let inbox = root.join("Inbox");
+        let target = root.join("Inbox/Target");
+        let s = |p: &str| root.join("Inbox").join(p);
         let body = |n: usize| vec![b'x'; n];
         std::fs::write(s("copy-me.txt"), body(11264)).unwrap();
         std::fs::write(s("bg-copy.txt"), body(16384)).unwrap();
@@ -11977,7 +11983,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(std::fs::metadata(s("copy-me.txt")).unwrap().ino(), ino);
         assert_eq!(std::fs::read(s("copy-me.txt")).unwrap(), body(11264));
-        assert_eq!(std::fs::read(format!("{target}/copy-me.txt")).unwrap(), body(11264));
+        assert_eq!(std::fs::read(target.join("copy-me.txt")).unwrap(), body(11264));
 
         // Background Ctrl COPY in the same folder is a clash, not a no-op; Duplicate
         // creates "(2)" and leaves the original inode and bytes alone.
@@ -12011,10 +12017,10 @@ mod tests {
         let t = take_drop_txn(&slot, true, &target, &srcs).expect("exact tuple").into_transfer();
         assert!(!t.is_copy);
         perform_transfer(&t.srcs, &t.dest, t.is_copy, native_core::PasteConflict::KeepBoth).unwrap();
-        assert!(!std::path::Path::new(&s("m1.txt")).exists());
-        assert!(!std::path::Path::new(&s("m2.txt")).exists());
-        assert_eq!(std::fs::read(format!("{target}/m1.txt")).unwrap(), body(100));
-        assert_eq!(std::fs::read(format!("{target}/m2.txt")).unwrap(), body(200));
+        assert!(!s("m1.txt").exists());
+        assert!(!s("m2.txt").exists());
+        assert_eq!(std::fs::read(target.join("m1.txt")).unwrap(), body(100));
+        assert_eq!(std::fs::read(target.join("m2.txt")).unwrap(), body(200));
 
         // A transaction negotiated for one target never feeds another.
         let srcs = vec![s("bg-move.txt")];
@@ -12024,7 +12030,7 @@ mod tests {
         assert!(take_drop_txn(&slot, true, &target, &srcs).is_none(), "missing tuple refuses");
         // refusal starts nothing: both sides stay byte-identical
         assert_eq!(std::fs::read(s("bg-move.txt")).unwrap(), body(15360));
-        assert!(!std::path::Path::new(&format!("{target}/bg-move.txt")).exists());
+        assert!(!target.join("bg-move.txt").exists());
     }
 
     #[test]
@@ -12065,8 +12071,8 @@ mod tests {
         // one aggregate prompt, Duplicate creates both "(2)", MOVE consumes both
         let srcs = drag_payload(Some(vec![d.clone(), e.clone()]), vec![e.clone()], &e);
         let t = Transfer {
-            srcs,
-            dest: p("Inbox/Target"),
+            srcs: srcs.into_iter().map(PathBuf::from).collect(),
+            dest: PathBuf::from(p("Inbox/Target")),
             is_copy: false,
             clear_cut_after: false,
             style: TransferStyle::DropOnRow,
@@ -12203,10 +12209,10 @@ mod tests {
         std::fs::write(root.join("src/a.txt"), b"SRC").unwrap();
         std::fs::write(root.join("dest/a.txt"), b"DST").unwrap();
         std::fs::write(root.join("src/free.txt"), b"FREE").unwrap();
-        let s = |p: &str| root.join(p).to_string_lossy().to_string();
-        let mk = |srcs: Vec<String>, dest: &str, is_copy| Transfer {
+        let s = |p: &str| root.join(p);
+        let mk = |srcs: Vec<PathBuf>, dest: &Path, is_copy| Transfer {
             srcs,
-            dest: dest.to_string(),
+            dest: dest.to_path_buf(),
             is_copy,
             clear_cut_after: !is_copy,
             style: TransferStyle::Paste,
@@ -13345,18 +13351,13 @@ Broken: Either state is wrong.\n";
         compress_selection(state.clone(), ui.clone());
         assert_eq!(ui.status.label(), refusal, "Compress refused inside a ZIP");
         {
-            let out_str = out_dir.to_string_lossy().to_string();
             std::fs::write(out_dir.join("blocker.txt"), "x").unwrap();
-            let paste_into_zip = Transfer {
-                srcs: vec![out_dir.join("blocker.txt").to_string_lossy().into_owned()],
-                dest: state.borrow().cwd.to_path_string(),
-                is_copy: true,
-                clear_cut_after: false,
-                style: TransferStyle::Paste,
-            };
-            transfer_with_preflight(state.clone(), ui.clone(), paste_into_zip);
+            state.borrow_mut().clipboard = Some(FileClipboard {
+                mode: ClipboardMode::Copy,
+                paths: vec![native_core::ClipboardSource::Real(out_dir.join("blocker.txt"))],
+            });
+            paste_clipboard(state.clone(), ui.clone());
             assert_eq!(ui.status.label(), refusal, "Paste into a ZIP is always refused");
-            let _ = out_str;
         }
 
         // ---- Open: streams the exact member to a private per-session cache.
@@ -13378,14 +13379,11 @@ Broken: Either state is wrong.\n";
         wait_for("docs children again", || state.borrow().visible_entries.len() == 2);
         let readme_source = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().source.clone();
         select_entry_by_source(&state, &ui, &readme_source);
-        let copy_out = Transfer {
-            srcs: vec![readme_source.to_path_string()],
-            dest: out_str.clone(),
-            is_copy: true,
-            clear_cut_after: false,
-            style: TransferStyle::Paste,
+        let native_core::EntrySource::ZipMember(native_core::ZipMemberRef { archive, internal }) = readme_source else {
+            panic!("readme.txt must be a ZipMember row");
         };
-        transfer_with_preflight(state.clone(), ui.clone(), copy_out);
+        copy_zip_members_out_action(state.clone(), ui.clone(), vec![(archive, internal)], out_dir.clone());
+        let _ = &out_str;
         wait_for("copy out lands on disk", || out_dir.join("readme.txt").is_file());
         assert_eq!(std::fs::read(out_dir.join("readme.txt")).unwrap(), b"read me");
         wait_for("undo stack grew by one", || state.borrow().undo_stack.len() == before_undo_len + 1);
@@ -17645,7 +17643,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.status.label(), "D32 job finished", "the result survives its own refresh");
 
         // Ordinary navigation replaces it with the normal listing status.
-        navigate(&state, native_core::Location::parse(&other_str));
+        navigate(&state, native_core::Location::real(&other_str));
         wait_for("ordinary status", || ui.status.label() == "1 item shown");
         assert_eq!(state.borrow().cwd.to_path_string(), other_str);
 
@@ -17668,11 +17666,11 @@ Broken: Either state is wrong.\n";
         // An overtaken request cannot put its old message on the newer path.
         navigate_to_with_message(
             &state,
-            native_core::Location::parse(&other_str),
+            native_core::Location::real(&other_str),
             NavMode::Keep,
             Some("D32 stale".to_string()),
         );
-        navigate(&state, native_core::Location::parse(&dir_str));
+        navigate(&state, native_core::Location::real(&dir_str));
         wait_for("newer path", || {
             state.borrow().cwd.to_path_string() == dir_str && ui.status.label() == "1 item shown"
         });
@@ -17714,7 +17712,7 @@ Broken: Either state is wrong.\n";
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
         let back_to_dir = |mode: ViewMode| {
-            navigate(&state, native_core::Location::parse(&dir_str));
+            navigate(&state, native_core::Location::real(&dir_str));
             wait_for("listing", || state.borrow().cwd.to_path_string() == dir_str && state.borrow().visible_entries.len() == 3);
             set_view_mode(&state, &ui, mode);
             pump();
@@ -18260,7 +18258,7 @@ Broken: Either state is wrong.\n";
         ui.window.present();
         let focus = || gtk::prelude::GtkWindowExt::focus(&ui.window);
         let back_to_dir = |mode: ViewMode| {
-            navigate(&state, native_core::Location::parse(&dir_str));
+            navigate(&state, native_core::Location::real(&dir_str));
             wait_for("listing", || state.borrow().cwd.to_path_string() == dir_str && state.borrow().visible_entries.len() == 3);
             set_view_mode(&state, &ui, mode);
             pump();
@@ -18283,7 +18281,7 @@ Broken: Either state is wrong.\n";
             };
             pump();
             assert!(focus_within(&ui.window, &root_widget) && focus().as_ref() != Some(&root_widget), "focus is on a row");
-            navigate(&state, native_core::Location::parse(&sub_str));
+            navigate(&state, native_core::Location::real(&sub_str));
             assert_eq!(rows(), 0, "the old rows are removed synchronously");
             assert_eq!(focus(), Some(root_widget.clone()), "the view root owns focus before the next frame");
             wait_for("sub listing", || state.borrow().cwd.to_path_string() == sub_str && state.borrow().visible_entries.len() == 1);
@@ -18297,7 +18295,7 @@ Broken: Either state is wrong.\n";
         pump();
         let outside = focus();
         assert!(outside.is_some() && !focus_within(&ui.window, &ui.list) && !focus_within(&ui.window, &ui.grid));
-        navigate(&state, native_core::Location::parse(&sub_str));
+        navigate(&state, native_core::Location::real(&sub_str));
         assert_eq!(focus(), outside, "focus outside the file view is not stolen");
         wait_for("sub listing", || state.borrow().cwd.to_path_string() == sub_str && state.borrow().visible_entries.len() == 1);
         pump();
@@ -18481,7 +18479,7 @@ Broken: Either state is wrong.\n";
         pop.popdown();
 
         // Stale window B navigates: only its new visit appears.
-        navigate(&sb, native_core::Location::parse(&p(5)));
+        navigate(&sb, native_core::Location::real(&p(5)));
         wait_for("new visit", || sb.borrow().cwd.to_path_string() == p(5) && sb.borrow().visible_entries.len() == 1);
         assert_eq!(disk_recents(), vec![p(5)], "only the new visit is on disk");
         assert_eq!(sb.borrow().recents.iter().map(|r| r.path.clone()).collect::<Vec<_>>(), vec![p(5)]);
@@ -19126,18 +19124,18 @@ Broken: Either state is wrong.\n";
         let v = |x: &[&String]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         wait_for("a0", at(&a0));
         for p in [&a1, &a2] {
-            navigate(&state, native_core::Location::parse(p));
+            navigate(&state, native_core::Location::real(p));
             wait_for("nav", at(p));
         }
         assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2));
 
         // a new tab and Open in New Tab each start with exactly one entry
         assert!(ui.back.is_sensitive(), "A at its end has Back");
-        open_path_in_new_tab(&state, &ui, native_core::Location::parse(&b0));
+        open_path_in_new_tab(&state, &ui, native_core::Location::real(&b0));
         assert!(!ui.back.is_sensitive() && !ui.forward.is_sensitive(), "one-entry tab, before the listing");
         wait_for("b0", at(&b0));
         assert_eq!(hist(1), (v(&[&b0]), 0));
-        navigate(&state, native_core::Location::parse(&b1));
+        navigate(&state, native_core::Location::real(&b1));
         wait_for("b1", at(&b1));
         assert_eq!(hist(1), (v(&[&b0, &b1]), 1));
         assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 2), "A untouched by B");
@@ -19184,25 +19182,25 @@ Broken: Either state is wrong.\n";
         assert_eq!(hist(0), (v(&[&a0, &a1, &a2]), 0));
         history_step(&state, true);
         wait_for("a1 again", at(&a1));
-        navigate(&state, native_core::Location::parse(&b0));
+        navigate(&state, native_core::Location::real(&b0));
         wait_for("branch", at(&b0));
         assert_eq!(hist(0), (v(&[&a0, &a1, &b0]), 2));
         assert_eq!(hist(1), (v(&[&b0, &b1]), 1), "B unchanged by A's branch");
 
         // a failed listing and a superseded one write to no tab
         let before = (hist(0), hist(1));
-        navigate(&state, native_core::Location::parse(&missing));
+        navigate(&state, native_core::Location::real(&missing));
         wait_for("failure reported", || ui.status.label().contains("Cannot open"));
         assert_eq!((hist(0), hist(1)), before);
         assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's own state after a failed listing");
-        navigate(&state, native_core::Location::parse(&a2));
-        navigate(&state, native_core::Location::parse(&a1));
+        navigate(&state, native_core::Location::real(&a2));
+        navigate(&state, native_core::Location::real(&a1));
         wait_for("superseding load", at(&a1));
         pump();
         assert_eq!(hist(0), (v(&[&a0, &a1, &b0, &a1]), 3), "only the newest load recorded");
         // a load pending while the tab changes lands nowhere
         let before = (hist(0), hist(1));
-        navigate(&state, native_core::Location::parse(&a2));
+        navigate(&state, native_core::Location::real(&a2));
         switch_tab_action(state.clone(), 1);
         wait_for("B shown", at(&b1));
         pump();
@@ -19215,7 +19213,7 @@ Broken: Either state is wrong.\n";
         switch_tab_action(state.clone(), 0);
         wait_for("A shown", at(&a1));
         assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive());
-        navigate(&state, native_core::Location::parse(&missing));
+        navigate(&state, native_core::Location::real(&missing));
         wait_for("second failure", || ui.status.label().contains("Cannot open"));
         assert!(ui.back.is_sensitive() && !ui.forward.is_sensitive(), "A's state, not B's");
         switch_tab_action(state.clone(), 1);
@@ -21018,8 +21016,8 @@ Broken: Either state is wrong.\n";
         wait_for("listing", || state.borrow().cwd.to_path_string() == dest.to_string_lossy());
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
         let transfer = |name: &str, is_copy: bool, clear_cut: bool| Transfer {
-            srcs: vec![src.join(name).to_string_lossy().to_string()],
-            dest: dest.to_string_lossy().to_string(),
+            srcs: vec![src.join(name)],
+            dest: dest.clone(),
             is_copy,
             clear_cut_after: clear_cut,
             style: TransferStyle::Paste,
@@ -21258,8 +21256,8 @@ Broken: Either state is wrong.\n";
             let clipboard_before = state.borrow().clipboard.clone();
             let undo_before = state.borrow().undo_stack.len();
             let transfer = Transfer {
-                srcs: vec![src.join(name).to_string_lossy().to_string()],
-                dest: dest.to_string_lossy().to_string(),
+                srcs: vec![src.join(name)],
+                dest: dest.clone(),
                 is_copy: true,
                 clear_cut_after: false,
                 style: TransferStyle::Paste,
@@ -21317,8 +21315,8 @@ Broken: Either state is wrong.\n";
             let undo_before = state.borrow().undo_stack.len();
             TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = true);
             let transfer = Transfer {
-                srcs: vec![src.join(name).to_string_lossy().to_string()],
-                dest: dest.to_string_lossy().to_string(),
+                srcs: vec![src.join(name)],
+                dest: dest.clone(),
                 is_copy: false,
                 clear_cut_after: true,
                 style: TransferStyle::Paste,

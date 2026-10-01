@@ -113,13 +113,6 @@ pub enum Location {
     ZipDir { archive: PathBuf, internal: String },
 }
 
-/// Marker that can never appear in a real filesystem path (NUL is illegal on
-/// every POSIX filesystem), used to encode a `Location` into the plain
-/// `String` that the existing tab/history/row plumbing already carries. A
-/// string without the marker always parses back to `RealDir` unchanged, so
-/// this is additive and cannot reinterpret any existing real path.
-const ZIP_LOCATION_MARKER: &str = "\0wf-zip\0";
-
 impl Location {
     pub fn real(path: impl Into<PathBuf>) -> Self {
         Self::RealDir(path.into())
@@ -133,23 +126,17 @@ impl Location {
         matches!(self, Self::ZipDir { .. })
     }
 
-    /// Encodes this location as the `String` the rest of the app passes
-    /// around. Round-trips exactly through `parse`.
+    /// A string form for display and real-directory comparisons. For a
+    /// `ZipDir` this is `display_string()` — there is no decoder that turns
+    /// it back into a `Location` (REJECT 1 forbids reinterpreting a row's
+    /// identity from a string); callers that need an actual `Location` must
+    /// carry one, never round-trip through this.
     pub fn to_path_string(&self) -> String {
-        match self {
-            Self::RealDir(path) => path.to_string_lossy().into_owned(),
-            Self::ZipDir { archive, internal } => {
-                let archive = archive.to_string_lossy();
-                format!("{archive}{ZIP_LOCATION_MARKER}{archive}{ZIP_LOCATION_MARKER}{internal}")
-            }
-        }
+        self.display_string()
     }
 
     /// A human-readable form safe for any GTK widget text (status line,
-    /// error message, window title): never contains the NUL-byte encoding
-    /// marker that `to_path_string` embeds for a `ZipDir`, which a raw
-    /// `to_path_string()` would hand straight to glib and crash on
-    /// (`GStrInteriorNulError`, D-188).
+    /// error message, window title).
     pub fn display_string(&self) -> String {
         match self {
             Self::RealDir(path) => path.to_string_lossy().into_owned(),
@@ -162,26 +149,6 @@ impl Location {
                 }
             }
         }
-    }
-
-    /// Parses a path string produced by `to_path_string`, or treats any
-    /// ordinary string (one without the marker) as a real directory path.
-    pub fn parse(path: &str) -> Self {
-        if let Some(first) = path.find(ZIP_LOCATION_MARKER) {
-            let archive_prefix = &path[..first];
-            let rest = &path[first + ZIP_LOCATION_MARKER.len()..];
-            if let Some(second) = rest.find(ZIP_LOCATION_MARKER) {
-                let archive_repeat = &rest[..second];
-                let internal = &rest[second + ZIP_LOCATION_MARKER.len()..];
-                if archive_repeat == archive_prefix {
-                    return Self::ZipDir {
-                        archive: PathBuf::from(archive_repeat),
-                        internal: internal.to_string(),
-                    };
-                }
-            }
-        }
-        Self::RealDir(PathBuf::from(path))
     }
 
     /// One level up: deeper into the archive pops the last internal segment;
@@ -240,17 +207,6 @@ impl Location {
 /// programmatic, drag/drop) — one exact string, never paraphrased.
 pub const ZIP_READ_ONLY_MESSAGE: &str = "ZIP folders are read-only";
 
-/// Fail-closed guard for every mutation entry point: returns the refusal
-/// message when `path` is inside a ZIP location, `None` when the mutation
-/// may proceed.
-pub fn zip_read_only_refusal(path: &str) -> Option<&'static str> {
-    if Location::parse(path).is_zip() {
-        Some(ZIP_READ_ONLY_MESSAGE)
-    } else {
-        None
-    }
-}
-
 /// A single indexed member of a specific archive, carrying enough identity
 /// to revalidate the archive before Open/Copy act on it (D-188): a stale or
 /// changed archive must be caught before a row from it reaches the
@@ -282,6 +238,16 @@ impl EntrySource {
 
     pub fn is_zip(&self) -> bool {
         matches!(self, Self::ZipMember(_))
+    }
+
+    /// The real filesystem path, when this row is a real entry. `None` for a
+    /// `ZipMember`, so a caller that needs an actual on-disk path can never
+    /// get a marker-encoded string instead (D-188).
+    pub fn real_path(&self) -> Option<&Path> {
+        match self {
+            Self::Real(path) => Some(path),
+            Self::ZipMember(_) => None,
+        }
     }
 
     /// Encodes this source as the `String` the still-string-typed plumbing
@@ -798,13 +764,10 @@ impl Drive {
 }
 
 pub fn parent_dir(path: &str) -> String {
-    match Location::parse(path) {
-        Location::ZipDir { .. } => Location::parse(path).parent().to_path_string(),
-        Location::RealDir(real) => real
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/".to_string()),
-    }
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".to_string())
 }
 
 pub fn standard_dirs() -> Vec<(String, String)> {
@@ -2256,11 +2219,11 @@ pub fn delete_permanent(paths: &[String]) -> Result<(), String> {
 
 /// Names that would clash at the destination. A MOVE onto its own path is a
 /// no-op, not a clash; a COPY onto its own path clashes (Duplicate is offered).
-pub fn check_conflicts(srcs: &[String], dest_dir: &str, is_copy: bool) -> Vec<String> {
+pub fn check_conflicts(srcs: &[PathBuf], dest_dir: &Path, is_copy: bool) -> Vec<String> {
     srcs.iter()
         .filter_map(|src| {
-            let name = Path::new(src).file_name()?.to_str()?.to_string();
-            let target = Path::new(dest_dir).join(&name);
+            let name = src.file_name()?.to_str()?.to_string();
+            let target = dest_dir.join(&name);
             if !target.exists() {
                 return None;
             }
@@ -2275,15 +2238,15 @@ pub fn check_conflicts(srcs: &[String], dest_dir: &str, is_copy: bool) -> Vec<St
 
 /// True when this is a MOVE and every item is already at its destination path:
 /// nothing to do, so no job, undo record or clipboard change should follow.
-pub fn is_noop_move(srcs: &[String], dest_dir: &str, is_copy: bool) -> bool {
+pub fn is_noop_move(srcs: &[PathBuf], dest_dir: &Path, is_copy: bool) -> bool {
     !is_copy
         && !srcs.is_empty()
         && srcs.iter().all(|src| {
-            let Some(name) = Path::new(src).file_name() else {
+            let Some(name) = src.file_name() else {
                 return false;
             };
             matches!(
-                (fs::canonicalize(src), fs::canonicalize(Path::new(dest_dir).join(name))),
+                (fs::canonicalize(src), fs::canonicalize(dest_dir.join(name))),
                 (Ok(a), Ok(b)) if a == b
             )
         })
@@ -2313,7 +2276,7 @@ pub enum PasteConflict {
 /// Explorer drag action: Ctrl copies, Shift moves, otherwise MOVE only when
 /// every source and the destination folder are on the same device. If any
 /// metadata cannot be read the choice is an explicit conservative COPY.
-pub fn drag_is_copy(srcs: &[String], dest_dir: &str, ctrl: bool, shift: bool) -> bool {
+pub fn drag_is_copy(srcs: &[PathBuf], dest_dir: &Path, ctrl: bool, shift: bool) -> bool {
     use std::os::unix::fs::MetadataExt;
     if ctrl {
         return true;
@@ -5548,15 +5511,17 @@ mod tests {
         let a = d.join("a.txt").to_string_lossy().to_string();
         let b = d.join("b.txt").to_string_lossy().to_string();
         let srcs = vec![a.clone(), b.clone()];
-        assert!(!drag_is_copy(&srcs, &dest, false, false), "same device defaults to MOVE");
-        assert!(drag_is_copy(&srcs, &dest, true, false), "Ctrl copies");
-        assert!(!drag_is_copy(&srcs, &dest, false, true), "Shift moves");
-        assert!(drag_is_copy(&srcs, &dest, true, true), "Ctrl wins over Shift");
+        let dest_path = PathBuf::from(&dest);
+        let path_srcs = vec![PathBuf::from(&a), PathBuf::from(&b)];
+        assert!(!drag_is_copy(&path_srcs, &dest_path, false, false), "same device defaults to MOVE");
+        assert!(drag_is_copy(&path_srcs, &dest_path, true, false), "Ctrl copies");
+        assert!(!drag_is_copy(&path_srcs, &dest_path, false, true), "Shift moves");
+        assert!(drag_is_copy(&path_srcs, &dest_path, true, true), "Ctrl wins over Shift");
         // unreadable source or destination: explicit conservative COPY
-        assert!(drag_is_copy(&[d.join("missing").to_string_lossy().to_string()], &dest, false, false));
-        assert!(drag_is_copy(&srcs, &d.join("nodir").to_string_lossy(), false, false));
+        assert!(drag_is_copy(&[d.join("missing")], &dest_path, false, false));
+        assert!(drag_is_copy(&path_srcs, &d.join("nodir"), false, false));
         // /proc is a different device from a scratch dir
-        assert!(drag_is_copy(&["/proc/self".to_string()], &dest, false, false), "different device copies");
+        assert!(drag_is_copy(&[PathBuf::from("/proc/self")], &dest_path, false, false), "different device copies");
         // a real move of both files, then the real undo
         let items = resolve_paste(&srcs, &dest, false, PasteConflict::KeepBoth).unwrap();
         assert_eq!(items.len(), 2);
@@ -5575,14 +5540,18 @@ mod tests {
         let dest = d.join("dest").to_string_lossy().to_string();
         fs::write(d.join("src/free.txt"), b"F").unwrap();
         let free = d.join("src/free.txt").to_string_lossy().to_string();
+        let dest_path = PathBuf::from(&dest);
         // one clash plus one clean item, for copy and for move
         for is_copy in [true, false] {
-            assert_eq!(check_conflicts(&[src.clone(), free.clone()], &dest, is_copy), vec!["note.txt"]);
+            assert_eq!(
+                check_conflicts(&[PathBuf::from(&src), PathBuf::from(&free)], &dest_path, is_copy),
+                vec!["note.txt"]
+            );
         }
         // moving onto its own folder is a no-op, not a clash; copying is a clash
         let own = d.join("dest/note.txt").to_string_lossy().to_string();
-        assert!(check_conflicts(&[own.clone()], &dest, false).is_empty());
-        assert_eq!(check_conflicts(&[own], &dest, true), vec!["note.txt"]);
+        assert!(check_conflicts(&[PathBuf::from(&own)], &dest_path, false).is_empty());
+        assert_eq!(check_conflicts(&[PathBuf::from(&own)], &dest_path, true), vec!["note.txt"]);
         // Cancel and Escape start nothing; the other two map to their modes
         assert_eq!(conflict_response("cancel"), None);
         assert_eq!(conflict_response("close"), None);
@@ -6206,37 +6175,6 @@ mod zip_member_name_safety_tests_d188 {
 #[cfg(test)]
 mod location_tests_d188 {
     use super::*;
-
-    #[test]
-    fn ordinary_path_round_trips_as_real_dir_d188() {
-        let loc = Location::parse("/home/zito/Downloads");
-        assert_eq!(loc, Location::RealDir(PathBuf::from("/home/zito/Downloads")));
-        assert_eq!(loc.to_path_string(), "/home/zito/Downloads");
-    }
-
-    #[test]
-    fn zip_location_round_trips_exactly_d188() {
-        let loc = Location::ZipDir { archive: PathBuf::from("/home/zito/a.zip"), internal: "x/y".to_string() };
-        let encoded = loc.to_path_string();
-        assert_eq!(Location::parse(&encoded), loc);
-    }
-
-    #[test]
-    fn zip_read_only_refusal_refuses_inside_zip_d188() {
-        let loc = Location::ZipDir { archive: PathBuf::from("/home/zito/a.zip"), internal: "x".to_string() };
-        assert_eq!(zip_read_only_refusal(&loc.to_path_string()), Some(ZIP_READ_ONLY_MESSAGE));
-    }
-
-    #[test]
-    fn zip_read_only_refusal_refuses_at_zip_root_d188() {
-        let loc = Location::zip_root(PathBuf::from("/home/zito/a.zip"));
-        assert_eq!(zip_read_only_refusal(&loc.to_path_string()), Some(ZIP_READ_ONLY_MESSAGE));
-    }
-
-    #[test]
-    fn zip_read_only_refusal_allows_real_dir_d188() {
-        assert_eq!(zip_read_only_refusal("/home/zito/Downloads"), None);
-    }
 
     #[test]
     fn zip_read_only_message_is_exact_d188() {
