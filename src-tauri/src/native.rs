@@ -13663,6 +13663,28 @@ Broken: Either state is wrong.\n";
         open_entry(&state, &ui, sub_entry);
         wait_for("sub dir children", || state.borrow().visible_entries.len() == 1 && state.borrow().visible_entries[0].name == "\u{1F600} emoji.txt");
         assert_eq!(state.borrow().visible_entries[0].name, "\u{1F600} emoji.txt");
+
+        // D-188 ledger #3: a Unicode+space member name must Open and Copy
+        // Out with the exact bytes, not just list and navigate correctly.
+        TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
+        let emoji_entry = state.borrow().visible_entries[0].clone();
+        open_entry(&state, &ui, emoji_entry.clone());
+        pump();
+        let cache_root = xdg_dir.join("wayfinder-zip-cache");
+        wait_for("the cache folder exists", || cache_root.is_dir());
+        let emoji_cached = walk_find_file(&cache_root, "\u{1F600} emoji.txt").expect("cached emoji member");
+        assert_eq!(std::fs::read(&emoji_cached).unwrap(), b"unicode and spaces");
+
+        let emoji_index = state.borrow().visible_entries.iter().position(|e| e.name == "\u{1F600} emoji.txt").unwrap();
+        select_index(&state, &ui, emoji_index);
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(out_dir.clone()));
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        let emoji_out = out_dir.join("\u{1F600} emoji.txt");
+        wait_for("emoji member copies out", || emoji_out.is_file());
+        assert_eq!(std::fs::read(&emoji_out).unwrap(), b"unicode and spaces");
+        std::fs::remove_file(&emoji_out).unwrap();
+        state.borrow_mut().undo_stack.clear();
         assert!(
             button_labelled(&ui.path_crumbs.clone().upcast(), "sub dir").is_some(),
             "nested internal folder is its own breadcrumb"
@@ -13732,9 +13754,32 @@ Broken: Either state is wrong.\n";
         // ---- Copy Out, through the real entry point: the "Copy Out..." item
         // menu action, with a destination injected in place of a physical
         // folder chooser (D-188 REJECT 4 picker contract).
-        let before_undo_len = state.borrow().undo_stack.len();
         navigate(&state, up_to_zip_root(&state));
         wait_for("back at zip root", || names(&state) == vec!["docs", "empty-dir", "zero.bin"]);
+
+        // D-188 ledger #3: a zero-byte member must Open and Copy Out with
+        // exactly zero bytes, not merely appear in the listing.
+        TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
+        let zero_entry = state.borrow().visible_entries.iter().find(|e| e.name == "zero.bin").cloned().unwrap();
+        open_entry(&state, &ui, zero_entry);
+        pump();
+        let cache_root = xdg_dir.join("wayfinder-zip-cache");
+        wait_for("the cache folder exists", || cache_root.is_dir());
+        let zero_cached = walk_find_file(&cache_root, "zero.bin").expect("cached zero.bin");
+        assert_eq!(std::fs::metadata(&zero_cached).unwrap().len(), 0, "zero-byte member must cache to exactly zero bytes");
+
+        let zero_index = state.borrow().visible_entries.iter().position(|e| e.name == "zero.bin").unwrap();
+        select_index(&state, &ui, zero_index);
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(out_dir.clone()));
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        let zero_out = out_dir.join("zero.bin");
+        wait_for("zero-byte member copies out", || zero_out.is_file());
+        assert_eq!(std::fs::metadata(&zero_out).unwrap().len(), 0, "zero-byte member must copy out to exactly zero bytes");
+        std::fs::remove_file(&zero_out).unwrap();
+        state.borrow_mut().undo_stack.clear();
+
+        let before_undo_len = state.borrow().undo_stack.len();
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
         wait_for("docs children again", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
