@@ -2401,15 +2401,25 @@ pub fn transfer_batch_ctl(
     Ok(TransferResult { items, warnings })
 }
 
-pub fn restore_moved_items(items: &[ResolvedItem]) -> Result<(), String> {
+/// D-187: moves each item from `item.to` back to `item.from`, refusing the
+/// whole batch if any destination (`item.from`) is already occupied, and
+/// returns the exact reciprocal (`from`/`to` swapped to where each item now
+/// sits) so the opposite stack can move it back again. Self-symmetric: the
+/// same function drives both directions of a move, like `reciprocal_rename`.
+pub fn restore_moved_items(items: &[ResolvedItem]) -> Result<Vec<ResolvedItem>, String> {
     for item in items {
         let original = Path::new(&item.from);
         if original.exists() {
             return Err(format!("undo target already exists: {}", item.from));
         }
+    }
+    for item in items {
         run_cmd_capture("mv", &["-T", "--", &item.to, &item.from])?;
     }
-    Ok(())
+    Ok(items
+        .iter()
+        .map(|item| ResolvedItem { from: item.to.clone(), to: item.from.clone() })
+        .collect())
 }
 
 pub fn restore_renamed_items(items: &[ResolvedItem]) -> Result<(), String> {
