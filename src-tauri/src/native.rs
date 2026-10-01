@@ -730,6 +730,11 @@ enum UndoAction {
     },
     BatchRenamed {
         items: Vec<ResolvedItem>,
+        /// D-187: one content fingerprint per `items[i].to`, in the same order,
+        /// at the moment this entry was recorded. Checked before Undo or Redo
+        /// executes the batch, so an edit/substitution of any single item is
+        /// refused and the whole batch stays untouched (all-or-nothing).
+        fps: Vec<native_core::Fingerprint>,
     },
     Pasted {
         items: Vec<ResolvedItem>,
@@ -9022,7 +9027,7 @@ fn undo_label(action: &UndoAction) -> String {
             format!("create/copy of {} item{}", paths.len(), plural(paths.len()))
         }
         UndoAction::Renamed { .. } => "rename".to_string(),
-        UndoAction::BatchRenamed { items } => {
+        UndoAction::BatchRenamed { items, .. } => {
             format!(
                 "batch rename of {} item{}",
                 items.len(),
@@ -9053,13 +9058,9 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
             let reciprocal = reciprocal_rename(from, to, fp, "Undo")?;
             Ok(JobOutcome::reciprocal("Undid rename", reciprocal))
         }
-        UndoAction::BatchRenamed { items } => {
-            let count = items.len();
-            native_core::restore_renamed_items(&items)?;
-            Ok(JobOutcome::message(format!(
-                "Undid batch rename of {count} item{}",
-                plural(count)
-            )))
+        UndoAction::BatchRenamed { items, fps } => {
+            let reciprocal = reciprocal_batch_rename(items, fps, "Undo")?;
+            Ok(JobOutcome::reciprocal("Undid batch rename", reciprocal))
         }
         UndoAction::Pasted { items, was_copy } => {
             let count = items.len();
@@ -9118,13 +9119,51 @@ fn reciprocal_rename(
     Ok(UndoAction::Renamed { from: to, to: result, fp })
 }
 
+/// D-187: batch sibling of `reciprocal_rename`. Checks every item's current
+/// fingerprint before touching anything, so one changed file refuses the
+/// whole batch instead of partially renaming; `batch_rename` itself is the
+/// existing all-or-nothing/rollback-on-error primitive, reused as-is, and
+/// already handles swap/cycle requests via its own staging step.
+fn reciprocal_batch_rename(
+    items: Vec<ResolvedItem>,
+    fps: Vec<native_core::Fingerprint>,
+    verb: &str,
+) -> Result<UndoAction, String> {
+    if items.len() != fps.len() {
+        return Err(format!("{verb} refused: history entry is malformed"));
+    }
+    for (item, fp) in items.iter().zip(fps.iter()) {
+        let now = native_core::fingerprint(&item.to)
+            .map_err(|err| format!("{verb} refused: {} is missing or unreadable ({err})", item.to))?;
+        if &now != fp {
+            return Err(format!(
+                "{verb} refused: {} changed since this history entry was recorded",
+                item.to
+            ));
+        }
+    }
+    let requests = items
+        .iter()
+        .map(|item| {
+            let old_name = PathBuf::from(&item.from)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("{verb} refused: bad original name"))?
+                .to_string();
+            Ok((item.to.clone(), old_name))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let result = native_core::batch_rename(&requests)?;
+    Ok(UndoAction::BatchRenamed { items: result, fps })
+}
+
 fn redo_label(action: &UndoAction) -> String {
     match action {
         UndoAction::Created { paths } => {
             format!("create/copy of {} item{}", paths.len(), plural(paths.len()))
         }
         UndoAction::Renamed { .. } => "rename".to_string(),
-        UndoAction::BatchRenamed { items } => {
+        UndoAction::BatchRenamed { items, .. } => {
             format!(
                 "batch rename of {} item{}",
                 items.len(),
@@ -9150,10 +9189,11 @@ fn perform_redo(action: UndoAction) -> Result<JobOutcome, String> {
             let reciprocal = reciprocal_rename(from, to, fp, "Redo")?;
             Ok(JobOutcome::reciprocal("Redid rename", reciprocal))
         }
-        UndoAction::Created { .. }
-        | UndoAction::BatchRenamed { .. }
-        | UndoAction::Pasted { .. }
-        | UndoAction::Trashed { .. } => {
+        UndoAction::BatchRenamed { items, fps } => {
+            let reciprocal = reciprocal_batch_rename(items, fps, "Redo")?;
+            Ok(JobOutcome::reciprocal("Redid batch rename", reciprocal))
+        }
+        UndoAction::Created { .. } | UndoAction::Pasted { .. } | UndoAction::Trashed { .. } => {
             Err("Redo not yet implemented for this action (D-187 in progress)".to_string())
         }
     }
@@ -9632,9 +9672,13 @@ fn show_batch_rename_dialog(state: Rc<RefCell<AppState>>, ui: Ui, entries: Vec<E
                     format!("Renaming {count} item{}", plural(count)),
                     move || {
                         let items = native_core::batch_rename(&requests)?;
+                        let fps = items
+                            .iter()
+                            .map(|item| native_core::fingerprint(&item.to))
+                            .collect::<Result<Vec<_>, _>>()?;
                         Ok(JobOutcome::undo(
                             format!("Renamed {} item{}", items.len(), plural(items.len())),
-                            UndoAction::BatchRenamed { items },
+                            UndoAction::BatchRenamed { items, fps },
                         ))
                     },
                     |_, _, _| {},
@@ -12685,6 +12729,7 @@ Broken: Either state is wrong.\n";
         emptied_folder_keeps_focus_on_the_view_root_d20();
         new_folder_menu_and_shared_inline_editor_d21();
         undo_redo_cycle_renamed_d187();
+        undo_redo_cycle_batch_renamed_d187();
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
@@ -19033,6 +19078,96 @@ Broken: Either state is wrong.\n";
         assert_eq!(state.borrow().redo_stack.len(), 1, "a refused Redo must not be consumed");
         assert!(created("original.txt").is_file(), "refused Redo must not rename the changed file");
         assert!(!created("renamed.txt").exists(), "refused Redo must not create the destination");
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        drop(win);
+    }
+
+    /// D-187: a batch-rename swap (`a.txt`<->`b.txt`, exercising batch_rename's
+    /// own staging/cycle handling) round-trips through Undo/Redo via the real
+    /// key controller, and a content edit to one of the two items between
+    /// recording and replay refuses the whole batch rather than renaming one
+    /// half of it.
+    fn undo_redo_cycle_batch_renamed_d187() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d187-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "payload A").unwrap();
+        std::fs::write(dir.join("b.txt"), "payload B").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d187batchtest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 2);
+        let win: gtk::Widget = ui.window.clone().upcast();
+        let created = |name: &str| dir.join(name);
+        let content = |name: &str| std::fs::read_to_string(created(name)).unwrap_or_default();
+
+        let press = |key: gdk::Key, mods: gdk::ModifierType| {
+            let handled = ui
+                .window
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]));
+            pump();
+            handled
+        };
+
+        // ---- Seed one real swap through the production all-or-nothing primitive,
+        // then record it exactly as show_batch_rename_dialog's job closure would.
+        let a = created("a.txt").to_string_lossy().to_string();
+        let b = created("b.txt").to_string_lossy().to_string();
+        let items = native_core::batch_rename(&[(a.clone(), "b.txt".to_string()), (b.clone(), "a.txt".to_string())])
+            .expect("a direct a<->b swap, exercising batch_rename's own cycle staging");
+        assert_eq!(content("a.txt"), "payload B");
+        assert_eq!(content("b.txt"), "payload A");
+        let fps: Vec<native_core::Fingerprint> = items
+            .iter()
+            .map(|item| native_core::fingerprint(&item.to).unwrap())
+            .collect();
+        push_undo(&state, UndoAction::BatchRenamed { items, fps });
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+
+        // ---- Ctrl+Z: Undo the swap.
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("undo restores original contents", || content("a.txt") == "payload A" && content("b.txt") == "payload B");
+        assert_eq!(state.borrow().redo_stack.len(), 1);
+        assert!(matches!(state.borrow().redo_stack.last(), Some(UndoAction::BatchRenamed { .. })));
+
+        // ---- Ctrl+Y: Redo re-applies the swap.
+        assert!(press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK));
+        wait_for("redo re-applies swap", || content("a.txt") == "payload B" && content("b.txt") == "payload A");
+        assert_eq!(state.borrow().redo_stack.len(), 0);
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::BatchRenamed { .. })));
+
+        // ---- Fail-closed: edit one item's content, then Undo must refuse the whole batch.
+        std::fs::write(created("a.txt"), "content changed after the swap was recorded").unwrap();
+        assert!(press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK));
+        wait_for("undo refused on content change", || !state.borrow().history_busy);
+        assert!(ui.status.label().starts_with("Undo refused:"), "status was {:?}", ui.status.label());
+        assert_eq!(content("a.txt"), "content changed after the swap was recorded", "refused Undo must not touch a.txt");
+        assert_eq!(content("b.txt"), "payload A", "refused Undo must not touch b.txt either (all-or-nothing)");
+        assert_eq!(state.borrow().undo_stack.last().is_some(), true, "a refused Undo must not be consumed");
 
         ui.window.close();
         pump();
