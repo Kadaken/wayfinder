@@ -14513,6 +14513,54 @@ Broken: Either state is wrong.\n";
             std::fs::write(&path, &bytes).unwrap();
         }
 
+        // ---- Encrypted (#53) and unsupported-compression (#54): same
+        // byte-patch-after-finish technique, but on the central directory's
+        // general-purpose flag bit 0 and compression-method field, which the
+        // writer API has no way to set directly.
+        fn patch_cd_u16(bytes: &mut [u8], name: &[u8], field_offset: usize, new_value: u16) {
+            let sig = [0x50u8, 0x4B, 0x01, 0x02]; // "PK\x01\x02" central directory signature
+            let mut i = 0;
+            while i + 46 <= bytes.len() {
+                if bytes[i..i + 4] == sig {
+                    let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+                    let name_start = i + 46;
+                    if name_start + name_len <= bytes.len() && &bytes[name_start..name_start + name_len] == name {
+                        let at = i + field_offset;
+                        bytes[at..at + 2].copy_from_slice(&new_value.to_le_bytes());
+                        return;
+                    }
+                }
+                i += 1;
+            }
+            panic!("central directory record for {:?} not found", String::from_utf8_lossy(name));
+        }
+        {
+            let path = root.join("encrypted.zip");
+            {
+                let file = std::fs::File::create(&path).unwrap();
+                let mut writer = zip::ZipWriter::new(file);
+                writer.start_file("secret.txt", stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+                writer.finish().unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            patch_cd_u16(&mut bytes, b"secret.txt", 8, 1);
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        {
+            let path = root.join("unsupported.zip");
+            {
+                let file = std::fs::File::create(&path).unwrap();
+                let mut writer = zip::ZipWriter::new(file);
+                writer.start_file("weird.txt", stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+                writer.finish().unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            patch_cd_u16(&mut bytes, b"weird.txt", 10, 7);
+            std::fs::write(&path, &bytes).unwrap();
+        }
+
         // ---- Duplicate regular-file logical path (ledger #44): UNREACHABLE-CLOSED.
         // zip-2.4.2/src/read.rs:74 inserts central-directory entries into an
         // IndexMap keyed by file_name, so a duplicate regular-file name is
@@ -14657,6 +14705,8 @@ Broken: Either state is wrong.\n";
         assert_refused("nul.zip", Some("contains a NUL byte"));
         assert_refused("drive.zip", Some("names an absolute path"));
         assert_refused("ambiguous.zip", Some("normalizes ambiguously"));
+        assert_refused("encrypted.zip", Some("is encrypted and cannot be browsed"));
+        assert_refused("unsupported.zip", Some("uses an unsupported format"));
 
         wait_for("listing shows badcrc.zip", || {
             state.borrow().visible_entries.iter().any(|e| e.name == "badcrc.zip")
