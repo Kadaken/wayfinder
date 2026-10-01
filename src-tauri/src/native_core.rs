@@ -462,6 +462,97 @@ pub fn index_zip<R: Read + std::io::Seek>(
     Ok(out)
 }
 
+/// Streams exactly one ZIP member's bytes to `dest_file` (D-188): opens the
+/// archive, locates the member by its normalized logical path, decompresses
+/// it to a sibling temp file under the same limits used at index time, then
+/// renames into place so a reader never observes a partial file. Never
+/// touches any other member.
+pub fn extract_zip_member(archive_path: &Path, internal: &str, dest_file: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("could not open archive: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("could not open archive: {e}"))?;
+    let mut found = None;
+    for i in 0..archive.len() {
+        let raw_name = archive
+            .by_index_raw(i)
+            .map_err(|e| format!("archive is corrupt: {e}"))?
+            .name()
+            .to_string();
+        let seen_files = HashSet::new();
+        let seen_dirs = HashSet::new();
+        if let Ok(normalized) = validate_zip_member_name(&raw_name, &seen_files, &seen_dirs, false) {
+            if normalized == internal {
+                found = Some(i);
+                break;
+            }
+        }
+    }
+    let index = found.ok_or_else(|| format!("\"{internal}\" was not found in the archive"))?;
+    let mut entry = archive.by_index(index).map_err(|e| format!("could not read \"{internal}\": {e}"))?;
+    if entry.size() > DEFAULT_ZIP_LIMITS.max_entry_claimed_bytes {
+        return Err(format!("\"{internal}\" is too large"));
+    }
+    let tmp_name = format!(
+        ".{}.wf-zip-tmp-{}",
+        dest_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        std::process::id()
+    );
+    let tmp = dest_file.with_file_name(tmp_name);
+    {
+        let mut out = std::fs::File::create(&tmp).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("could not extract \"{internal}\": {e}")
+        })?;
+    }
+    std::fs::rename(&tmp, dest_file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not publish {}: {e}", dest_file.display())
+    })
+}
+
+/// Private, per-session, mode-0700 cache folder for streamed-out ZIP members
+/// (D-188 Open), under `runtime_dir` (the caller passes `$XDG_RUNTIME_DIR`,
+/// or a test fixture's own override). Each call to `cache_path_for_zip_member`
+/// gets its own numbered subfolder so two members with the same file name
+/// (from the same or different archives) never collide.
+pub fn ensure_zip_open_cache_dir(runtime_dir: &Path, session_id: &str, slot: u64) -> Result<PathBuf, String> {
+    let root = runtime_dir.join("wayfinder-zip-cache").join(session_id).join(slot.to_string());
+    std::fs::create_dir_all(&root).map_err(|e| format!("could not create cache folder: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("could not secure cache folder: {e}"))?;
+    }
+    Ok(root)
+}
+
+/// Streams one ZIP member out to a real destination folder (D-188 Copy Out):
+/// the member's own file name, refusing (not overwriting) on a name clash.
+/// Returns the path of every file actually created, for the caller to build
+/// a reciprocal `Created` undo entry from, or rolls every created file back
+/// and returns the first error.
+pub fn copy_zip_members_out(archive_path: &Path, members: &[(String, String)], dest_dir: &Path) -> Result<Vec<String>, String> {
+    let mut created = Vec::new();
+    for (internal, file_name) in members {
+        let dest = dest_dir.join(file_name);
+        if dest.exists() {
+            for path in &created {
+                let _: Result<(), _> = std::fs::remove_file(path);
+            }
+            return Err(format!("\"{file_name}\" already exists in the destination"));
+        }
+        if let Err(e) = extract_zip_member(archive_path, internal, &dest) {
+            for path in &created {
+                let _: Result<(), _> = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+        created.push(dest.to_string_lossy().into_owned());
+    }
+    Ok(created)
+}
+
 /// Immediate children of `internal` (the virtual directory being browsed; ""
 /// for the ZIP root), folders-first, matching the real-directory sort
 /// contract in `list_dir_cancellable` (D-188). Each row's `path` is an
@@ -6138,5 +6229,105 @@ mod zip_index_tests_d188 {
     fn rejects_corrupt_bytes_boundedly_d188() {
         let result = index_zip(Cursor::new(b"not a zip file at all".to_vec()), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
         assert!(matches!(result, Err(ZipIndexError::Open(_))));
+    }
+}
+
+#[cfg(test)]
+mod zip_extraction_tests_d188 {
+    use super::*;
+
+    fn write_zip_file(entries: &[(&str, &[u8])], at: &Path) {
+        let file = std::fs::File::create(at).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in entries {
+            writer.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut writer, content).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wf-zip-extract-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extract_zip_member_streams_exact_bytes_d188() {
+        let dir = scratch("one");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("notes/todo.txt", b"buy milk")], &archive);
+        let dest = dir.join("todo.txt");
+        extract_zip_member(&archive, "notes/todo.txt", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"buy milk");
+    }
+
+    #[test]
+    fn extract_zip_member_rejects_unknown_name_d188() {
+        let dir = scratch("missing");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("a.txt", b"x")], &archive);
+        let dest = dir.join("out.txt");
+        assert!(extract_zip_member(&archive, "not-there.txt", &dest).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn ensure_zip_open_cache_dir_is_mode_0700_d188() {
+        let dir = scratch("cache");
+        let cache = ensure_zip_open_cache_dir(&dir, "sess1", 1).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn ensure_zip_open_cache_dir_distinct_slots_never_collide_d188() {
+        let dir = scratch("slots");
+        let a = ensure_zip_open_cache_dir(&dir, "sess1", 1).unwrap();
+        let b = ensure_zip_open_cache_dir(&dir, "sess1", 2).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn copy_zip_members_out_writes_every_file_d188() {
+        let dir = scratch("copyout");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("x.txt", b"one"), ("y.txt", b"two")], &archive);
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let created = copy_zip_members_out(
+            &archive,
+            &[("x.txt".to_string(), "x.txt".to_string()), ("y.txt".to_string(), "y.txt".to_string())],
+            &dest,
+        )
+        .unwrap();
+        assert_eq!(created.len(), 2);
+        assert_eq!(std::fs::read(dest.join("x.txt")).unwrap(), b"one");
+        assert_eq!(std::fs::read(dest.join("y.txt")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn copy_zip_members_out_refuses_and_rolls_back_on_conflict_d188() {
+        let dir = scratch("conflict");
+        let archive = dir.join("a.zip");
+        write_zip_file(&[("x.txt", b"one"), ("y.txt", b"two")], &archive);
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("y.txt"), b"already here").unwrap();
+        let result = copy_zip_members_out(
+            &archive,
+            &[("x.txt".to_string(), "x.txt".to_string()), ("y.txt".to_string(), "y.txt".to_string())],
+            &dest,
+        );
+        assert!(result.is_err());
+        assert!(!dest.join("x.txt").exists());
+        assert_eq!(std::fs::read(dest.join("y.txt")).unwrap(), b"already here");
     }
 }
