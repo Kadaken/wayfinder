@@ -6297,7 +6297,7 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         return;
     }
 
-    let selected = selected_paths(state, ui);
+    let selected = selected_sources(state, ui);
     let saved_scroll = ui.list_scroll.vadjustment().value();
     let (item_count, metadata_unavailable, unreadable_entries) = (
         listing.entries.len(),
@@ -6318,14 +6318,14 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
 }
 
 /// Re-selects every surviving path after a structural rebuild.
-fn restore_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, paths: &[String]) {
+fn restore_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, sources: &[native_core::EntrySource]) {
     let (view_mode, indices): (ViewMode, Vec<usize>) = {
         let state = state.borrow();
         (
             state.view_mode,
-            paths
+            sources
                 .iter()
-                .filter_map(|path| state.visible_entries.iter().position(|e| &e.source.to_path_string() == path))
+                .filter_map(|source| state.visible_entries.iter().position(|e| &e.source == source))
                 .collect(),
         )
     };
@@ -7730,6 +7730,10 @@ fn selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> {
         .into_iter()
         .map(|entry| entry.source.to_path_string())
         .collect()
+}
+
+fn selected_sources(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<native_core::EntrySource> {
+    selected_entries(state, ui).into_iter().map(|entry| entry.source).collect()
 }
 
 /// A ZIP member is never a valid picker result: the picker hands its result
