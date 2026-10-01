@@ -1352,8 +1352,8 @@ enum NavMode {
 #[derive(Clone)]
 struct AppState {
     inline_rename: Option<InlineRename>,
-    /// A path to select and scroll to once the next listing is on screen.
-    reveal_path: Option<String>,
+    /// A row to select and scroll to once the next listing is on screen.
+    reveal_path: Option<native_core::EntrySource>,
     /// Last plain click on a Name label: source and when, for slow-second-click.
     last_name_click: Option<(native_core::EntrySource, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
@@ -6541,7 +6541,7 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
             // D-91 follow-up: arm the one-shot reveal so the reload below reselects
             // and scrolls to the renamed row, at its natural sorted position
             // (never pinned_top, which would jump it out of sort order).
-            state.borrow_mut().reveal_path = Some(to);
+            state.borrow_mut().reveal_path = Some(native_core::EntrySource::real(to));
             let cwd = state.borrow().cwd.clone();
             navigate(state, cwd);
             ui.status.set_label(&format!("Renamed {old_name} to {typed}"));
@@ -7169,10 +7169,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 /// Selects and scrolls to a just-created path once its row exists. Focus is left
 /// to the inline editor, which claims it itself.
 fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let Some(path) = state.borrow_mut().reveal_path.take() else {
+    let Some(source) = state.borrow_mut().reveal_path.take() else {
         return;
     };
-    let index = state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == path);
+    let index = state.borrow().visible_entries.iter().position(|e| e.source == source);
     let Some(index) = index else {
         return;
     };
@@ -8117,7 +8117,7 @@ fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
                         .unwrap_or_default();
                     let mut st = state.borrow_mut();
                     st.inline_rename = Some(InlineRename::new(path, &name));
-                    st.reveal_path = Some(path.clone());
+                    st.reveal_path = Some(native_core::EntrySource::real(path));
                 }
             }
         },
