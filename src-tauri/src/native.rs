@@ -1354,8 +1354,8 @@ struct AppState {
     inline_rename: Option<InlineRename>,
     /// A path to select and scroll to once the next listing is on screen.
     reveal_path: Option<String>,
-    /// Last plain click on a Name label: path and when, for slow-second-click.
-    last_name_click: Option<(String, std::time::Instant)>,
+    /// Last plain click on a Name label: source and when, for slow-second-click.
+    last_name_click: Option<(native_core::EntrySource, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
     cwd: native_core::Location,
     tabs: TabSet,
@@ -6715,22 +6715,22 @@ fn connect_name_slow_click(
     label: &gtk::Label,
     state: &Rc<RefCell<AppState>>,
     ui: &Ui,
-    path: &str,
+    source: &native_core::EntrySource,
 ) {
     let click = gtk::GestureClick::new();
     click.set_button(1);
-    let (state, ui, path) = (state.clone(), ui.clone(), path.to_string());
+    let (state, ui, source) = (state.clone(), ui.clone(), source.clone());
     click.connect_released(move |_, n_press, _, _| {
         let prior = state
             .borrow()
             .last_name_click
             .as_ref()
-            .filter(|(p, _)| *p == path)
+            .filter(|(s, _)| *s == source)
             .map(|(_, at)| at.elapsed());
-        let only_this = selected_paths(&state, &ui) == vec![path.clone()];
-        state.borrow_mut().last_name_click = Some((path.clone(), std::time::Instant::now()));
+        let only_this = selected_sources(&state, &ui) == vec![source.clone()];
+        state.borrow_mut().last_name_click = Some((source.clone(), std::time::Instant::now()));
         if slow_click_starts_rename(prior, n_press, only_this) {
-            let entry = state.borrow().visible_entries.iter().find(|e| e.source.to_path_string() == path).cloned();
+            let entry = state.borrow().visible_entries.iter().find(|e| e.source == source).cloned();
             if let Some(entry) = entry {
                 begin_inline_rename(&state, &ui, &entry);
             }
@@ -6804,7 +6804,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         let name: gtk::Widget = match editing {
             Some(edit) => build_inline_editor(&state, &ui, &entry, &edit).upcast(),
             None => {
-                connect_name_slow_click(&name, &state, &ui, &entry.source.to_path_string());
+                connect_name_slow_click(&name, &state, &ui, &entry.source);
                 name.upcast()
             }
         };
