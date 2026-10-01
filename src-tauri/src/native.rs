@@ -6876,7 +6876,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             });
             line.add_controller(press);
         }
-        connect_file_drag(&line, state.clone(), ui.clone(), entry.source.to_path_string(), Some(&size));
+        connect_file_drag(&line, state.clone(), ui.clone(), &entry.source, Some(&size));
         if entry.is_dir {
             connect_file_drop_to_dir(&line, state.clone(), ui.clone(), entry.source.to_path_string());
         }
@@ -7132,7 +7132,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 None => grid_item.append(&name),
             }
             grid_child.set_child(Some(&grid_item));
-            connect_file_drag(&grid_child, state.clone(), ui.clone(), entry.source.to_path_string(), None);
+            connect_file_drag(&grid_child, state.clone(), ui.clone(), &entry.source, None);
             if entry.is_dir {
                 connect_file_drop_to_dir(
                     &grid_child,
@@ -11181,14 +11181,32 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
     (drag, snap_out.expect("snapshot gesture"))
 }
 
+/// A ZIP member row offers no real file to a drag target (file manager,
+/// browser drop zone): it is never wired as a drag source at all, rather
+/// than relying on a filter further down to strip it out (D-188).
 fn connect_file_drag<W: IsA<gtk::Widget>>(
     widget: &W,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
-    path: String,
+    source: &native_core::EntrySource,
     box_select_edge: Option<&gtk::Label>,
 ) {
-    let selected: Rc<dyn Fn() -> Vec<String>> = Rc::new(move || selected_paths(&state, &ui));
+    if source.is_zip() {
+        return;
+    }
+    let path = source.to_path_string();
+    // The multi-select payload is built from real rows only: a ZIP member
+    // mixed into the selection must not be offered to an external drop
+    // target through its serialized pseudo-path.
+    let selected: Rc<dyn Fn() -> Vec<String>> = Rc::new(move || {
+        selected_entries(&state, &ui)
+            .into_iter()
+            .filter_map(|e| match e.source {
+                native_core::EntrySource::Real(path) => Some(path.to_string_lossy().into_owned()),
+                native_core::EntrySource::ZipMember(_) => None,
+            })
+            .collect()
+    });
     connect_file_drag_with(widget, selected, path, box_select_edge);
 }
 
@@ -22948,7 +22966,7 @@ Broken: Either state is wrong.\n";
             "gesture.set_state(gtk::EventSequenceState::Claimed);",
             "if strip_for_prepare(x) {",
             "drag.set_propagation_phase(gtk::PropagationPhase::Capture);",
-            "connect_file_drag(&line, state.clone(), ui.clone(), entry.source.to_path_string(), Some(&size));",
+            "connect_file_drag(&line, state.clone(), ui.clone(), &entry.source, Some(&size));",
             "const BOX_SELECT_STRIP_W: f64 = 24.0;",
             "padding: 4px 12px;",
         ] {
