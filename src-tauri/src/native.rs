@@ -14346,6 +14346,31 @@ Broken: Either state is wrong.\n";
             std::fs::write(root.join("localhdr.zip"), &bytes).unwrap();
         }
 
+        // ---- Truncated member data: the archive and its central directory
+        // are both intact and list fine, but the one member's declared
+        // compressed size (in the local header and the central directory)
+        // is patched far past what bytes actually exist, so reading the
+        // member itself runs out of real data (D-188 ledger #36).
+        {
+            let file = std::fs::File::create(root.join("truncmember.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("member.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"hello world").unwrap();
+            writer.finish().unwrap();
+        }
+        {
+            let mut bytes = std::fs::read(root.join("truncmember.zip")).unwrap();
+            assert_eq!(&bytes[0..4], b"PK\x03\x04", "the local file header must start where expected");
+            let huge: u32 = 10_000_000;
+            bytes[18..22].copy_from_slice(&huge.to_le_bytes());
+            let cd_pos = bytes
+                .windows(4)
+                .position(|w| w == b"PK\x01\x02")
+                .expect("find the central directory entry");
+            bytes[cd_pos + 20..cd_pos + 24].copy_from_slice(&huge.to_le_bytes());
+            std::fs::write(root.join("truncmember.zip"), &bytes).unwrap();
+        }
+
         // ---- Unsafe names: traversal and an absolute path.
         {
             let file = std::fs::File::create(root.join("traversal.zip")).unwrap();
@@ -14665,6 +14690,28 @@ Broken: Either state is wrong.\n";
         open_entry(&state, &ui, stale_entry);
         wait_for("stale row is refused boundedly", || ui.status.label().starts_with("Cannot open "));
         assert!(!state.borrow().cwd.is_zip(), "a vanished archive must never be entered");
+
+        // D-188 ledger #36: truncated member data refuses through
+        // production member Open, boundedly, with no cached bytes
+        // published — the archive itself activates and lists fine.
+        wait_for("listing shows truncmember.zip", || {
+            state.borrow().visible_entries.iter().any(|e| e.name == "truncmember.zip")
+        });
+        let truncmember_entry = state.borrow().visible_entries.iter().find(|e| e.name == "truncmember.zip").cloned().unwrap();
+        open_entry(&state, &ui, truncmember_entry);
+        wait_for("inside the truncmember zip root", || state.borrow().cwd.is_zip());
+        wait_for("truncmember member listed", || state.borrow().visible_entries.len() == 1);
+        let trunc_member_entry = state.borrow().visible_entries[0].clone();
+        assert_eq!(trunc_member_entry.name, "member.txt");
+        open_entry(&state, &ui, trunc_member_entry);
+        wait_for("open failed boundedly", || ui.status.label().starts_with("Open failed:"));
+        assert!(
+            !cache_root.is_dir() || walk_find_file(&cache_root, "member.txt").is_none(),
+            "a truncated member leaves no cached file"
+        );
+        let up_from_truncmember = state.borrow().cwd.parent();
+        navigate(&state, up_from_truncmember);
+        wait_for("back at the real folder after truncmember", || !state.borrow().cwd.is_zip());
 
         ui.window.close();
         pump();
