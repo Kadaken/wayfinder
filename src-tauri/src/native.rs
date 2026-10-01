@@ -2688,7 +2688,7 @@ fn main() {
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| state.borrow().cwd.to_path_string());
                 navigate(&state, native_core::Location::parse(&parent));
-                select_entry_by_path(&state, &ui, &target);
+                select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&target));
             } else if let Some(path) = initial_path {
                 navigate(&state, native_core::Location::parse(&path));
             }
@@ -3547,19 +3547,19 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     // Launched pointing at a file (download finished, "show in folder"): highlight it.
     if let Some(target) = select_path.as_deref() {
-        select_entry_by_path(&state, &ui, target);
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(target));
     }
 
     ui.window.present();
 }
 
 /// Select+focus the row for `path` in the current listing, if it is present.
-fn select_entry_by_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+fn select_entry_by_source(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::EntrySource) {
     let index = state
         .borrow()
         .visible_entries
         .iter()
-        .position(|entry| entry.source.to_path_string() == path);
+        .position(|entry| &entry.source == source);
     if let Some(index) = index {
         select_index(state, ui, index);
     }
@@ -6029,7 +6029,7 @@ fn navigate_to_with_message(
                 update_sidebar_active_rows(&state, ui);
                 install_directory_monitor(&state, ui, &path_str);
                 if let Some(target) = state.borrow().pinned_top.clone() {
-                    select_entry_by_path(&state, ui, &target);
+                    select_entry_by_source(&state, ui, &native_core::EntrySource::real(&target));
                 }
                 ui.status.set_label(&listing_status(
                     item_count,
@@ -6476,17 +6476,17 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::L
 /// folder holds ten files or a hundred thousand.
 /// Re-binds one row (after an inline edit starts or is cancelled) and keeps it
 /// selected; a ListStore change on a position drops that row's selection.
-fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::EntrySource) {
     if state.borrow().view_mode == ViewMode::Grid {
         // Grid has no row model: rebuild its children and re-select the item.
         repopulate_rows(state, ui);
-        select_entry_by_path(state, ui, path);
+        select_entry_by_source(state, ui, source);
         return;
     }
-    let Some(entry) = state.borrow().visible_entries.iter().find(|e| e.source.to_path_string() == path).cloned() else {
+    let Some(entry) = state.borrow().visible_entries.iter().find(|e| &e.source == source).cloned() else {
         return;
     };
-    let pos = state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == path).unwrap_or(0);
+    let pos = state.borrow().visible_entries.iter().position(|e| &e.source == source).unwrap_or(0);
     // A real replace, not items_changed: ListView only rebinds a row when the
     // model reports a different item there.
     ui.list_store.splice(pos as u32, 1, &[glib::BoxedAnyObject::new(entry)]);
@@ -6496,14 +6496,14 @@ fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
 fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
     state.borrow_mut().inline_rename = Some(InlineRename::new(&entry.source.to_path_string(), &entry.name));
     state.borrow_mut().last_name_click = None;
-    refresh_row(state, ui, &entry.source.to_path_string());
+    refresh_row(state, ui, &entry.source);
 }
 
 fn cancel_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let Some(edit) = state.borrow_mut().inline_rename.take() else {
         return;
     };
-    refresh_row(state, ui, &edit.path);
+    refresh_row(state, ui, &native_core::EntrySource::real(&edit.path));
 }
 
 /// The one commit path for Enter and focus loss. Success renames on disk,
@@ -13311,7 +13311,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
 
         // ---- Every mutation surface refuses with the exact message, fail-closed.
-        select_entry_by_path(&state, &ui, &state.borrow().visible_entries[0].source.to_path_string());
+        select_entry_by_source(&state, &ui, &state.borrow().visible_entries[0].source.clone());
         let refusal = native_core::ZIP_READ_ONLY_MESSAGE;
         create_folder_action(state.clone(), ui.clone());
         assert_eq!(ui.status.label(), refusal, "New Folder refused inside a ZIP");
@@ -13357,10 +13357,10 @@ Broken: Either state is wrong.\n";
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
         wait_for("docs children again", || state.borrow().visible_entries.len() == 2);
-        let readme_path = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().source.to_path_string();
-        select_entry_by_path(&state, &ui, &readme_path);
+        let readme_source = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().source.clone();
+        select_entry_by_source(&state, &ui, &readme_source);
         let copy_out = Transfer {
-            srcs: vec![readme_path],
+            srcs: vec![readme_source.to_path_string()],
             dest: out_str.clone(),
             is_copy: true,
             clear_cut_after: false,
@@ -17403,7 +17403,7 @@ Broken: Either state is wrong.\n";
                 changes_for_signal.set(changes_for_signal.get() + 1);
             });
 
-        select_entry_by_path(&state, &ui, &dir.join("clip.mp4").to_string_lossy());
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(dir.join("clip.mp4")));
         wait_for("preview switches to media", || {
             ui.preview_stack.visible_child_name().as_deref() == Some("media")
         });
@@ -17491,7 +17491,7 @@ Broken: Either state is wrong.\n";
         assert!(ui.preview_scroll.is_visible() && ui.preview_scroll.is_mapped());
         assert!(ui.preview_scroll.parent().as_ref() == Some(ui.file_preview.upcast_ref()));
 
-        select_entry_by_path(&state, &ui, &path("a.txt"));
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(path("a.txt")));
         wait_for("a preview", || ui.preview.label().contains("AAA-preview-text"));
 
         // a valid non-default divider position
@@ -17530,7 +17530,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.preview_saved_position.get(), custom);
 
         // select another row while off: selection/status change, no preview work
-        select_entry_by_path(&state, &ui, &path("b.txt"));
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(path("b.txt")));
         assert_eq!(selected_paths(&state, &ui), vec![path("b.txt")]);
         assert!(ui.status.label().contains("1 selected"), "{}", ui.status.label());
         pump();
@@ -19253,7 +19253,7 @@ Broken: Either state is wrong.\n";
 
         // ---- Details: a real monitor event updates size/time in place.
         wait_for("row b realized", || b_labels(&state).is_some());
-        select_entry_by_path(&state, &ui, &b_path);
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&b_path));
         let (size_before, modified_before) = b_labels(&state).unwrap();
         let row_before = size_before.parent().unwrap();
         let object_before = ui.list_store.item(1).unwrap();
@@ -19283,7 +19283,7 @@ Broken: Either state is wrong.\n";
         // ---- Compact: a second metadata-only change keeps every object.
         set_view_mode(&state, &ui, ViewMode::Compact);
         wait_for("compact rows", || b_labels(&state).is_some());
-        select_entry_by_path(&state, &ui, &b_path);
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&b_path));
         let (c_size, c_modified) = b_labels(&state).unwrap();
         let c_row = c_size.parent().unwrap();
         let b_index = state.borrow().visible_entries.iter().position(|e| e.source.to_path_string() == b_path).unwrap() as u32;
@@ -19302,7 +19302,7 @@ Broken: Either state is wrong.\n";
         // ---- Grid: a metadata-only scan does not remove or recreate children.
         set_view_mode(&state, &ui, ViewMode::Grid);
         wait_for("grid children", || ui.grid.observe_children().n_items() == 3);
-        select_entry_by_path(&state, &ui, &b_path);
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&b_path));
         let children_before: Vec<gtk::Widget> = (0..3)
             .map(|i| ui.grid.child_at_index(i).unwrap().upcast())
             .collect();
@@ -19428,7 +19428,7 @@ Broken: Either state is wrong.\n";
             for _ in 0..5 {
                 pump();
             }
-            select_entry_by_path(&state, &ui, &a_path);
+            select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&a_path));
             assert_eq!(selected_paths(&state, &ui), vec![a_path.clone()]);
 
             // Earlier fixture events must drain before the timed stream: no scan
@@ -19450,7 +19450,7 @@ Broken: Either state is wrong.\n";
             // The stable row is selected in code while the writer runs; the real
             // pointer click is carried to the watched gate.
             let row = row_widget(mode, &b_path).expect("b.txt row is realized");
-            select_entry_by_path(&state, &ui, &b_path);
+            select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&b_path));
             assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()]);
             let object = ui.list_store.item(index_of(&b_path) as u32);
 
