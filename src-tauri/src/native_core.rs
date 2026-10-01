@@ -6437,6 +6437,43 @@ mod zip_index_tests_d188 {
 
 
     #[test]
+    fn rejects_explicit_file_directory_collision_file_first_d188() {
+        // Two explicit top-level entries at the same normalized path, one a
+        // file and one a directory — REJECT 7's forged collision case, file
+        // read first.
+        let bytes = build_zip(&[("a", b"x"), ("a/", b"")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::FileDirectoryCollision))), "{result:?}");
+    }
+
+    #[test]
+    fn rejects_explicit_file_directory_collision_dir_first_d188() {
+        // Same forged pair as above, directory read first — the message must
+        // be identical regardless of read order (REJECT 7).
+        let bytes = build_zip(&[("a/", b""), ("a", b"x")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::FileDirectoryCollision))), "{result:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_explicit_directory_first_order_d188() {
+        // Two explicit directory entries that normalize to the same path via
+        // different raw spellings ("a/" and "a//", both read as directories
+        // by the archive format) — a forged true duplicate, not a collision,
+        // regardless of which raw form is read first (REJECT 7).
+        let bytes = build_zip(&[("a/", b""), ("a//", b"")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::DuplicatePath))), "{result:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_explicit_directory_second_order_d188() {
+        let bytes = build_zip(&[("a//", b""), ("a/", b"")]);
+        let result = index_zip(Cursor::new(bytes), &DEFAULT_ZIP_LIMITS, &AtomicBool::new(false));
+        assert!(matches!(result, Err(ZipIndexError::BadName(_, ZipNameError::DuplicatePath))), "{result:?}");
+    }
+
+    #[test]
     fn explicit_directory_matching_an_implicit_ancestor_is_not_a_duplicate_d188() {
         // "a/b.txt" implicitly reserves "a" as a directory; a later explicit
         // "a/" entry for the same path is the normal archive form, not a
