@@ -113,6 +113,110 @@ pub enum Location {
     ZipDir { archive: PathBuf, internal: String },
 }
 
+/// Marker that can never appear in a real filesystem path (NUL is illegal on
+/// every POSIX filesystem), used to encode a `Location` into the plain
+/// `String` that the existing tab/history/row plumbing already carries. A
+/// string without the marker always parses back to `RealDir` unchanged, so
+/// this is additive and cannot reinterpret any existing real path.
+const ZIP_LOCATION_MARKER: &str = "\0wf-zip\0";
+
+impl Location {
+    pub fn real(path: impl Into<PathBuf>) -> Self {
+        Self::RealDir(path.into())
+    }
+
+    pub fn zip_root(archive: impl Into<PathBuf>) -> Self {
+        Self::ZipDir { archive: archive.into(), internal: String::new() }
+    }
+
+    pub fn is_zip(&self) -> bool {
+        matches!(self, Self::ZipDir { .. })
+    }
+
+    /// Encodes this location as the `String` the rest of the app passes
+    /// around. Round-trips exactly through `parse`.
+    pub fn to_path_string(&self) -> String {
+        match self {
+            Self::RealDir(path) => path.to_string_lossy().into_owned(),
+            Self::ZipDir { archive, internal } => {
+                let archive = archive.to_string_lossy();
+                format!("{archive}{ZIP_LOCATION_MARKER}{archive}{ZIP_LOCATION_MARKER}{internal}")
+            }
+        }
+    }
+
+    /// Parses a path string produced by `to_path_string`, or treats any
+    /// ordinary string (one without the marker) as a real directory path.
+    pub fn parse(path: &str) -> Self {
+        if let Some(first) = path.find(ZIP_LOCATION_MARKER) {
+            let archive_prefix = &path[..first];
+            let rest = &path[first + ZIP_LOCATION_MARKER.len()..];
+            if let Some(second) = rest.find(ZIP_LOCATION_MARKER) {
+                let archive_repeat = &rest[..second];
+                let internal = &rest[second + ZIP_LOCATION_MARKER.len()..];
+                if archive_repeat == archive_prefix {
+                    return Self::ZipDir {
+                        archive: PathBuf::from(archive_repeat),
+                        internal: internal.to_string(),
+                    };
+                }
+            }
+        }
+        Self::RealDir(PathBuf::from(path))
+    }
+
+    /// One level up: deeper into the archive pops the last internal segment;
+    /// at the archive's virtual root, Up returns to the real containing
+    /// folder (D-188's "Up at the ZIP root returns to the real containing
+    /// folder").
+    pub fn parent(&self) -> Location {
+        match self {
+            Self::RealDir(path) => {
+                Self::RealDir(path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")))
+            }
+            Self::ZipDir { archive, internal } => {
+                if internal.is_empty() {
+                    Self::RealDir(archive.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")))
+                } else {
+                    match internal.rsplit_once('/') {
+                        Some((parent, _)) => Self::ZipDir { archive: archive.clone(), internal: parent.to_string() },
+                        None => Self::ZipDir { archive: archive.clone(), internal: String::new() },
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn child_dir(&self, name: &str) -> Location {
+        match self {
+            Self::RealDir(path) => Self::RealDir(path.join(name)),
+            Self::ZipDir { archive, internal } => {
+                let internal = if internal.is_empty() { name.to_string() } else { format!("{internal}/{name}") };
+                Self::ZipDir { archive: archive.clone(), internal }
+            }
+        }
+    }
+
+    /// Breadcrumb segments from the ZIP's containing real folder onward: the
+    /// archive's own file name, then each internal folder, each paired with
+    /// the `Location` that activating that crumb navigates to. `None` when
+    /// this is a real location (the existing real-path breadcrumb builder
+    /// still applies).
+    pub fn zip_breadcrumb_tail(&self) -> Option<Vec<(String, Location)>> {
+        let Self::ZipDir { archive, internal } = self else { return None };
+        let archive_name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut crumbs = vec![(archive_name, Location::zip_root(archive.clone()))];
+        let mut accumulated = String::new();
+        if !internal.is_empty() {
+            for part in internal.split('/') {
+                accumulated = if accumulated.is_empty() { part.to_string() } else { format!("{accumulated}/{part}") };
+                crumbs.push((part.to_string(), Self::ZipDir { archive: archive.clone(), internal: accumulated.clone() }));
+            }
+        }
+        Some(crumbs)
+    }
+}
+
 /// Where a single row's bytes live, for the same reason: `Entry.path` alone
 /// cannot say whether rename/trash/paste-target code may touch it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,8 +449,11 @@ pub fn index_zip<R: Read + std::io::Seek>(
 
 /// Immediate children of `internal` (the virtual directory being browsed; ""
 /// for the ZIP root), folders-first, matching the real-directory sort
-/// contract in `list_dir_cancellable` (D-188).
-pub fn zip_dir_children(index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
+/// contract in `list_dir_cancellable` (D-188). Each row's `path` is an
+/// encoded `Location` string (see `Location::to_path_string`), so existing
+/// activation/navigation code that reads `Entry.path` keeps working without
+/// having to special-case ZIP rows for navigation.
+pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
     let prefix = if internal.is_empty() { String::new() } else { format!("{internal}/") };
     let mut children: HashMap<String, (bool, u64)> = HashMap::new();
     for item in index {
@@ -368,11 +475,13 @@ pub fn zip_dir_children(index: &[ZipIndexEntry], internal: &str) -> Vec<Entry> {
         .into_iter()
         .map(|(name, (is_dir, size))| {
             let fake_path = Path::new(&name);
+            let child_internal = if internal.is_empty() { name.clone() } else { format!("{internal}/{name}") };
+            let location = Location::ZipDir { archive: archive.to_path_buf(), internal: child_internal };
             Entry {
                 icon: icon_name(fake_path, is_dir).to_string(),
                 is_image: is_image(fake_path),
                 name,
-                path: String::new(),
+                path: location.to_path_string(),
                 is_dir,
                 size,
                 modified: 0,
@@ -443,10 +552,13 @@ impl Drive {
 }
 
 pub fn parent_dir(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "/".to_string())
+    match Location::parse(path) {
+        Location::ZipDir { .. } => Location::parse(path).parent().to_path_string(),
+        Location::RealDir(real) => real
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string()),
+    }
 }
 
 pub fn standard_dirs() -> Vec<(String, String)> {
@@ -644,6 +756,31 @@ pub fn list_dir_cancellable(
         metadata_unavailable,
         unreadable_entries,
     })
+}
+
+/// Same contract as `list_dir_cancellable`, for a ZIP virtual location:
+/// re-indexes the archive's central directory (no extraction) and returns
+/// that directory's immediate children. `path` must be a `Location::ZipDir`
+/// string; callers dispatch on `Location::parse(path).is_zip()` before using
+/// this. Shares the generation/tab-id staleness guard applied by the caller,
+/// same as a real folder (D-188).
+pub fn list_zip_dir_cancellable(path: &str, cancelled: &AtomicBool) -> Result<DirectoryListing, ListDirError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(ListDirError::Cancelled);
+    }
+    let Location::ZipDir { archive, internal } = Location::parse(path) else {
+        return Err(ListDirError::Open("not a ZIP location".to_string()));
+    };
+    let file = fs::File::open(&archive).map_err(|e| ListDirError::Open(e.to_string()))?;
+    let index = index_zip(file, &DEFAULT_ZIP_LIMITS, cancelled).map_err(|e| match e {
+        ZipIndexError::Cancelled => ListDirError::Cancelled,
+        other => ListDirError::Open(other.to_string()),
+    })?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(ListDirError::Cancelled);
+    }
+    let entries = zip_dir_children(&archive, &index, &internal);
+    Ok(DirectoryListing { entries, metadata_unavailable: 0, unreadable_entries: 0 })
 }
 
 pub fn search_dir(
@@ -5820,6 +5957,59 @@ mod zip_member_name_safety_tests_d188 {
 }
 
 #[cfg(test)]
+mod location_tests_d188 {
+    use super::*;
+
+    #[test]
+    fn ordinary_path_round_trips_as_real_dir_d188() {
+        let loc = Location::parse("/home/zito/Downloads");
+        assert_eq!(loc, Location::RealDir(PathBuf::from("/home/zito/Downloads")));
+        assert_eq!(loc.to_path_string(), "/home/zito/Downloads");
+    }
+
+    #[test]
+    fn zip_location_round_trips_exactly_d188() {
+        let loc = Location::ZipDir { archive: PathBuf::from("/home/zito/a.zip"), internal: "x/y".to_string() };
+        let encoded = loc.to_path_string();
+        assert_eq!(Location::parse(&encoded), loc);
+    }
+
+    #[test]
+    fn zip_root_up_returns_to_the_real_containing_folder_d188() {
+        let root = Location::zip_root("/home/zito/stuff/a.zip");
+        assert_eq!(root.parent(), Location::RealDir(PathBuf::from("/home/zito/stuff")));
+    }
+
+    #[test]
+    fn nested_zip_dir_up_pops_one_internal_segment_d188() {
+        let deep = Location::ZipDir { archive: PathBuf::from("/a.zip"), internal: "x/y".to_string() };
+        assert_eq!(deep.parent(), Location::ZipDir { archive: PathBuf::from("/a.zip"), internal: "x".to_string() });
+    }
+
+    #[test]
+    fn child_dir_descends_one_level_d188() {
+        let root = Location::zip_root("/a.zip");
+        let child = root.child_dir("docs");
+        assert_eq!(child, Location::ZipDir { archive: PathBuf::from("/a.zip"), internal: "docs".to_string() });
+    }
+
+    #[test]
+    fn breadcrumb_tail_names_the_archive_then_each_internal_folder_d188() {
+        let loc = Location::ZipDir { archive: PathBuf::from("/home/zito/a.zip"), internal: "x/y".to_string() };
+        let tail = loc.zip_breadcrumb_tail().unwrap();
+        let names: Vec<_> = tail.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, vec!["a.zip".to_string(), "x".to_string(), "y".to_string()]);
+        assert_eq!(tail[0].1, Location::zip_root("/home/zito/a.zip"));
+        assert_eq!(tail[2].1, loc);
+    }
+
+    #[test]
+    fn real_location_has_no_zip_breadcrumb_tail_d188() {
+        assert_eq!(Location::real("/home").zip_breadcrumb_tail(), None);
+    }
+}
+
+#[cfg(test)]
 mod zip_index_tests_d188 {
     use super::*;
     use std::io::Cursor;
@@ -5858,7 +6048,7 @@ mod zip_index_tests_d188 {
     #[test]
     fn zip_root_children_are_folders_first_then_alphabetical_d188() {
         let entries = idx(&[("zeta.txt", b"z"), ("alpha/", b""), ("mid.txt", b"m")]);
-        let children = zip_dir_children(&entries, "");
+        let children = zip_dir_children(Path::new("sample.zip"), &entries, "");
         let names: Vec<_> = children.iter().map(|e| (e.name.clone(), e.is_dir)).collect();
         assert_eq!(names, vec![
             ("alpha".to_string(), true),
@@ -5870,9 +6060,9 @@ mod zip_index_tests_d188 {
     #[test]
     fn nested_children_only_show_one_level_d188() {
         let entries = idx(&[("a/b/c.txt", b"x"), ("a/d.txt", b"y")]);
-        let root_children = zip_dir_children(&entries, "");
+        let root_children = zip_dir_children(Path::new("sample.zip"), &entries, "");
         assert_eq!(root_children.len(), 1, "only 'a' at the root");
-        let a_children = zip_dir_children(&entries, "a");
+        let a_children = zip_dir_children(Path::new("sample.zip"), &entries, "a");
         let names: HashSet<_> = a_children.iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, HashSet::from(["b".to_string(), "d.txt".to_string()]));
     }
