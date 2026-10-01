@@ -8222,32 +8222,14 @@ fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, member: &native_core:
     });
 }
 
-/// Hands `path` to the external launcher the same way for an ordinary real
-/// file and a ZIP member's cached copy (D-188 REJECT 3: Open's one shared
-/// launch point). A test never starts a real application: it records the
-/// call instead, so a named gate can prove exactly one launch with the exact
-/// owned path.
-#[cfg(not(test))]
-fn launch_path(path: &str) -> Result<(), String> {
-    native_core::open_path(path)
-}
-
-#[cfg(test)]
-fn launch_path(path: &str) -> Result<(), String> {
-    TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().push(path.to_string()));
-    Ok(())
-}
-
-/// Counts every `open_zip_member` poll tick (D-188 REJECT 3): a test proves
-/// GTK main-loop ticks actually advance while an allowed large member streams
-/// on its own thread, not just that the final result eventually arrives.
-#[cfg(test)]
-fn note_open_poll_tick() {
-    TEST_OPEN_POLL_TICKS.with(|c| c.set(c.get() + 1));
-}
-
-#[cfg(not(test))]
-fn note_open_poll_tick() {}
+/// D-188: every test-only seam in this file (anything gated on the "test"
+/// cfg) belongs below the locked drag code, in the cluster starting at
+/// `drive_scan` — never above it. `row_drag_beats_selection_box_locked`
+/// stops scanning the source at the file's first such seam marker; one
+/// placed earlier in the file (as `launch_path`/`note_open_poll_tick`
+/// briefly were) makes that scan miss the real drag code entirely and the
+/// locked gate silently passes for the wrong reason.
+/// `drag_code_precedes_first_test_seam_d188` guards this.
 
 /// The one New Folder path (background menu, toolbar, options menu, Ctrl+Shift+N):
 /// create a real numbered folder, then open the shared inline editor on it with
@@ -11178,6 +11160,9 @@ fn show_properties_for_path(ui: Ui, path: String) {
 /// it without his say-so. The test `row_drag_beats_selection_box_locked` fails if
 /// any piece below is removed: the grouped capture-phase claim gesture, the
 /// half-threshold claim, the strip check in prepare, and the row padding CSS.
+/// That test stops scanning this file's source at the first test-only seam
+/// marker it finds, so every such seam belongs below this code, in the
+/// cluster starting at `drive_scan` — never above it.
 ///
 /// `box_select_edge` is the Size label of a Details row. Pressing in the strip
 /// just left of it starts a selection box; pressing anywhere else on the row
@@ -11793,6 +11778,10 @@ fn open_with_test_apps() -> Option<Vec<native_core::AppEntry>> {
 
 thread_local! {
     /// Test-only stand-ins so a test never launches a real application.
+    /// D-188: `row_drag_beats_selection_box_locked` stops scanning this
+    /// file's source at the first `#[cfg(test)]` it finds, and this is
+    /// that first one — every new test seam belongs here, in this cluster
+    /// below the locked drag code, never above it.
     #[cfg(test)]
     static TEST_DRIVE_SCAN: RefCell<Option<DriveScan>> = const { RefCell::new(None) };
     #[cfg(test)]
@@ -11820,6 +11809,36 @@ thread_local! {
     #[cfg(test)]
     static TEST_OPEN_POLL_TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// Hands `path` to the external launcher the same way for an ordinary real
+/// file and a ZIP member's cached copy (D-188 REJECT 3: Open's one shared
+/// launch point). A test never starts a real application: it records the
+/// call instead, so a named gate can prove exactly one launch with the exact
+/// owned path. Every test seam, including this one, belongs below the
+/// locked drag code (see the note above `drag_payload`'s LOCKED comment) —
+/// `row_drag_beats_selection_box_locked` stops scanning at the file's first
+/// `#[cfg(test)]`, so a seam placed above it is invisible to that gate.
+#[cfg(not(test))]
+fn launch_path(path: &str) -> Result<(), String> {
+    native_core::open_path(path)
+}
+
+#[cfg(test)]
+fn launch_path(path: &str) -> Result<(), String> {
+    TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().push(path.to_string()));
+    Ok(())
+}
+
+/// Counts every `open_zip_member` poll tick (D-188 REJECT 3): a test proves
+/// GTK main-loop ticks actually advance while an allowed large member streams
+/// on its own thread, not just that the final result eventually arrives.
+#[cfg(test)]
+fn note_open_poll_tick() {
+    TEST_OPEN_POLL_TICKS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_open_poll_tick() {}
 
 /// The real scan, or in tests a synthetic one; tests never touch a real drive.
 #[cfg(not(test))]
@@ -23476,6 +23495,32 @@ Broken: Either state is wrong.\n";
         assert!(
             !src.contains(concat!("line.set_", "margin_top(2);")),
             "row margins are back: they leave dead space that starts a selection box"
+        );
+    }
+
+    /// D-188: `row_drag_beats_selection_box_locked` only scans the slice of
+    /// this file before the first `#[cfg(test)]` it finds, so a new test
+    /// seam placed above the locked drag code silently makes that gate stop
+    /// seeing the production drag code it is supposed to protect. This test
+    /// proves the ordering directly instead of relying on the other gate to
+    /// notice: the locked drag line must appear before the first test seam.
+    /// The search string is built with `concat!` (matching the pattern
+    /// above) so this assertion's own source text can never become the
+    /// first false `#[cfg(test)]` match it is checking for.
+    #[test]
+    fn drag_code_precedes_first_test_seam_d188() {
+        let full = include_str!("native.rs");
+        let drag_idx = full
+            .find("claim.set_propagation_phase(gtk::PropagationPhase::Capture);")
+            .expect("locked drag production line must still exist");
+        let seam_idx = full
+            .find(concat!("#[cfg", "(test)]"))
+            .expect("this file must still have at least one test seam");
+        assert!(
+            drag_idx < seam_idx,
+            "a test seam was added above the locked drag code (first #[cfg(test)] is at byte {seam_idx}, \
+             the locked drag line is at byte {drag_idx}) — row_drag_beats_selection_box_locked can no longer \
+             see the production drag code; move the seam down to the test-seam cluster starting at drive_scan"
         );
     }
 }
