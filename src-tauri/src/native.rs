@@ -14548,12 +14548,24 @@ Broken: Either state is wrong.\n";
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
         let before_cwd = state.borrow().cwd.real_path_string().unwrap_or_default();
+        // D-188 ledger #32: snapshot every fixture's bytes and the scratch
+        // root's own cache/residue state once, up front, so each refusal
+        // below can prove it changed nothing — not just that it refused.
+        let cache_root = xdg_dir.join("wayfinder-zip-cache");
+        let fixture_bytes_before: std::collections::HashMap<String, Vec<u8>> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("zip"))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+            .collect();
 
         let assert_refused = |zip_name: &str, expect_fragment: Option<&str>| {
             wait_for("listing shows the fixture", || {
                 state.borrow().visible_entries.iter().any(|e| e.name == zip_name)
             });
             let entry = state.borrow().visible_entries.iter().find(|e| e.name == zip_name).cloned().unwrap();
+            let undo_len_before = state.borrow().undo_stack.len();
+            TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
             open_entry(&state, &ui, entry);
             wait_for("a bounded status appears", || ui.status.label().starts_with("Cannot open "));
             let label = ui.status.label().to_string();
@@ -14564,6 +14576,23 @@ Broken: Either state is wrong.\n";
             assert!(
                 !state.borrow().cwd.is_zip(),
                 "{zip_name}: never left sitting inside a bad archive"
+            );
+            // D-188 ledger #32: history, this fixture's own bytes, the
+            // Open cache, and any launched child process are all untouched
+            // by a refused action path.
+            assert_eq!(state.borrow().undo_stack.len(), undo_len_before, "{zip_name}: a refused action must not add history");
+            assert_eq!(
+                std::fs::read(root.join(zip_name)).unwrap(),
+                fixture_bytes_before[zip_name],
+                "{zip_name}: the fixture's own bytes must stay untouched by a refused action"
+            );
+            assert!(
+                !cache_root.is_dir() || walk_find_file(&cache_root, zip_name).is_none(),
+                "{zip_name}: a refused action must leave no cache residue"
+            );
+            assert!(
+                TEST_LAUNCHER_CALLS.with(|c| c.borrow().is_empty()),
+                "{zip_name}: a refused action must launch no child process"
             );
         };
 
