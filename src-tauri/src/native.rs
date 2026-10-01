@@ -9121,36 +9121,6 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
     );
 }
 
-/// D-188 Copy Out: streams the selected ZIP members directly into a real
-/// destination folder, each under its own file name, refusing (not
-/// overwriting) on a name clash. The committed copy enters the accepted
-/// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
-/// New Folder/New File — Undo simply deletes the real files it made.
-fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String, u64, u32)>, dest_path: PathBuf) {
-    let archive = zip_srcs[0].0.clone();
-    let count = zip_srcs.len();
-    let members: Vec<(String, String, u64, u32)> = zip_srcs
-        .into_iter()
-        .map(|(_, internal, size, crc32)| {
-            let name = internal.rsplit('/').next().unwrap_or(&internal).to_string();
-            (internal, name, size, crc32)
-        })
-        .collect();
-    run_job(
-        state,
-        ui,
-        format!("Copying {count} item{} out of the ZIP", plural(count)),
-        move || {
-            let created = native_core::copy_zip_members_out(&archive, &members, &dest_path)?;
-            Ok(JobOutcome::undo(
-                format!("Copied {count} item{} out of the ZIP", plural(count)),
-                UndoAction::Created { paths: created },
-            ))
-        },
-        |_, _, _| {},
-    );
-}
-
 fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
     if state.borrow().cwd.is_zip() {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
@@ -10428,6 +10398,13 @@ fn show_item_context_menu(
         let entry = entry.clone();
         menu.append(&context_item("document-open-symbolic", "Open", "", &popover, move || {
             open_entry(&state, &ui, entry.clone())
+        }));
+    }
+    if entry.source.is_zip() && eligible_zip_members_for_copy_out(&selected_entries(&state, &ui)).is_some() {
+        let state = state.clone();
+        let ui = ui.clone();
+        menu.append(&context_item("document-save-symbolic", "Copy Out...", "", &popover, move || {
+            copy_out_action(state.clone(), ui.clone())
         }));
     }
     if entry.is_dir {
@@ -11741,6 +11718,11 @@ thread_local! {
     static TEST_CHILD_MISSING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     #[cfg(test)]
     static TEST_CHILD_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// D-188 REJECT 4: the gate injects a destination here instead of ever
+    /// opening a physical folder-chooser dialog; unset or `None` simulates
+    /// Cancel, consumed (taken) by the one call that reads it.
+    #[cfg(test)]
+    static TEST_COPY_OUT_DESTINATION: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 /// The real scan, or in tests a synthetic one; tests never touch a real drive.
@@ -11815,6 +11797,92 @@ fn spawn_child(ui: &Ui, launch: ChildLaunch) -> Result<(), native_core::LaunchEr
     TEST_CHILD_ATTEMPTS.with(|a| a.borrow_mut().push(record));
     Ok(())
 }
+
+/// The exact typed `(archive, internal, size, crc32)` tuples for every
+/// selected row, only when the whole selection is one or more regular
+/// (non-directory) `ZipMemberRef` rows — never offered for a directory or a
+/// mixed/ineligible selection (D-188 REJECT 4 picker contract).
+fn eligible_zip_members_for_copy_out(entries: &[Entry]) -> Option<Vec<(PathBuf, String, u64, u32)>> {
+    if entries.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .map(|entry| match (&entry.source, entry.is_dir) {
+            (native_core::EntrySource::ZipMember(native_core::ZipMemberRef { archive, internal, size, crc32 }), false) => {
+                Some((archive.clone(), internal.clone(), *size, *crc32))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Opens a destination-folder chooser for Copy Out. Production uses the real
+/// GTK folder dialog; a test injects the result through
+/// `TEST_COPY_OUT_DESTINATION` instead of a physical dialog ever opening
+/// (D-188 REJECT 4).
+#[cfg(not(test))]
+async fn choose_copy_out_destination(ui: &Ui) -> Option<PathBuf> {
+    let dialog = gtk::FileDialog::builder().title("Copy Out To").modal(true).build();
+    dialog.select_folder_future(Some(&ui.window)).await.ok().and_then(|f| f.path())
+}
+
+#[cfg(test)]
+async fn choose_copy_out_destination(_ui: &Ui) -> Option<PathBuf> {
+    TEST_COPY_OUT_DESTINATION.with(|d| d.borrow_mut().take())
+}
+
+/// The one user-reachable entry point for Copy Out (D-188 REJECT 4): captures
+/// the exact typed selected member refs before anything async runs, opens the
+/// destination chooser, and starts the transactional job only on a real
+/// chosen folder. Cancelling the chooser, or it failing, starts no job and
+/// changes no history or bytes.
+fn copy_out_action(state: Rc<RefCell<AppState>>, ui: Ui) {
+    let entries = selected_entries(&state, &ui);
+    let Some(zip_srcs) = eligible_zip_members_for_copy_out(&entries) else {
+        ui.status.set_label("Select one or more files inside the ZIP to copy out");
+        return;
+    };
+    glib::spawn_future_local(async move {
+        let Some(dest) = choose_copy_out_destination(&ui).await else { return };
+        if !dest.is_dir() {
+            ui.status.set_label("Copy Out failed: the chosen destination is not a folder");
+            return;
+        }
+        copy_zip_members_out_action(state, ui, zip_srcs, dest);
+    });
+}
+
+/// D-188 Copy Out: streams the selected ZIP members directly into a real
+/// destination folder, each under its own file name, refusing (not
+/// overwriting) on a name clash. The committed copy enters the accepted
+/// Round-187 Undo/Redo history as an ordinary `Created` entry, same as
+/// New Folder/New File — Undo simply deletes the real files it made.
+fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: Vec<(PathBuf, String, u64, u32)>, dest_path: PathBuf) {
+    let archive = zip_srcs[0].0.clone();
+    let count = zip_srcs.len();
+    let members: Vec<(String, String, u64, u32)> = zip_srcs
+        .into_iter()
+        .map(|(_, internal, size, crc32)| {
+            let name = internal.rsplit('/').next().unwrap_or(&internal).to_string();
+            (internal, name, size, crc32)
+        })
+        .collect();
+    run_job(
+        state,
+        ui,
+        format!("Copying {count} item{} out of the ZIP", plural(count)),
+        move || {
+            let created = native_core::copy_zip_members_out(&archive, &members, &dest_path)?;
+            Ok(JobOutcome::undo(
+                format!("Copied {count} item{} out of the ZIP", plural(count)),
+                UndoAction::Created { paths: created },
+            ))
+        },
+        |_, _, _| {},
+    );
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -13327,6 +13395,7 @@ Broken: Either state is wrong.\n";
         // `undo_redo_gate_trash_d187` already established: lock out other
         // real-trash tests and use the ambient `$HOME` instead.
         let _trash_guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _xdg_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
         gtk::init().expect("gtk init on the virtual display");
         let root = crate::native_core::scratch_root().join(format!("wf-d188-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -13345,6 +13414,8 @@ Broken: Either state is wrong.\n";
             writer.add_directory("docs/", options).unwrap();
             writer.start_file("docs/readme.txt", options).unwrap();
             std::io::Write::write_all(&mut writer, b"read me").unwrap();
+            writer.start_file("docs/second.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"second file").unwrap();
             writer.start_file("docs/sub dir/\u{1F600} emoji.txt", options).unwrap();
             std::io::Write::write_all(&mut writer, b"unicode and spaces").unwrap();
             writer.add_directory("empty-dir/", options).unwrap();
@@ -13354,10 +13425,9 @@ Broken: Either state is wrong.\n";
         let archive_bytes_before = std::fs::read(&archive_path).unwrap();
         let archive_mtime_before = std::fs::metadata(&archive_path).unwrap().modified().unwrap();
 
-        let old_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         let xdg_dir = root.join("xdg-runtime");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", &xdg_dir);
+        let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
 
         let app = adw::Application::builder()
             .application_id("com.kadaken.wayfinder.d188test")
@@ -13436,11 +13506,11 @@ Broken: Either state is wrong.\n";
         // ---- Descend into a nested dir with a space in its name; verify Up pops one segment.
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
-        wait_for("docs children", || state.borrow().visible_entries.len() == 2);
-        assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
+        wait_for("docs children", || names(&state) == vec!["readme.txt", "second.txt", "sub dir"]);
+        assert_eq!(names(&state), vec!["readme.txt", "second.txt", "sub dir"]);
         let sub_entry = state.borrow().visible_entries.iter().find(|e| e.name == "sub dir").cloned().unwrap();
         open_entry(&state, &ui, sub_entry);
-        wait_for("sub dir children", || state.borrow().visible_entries.len() == 1);
+        wait_for("sub dir children", || state.borrow().visible_entries.len() == 1 && state.borrow().visible_entries[0].name == "\u{1F600} emoji.txt");
         assert_eq!(state.borrow().visible_entries[0].name, "\u{1F600} emoji.txt");
         assert!(
             button_labelled(&ui.path_crumbs.clone().upcast(), "sub dir").is_some(),
@@ -13449,8 +13519,8 @@ Broken: Either state is wrong.\n";
 
         let up_to = state.borrow().cwd.parent();
         navigate(&state, up_to);
-        wait_for("up one level", || state.borrow().visible_entries.len() == 2);
-        assert_eq!(names(&state), vec!["readme.txt", "sub dir"]);
+        wait_for("up one level", || names(&state) == vec!["readme.txt", "second.txt", "sub dir"]);
+        assert_eq!(names(&state), vec!["readme.txt", "second.txt", "sub dir"]);
 
         // ---- Every mutation surface refuses with the exact message, fail-closed.
         select_entry_by_source(&state, &ui, &state.borrow().visible_entries[0].source.clone());
@@ -13486,25 +13556,57 @@ Broken: Either state is wrong.\n";
         let cached_file = walk_find_file(&cache_root, "readme.txt").expect("cached readme.txt");
         assert_eq!(std::fs::read(&cached_file).unwrap(), b"read me");
 
-        // ---- Copy Out: lands real files in a real folder with working Undo/Redo.
+        // ---- Copy Out, through the real entry point: the "Copy Out..." item
+        // menu action, with a destination injected in place of a physical
+        // folder chooser (D-188 REJECT 4 picker contract).
         let before_undo_len = state.borrow().undo_stack.len();
-        let out_str = out_dir.to_string_lossy().to_string();
         navigate(&state, up_to_zip_root(&state));
-        wait_for("back at zip root", || state.borrow().visible_entries.len() == 3);
+        wait_for("back at zip root", || names(&state) == vec!["docs", "empty-dir", "zero.bin"]);
         let docs_entry = state.borrow().visible_entries.iter().find(|e| e.name == "docs").cloned().unwrap();
         open_entry(&state, &ui, docs_entry);
-        wait_for("docs children again", || state.borrow().visible_entries.len() == 2);
-        let readme_source = state.borrow().visible_entries.iter().find(|e| e.name == "readme.txt").unwrap().source.clone();
-        select_entry_by_source(&state, &ui, &readme_source);
-        let native_core::EntrySource::ZipMember(native_core::ZipMemberRef { archive, internal, size, crc32 }) = readme_source else {
-            panic!("readme.txt must be a ZipMember row");
-        };
-        copy_zip_members_out_action(state.clone(), ui.clone(), vec![(archive, internal, size, crc32)], out_dir.clone());
-        let _ = &out_str;
-        wait_for("copy out lands on disk", || out_dir.join("readme.txt").is_file());
+        wait_for("docs children again", || names(&state) == vec!["readme.txt", "second.txt", "sub dir"]);
+
+        // ---- Cancelling the chooser starts no job and changes no history or bytes.
+        let readme_index = state.borrow().visible_entries.iter().position(|e| e.name == "readme.txt").unwrap();
+        select_index(&state, &ui, readme_index);
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = None);
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        assert!(!out_dir.join("readme.txt").exists(), "a cancelled chooser copies nothing");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len, "a cancelled chooser adds no history");
+
+        // ---- Select two regular members and copy both out through the menu.
+        select_index(&state, &ui, readme_index);
+        let second_index = state.borrow().visible_entries.iter().position(|e| e.name == "second.txt").unwrap();
+        ui.list_selection.select_item(second_index as u32, false);
+        assert_eq!(selected_entries(&state, &ui).len(), 2, "both regular members are selected");
+
+        ui.window.present();
+        pump();
+        let readme_row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a selected zip row carries the right-click gesture");
+        let readme_entry = state.borrow().visible_entries[readme_index].clone();
+        show_item_context_menu(&readme_row, state.clone(), ui.clone(), readme_entry, 5.0, 5.0);
+        pump();
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(out_dir.clone()));
+        {
+            let menu = popovers_of(&readme_row).pop().expect("the zip item menu");
+            let menu_widget: gtk::Widget = menu.clone().upcast();
+            button_labelled(&menu_widget, "Copy Out...").expect("Copy Out is offered for a regular ZIP selection").emit_clicked();
+        }
+        pump();
+        wait_for("copy out lands on disk", || out_dir.join("readme.txt").is_file() && out_dir.join("second.txt").is_file());
         assert_eq!(std::fs::read(out_dir.join("readme.txt")).unwrap(), b"read me");
-        wait_for("undo stack grew by one", || state.borrow().undo_stack.len() == before_undo_len + 1);
-        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Created { paths }) if paths == &vec![out_dir.join("readme.txt").to_string_lossy().into_owned()]));
+        assert_eq!(std::fs::read(out_dir.join("second.txt")).unwrap(), b"second file");
+        wait_for("undo stack grew by exactly one transaction", || state.borrow().undo_stack.len() == before_undo_len + 1);
+        let mut expected_paths = vec![
+            out_dir.join("readme.txt").to_string_lossy().into_owned(),
+            out_dir.join("second.txt").to_string_lossy().into_owned(),
+        ];
+        expected_paths.sort();
+        assert!(matches!(state.borrow().undo_stack.last(), Some(UndoAction::Created { paths }) if { let mut p = paths.clone(); p.sort(); p == expected_paths }));
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             ui.window
@@ -13515,9 +13617,9 @@ Broken: Either state is wrong.\n";
             pump();
         };
         press(gdk::Key::Z, gdk::ModifierType::CONTROL_MASK);
-        wait_for("undo removes the copied-out file", || !out_dir.join("readme.txt").exists());
+        wait_for("undo removes both copied-out files", || !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists());
         press(gdk::Key::Y, gdk::ModifierType::CONTROL_MASK);
-        wait_for("redo brings it back", || out_dir.join("readme.txt").is_file());
+        wait_for("redo brings both back", || out_dir.join("readme.txt").is_file() && out_dir.join("second.txt").is_file());
 
         // ---- The archive itself was never touched by any of the above.
         assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "archive bytes unchanged");
@@ -13525,11 +13627,6 @@ Broken: Either state is wrong.\n";
 
         ui.window.close();
         pump();
-        match old_xdg {
-            Some(xdg) => std::env::set_var("XDG_RUNTIME_DIR", xdg),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// D-188 bad-ZIP oracles: every rejection the archive-loading path (and,
@@ -13543,10 +13640,10 @@ Broken: Either state is wrong.\n";
         let _cleanup = ScratchCleanup(root.clone());
         std::fs::create_dir_all(&root).unwrap();
 
-        let old_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let _xdg_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
         let xdg_dir = root.join("xdg-runtime");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", &xdg_dir);
+        let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
 
         let stored_options: zip::write::FileOptions<'_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -13679,11 +13776,6 @@ Broken: Either state is wrong.\n";
 
         ui.window.close();
         pump();
-        match old_xdg {
-            Some(xdg) => std::env::set_var("XDG_RUNTIME_DIR", xdg),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     fn up_to_zip_root(state: &Rc<RefCell<AppState>>) -> native_core::Location {
@@ -19632,6 +19724,62 @@ Broken: Either state is wrong.\n";
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Restores `XDG_RUNTIME_DIR` to its exact prior state (present at that
+    /// value, or absent) on drop — including on panic/unwind, unlike a manual
+    /// tail restore that a mid-test assertion failure skips and that then
+    /// leaks a private per-test directory into every test that runs after it
+    /// in the same process. Declare this *after* `ScratchCleanup` in a test so
+    /// Drop's LIFO order restores the env before the scratch root (which may
+    /// hold the private `XDG_RUNTIME_DIR` itself) is deleted.
+    struct XdgRuntimeDirGuard(Option<std::ffi::OsString>);
+    impl XdgRuntimeDirGuard {
+        fn set(value: &std::path::Path) -> Self {
+            let prior = std::env::var_os("XDG_RUNTIME_DIR");
+            std::env::set_var("XDG_RUNTIME_DIR", value);
+            Self(prior)
+        }
+    }
+    impl Drop for XdgRuntimeDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+    }
+
+    /// Serializes every test that mutates the process-wide `XDG_RUNTIME_DIR`
+    /// env var, so two such tests running concurrently (the default test
+    /// harness) cannot observe or restore each other's value.
+    static XDG_RUNTIME_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn xdg_runtime_dir_guard_restores_a_prior_value_through_a_panic_d188() {
+        let _env_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", "/wf-prior-value-marker");
+        let result = std::panic::catch_unwind(|| {
+            let _guard = XdgRuntimeDirGuard::set(std::path::Path::new("/wf-new-value-marker"));
+            assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), "/wf-new-value-marker");
+            panic!("simulated mid-test failure");
+        });
+        assert!(result.is_err());
+        assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), "/wf-prior-value-marker");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+    }
+
+    #[test]
+    fn xdg_runtime_dir_guard_restores_absence_through_a_panic_d188() {
+        let _env_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let result = std::panic::catch_unwind(|| {
+            let _guard = XdgRuntimeDirGuard::set(std::path::Path::new("/wf-new-value-marker"));
+            assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), "/wf-new-value-marker");
+            panic!("simulated mid-test failure");
+        });
+        assert!(result.is_err());
+        assert!(std::env::var_os("XDG_RUNTIME_DIR").is_none());
     }
 
     #[test]
