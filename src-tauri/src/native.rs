@@ -8039,6 +8039,10 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
 /// the whole name selected. Nothing is shown or recorded unless the folder exists.
 fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.clone();
+    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
+        ui.status.set_label(msg);
+        return;
+    }
     run_job(
         state,
         ui,
@@ -8068,6 +8072,10 @@ fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let cwd = state.borrow().cwd.clone();
+    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
+        ui.status.set_label(msg);
+        return;
+    }
     let ui_for_action = ui.clone();
     show_name_dialog(&ui, "New file", "new.txt", NameSelection::StemOnly, move |name| {
         let state = state.clone();
@@ -8092,6 +8100,10 @@ fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let entries = selected_entries(&state, &ui);
+    if entries.iter().any(|e| native_core::zip_read_only_refusal(&e.path).is_some()) {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    }
     if entries.len() > 1 {
         show_batch_rename_dialog(state, ui, entries);
         return;
@@ -8100,6 +8112,10 @@ fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Select one item to rename");
         return;
     };
+    if let Some(msg) = native_core::zip_read_only_refusal(&entry.path) {
+        ui.status.set_label(msg);
+        return;
+    }
     if f2_starts_inline_rename(entries.len(), state.borrow().view_mode) {
         begin_inline_rename(&state, &ui, &entry);
         return;
@@ -8159,6 +8175,10 @@ fn cut_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.status.set_label("Nothing selected");
         return;
     }
+    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    }
     state.borrow_mut().clipboard = Some(FileClipboard {
         mode: ClipboardMode::Cut,
         paths,
@@ -8209,6 +8229,10 @@ struct Transfer {
 /// straight away; a clash asks Replace / Duplicate / Cancel once for the whole
 /// operation, and Cancel starts nothing.
 fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
+    if let Some(msg) = native_core::zip_read_only_refusal(&transfer.dest) {
+        ui.status.set_label(msg);
+        return;
+    }
     if state.borrow().active_transfer.is_some() {
         ui.status.set_label("A transfer is already running");
         return;
@@ -8629,6 +8653,10 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Nothing selected");
         return;
     }
+    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    }
     let count = paths.len();
     run_job(
         state,
@@ -8649,6 +8677,10 @@ fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
     let paths = selected_paths(&state, &ui);
     if paths.is_empty() {
         ui.status.set_label("Nothing selected");
+        return;
+    }
+    if paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some()) {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
     let count = paths.len();
@@ -8869,6 +8901,12 @@ fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         return;
     }
     let cwd = state.borrow().cwd.clone();
+    if native_core::zip_read_only_refusal(&cwd).is_some()
+        || paths.iter().any(|p| native_core::zip_read_only_refusal(p).is_some())
+    {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
+        return;
+    }
     let count = paths.len();
     run_job(
         state,
@@ -8888,6 +8926,10 @@ fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
 /// Extract into a new folder named after the archive, then select it.
 fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
     let cwd = state.borrow().cwd.clone();
+    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
+        ui.status.set_label(msg);
+        return;
+    }
     let stem = native_core::archive_stem(&path);
     run_job(
         state,
@@ -8909,6 +8951,10 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
 
 fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
     let cwd = state.borrow().cwd.clone();
+    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
+        ui.status.set_label(msg);
+        return;
+    }
     run_job(
         state,
         ui,
