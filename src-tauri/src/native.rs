@@ -10319,8 +10319,10 @@ fn show_item_context_menu(
     menu.set_margin_start(4);
 
     // Explorer leads with a strip of icon-only buttons for the actions you reach
-    // for constantly, then the labelled list underneath.
-    {
+    // for constantly, then the labelled list underneath. A ZIP member has no
+    // real path for any of them to act on (D-188 REJECT 2): skip the strip
+    // entirely rather than construct buttons that can only ever refuse.
+    if !entry.source.is_zip() {
         let strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         strip.add_css_class("wf-menu-strip");
         strip.set_homogeneous(true);
@@ -10429,52 +10431,57 @@ fn show_item_context_menu(
     }
 
     menu.append(&context_separator());
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("edit-cut-symbolic", "Cut", "Ctrl+X", &popover, move || {
-            cut_selection(&state, &ui)
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("edit-copy-symbolic", "Copy", "Ctrl+C", &popover, move || {
-            copy_selection(&state, &ui)
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("edit-copy-symbolic", "Copy Paths", "Ctrl+Shift+C", &popover, move || {
-            copy_paths_to_system_clipboard(&state, &ui)
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("edit-paste-symbolic", "Paste", "Ctrl+V", &popover, move || {
-            paste_clipboard(state.clone(), ui.clone())
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        let label = if selected_entries(&state, &ui).len() > 1 {
-            "Batch Rename..."
-        } else {
-            "Rename"
-        };
-        menu.append(&context_button(label, &popover, move || {
-            rename_action(state.clone(), ui.clone())
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("package-symbolic", "Compress to ZIP", "", &popover, move || {
-            compress_selection(state.clone(), ui.clone())
-        }));
+    // Cut/Copy/Copy Paths/Paste/Rename/Compress are all real-path mutation or
+    // staging actions; a ZIP member offers none of them (D-188 REJECT 2) —
+    // only Open and, eventually, Copy Out survive inside a ZIP.
+    if !entry.source.is_zip() {
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("edit-cut-symbolic", "Cut", "Ctrl+X", &popover, move || {
+                cut_selection(&state, &ui)
+            }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("edit-copy-symbolic", "Copy", "Ctrl+C", &popover, move || {
+                copy_selection(&state, &ui)
+            }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("edit-copy-symbolic", "Copy Paths", "Ctrl+Shift+C", &popover, move || {
+                copy_paths_to_system_clipboard(&state, &ui)
+            }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("edit-paste-symbolic", "Paste", "Ctrl+V", &popover, move || {
+                paste_clipboard(state.clone(), ui.clone())
+            }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            let label = if selected_entries(&state, &ui).len() > 1 {
+                "Batch Rename..."
+            } else {
+                "Rename"
+            };
+            menu.append(&context_button(label, &popover, move || {
+                rename_action(state.clone(), ui.clone())
+            }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("package-symbolic", "Compress to ZIP", "", &popover, move || {
+                compress_selection(state.clone(), ui.clone())
+            }));
+        }
     }
     if let Some(path) = entry.source.real_path_string().filter(|p| native_core::is_archive_path(p)) {
         {
@@ -10495,20 +10502,22 @@ fn show_item_context_menu(
         }));
     }
 
-    menu.append(&context_separator());
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
-            trash_selection(state.clone(), ui.clone())
-        }));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("edit-delete-symbolic", "Delete Permanently", "Shift+Delete", &popover, move || {
-            permanent_delete_selection(state.clone(), ui.clone())
-        }));
+    if !entry.source.is_zip() {
+        menu.append(&context_separator());
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
+                trash_selection(state.clone(), ui.clone())
+            }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("edit-delete-symbolic", "Delete Permanently", "Shift+Delete", &popover, move || {
+                permanent_delete_selection(state.clone(), ui.clone())
+            }));
+        }
     }
 
     menu.append(&context_separator());
@@ -10624,7 +10633,11 @@ fn show_background_context_menu(
     menu.set_margin_bottom(4);
     menu.set_margin_start(4);
 
-    {
+    // New and Paste both need a real destination to write into; a ZIP cwd has
+    // none (D-188 REJECT 2) — skip both rather than construct a button that
+    // can only ever refuse.
+    let cwd_is_zip = state.borrow().cwd.is_zip();
+    if !cwd_is_zip {
         let (folder_state, folder_ui) = (state.clone(), ui.clone());
         let (file_state, file_ui) = (state.clone(), ui.clone());
         menu.append(&context_submenu(
@@ -10646,8 +10659,6 @@ fn show_background_context_menu(
                 ),
             ],
         ));
-    }
-    {
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("edit-paste-symbolic", "Paste", "Ctrl+V", &popover, move || {
@@ -10688,7 +10699,7 @@ fn show_background_context_menu(
             show_properties_for_path(ui.clone(), cwd);
         }));
     }
-    {
+    if !cwd_is_zip {
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("utilities-terminal-symbolic", "Open Terminal Here", "", &popover, move || {
@@ -13336,6 +13347,51 @@ Broken: Either state is wrong.\n";
             v
         };
         assert_eq!(names(&state), vec!["docs", "empty-dir", "zero.bin"]);
+
+        // ---- REJECT 2: item and background menus inside a ZIP expose only
+        // navigation/selection/Open, never a real-path mutation action.
+        ui.window.present();
+        pump();
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3))
+        };
+        let zip_row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .expect("a zip row carries the right-click gesture");
+        let zip_item_entry = state.borrow().visible_entries[0].clone();
+        show_item_context_menu(&zip_row, state.clone(), ui.clone(), zip_item_entry, 5.0, 5.0);
+        pump();
+        {
+            let menu = popovers_of(&zip_row).pop().expect("the zip item menu");
+            let menu_widget: gtk::Widget = menu.clone().upcast();
+            for forbidden in [
+                "Cut", "Copy", "Copy Paths", "Paste", "Rename", "Compress to ZIP",
+                "Move to Trash", "Delete Permanently", "Open With", "Properties",
+                "Open Terminal Here", "Add to Favorites", "Remove from Favorites",
+                "Open in New Window",
+            ] {
+                assert!(button_labelled(&menu_widget, forbidden).is_none(), "ZIP item menu must not offer {forbidden}");
+            }
+            assert!(button_labelled(&menu_widget, "Open").is_some(), "ZIP item menu keeps Open");
+            menu.popdown();
+            pump();
+        }
+        show_background_context_menu(&ui.list, state.clone(), ui.clone(), 10.0, 10.0);
+        pump();
+        {
+            let menu = popovers_of(ui.list.upcast_ref()).pop().expect("the zip background menu");
+            let menu_widget: gtk::Widget = menu.clone().upcast();
+            for forbidden in [
+                "New", "Paste", "Properties", "Open Terminal Here",
+                "Add Current Folder to Favorites", "Remove Current Folder from Favorites",
+            ] {
+                assert!(button_labelled(&menu_widget, forbidden).is_none(), "ZIP background menu must not offer {forbidden}");
+            }
+            menu.popdown();
+            pump();
+        }
 
         // ---- Breadcrumbs: the real containing folder, then the archive, with no crumb for it being "current" misleadingly.
         let crumbs_root: gtk::Widget = ui.path_crumbs.clone().upcast();
