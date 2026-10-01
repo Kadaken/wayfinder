@@ -902,6 +902,77 @@ fn remove_if_still_owned(path: &Path, owned_identity: Option<(u64, u64)>) {
     }
 }
 
+/// Parses a candidate stage file's name against the exact grammar
+/// `next_zip_stage_name` generates — `.{prefix}-wf-zip-{pid}-{counter}` —
+/// and returns the embedded PID only on an exact match (D-188 ledger #20):
+/// the leading dot, the last `-wf-zip-` marker (so a `prefix` itself
+/// containing a dash never desyncs the split), and a PID/counter suffix
+/// that is purely numeric on both sides. Anything else, including a name
+/// that merely `contains("-wf-zip-")`, returns `None` and is left alone.
+fn parse_owned_stage_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix('.')?;
+    let marker = "-wf-zip-";
+    let idx = rest.rfind(marker)?;
+    if idx == 0 {
+        return None;
+    }
+    let suffix = &rest[idx + marker.len()..];
+    let (pid_str, counter_str) = suffix.split_once('-')?;
+    if pid_str.is_empty() || counter_str.is_empty() {
+        return None;
+    }
+    if !pid_str.bytes().all(|b| b.is_ascii_digit()) || !counter_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid_str.parse::<u32>().ok()
+}
+
+/// True only when `pid` is confirmed not alive (D-188 ledger #20): `kill(pid,
+/// 0)` sends no signal but fails with `ESRCH` exactly when no such process
+/// exists. Any other outcome, including "alive" or "exists but not ours to
+/// signal" (`EPERM`), must never be treated as dead — a live owner's stage
+/// file must survive.
+#[cfg(unix)]
+fn is_pid_confirmed_dead(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn is_pid_confirmed_dead(_pid: u32) -> bool {
+    false
+}
+
+/// Best-effort removal of this one destination folder's own dead-owner stage
+/// residue (D-188 ledger #20), run immediately before a Copy Out transaction
+/// starts writing into `dest_dir`. Every one of four conditions must hold
+/// before an entry is touched: its name exactly matches the stage grammar
+/// (`parse_owned_stage_pid`); the embedded PID is confirmed dead
+/// (`is_pid_confirmed_dead`); and a symlink-not-following check
+/// (`symlink_metadata`) confirms it is a regular file. Non-recursive, this
+/// one folder only, never a glob wider than the exact grammar. Any read,
+/// stat or remove failure is silently skipped — sweep failure must never
+/// fail the Copy Out it runs ahead of, and no real filename is ever logged.
+fn sweep_dead_owned_zip_stage_files(dest_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dest_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = parse_owned_stage_pid(name) else { continue };
+        if !is_pid_confirmed_dead(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// `after_preflight` runs once every member has passed revalidation and
 /// before anything is staged — the real production call passes a no-op, and
 /// a test passes a closure that creates a destination file at this exact
@@ -918,6 +989,7 @@ fn copy_zip_members_out_inner(
         validate_zip_member_matches(archive_path, member, cancelled)?;
     }
     after_preflight();
+    sweep_dead_owned_zip_stage_files(dest_dir);
 
     let mut stages: Vec<(PathBuf, Option<(u64, u64)>, PathBuf)> = Vec::new();
     for (member, file_name) in members {
