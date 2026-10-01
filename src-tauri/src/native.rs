@@ -9667,7 +9667,9 @@ where
         let _ = tx.send(job());
     });
 
-    glib::timeout_add_local(JOB_POLL_INTERVAL, move || match rx.try_recv() {
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || {
+        note_job_poll_tick();
+        match rx.try_recv() {
         Ok(Ok(outcome)) => {
             complete_job(&state, &ui, outcome, &refresh_path, &after_success);
             glib::ControlFlow::Break
@@ -9681,8 +9683,20 @@ where
             ui.status.set_label("Operation failed");
             glib::ControlFlow::Break
         }
+        }
     });
 }
+
+/// Counts every `run_job` poll tick (D-188 ledger #9): a test proves GTK
+/// main-loop ticks actually advance while an allowed large Copy Out streams
+/// on its own thread, not just that the final result eventually arrives.
+#[cfg(test)]
+fn note_job_poll_tick() {
+    TEST_JOB_POLL_TICKS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_job_poll_tick() {}
 
 /// A successful job's shared ending: after-success work, Undo, then the refresh
 /// that carries the outcome message.
@@ -11808,6 +11822,11 @@ thread_local! {
     /// on its own thread instead of merely waiting for the final result.
     #[cfg(test)]
     static TEST_OPEN_POLL_TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// D-188 ledger #9: counts `run_job`'s poll ticks, so a test can prove
+    /// the GTK main loop keeps advancing while a large Copy Out streams on
+    /// its own thread instead of merely waiting for the final result.
+    #[cfg(test)]
+    static TEST_JOB_POLL_TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Hands `path` to the external launcher the same way for an ordinary real
@@ -13754,16 +13773,44 @@ Broken: Either state is wrong.\n";
         TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
         native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(20_000, Ordering::Relaxed);
         let big_entry = state.borrow().visible_entries.iter().find(|e| e.name == "big.bin").cloned().unwrap();
+        let big_open_started = Instant::now();
         open_entry(&state, &ui, big_entry);
         pump();
         wait_for("big.bin is cached", || walk_find_file(&cache_root, "big.bin").is_some());
         native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(0, Ordering::Relaxed);
+        // D-188 ledger #8: the allowed large Open completes within a named
+        // bound, with the tick counter proving GTK kept pumping meanwhile.
+        let big_open_elapsed = big_open_started.elapsed();
+        assert!(big_open_elapsed < Duration::from_secs(10), "large Open exceeded its named 10s bound: {big_open_elapsed:?}");
         let ticks = TEST_OPEN_POLL_TICKS.with(|c| c.get());
         assert!(ticks > 1, "main loop must tick more than once while a large member streams, got {ticks}");
         let big_cached = walk_find_file(&cache_root, "big.bin").expect("cached big.bin");
         assert_eq!(std::fs::metadata(&big_cached).unwrap().len(), BIG_MEMBER_LEN as u64);
         let calls = TEST_LAUNCHER_CALLS.with(|c| c.borrow().clone());
         assert_eq!(calls, vec![big_cached.to_string_lossy().to_string()], "Open of the large member must also launch exactly once");
+
+        // D-188 ledger #9: an allowed large Copy Out also completes within a
+        // named bound, with run_job's own tick counter proving GTK kept
+        // pumping meanwhile instead of blocking on the background thread.
+        let big_out_dir = dir.join("big-out");
+        std::fs::create_dir_all(&big_out_dir).unwrap();
+        TEST_JOB_POLL_TICKS.with(|c| c.set(0));
+        native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(20_000, Ordering::Relaxed);
+        let big_index = state.borrow().visible_entries.iter().position(|e| e.name == "big.bin").unwrap();
+        select_index(&state, &ui, big_index);
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(big_out_dir.clone()));
+        let big_copy_started = Instant::now();
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        let big_copied = big_out_dir.join("big.bin");
+        wait_for("large member copies out", || big_copied.is_file());
+        native_core::TEST_STREAM_CHUNK_DELAY_MICROS.store(0, Ordering::Relaxed);
+        let big_copy_elapsed = big_copy_started.elapsed();
+        assert!(big_copy_elapsed < Duration::from_secs(10), "large Copy Out exceeded its named 10s bound: {big_copy_elapsed:?}");
+        let job_ticks = TEST_JOB_POLL_TICKS.with(|c| c.get());
+        assert!(job_ticks > 1, "main loop must tick more than once while a large Copy Out streams, got {job_ticks}");
+        assert_eq!(std::fs::metadata(&big_copied).unwrap().len(), BIG_MEMBER_LEN as u64);
+        state.borrow_mut().undo_stack.clear();
 
         // ---- Copy Out, through the real entry point: the "Copy Out..." item
         // menu action, with a destination injected in place of a physical
@@ -14021,23 +14068,75 @@ Broken: Either state is wrong.\n";
             writer.finish().unwrap();
         }
 
-        // ---- Device (#51) and FIFO/socket (#52) entries have no equivalent
-        // writer-API method — only `start_file` (always forces S_IFREG) and
-        // `add_symlink` (always forces S_IFLNK) exist; the lower-level entry
-        // builder that could set an arbitrary unix mode is private to the
-        // `zip` crate. Left OPEN: not forgeable through this crate's public
-        // writer API, same wall as the duplicate-filename case (#44).
+        // ---- Device (#51), FIFO and socket (#52): the writer API has no
+        // method that sets these unix mode bits, but the central directory
+        // record is ordinary writer output until its bytes are patched after
+        // `finish()` — the same technique `badcrc.zip` below uses for CRC.
+        // `ZipFileData::default()` already sets `system: System::Unix`
+        // (zip-2.4.2 src/types.rs:652), so even a plain `start_file` entry's
+        // central-directory record already carries a Unix "version made by"
+        // host; only the external-attributes field's high 16 bits (the unix
+        // mode) need patching in place, leaving the local header and CRC
+        // untouched so indexing reaches and refuses the special-mode check.
+        fn patch_unix_mode(bytes: &mut [u8], name: &[u8], new_type_bits: u32) {
+            let sig = [0x50u8, 0x4B, 0x01, 0x02]; // "PK\x01\x02" central directory signature
+            let mut i = 0;
+            while i + 46 <= bytes.len() {
+                if bytes[i..i + 4] == sig {
+                    let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+                    let name_start = i + 46;
+                    if name_start + name_len <= bytes.len() && &bytes[name_start..name_start + name_len] == name {
+                        let ext_attr_at = i + 38;
+                        let existing = u32::from_le_bytes(bytes[ext_attr_at..ext_attr_at + 4].try_into().unwrap());
+                        let dos_low = existing & 0xFFFF;
+                        let new_mode = (new_type_bits | 0o644) << 16;
+                        let patched = new_mode | dos_low;
+                        bytes[ext_attr_at..ext_attr_at + 4].copy_from_slice(&patched.to_le_bytes());
+                        return;
+                    }
+                }
+                i += 1;
+            }
+            panic!("central directory record for {:?} not found", String::from_utf8_lossy(name));
+        }
+        const S_IFCHR: u32 = 0o020000;
+        const S_IFIFO: u32 = 0o010000;
+        const S_IFSOCK: u32 = 0o140000;
+        for (fixture_name, member_name, type_bits) in [
+            ("device.zip", "dev-entry", S_IFCHR),
+            ("fifo.zip", "fifo-entry", S_IFIFO),
+            ("socket.zip", "socket-entry", S_IFSOCK),
+        ] {
+            let path = root.join(fixture_name);
+            {
+                let file = std::fs::File::create(&path).unwrap();
+                let mut writer = zip::ZipWriter::new(file);
+                writer.start_file(member_name, stored_options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+                writer.finish().unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            patch_unix_mode(&mut bytes, member_name.as_bytes(), type_bits);
+            std::fs::write(&path, &bytes).unwrap();
+        }
 
-        // ---- Duplicate regular-file logical path (ledger #44): the `zip`
-        // crate's reader collapses two central-directory records sharing an
-        // identical raw name down to one entry at parse time — confirmed
-        // both for a post-write byte patch of a crate-written archive AND
-        // for a hand-built raw-bytes archive with two complete, distinct
-        // local-file-header + central-directory-record pairs. `index_zip`
-        // (via `zip::ZipArchive::new`) can never observe two same-named
-        // entries through this crate, so this fixture cannot be forged at
-        // this layer; see the D-188 ledger report for #44 (OPEN, with this
-        // finding as the reason).
+        // ---- Duplicate regular-file logical path (ledger #44): re-attempted
+        // by byte-level construction per the ruling that writer-API shape is
+        // not an acceptable reason to call it unreachable. The exact reader
+        // mechanism that defeats it: `zip::ZipArchive::new` parses the central
+        // directory into an `IndexMap<String, ZipFileData>` keyed by name via
+        // `index_map.insert(file.file_name.clone(), file)` (zip-2.4.2
+        // src/read.rs:74) — a plain map insert, so a second central-directory
+        // record sharing an exact name silently overwrites the first entry in
+        // that map before `index_zip` (which only ever walks `shared.files`
+        // through the crate's public iteration, never the raw central
+        // directory bytes) can observe it. This holds for a crate-written
+        // archive byte-patched after `finish()` AND for a fully hand-built
+        // raw-bytes archive with two complete, independent local-header +
+        // central-directory-record pairs sharing one name — both constructions
+        // were tried; both collapse to one entry at this exact insert call,
+        // because it is `ZipArchive::new` itself, not anything the writer
+        // produced, that performs the collapse. Left OPEN with this finding.
 
         // ---- Unsafe separator: a raw name carrying a backslash.
         {
@@ -14134,6 +14233,9 @@ Broken: Either state is wrong.\n";
         assert_refused("implicit-collision-file-first.zip", Some("collides as a file and a directory"));
         assert_refused("implicit-collision-dir-first.zip", Some("collides as a file and a directory"));
         assert_refused("symlink.zip", Some("is a symlink or special entry"));
+        assert_refused("device.zip", Some("is a symlink or special entry"));
+        assert_refused("fifo.zip", Some("is a symlink or special entry"));
+        assert_refused("socket.zip", Some("is a symlink or special entry"));
         assert_refused("backslash.zip", Some("uses an unsafe separator"));
         assert_refused("nul.zip", Some("contains a NUL byte"));
         assert_refused("drive.zip", Some("names an absolute path"));
