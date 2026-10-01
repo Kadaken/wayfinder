@@ -8106,11 +8106,11 @@ fn open_zip_member(ui: &Ui, archive: &Path, internal: &str, display_name: &str) 
 /// create a real numbered folder, then open the shared inline editor on it with
 /// the whole name selected. Nothing is shown or recorded unless the folder exists.
 fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let cwd = state.borrow().cwd.to_path_string();
-    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
-        ui.status.set_label(msg);
+    if state.borrow().cwd.is_zip() {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let cwd = state.borrow().cwd.to_path_string();
     run_job(
         state,
         ui,
@@ -8139,11 +8139,11 @@ fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let cwd = state.borrow().cwd.to_path_string();
-    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
-        ui.status.set_label(msg);
+    if state.borrow().cwd.is_zip() {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let cwd = state.borrow().cwd.to_path_string();
     let ui_for_action = ui.clone();
     show_name_dialog(&ui, "New file", "new.txt", NameSelection::StemOnly, move |name| {
         let state = state.clone();
@@ -9013,11 +9013,11 @@ fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         ui.status.set_label("Nothing selected");
         return;
     }
-    let cwd = state.borrow().cwd.to_path_string();
-    if native_core::zip_read_only_refusal(&cwd).is_some() || entries.iter().any(|e| e.source.is_zip()) {
+    if state.borrow().cwd.is_zip() || entries.iter().any(|e| e.source.is_zip()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let cwd = state.borrow().cwd.to_path_string();
     let paths: Vec<String> = entries.into_iter().map(|e| e.source.to_path_string()).collect();
     let count = paths.len();
     run_job(
@@ -9037,11 +9037,11 @@ fn compress_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 /// Extract into a new folder named after the archive, then select it.
 fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
-    let cwd = state.borrow().cwd.to_path_string();
-    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
-        ui.status.set_label(msg);
+    if state.borrow().cwd.is_zip() {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let cwd = state.borrow().cwd.to_path_string();
     let stem = native_core::archive_stem(&path);
     run_job(
         state,
@@ -9093,11 +9093,11 @@ fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: V
 }
 
 fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
-    let cwd = state.borrow().cwd.to_path_string();
-    if let Some(msg) = native_core::zip_read_only_refusal(&cwd) {
-        ui.status.set_label(msg);
+    if state.borrow().cwd.is_zip() {
+        ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    let cwd = state.borrow().cwd.to_path_string();
     run_job(
         state,
         ui,
