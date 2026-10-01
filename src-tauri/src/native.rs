@@ -14675,6 +14675,30 @@ Broken: Either state is wrong.\n";
             "a bad-CRC member leaves no cached file"
         );
 
+        // D-188 ledger #37: Copy Out of the same bad-CRC member also
+        // refuses, through the real production transaction path, with
+        // no bytes published and no history or stage residue left behind.
+        let badcrc_out_dir = root.join("badcrc-out");
+        std::fs::create_dir_all(&badcrc_out_dir).unwrap();
+        select_index(&state, &ui, 0);
+        let before_undo_len_37 = state.borrow().undo_stack.len();
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(badcrc_out_dir.clone()));
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        wait_for("bad-CRC Copy Out refuses boundedly", || {
+            ui.status.label().starts_with("Copy Out failed:") || ui.status.label().starts_with("Operation failed")
+        });
+        assert!(!badcrc_out_dir.join("member.txt").exists(), "D-188 #37: a refused bad-CRC Copy Out must publish nothing");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len_37, "D-188 #37: a refused bad-CRC Copy Out adds no history");
+        let badcrc_leftovers: Vec<_> = std::fs::read_dir(&badcrc_out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-wf-zip-"))
+            .collect();
+        assert!(badcrc_leftovers.is_empty(), "D-188 #37: no owned stage residue may survive a refused bad-CRC Copy Out, found {badcrc_leftovers:?}");
+
         // D-188 REJECT 7: stale-list proof. The archive backing an already-
         // listed row vanishes from disk after it was indexed; re-activating
         // that now-stale row must surface a bounded "Cannot open" error, not
