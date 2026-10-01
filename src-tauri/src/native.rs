@@ -13922,6 +13922,33 @@ Broken: Either state is wrong.\n";
             writer.finish().unwrap();
         }
 
+        // ---- Implicit ancestor collision, explicit file first (ledger #48):
+        // "c" is declared as a regular file, then "c/d.txt" implies "c" must
+        // also be a directory — collision via the ancestor-reservation walk,
+        // not a second explicit directory entry.
+        {
+            let file = std::fs::File::create(root.join("implicit-collision-file-first.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("c", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.start_file("c/d.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // ---- Implicit ancestor collision, directory reservation first
+        // (ledger #49): "e/f.txt" reserves "e" as a directory implicitly,
+        // then an explicit file "e" collides with that reservation.
+        {
+            let file = std::fs::File::create(root.join("implicit-collision-dir-first.zip")).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer.start_file("e/f.txt", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.start_file("e", stored_options).unwrap();
+            std::io::Write::write_all(&mut writer, b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
         // ---- Duplicate regular-file logical path (ledger #44): the `zip`
         // crate's reader collapses two central-directory records sharing an
         // identical raw name down to one entry at parse time — confirmed
@@ -14025,6 +14052,8 @@ Broken: Either state is wrong.\n";
         assert_refused("duplicate.zip", Some("duplicates another entry's path"));
         assert_refused("collision.zip", Some("collides as a file and a directory"));
         assert_refused("collision-reverse.zip", Some("collides as a file and a directory"));
+        assert_refused("implicit-collision-file-first.zip", Some("collides as a file and a directory"));
+        assert_refused("implicit-collision-dir-first.zip", Some("collides as a file and a directory"));
         assert_refused("backslash.zip", Some("uses an unsafe separator"));
         assert_refused("nul.zip", Some("contains a NUL byte"));
         assert_refused("drive.zip", Some("names an absolute path"));
