@@ -13664,6 +13664,14 @@ Broken: Either state is wrong.\n";
         wait_for("sub dir children", || state.borrow().visible_entries.len() == 1 && state.borrow().visible_entries[0].name == "\u{1F600} emoji.txt");
         assert_eq!(state.borrow().visible_entries[0].name, "\u{1F600} emoji.txt");
 
+        // D-188 ledger #5: browsing and navigating alone — entering the zip
+        // root, descending into docs and sub dir — must not extract the
+        // whole archive to disk: no cache directory is created, and the
+        // archive file on disk is byte-for-byte unchanged, before any Open.
+        let xdg_cache_root_before_open = xdg_dir.join("wayfinder-zip-cache");
+        assert!(!xdg_cache_root_before_open.exists(), "browsing alone must create no cache directory");
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes_before, "browsing must not touch the archive's bytes on disk");
+
         // D-188 ledger #3: a Unicode+space member name must Open and Copy
         // Out with the exact bytes, not just list and navigate correctly.
         TEST_LAUNCHER_CALLS.with(|c| c.borrow_mut().clear());
