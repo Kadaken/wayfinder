@@ -1336,6 +1336,15 @@ pub struct TrashReceipt {
     pub selector: String,
 }
 
+/// `trash_paths_exact` identifies its new receipt by diffing the real
+/// `Trash/files` directory before/after; any other test trashing something to
+/// the SAME real Trash at the same moment makes that diff ambiguous. Every
+/// test across the crate that calls `trash_paths_exact` on the real Trash
+/// must hold this for its whole run, serializing those tests against each
+/// other under cargo's parallel runner.
+#[cfg(test)]
+pub static REAL_TRASH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn trash_files_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     Ok(Path::new(&home).join(".local/share/Trash/files"))
@@ -1677,7 +1686,6 @@ pub enum Fingerprint {
 /// into `Stop::Cancelled` so a cancel is never mistaken for a disk failure.
 const CANCELLED_MSG: &str = "transfer cancelled";
 
-#[cfg(any(test))]
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
@@ -1750,7 +1758,6 @@ fn hash_tree(
     Ok(())
 }
 
-#[cfg(any(test))]
 pub fn fingerprint(path: &str) -> Result<Fingerprint, String> {
     fingerprint_c(path, &NEVER_CANCELLED)
 }
@@ -4037,6 +4044,12 @@ mod tests {
         //
         // Must live on the real $HOME filesystem: GIO refuses to trash from tmpfs
         // ("system internal mounts"), so /tmp cannot exercise this path.
+        //
+        // Also serialized against the other real-Trash tests: it doesn't rely on
+        // a before/after diff itself, but trashing into the shared real Trash
+        // concurrently with a test that does (trash_paths_exact) would corrupt
+        // that other test's diff.
+        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4088,6 +4101,7 @@ mod tests {
         // each restore to their own exact payload, never "newest by original
         // path" (that heuristic is what `restore_from_trash` uses and is exactly
         // the bug this gate exists to prove fixed for Redo).
+        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
