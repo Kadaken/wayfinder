@@ -13860,14 +13860,54 @@ Broken: Either state is wrong.\n";
         open_entry(&state, &ui, docs_entry);
         wait_for("docs children again", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
 
-        // ---- Cancelling the chooser starts no job and changes no history or bytes.
+        // D-188 ledger #12: Copy Out selection eligibility rejects empty,
+        // directory-only and mixed selections, starting no job either way.
+        let sub_dir_index = state.borrow().visible_entries.iter().position(|e| e.name == "sub dir").unwrap();
         let readme_index = state.borrow().visible_entries.iter().position(|e| e.name == "readme.txt").unwrap();
+
+        ui.list_selection.unselect_all();
+        ui.status.set_label("");
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(out_dir.clone()));
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        assert_eq!(ui.status.label(), "Select one or more files inside the ZIP to copy out", "an empty selection must be refused without opening a chooser");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len, "an empty selection adds no history");
+
+        select_index(&state, &ui, sub_dir_index);
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        assert_eq!(ui.status.label(), "Select one or more files inside the ZIP to copy out", "a directory-only selection must be refused");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len, "a directory-only selection adds no history");
+
+        select_index(&state, &ui, readme_index);
+        ui.list_selection.select_item(sub_dir_index as u32, false);
+        ui.status.set_label("");
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        assert_eq!(ui.status.label(), "Select one or more files inside the ZIP to copy out", "a mixed file+directory selection must be refused");
+        assert!(!out_dir.join("readme.txt").exists(), "a refused mixed selection copies nothing");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len, "a mixed selection adds no history");
+
+        // ---- Cancelling the chooser starts no job and changes no history or bytes.
         select_index(&state, &ui, readme_index);
         TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = None);
         copy_out_action(state.clone(), ui.clone());
         pump();
         assert!(!out_dir.join("readme.txt").exists(), "a cancelled chooser copies nothing");
         assert_eq!(state.borrow().undo_stack.len(), before_undo_len, "a cancelled chooser adds no history");
+
+        // D-188 ledger #13: a destination that fails the folder check (not a
+        // real directory) also starts no job and leaves no history or residue.
+        select_index(&state, &ui, readme_index);
+        let not_a_dir = dir.join("not-a-real-folder.txt");
+        std::fs::write(&not_a_dir, b"not a folder").unwrap();
+        TEST_COPY_OUT_DESTINATION.with(|d| *d.borrow_mut() = Some(not_a_dir.clone()));
+        copy_out_action(state.clone(), ui.clone());
+        pump();
+        assert!(!out_dir.join("readme.txt").exists(), "a failing destination copies nothing");
+        assert_eq!(std::fs::read(&not_a_dir).unwrap(), b"not a folder", "a failing destination must not be touched");
+        assert_eq!(state.borrow().undo_stack.len(), before_undo_len, "a failing destination adds no history");
 
         // ---- Select two regular members and copy both out through the menu.
         select_index(&state, &ui, readme_index);
