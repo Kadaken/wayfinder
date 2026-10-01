@@ -14909,7 +14909,7 @@ Broken: Either state is wrong.\n";
         open_and_expect_ok(&state, &ui, &dir55, "atlimit.zip");
         open_and_expect_refused(&state, &ui, &dir55, "over.zip", "archive has too many entries");
 
-        // ---- #57: name length. max_name_len tightened to 8.
+        // ---- #56: name length. max_name_len tightened to 8.
         native_core::set_test_zip_limits(Some(native_core::ZipLimits { max_name_len: 8, ..native_core::DEFAULT_ZIP_LIMITS }));
         let dir57 = group_dir("g57-namelen");
         for (fixture, name) in [("below.zip", "a.txt"), ("atlimit.zip", "abcde.tx"), ("over.zip", "abcdef.txt")] {
@@ -14924,7 +14924,7 @@ Broken: Either state is wrong.\n";
         open_and_expect_ok(&state, &ui, &dir57, "atlimit.zip");
         open_and_expect_refused(&state, &ui, &dir57, "over.zip", "has too long a name");
 
-        // ---- #58: per-entry claimed bytes. max_entry_claimed_bytes
+        // ---- #57: per-entry claimed bytes. max_entry_claimed_bytes
         // tightened to 50; the fixture's declared and real content lengths
         // are the same actual bytes (no field patch needed), so this group
         // never also exercises #59's streamed-bytes check.
@@ -14942,7 +14942,7 @@ Broken: Either state is wrong.\n";
         open_and_expect_ok(&state, &ui, &dir58, "atlimit.zip");
         open_and_expect_refused(&state, &ui, &dir58, "over.zip", "is too large");
 
-        // ---- #56: total claimed bytes across the whole archive.
+        // ---- #58: total claimed bytes across the whole archive.
         // max_total_claimed_bytes tightened to 100, each fixture carrying
         // two equal-size members so their declared sum lands exactly
         // below/at/over.
