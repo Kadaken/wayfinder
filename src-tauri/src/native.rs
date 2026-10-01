@@ -14153,6 +14153,42 @@ Broken: Either state is wrong.\n";
         navigate(&state, docs_location_before_swap);
         wait_for("back inside docs after the swap proofs", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
 
+        // D-188 ledger #30/#31: ZIP rows construct no drag source
+        // controller and no mutation drop target. A real sibling row, by
+        // contrast, constructs both, proving the inspection below can
+        // actually detect either controller when one is present.
+        ui.window.present();
+        pump();
+        let has_drag_source = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::DragSource>().ok()).is_some())
+        };
+        let has_drop_target = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::DropTarget>().ok()).is_some())
+        };
+        let zip_rows: Vec<gtk::Widget> = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .filter(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .collect();
+        assert!(!zip_rows.is_empty(), "D-188 #30/#31: the zip listing must carry rows to inspect");
+        for row in &zip_rows {
+            assert!(!has_drag_source(row), "D-188 #30: a ZIP row must construct no drag source controller");
+            assert!(!has_drop_target(row), "D-188 #31: a ZIP row must construct no mutation drop target");
+        }
+        let docs_location_for_contrast = state.borrow().cwd.clone();
+        navigate(&state, native_core::Location::real(dir.clone()));
+        wait_for("back at the real folder for the drag/drop contrast", || state.borrow().visible_entries.iter().any(|e| e.name == "swap"));
+        ui.window.present();
+        pump();
+        all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .filter(|w| w.is::<gtk::Box>() && has_right_click(w))
+            .find(|w| has_drag_source(w) && has_drop_target(w))
+            .expect("D-188 #30/#31: a real directory row must carry both a drag source and a drop target, proving the inspection can detect either");
+        navigate(&state, docs_location_for_contrast);
+        wait_for("back inside docs after the drag/drop contrast", || names(&state) == vec!["big.bin", "readme.txt", "second.txt", "sub dir"]);
+
         // D-188 ledger #15/#19: a pre-existing destination conflict refuses
         // without overwrite, and leaves no job/history/stage residue.
         let conflict_dir = dir.join("conflict-out");
