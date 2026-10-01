@@ -22,7 +22,7 @@ const VIDEO_EXT: [&str; 12] = [
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
-    pub location: Location,
+    pub source: EntrySource,
     pub is_dir: bool,
     pub size: u64,
     pub modified: i64,
@@ -255,7 +255,7 @@ pub fn zip_read_only_refusal(path: &str) -> Option<&'static str> {
 /// to revalidate the archive before Open/Copy act on it (D-188): a stale or
 /// changed archive must be caught before a row from it reaches the
 /// filesystem, not after.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ZipMemberRef {
     pub archive: PathBuf,
     pub internal: String,
@@ -265,15 +265,47 @@ pub struct ZipMemberRef {
 /// pseudo-path so a ZIP member can never reach a real-filesystem-only API
 /// (picker, preview, launcher, drag, rename, trash) by accident: `Real`
 /// converts explicitly to `PathBuf`, `ZipMember` never does.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EntrySource {
     Real(PathBuf),
     ZipMember(ZipMemberRef),
 }
 
 impl EntrySource {
+    pub fn real(path: impl Into<PathBuf>) -> Self {
+        Self::Real(path.into())
+    }
+
+    pub fn zip_member(archive: impl Into<PathBuf>, internal: impl Into<String>) -> Self {
+        Self::ZipMember(ZipMemberRef { archive: archive.into(), internal: internal.into() })
+    }
+
     pub fn is_zip(&self) -> bool {
         matches!(self, Self::ZipMember(_))
+    }
+
+    /// Encodes this source as the `String` the still-string-typed plumbing
+    /// (GTK drag payloads, the rename/picker/launcher call sites) carries.
+    /// Round-trips exactly through `Location::parse`.
+    pub fn to_path_string(&self) -> String {
+        self.to_location().to_path_string()
+    }
+
+    pub fn display_string(&self) -> String {
+        self.to_location().display_string()
+    }
+
+    /// The browse-state `Location` this row would navigate to if it is a
+    /// directory. Only `to_path_string`/`display_string`/navigation use
+    /// this; a real-filesystem-only API must match on `EntrySource` itself
+    /// instead, so a ZIP member can't reach it through this conversion.
+    pub fn to_location(&self) -> Location {
+        match self {
+            Self::Real(path) => Location::RealDir(path.clone()),
+            Self::ZipMember(ZipMemberRef { archive, internal }) => {
+                Location::ZipDir { archive: archive.clone(), internal: internal.clone() }
+            }
+        }
     }
 }
 
@@ -690,12 +722,12 @@ pub fn zip_dir_children(archive: &Path, index: &[ZipIndexEntry], internal: &str)
         .map(|(name, (is_dir, size))| {
             let fake_path = Path::new(&name);
             let child_internal = if internal.is_empty() { name.clone() } else { format!("{internal}/{name}") };
-            let location = Location::ZipDir { archive: archive.to_path_buf(), internal: child_internal };
+            let source = EntrySource::zip_member(archive.to_path_buf(), child_internal);
             Entry {
                 icon: icon_name(fake_path, is_dir).to_string(),
                 is_image: is_image(fake_path),
                 name,
-                location,
+                source,
                 is_dir,
                 size,
                 modified: 0,
@@ -883,7 +915,7 @@ fn entry_from_dirent(ent: &fs::DirEntry) -> (Entry, bool) {
     (
         Entry {
             name,
-            location: Location::real(path_buf.clone()),
+            source: EntrySource::real(path_buf.clone()),
             is_dir,
             size,
             modified,
@@ -1042,7 +1074,7 @@ pub fn search_dir(
             if matched {
                 out.push(Entry {
                     name,
-                    location: Location::real(path.clone()),
+                    source: EntrySource::real(path.clone()),
                     is_dir,
                     size: md.len(),
                     modified: md
@@ -3280,7 +3312,7 @@ pub fn properties(path: &str) -> Result<FileProperties, String> {
 }
 
 pub fn entry_summary(entry: &Entry) -> String {
-    let display_path = entry.location.display_string();
+    let display_path = entry.source.display_string();
     if entry.is_dir {
         return format!("Folder\n{display_path}");
     }
@@ -3680,13 +3712,13 @@ pub fn classify_refresh(current: &[Entry], scanned: &[Entry]) -> RefreshKind {
     if current.len() != scanned.len() {
         return RefreshKind::Structural;
     }
-    let by_path: std::collections::HashMap<&Location, &Entry> =
-        current.iter().map(|entry| (&entry.location, entry)).collect();
+    let by_path: std::collections::HashMap<&EntrySource, &Entry> =
+        current.iter().map(|entry| (&entry.source, entry)).collect();
     if by_path.len() != current.len() {
         return RefreshKind::Structural;
     }
     for new in scanned {
-        let Some(old) = by_path.get(&new.location) else {
+        let Some(old) = by_path.get(&new.source) else {
             return RefreshKind::Structural;
         };
         if old.name != new.name
@@ -3783,7 +3815,7 @@ mod tests {
     fn refresh_entry(path: &str, size: u64, modified: i64) -> Entry {
         Entry {
             name: path.rsplit('/').next().unwrap().to_string(),
-            location: Location::real(path),
+            source: EntrySource::real(path),
             is_dir: false,
             size,
             modified,
@@ -5409,11 +5441,11 @@ mod tests {
 
         let name_hits = search_dir(dir.to_str().unwrap(), "needle", false, false).unwrap();
         assert_eq!(name_hits.len(), 1);
-        assert_eq!(name_hits[0].location, Location::real(&hit));
+        assert_eq!(name_hits[0].source, EntrySource::real(&hit));
 
         let content_hits = search_dir(dir.to_str().unwrap(), "content only", true, false).unwrap();
         assert_eq!(content_hits.len(), 1);
-        assert_eq!(content_hits[0].location, Location::real(&miss));
+        assert_eq!(content_hits[0].source, EntrySource::real(&miss));
 
         fs::remove_dir_all(dir).unwrap();
     }
