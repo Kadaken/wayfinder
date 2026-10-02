@@ -662,7 +662,10 @@ impl<A: Adapter> Sitting<A> {
 
 // ---- GTK4 adapter (adapter one) --------------------------------------------
 
-use super::{guide_apply, guide_claimed_by, guide_descriptor_path, ui_for_state, unregister_window, AppState, GuideRequest};
+use super::{
+    guide_alias_target, guide_apply, guide_claimed_by, guide_descriptor_path, guide_painted_targets,
+    guide_resolve_tag, ui_for_state, unregister_window, AppState, GuideRequest,
+};
 use adw::gtk;
 use adw::prelude::*;
 use adw::gtk::{gdk, glib};
@@ -1797,6 +1800,16 @@ fn invoke_refuse(reply_path: &Path, nonce: &str, widget: &str, why: &str) {
     let _ = atomic_write(reply_path, &body.to_string());
 }
 
+// D-197 test seam: when set, `invoke_tick` strips the painted circle class
+// off this target right after the real clicked signal fires and before its
+// own post-click readback runs, so a test can prove that readback -- not
+// `card.marked`, the label or the step tag -- is what decides success.
+// Always `None` outside tests; production never sets it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static GUIDE_RIP_PAINT_AFTER_CLICK: RefCell<Option<glib::WeakRef<gtk::Widget>>> = const { RefCell::new(None) };
+}
+
 /// One poll tick of the D-196 invoke protocol. Reads at most one request from
 /// `invoke_path`, consumes it immediately so it is never replayed by being
 /// re-read, and replies atomically beside it. Never calls `CardUi::point` or
@@ -1839,7 +1852,7 @@ fn invoke_tick(cell: &SittingCell, token: &str, invoke_path: &Path, seen_nonces:
     // cause a second activation even if the first reply was lost.
     seen_nonces.borrow_mut().insert(nonce.clone());
 
-    let setup = with_sitting(cell, |s| -> Result<(gtk::Button, usize), String> {
+    let setup = with_sitting(cell, |s| -> Result<(gtk::Button, usize, String), String> {
         if !s.is_open() || !s.live() {
             return Err("descriptor/ack/live verification failed; nothing was written".into());
         }
@@ -1862,9 +1875,45 @@ fn invoke_tick(cell: &SittingCell, token: &str, invoke_path: &Path, seen_nonces:
             .iter()
             .position(|st| st.show.as_ref() == Some(&button))
             .ok_or_else(|| format!("{widget} names no step; nothing was written"))?;
-        Ok((button, idx))
+        let tag = card.steps[idx].tag.clone();
+
+        // D-197 preflight, gate one: the step's tag must resolve to exactly
+        // one live, correctly-named, mapped, visible widget in the bound app
+        // window -- the same window the card is attached to, never the card
+        // window itself. Nothing here mutates `guide_pending`, `guide_target`,
+        // `guide_visual` or the app guide request file.
+        let state = s.adapter.state.upgrade().ok_or_else(|| "app state gone; nothing was written".to_string())?;
+        let app_window: gtk::Widget = s.adapter.window.clone().upcast();
+        let expected_name = guide_alias_target(&tag);
+        let expected = guide_resolve_tag(&app_window, &tag)
+            .ok_or_else(|| format!("{tag} does not resolve to exactly one live widget; nothing was written"))?;
+        if expected.widget_name() != expected_name {
+            return Err(format!("{tag} resolved to the wrong widget name; nothing was written"));
+        }
+        if !expected.is_mapped() || !expected.is_visible() {
+            return Err(format!("{tag} is not mapped and visible; nothing was written"));
+        }
+        if !expected.is_ancestor(&app_window) {
+            return Err(format!("{tag} does not belong to the bound window; nothing was written"));
+        }
+
+        // D-197 preflight, gate two: an integrity check on the paint state
+        // already standing before this press. Zero painted targets is only
+        // honest when no visual is currently drawn either; one painted target
+        // is only honest when it is exactly the visual's own upgraded target.
+        // Anything else (stale, foreign, mismatched, multiple) refuses before
+        // the button is ever touched.
+        let visual_before = state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade());
+        let painted_before = guide_painted_targets(&app_window);
+        match (painted_before.len(), &visual_before) {
+            (0, None) => {}
+            (1, Some(t)) if painted_before[0] == *t => {}
+            _ => return Err(format!("{tag}'s paint state is not clean before the press; nothing was written")),
+        }
+
+        Ok((button, idx, expected_name))
     });
-    let (button, idx) = match setup {
+    let (button, idx, expected_name) = match setup {
         Some(Ok(v)) => v,
         Some(Err(why)) => {
             invoke_refuse(&reply_path, &nonce, &widget, &why);
@@ -1882,6 +1931,15 @@ fn invoke_tick(cell: &SittingCell, token: &str, invoke_path: &Path, seen_nonces:
     // re-enters `with_sitting` on the same cell.
     button.emit_clicked();
 
+    // D-197 test seam only: corrupts the real paint the instant after the
+    // real clicked signal fired, so the post-click readback gate below is
+    // proved to be what actually decides success, never `card.marked`, the
+    // label or the step tag. Production takes no action here outside tests.
+    #[cfg(test)]
+    if let Some(target) = GUIDE_RIP_PAINT_AFTER_CLICK.with(|r| r.borrow_mut().take()).and_then(|w| w.upgrade()) {
+        target.remove_css_class("wf-guide-circle");
+    }
+
     let outcome = with_sitting(cell, |s| -> Result<(String, String), String> {
         let card = s.adapter.card.clone().ok_or_else(|| "no card is open; nothing was written".to_string())?;
         if card.marked.get() != Some(idx) {
@@ -1891,7 +1949,36 @@ fn invoke_tick(cell: &SittingCell, token: &str, invoke_path: &Path, seen_nonces:
         if label != "Showing in the app" {
             return Err(format!("the ring did not confirm (label was \"{label}\"); nothing was written"));
         }
-        Ok((label, card.steps[idx].tag.clone()))
+
+        // D-197 post-click readback, the gate that actually decides success:
+        // never inferred from `card.marked`, the button label or the step
+        // tag above, all of which remain additional facts, not substitutes.
+        // Independently re-reads the bound window's own visual and paint
+        // state right now and requires the exact same proof the preflight
+        // demanded of the pre-press state, this time of the post-press one.
+        let state = s.adapter.state.upgrade().ok_or_else(|| "app state gone; nothing was written".to_string())?;
+        let app_window: gtk::Widget = s.adapter.window.clone().upcast();
+        let visual_target = state
+            .borrow()
+            .guide_visual
+            .as_ref()
+            .and_then(|v| v.target.upgrade())
+            .ok_or_else(|| "no painted target after the press; nothing was written".to_string())?;
+        if visual_target.widget_name() != expected_name {
+            return Err("the painted target's name does not match the invoked step; nothing was written".into());
+        }
+        if !visual_target.is_mapped() || !visual_target.is_visible() {
+            return Err("the painted target is not mapped and visible after the press; nothing was written".into());
+        }
+        if !visual_target.is_ancestor(&app_window) {
+            return Err("the painted target left the bound window; nothing was written".into());
+        }
+        let painted_after = guide_painted_targets(&app_window);
+        if painted_after.len() != 1 || painted_after[0] != visual_target {
+            return Err("the press did not leave exactly one sole painted target; nothing was written".into());
+        }
+
+        Ok((label, visual_target.widget_name().to_string()))
     });
     match outcome {
         Some(Ok((label, target))) => {
