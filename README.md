@@ -338,11 +338,20 @@ cargo build --release --manifest-path src-tauri/Cargo.toml
 scripts/install-daily.sh <change-label> src-tauri/target/release/wayfinder-native
 ```
 
-**Hard rule: no daily replacement without a verified rollback copy first.**
+**Hard rule: no daily replacement without an explicitly authorized identity
+and a verified rollback copy first.** The candidate's SHA-256 must equal the
+single identity in `scripts/daily-approved.sha256`; changing that tracked pin
+requires matching `scripts/daily-approved.authorization` text from the
+Coordinator naming the accepted commit and SHA-256. Only the Coordinator moves
+those two records, in writing, after acceptance runs; a guide, card or sitting
+round never changes them or installs the daily. The production approval cannot
+be overridden by a flag or environment variable, and every identity refusal
+names the candidate and pin and confirms that no file or rollback was written.
 `scripts/install-daily.sh` saves the current `~/.local/bin/wayfinder` as
 `wayfinder.pre-<change-label>-<old-short-sha>`, verifies it, and only then
 swaps in the new binary atomically. Never copy over the daily by hand. Its
-fixture tests are `scripts/test-install-daily.sh`.
+fixture tests are `scripts/test-install-daily.sh`. Guide builds are installed
+under their own round-specific names and never through this installer.
 
 The `--features native` flag is gone: GTK is no longer optional, because there
 is no other shell to build. The old `npm run native:build` script is gone too —
