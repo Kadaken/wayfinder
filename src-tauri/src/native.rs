@@ -10571,7 +10571,7 @@ fn show_item_context_menu(
     if entry.source.is_zip() && eligible_zip_members_for_copy_out(&selected_entries(&state, &ui)).is_some() {
         let state = state.clone();
         let ui = ui.clone();
-        menu.append(&context_item("document-save-symbolic", "Copy Out...", "", &popover, move || {
+        menu.append(&context_item("document-save-symbolic", "Copy to...", "", &popover, move || {
             copy_out_action(state.clone(), ui.clone())
         }));
         #[cfg(feature = "guide")]
@@ -14127,7 +14127,7 @@ Broken: Either state is wrong.\n";
         {
             let menu = popovers_of(&readme_row).pop().expect("the zip item menu");
             let menu_widget: gtk::Widget = menu.clone().upcast();
-            button_labelled(&menu_widget, "Copy Out...").expect("Copy Out is offered for a regular ZIP selection").emit_clicked();
+            button_labelled(&menu_widget, "Copy to...").expect("Copy Out is offered for a regular ZIP selection").emit_clicked();
         }
         pump();
         wait_for("copy out lands on disk", || out_dir.join("readme.txt").is_file() && out_dir.join("second.txt").is_file());
@@ -17549,7 +17549,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(all_widgets(&menu_widget).into_iter().filter(|w| w.widget_name() == "zip-member-open").count(), 1, "exactly one zip-member-open target");
         assert_eq!(all_widgets(&menu_widget).into_iter().filter(|w| w.widget_name() == "zip-copy-out").count(), 1, "exactly one zip-copy-out target");
         assert!(button_labelled(&menu_widget, "Open").is_some());
-        assert!(button_labelled(&menu_widget, "Copy Out...").is_some());
+        assert!(button_labelled(&menu_widget, "Copy to...").is_some());
         menu.popdown();
         pump();
         assert!(all_widgets(ui.window.upcast_ref()).into_iter().all(|w| w.widget_name() != "zip-member-open" && w.widget_name() != "zip-copy-out"), "both targets go with the popover");
