@@ -618,6 +618,13 @@ impl<A: Adapter> Sitting<A> {
             return Some(false);
         }
         if action == "back" {
+            let expected = json!({"schema": "checkrun-back/1", "nonce": nonce,
+                                  "restored": true});
+            if reply["back_receipt"] != expected {
+                self.error = "checkrun did not prove that the start was restored".into();
+                self.clear_exchange();
+                return Some(false);
+            }
             self.clear_exchange();
             return Some(true);
         }
@@ -1160,7 +1167,7 @@ impl CardUi {
             return;
         }
         let began = with_sitting(&self.cell, |s| {
-            if s.begin("back", &json!([])) { Ok(()) } else { Err(s.error.clone()) }
+            if s.begin("back", &self.results(false)) { Ok(()) } else { Err(s.error.clone()) }
         });
         match began {
             Some(Ok(())) => {
@@ -1180,12 +1187,8 @@ impl CardUi {
             let Some(ok) = r else { return glib::ControlFlow::Continue };
             ui.busy.set(false);
             if action == "back" {
-                let says = ui.payload["way_back"]["says"].as_str().unwrap_or("").to_string();
-                ui.back_says.set_text(if ok { "Putting it back. Give it a few seconds." } else { &err });
-                if ok {
-                    let ui2 = ui.clone();
-                    glib::timeout_add_local_once(Duration::from_secs(6), move || ui2.back_says.set_text(&says));
-                }
+                ui.back_says.set_text(if ok { "Back at the start." } else { &err });
+                if !ok { ui.back.set_sensitive(false); }
             } else if !ok {
                 ui.submit.set_sensitive(true);
                 ui.say(&err);
@@ -1668,6 +1671,14 @@ impl Adapter for GtkAdapter {
             return Err(format!("{control} is not in the guide registry"));
         }
         guide_apply(&state, GuideRequest::Known { name: control.into(), label: String::new() });
+        if state.borrow().guide_visual.is_none() {
+            guide_apply(&state, GuideRequest::Clear);
+            return Err(match control {
+                "transfer-cancel" => "Cancel appears only while a copy is running. Start the copy first.",
+                "transfer-progress" => "Copy progress appears only while a copy is running. Start the copy first.",
+                _ => "That control is not on screen yet.",
+            }.into());
+        }
         Ok(())
     }
 
@@ -2231,6 +2242,38 @@ mod protocol_tests {
         assert_eq!(record(&r)["lifecycle"], "submitted");
         assert_eq!((calls(&r, "close_card"), calls(&r, "close_app")), (1, 1));
         assert!(no_temp_files(&r));
+    }
+
+    #[test]
+    fn back_requires_nonce_bound_restored_receipt_and_keeps_pair_open() {
+        let (r, mut s) = rig("back-proof");
+        s.open().unwrap();
+        assert!(s.begin("back", &json!([])));
+        let n = nonce(&r);
+        fs::write(
+            side_path(&r.dir.join("desc.json"), "reply"),
+            json!({"nonce": n, "ok": true, "back_receipt": {
+                "schema": "checkrun-back/1", "nonce": n, "restored": true
+            }}).to_string(),
+        ).unwrap();
+        assert_eq!(s.poll(), Some(true));
+        assert_eq!((calls(&r, "close_card"), calls(&r, "close_app")), (0, 0));
+        assert!(s.is_open());
+    }
+
+    #[test]
+    fn back_bare_ok_is_not_proof() {
+        let (r, mut s) = rig("back-bare-ok");
+        s.open().unwrap();
+        assert!(s.begin("back", &json!([])));
+        let n = nonce(&r);
+        fs::write(
+            side_path(&r.dir.join("desc.json"), "reply"),
+            json!({"nonce": n, "ok": true}).to_string(),
+        ).unwrap();
+        assert_eq!(s.poll(), Some(false));
+        assert!(s.error.contains("did not prove"));
+        assert_eq!((calls(&r, "close_card"), calls(&r, "close_app")), (0, 0));
     }
 
     #[test]

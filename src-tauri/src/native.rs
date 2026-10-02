@@ -12882,7 +12882,7 @@ Broken: nothing opens.\n\
 - Right-click: a.txt\n\
 Works: a side menu opens.\n\
 Broken: no menu.\n\
-3. Type \"ls -la\" and it lists files.\n\
+3. Type \"ls -la\" and it lists files. [#transfer-cancel]\n\
 - Type: \"ls -la\"\n\
 - Press: Enter\n\
 Works: files listed.\n\
@@ -13112,7 +13112,14 @@ Broken: error.\n";
         assert!(find(card.upcast_ref(), "guide-card-step-4").is_none());
         assert!(find(card.upcast_ref(), "guide-card-show-1").is_some());
         assert!(find(card.upcast_ref(), "guide-card-show-2").is_some());
-        assert!(find(card.upcast_ref(), "guide-card-show-3").is_none(), "untagged step has no Show me where");
+        assert!(find(card.upcast_ref(), "guide-card-show-3").is_some());
+        button(&card, "guide-card-show-3").emit_clicked();
+        pump();
+        assert_eq!(button(&card, "guide-card-show-3").label().as_deref(), Some("Show me where"),
+                   "an invisible control never reports that it is showing");
+        assert!(label_text(&card, "guide-card-notice").contains(
+            "Cancel appears only while a copy is running. Start the copy first."));
+        assert!(s3.state.borrow().guide_visual.is_none(), "an invisible target paints no ring");
         let all_text: String = {
             fn texts(w: &gtk::Widget, out: &mut String) {
                 if let Ok(l) = w.clone().downcast::<gtk::Label>() {
