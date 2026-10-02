@@ -13413,6 +13413,29 @@ Broken: nothing happens.\n";
         assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
             "unmapped/invisible-leg refusal left the app guide request untouched");
 
+        // D-198B: unmapped-only leg. The target's own `visible` property
+        // stays true while a real ancestor is hidden, so this proves the
+        // preflight checks the target's ordered, ancestor-aware mapped
+        // state rather than inferring it from the target's own flag.
+        let target1_parent = target1.parent().expect("target1 has a real ancestor to hide");
+        target1_parent.set_visible(false);
+        pump();
+        assert!(target1.get_visible() && !target1.is_mapped(),
+            "the target's own visible flag stays true while the hidden ancestor leaves it unmapped");
+        let before = click_count.get();
+        let unmapped_only = invoke_press(&invoke_path, "tok-invoke", "nonce-10b", "guide-card-show-1");
+        target1_parent.set_visible(true);
+        pump();
+        assert_eq!(unmapped_only["ok"], false, "{unmapped_only}");
+        assert!(unmapped_only.get("target").is_none(), "an unmapped-only refusal never claims a target");
+        assert!(unmapped_only["error"].as_str().unwrap().contains("mapped and visible"));
+        assert!(unmapped_only["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(click_count.get(), before, "an unmapped-only refusal never reached the real button's clicked signal");
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "unmapped-only refusal left the app guide request untouched");
+        assert!(target1.is_mapped() && target1.is_visible(),
+            "the target returns mapped and visible once its ancestor is restored");
+
         // Leg 4: a second marked target in the same window. toolbar-undo is
         // still the one real painted target from nonce-2; forcing the circle
         // class onto a second, unrelated widget makes the pre-press paint
@@ -13927,6 +13950,53 @@ Broken: Either state is wrong.\n";
         card.close();
         wait_for("abandon closed both", || cards().is_empty() && !s5.ui.window.is_visible());
         finish_child(s5, 3);
+
+        // ---- Sitting six (D-198A): stage-one Back durable-answer proof
+        // through the real attached GTK card. The dedicated companion first
+        // checks the canonical progress file already carries this exact
+        // answer and note -- proving the durable write happened before the
+        // companion ever ran -- then refuses with the Coordinator-approved
+        // sentence. Back disables; the card and app stay open; nothing
+        // false is claimed. ----
+        let s6 = open_sitting("six", checklist_text);
+        let card = wait_card();
+        wait_for("card on the left edge", || adjacent(&s6.ui.window, &card));
+        click_radio(&toggle(&card, "guide-card-broken-1"));
+        set_notes(&card, 1, "d198 note");
+        pump();
+        let progress6 = cl.join("six_PROGRESS.md");
+        let answers6 = cl.join("six_ANSWERS.md");
+        let back6 = cl.join("six_START.sh");
+        std::fs::write(&back6, format!(
+            "#!/bin/bash\n# Back to: the start.\n\
+             grep -q '1. BROKEN' '{p}' || {{ echo 'CHECKRUN_BACK_ERROR: progress file missing the real verdict' >&2; exit 1; }}\n\
+             grep -q 'd198 note' '{p}' || {{ echo 'CHECKRUN_BACK_ERROR: progress file missing the real note' >&2; exit 1; }}\n\
+             echo 'CHECKRUN_BACK_ERROR: Starting over is not available yet. Your answers are saved, and this card and the app are still open.' >&2\n\
+             exit 1\n",
+            p = progress6.display(),
+        )).unwrap();
+        std::fs::set_permissions(&back6, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!progress6.exists(), "progress file does not exist before Back is pressed");
+        let back_before = button(&card, "guide-card-back").is_sensitive();
+        assert!(back_before, "Back starts sensitive");
+        button(&card, "guide-card-back").emit_clicked();
+        const APPROVED: &str = "Starting over is not available yet. Your answers are saved, and this card and the app are still open.";
+        wait_for("Back answered", || label_text(&card, "guide-card-back-says") == APPROVED);
+        assert_eq!(label_text(&card, "guide-card-back-says"), APPROVED);
+        assert!(!label_text(&card, "guide-card-back-says").contains("installed"));
+        assert!(!label_text(&card, "guide-card-back-says").contains("sitting"));
+        assert!(!button(&card, "guide-card-back").is_sensitive(), "Back alone disables on refusal");
+        assert!(find(card.upcast_ref(), "guide-card-submit").map(|w| w.is_sensitive()).unwrap_or(true),
+            "Submit is not disabled by a Back refusal");
+        assert!(card.is_visible() && s6.ui.window.is_visible(), "card and app stay open on refusal");
+        let saved6 = std::fs::read_to_string(&progress6).expect("progress file is durable before the companion ran");
+        assert!(saved6.contains("1. BROKEN") && saved6.contains("d198 note"),
+            "the durable progress file carries the real verdict and note: {saved6}");
+        assert!(!answers6.exists(), "no answer file is created by a Back refusal");
+        assert!(!root.join("back-six").exists(), "no restart receipt is created by a refused Back");
+        card.close();
+        wait_for("abandon closed both", || cards().is_empty() && !s6.ui.window.is_visible());
+        finish_child(s6, 4);
 
         dui.window.destroy();
         for k in ["WF_GUIDE_DESCRIPTOR", "WF_GUIDE_VERIFIER", "CHECKRUN_NO_HANDOFF", "CHECKRUN_WAIT_APP", "CHECKRUN_COPY_CMD", "CHECKRUN_SHOT_CMD"] {
