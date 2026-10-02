@@ -2095,6 +2095,40 @@ fn guide_waits_for_open_file(state: &Rc<RefCell<AppState>>) -> bool {
     matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_OPEN_FILE)
 }
 
+/// D-194: the ordinary row for a real `.zip` file, the one used to browse into it
+/// as a read-only folder. Any real, non-directory `.zip` entry qualifies; a ZIP
+/// member row (already inside an archive) never does.
+#[cfg(feature = "guide")]
+const GUIDE_ZIP_ROW: &str = "zip-archive-row";
+
+#[cfg(feature = "guide")]
+fn guide_is_zip_archive_row(entry: &Entry) -> bool {
+    let Some(path) = entry.source.real_path() else { return false };
+    !entry.is_dir
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+#[cfg(feature = "guide")]
+fn guide_waits_for_zip_row(state: &Rc<RefCell<AppState>>) -> bool {
+    matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == GUIDE_ZIP_ROW)
+}
+
+#[cfg(feature = "guide")]
+fn guide_resolve_zip_row_later(state: &Rc<RefCell<AppState>>) {
+    if !guide_waits_for_zip_row(state) {
+        return;
+    }
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        if guide_waits_for_zip_row(&state) {
+            guide_resolve(&state);
+        }
+    });
+}
+
 /// One post-layout resolve after the fixture item binds or goes away: the item is allocated only
 /// after its view lays out. Nothing runs when the pending request is not this one.
 #[cfg(feature = "guide")]
@@ -3042,6 +3076,25 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         guide_name(&terminal, "terminal-here-folder");
         guide_name(&trash, "trash-and-restore-file");
         guide_name(&rename, "rename-in-place");
+        guide_name(&transfer_bar, "transfer-progress");
+        guide_name(&transfer_cancel, "transfer-cancel");
+        guide_name(&undo, "toolbar-undo");
+        guide_name(&redo, "toolbar-redo");
+        // These two start invisible and only map once a transfer begins; nothing else
+        // re-triggers a paint for a static (non-row) target when its visibility changes.
+        // Guarded on the pending name so an unrelated test's transfer doesn't disturb
+        // whatever other guide target is currently resolved.
+        for (w, key) in [
+            (transfer_bar.clone().upcast::<gtk::Widget>(), "transfer-progress"),
+            (transfer_cancel.clone().upcast::<gtk::Widget>(), "transfer-cancel"),
+        ] {
+            let state = state.clone();
+            w.connect_map(move |_| {
+                if matches!(&state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == key) {
+                    guide_resolve(&state);
+                }
+            });
+        }
     }
     let details_view = gtk::ToggleButton::builder()
         .icon_name("view-list-symbolic")
@@ -3577,6 +3630,20 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         select_entry_by_source(&state, &ui, &native_core::EntrySource::real(target));
     }
 
+    #[cfg(feature = "guide")]
+    {
+        let state = state.clone();
+        let this_window = ui.window.clone();
+        // A raw destroy() (as opposed to the real close-request path, which already
+        // calls this) left the WINDOWS entry and guide visual behind. Only react to
+        // this window closing, not any transient dialog the app also owns.
+        app.connect_window_removed(move |_, w| {
+            if w == &this_window {
+                unregister_window(&state);
+            }
+        });
+    }
+
     ui.window.present();
 }
 
@@ -4019,6 +4086,11 @@ fn details_header() -> (gtk::Box, ColumnSizing) {
     header.append(&kind);
     header.append(&resizers[2]);
     header.append(&modified);
+    // D-194: no separate Size/Type/Modified group exists without rebuilding/reparenting
+    // the header, which the default build must not do; name the already-built header
+    // itself for the one arrow this binds.
+    #[cfg(feature = "guide")]
+    guide_name(&header, "details-columns");
     (header, sizing)
 }
 
@@ -6990,6 +7062,11 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             guide_name(&line, GUIDE_OPEN_FILE);
             guide_resolve_open_file_later(&state);
         }
+        #[cfg(feature = "guide")]
+        if guide_is_zip_archive_row(&entry) {
+            guide_name(&line, GUIDE_ZIP_ROW);
+            guide_resolve_zip_row_later(&state);
+        }
         item.set_child(Some(&line));
     });
     factory.connect_unbind(move |_, item| {
@@ -7035,6 +7112,13 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             // The visual's label is parented to this row: drop it before the row goes.
             guide_unpaint(&state_for_unbind);
             guide_resolve_open_file_later(&state_for_unbind);
+        }
+        #[cfg(feature = "guide")]
+        if guide_waits_for_zip_row(&state_for_unbind)
+            && item.child().is_some_and(|c| c.widget_name() == GUIDE_ZIP_ROW)
+        {
+            guide_unpaint(&state_for_unbind);
+            guide_resolve_zip_row_later(&state_for_unbind);
         }
         item.set_child(None::<&gtk::Widget>);
     });
@@ -7185,6 +7269,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             #[cfg(feature = "guide")]
             if guide_is_open_file_fixture(&entry) {
                 guide_name(&grid_child, GUIDE_OPEN_FILE);
+            }
+            #[cfg(feature = "guide")]
+            if guide_is_zip_archive_row(&entry) {
+                guide_name(&grid_child, GUIDE_ZIP_ROW);
             }
             let grid_item = gtk::Box::new(gtk::Orientation::Vertical, 4);
             grid_item.add_css_class("wf-grid-item");
@@ -10467,10 +10555,18 @@ fn show_item_context_menu(
     {
         let state = state.clone();
         let ui = ui.clone();
+        #[cfg(feature = "guide")]
+        let is_zip_member_open = entry.source.is_zip() && !entry.is_dir;
         let entry = entry.clone();
         menu.append(&context_item("document-open-symbolic", "Open", "", &popover, move || {
             open_entry(&state, &ui, entry.clone())
         }));
+        #[cfg(feature = "guide")]
+        if is_zip_member_open {
+            if let Some(open_item) = menu.last_child() {
+                guide_name(&open_item, "zip-member-open");
+            }
+        }
     }
     if entry.source.is_zip() && eligible_zip_members_for_copy_out(&selected_entries(&state, &ui)).is_some() {
         let state = state.clone();
@@ -10478,6 +10574,10 @@ fn show_item_context_menu(
         menu.append(&context_item("document-save-symbolic", "Copy Out...", "", &popover, move || {
             copy_out_action(state.clone(), ui.clone())
         }));
+        #[cfg(feature = "guide")]
+        if let Some(copy_out_item) = menu.last_child() {
+            guide_name(&copy_out_item, "zip-copy-out");
+        }
     }
     if entry.is_dir {
         let state = state.clone();
@@ -15720,6 +15820,12 @@ Broken: Either state is wrong.\n";
         guide_open_file_item_d75();
         #[cfg(feature = "guide")]
         guide_crucial_back_d77();
+        #[cfg(feature = "guide")]
+        guide_details_columns_d194();
+        #[cfg(feature = "guide")]
+        guide_toolbar_and_transfer_targets_d194b();
+        #[cfg(feature = "guide")]
+        guide_zip_targets_d194c();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         {
             let root = crate::native_core::scratch_root().join(format!("wf-d80-{}", std::process::id()));
@@ -17153,6 +17259,303 @@ Broken: Either state is wrong.\n";
 
         ui.window.destroy();
         TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+    }
+
+    /// D-194: the arrow on the one real Details-header region spanning Size/Type/Modified.
+    /// Static, always-eligible (unlike D-77/D-76), so this proves exactly one bound window,
+    /// correct arrow identity, unchanged header/list geometry, and full clear/close teardown.
+    #[cfg(feature = "guide")]
+    fn guide_details_columns_d194() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d194-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let fixture = root.join("fixture");
+        let gdir = root.join("guide");
+        for d in [&home, &fixture, &gdir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(fixture.join("a.txt"), "x").unwrap();
+        std::fs::write(fixture.join("b.txt"), "yy").unwrap();
+        std::env::set_var("HOME", &home);
+        let file = gdir.join("wayfinder.json");
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d194test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        install_app_css();
+        build_ui(&app, Some(fixture.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() >= 2);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let put = |name: &str, label: &str| {
+            let tmp = gdir.join("wayfinder.json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || state.borrow().guide_pending == want);
+            pump();
+        };
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let by_name = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+        let label_pops = || -> Vec<gtk::Popover> {
+            tree().into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).filter(|p| p.has_css_class("wf-guide-label")).collect()
+        };
+        let geometry = || (ui.window.width(), ui.window.height(), ui.sidebar.width(), ui.files_stack.width(), ui.files_stack.height());
+        let before = geometry();
+        let label = "Size, Type and Modified";
+
+        // No other window of this run gets marked: a second, unbound app instance ignores the file.
+        put("details-columns", label);
+        wait_for("one bound target", || by_name("details-columns").len() == 1 && label_pops().len() == 1);
+        let names = by_name("details-columns");
+        let marked = guide_marked(tree());
+        assert_eq!((names.len(), marked.len()), (1, 1), "exactly one real target, one visual");
+        assert_eq!(names[0], marked[0], "the named region is the marked one");
+        assert!(names[0].is_mapped(), "the Size/Type/Modified region is mapped in Details view");
+        let header_box = names[0].clone().downcast::<gtk::Box>().expect("a plain Box, no geometry change");
+        assert!(header_box.first_child().is_some(), "the box still parents Size/Type/Modified");
+        let pop = &label_pops()[0];
+        assert!(pop.has_css_class("wf-guide-arrow") && !pop.can_target() && !pop.can_focus(), "arrow mark, non-interactive");
+        let shown = all_widgets(pop.upcast_ref()).iter().find_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.label().to_string()));
+        assert_eq!(shown.as_deref(), Some(label), "exact label text");
+        assert_eq!(geometry(), before, "Details header/list geometry is unchanged by the mark");
+        assert!(state.borrow().visible_entries.iter().any(|e| e.name == "a.txt"), "Size/Type/Modified row values are present");
+
+        // Clear removes the visual and the name stays resolvable but unmarked.
+        put("", "");
+        assert!(guide_marked(tree()).is_empty() && label_pops().is_empty(), "clear left a visual");
+        assert!(state.borrow().guide_visual.is_none(), "clear left visual state");
+        assert_eq!(geometry(), before, "geometry unchanged after clear");
+
+        // Re-request, then a window close tears the whole visual down with it.
+        put("details-columns", label);
+        wait_for("rebound", || label_pops().len() == 1);
+        ui.window.destroy();
+        pump();
+        assert!(label_pops().is_empty(), "destroying the window leaves no label popover behind");
+
+        TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+    }
+
+    /// D-194: the four static toolbar/transfer targets. `toolbar-undo`/`toolbar-redo` are
+    /// always-mapped real buttons; `transfer-progress`/`transfer-cancel` are the real bar and
+    /// Cancel button, named at construction but only mapped while a transfer is actually live —
+    /// the ring must appear exactly then and nowhere else, with no change to the controls'
+    /// normal visibility, sensitivity or click routing.
+    #[cfg(feature = "guide")]
+    fn guide_toolbar_and_transfer_targets_d194b() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d194b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, src, dest) = (root.join("home"), root.join("src"), root.join("dest"));
+        for d in [&home, &src, &dest] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let bytes: Vec<u8> = vec![0x5Au8; 3 * 1024 * 1024];
+        std::fs::write(src.join("big.bin"), &bytes).unwrap();
+        let slow = root.join("slowcp.sh");
+        std::fs::write(
+            &slow,
+            "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
+             while [ $i -lt 3 ]; do\n\
+             dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
+             i=$((i+1)); sleep 0.2; done\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let file = root.join("guide").join("wayfinder.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::env::set_var("WF_GUIDE_FILE", &file);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d194btest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dest.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dest.to_string_lossy());
+        pump();
+
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let put = |name: &str, label: &str| {
+            let tmp = file.with_extension("json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &file).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || state.borrow().guide_pending == want);
+            pump();
+        };
+        let tree = || all_widgets(ui.window.upcast_ref());
+        let by_name = |n: &str| -> Vec<gtk::Widget> { tree().into_iter().filter(|w| w.widget_name() == n).collect() };
+
+        // Undo/Redo: real, always-mapped toolbar buttons. Exactly one of each, click
+        // routing untouched (neither has a guide-only click hook; D-194 only names them).
+        for (key, tip) in [("toolbar-undo", "Undo"), ("toolbar-redo", "Redo")] {
+            put(key, "shown");
+            let names = by_name(key);
+            assert_eq!(names.len(), 1, "exactly one {key} target");
+            let button = names[0].clone().downcast::<gtk::Button>().expect("a real button");
+            assert_eq!(button.tooltip_text().as_deref(), Some(tip), "{key} names the real {tip} button");
+            wait_for("ring paints on a visible target", || !guide_marked(tree()).is_empty());
+            put("", "");
+        }
+
+        // transfer-progress / transfer-cancel: unmapped at rest, so no ring; only
+        // paints once a real transfer makes the bar/Cancel visible, and clears when it ends.
+        assert!(!ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible(), "at rest before the transfer");
+        put("transfer-progress", "copy progress");
+        assert!(guide_marked(tree()).is_empty(), "no ring on an unmapped progress bar");
+
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
+        run_transfer(
+            state.clone(),
+            ui.clone(),
+            Transfer { srcs: vec![src.join("big.bin")], dest: dest.clone(), is_copy: true, clear_cut_after: false, style: TransferStyle::Paste },
+            native_core::PasteConflict::KeepBoth,
+        );
+        wait_for("bar and Cancel become visible", || ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible());
+        assert_eq!(by_name("transfer-progress").len(), 1, "exactly one transfer-progress target once live");
+        assert!(by_name("transfer-progress")[0].clone().downcast::<gtk::ProgressBar>().is_ok(), "the real progress bar");
+        wait_for("ring paints once the bar is mapped", || !guide_marked(tree()).is_empty());
+
+        put("transfer-cancel", "cancel");
+        assert_eq!(by_name("transfer-cancel").len(), 1, "exactly one transfer-cancel target once live");
+        let cancel_button = by_name("transfer-cancel")[0].clone().downcast::<gtk::Button>().expect("the real Cancel button");
+        assert!(cancel_button.is_sensitive(), "Cancel stays sensitive while named");
+        wait_for("ring paints on the live Cancel", || !guide_marked(tree()).is_empty());
+        // Clicking Cancel still routes to the real handler: the transfer actually cancels.
+        cancel_button.emit_clicked();
+        wait_for("transfer ends after the real Cancel click", || state.borrow().active_transfer.is_none());
+        wait_for("controls hide at rest again", || !ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible());
+        wait_for("the ring clears once its target is unmapped again", || guide_marked(tree()).is_empty());
+
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_env {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+    }
+
+    /// D-194: the three ZIP targets. `zip-archive-row` names only the real `.zip` file's own
+    /// row, never a decoy real file or a member row once browsed inside; `zip-member-open` and
+    /// `zip-copy-out` name only the real context-menu buttons built for an eligible regular
+    /// member inside an open ZIP, and disappear with the popover.
+    #[cfg(feature = "guide")]
+    fn guide_zip_targets_d194c() {
+        let old_env = std::env::var("WF_GUIDE_FILE").ok();
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d194c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("decoy.txt"), "not a zip").unwrap();
+        let archive_path = dir.join("fixture.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("member.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"inside the zip").unwrap();
+            writer.finish().unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let gfile = root.join("guide").join("wayfinder.json");
+        std::fs::create_dir_all(gfile.parent().unwrap()).unwrap();
+        std::env::set_var("WF_GUIDE_FILE", &gfile);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d194ctest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing the real folder", || state.borrow().visible_entries.len() == 2);
+        pump();
+
+        let by_name = |n: &str| -> Vec<gtk::Widget> { all_widgets(ui.window.upcast_ref()).into_iter().filter(|w| w.widget_name() == n).collect() };
+        wait_for("exactly one zip-archive-row target, never the decoy", || by_name("zip-archive-row").len() == 1);
+        assert!(by_name("zip-archive-row")[0].is_mapped(), "the archive row is mapped");
+
+        // ---- Browse into the archive: the row name must not survive the navigation.
+        let zip_entry = state.borrow().visible_entries.iter().find(|e| e.name == "fixture.zip").cloned().unwrap();
+        open_entry(&state, &ui, zip_entry);
+        wait_for("inside the zip root", || state.borrow().cwd.is_zip());
+        wait_for("zip root children", || state.borrow().visible_entries.len() == 1);
+        pump();
+        assert!(by_name("zip-archive-row").is_empty(), "no stale archive-row target once inside the zip");
+
+        let member_entry = state.borrow().visible_entries[0].clone();
+        assert_eq!(member_entry.name, "member.txt");
+        assert!(member_entry.source.is_zip() && !member_entry.is_dir);
+        ui.list_selection.select_item(0, true);
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>())
+            .expect("the member's row widget");
+        show_item_context_menu(&row, state.clone(), ui.clone(), member_entry.clone(), 5.0, 5.0);
+        pump();
+        let menu = popovers_of(&row).pop().expect("the member context menu");
+        let menu_widget: gtk::Widget = menu.clone().upcast();
+        assert_eq!(all_widgets(&menu_widget).into_iter().filter(|w| w.widget_name() == "zip-member-open").count(), 1, "exactly one zip-member-open target");
+        assert_eq!(all_widgets(&menu_widget).into_iter().filter(|w| w.widget_name() == "zip-copy-out").count(), 1, "exactly one zip-copy-out target");
+        assert!(button_labelled(&menu_widget, "Open").is_some());
+        assert!(button_labelled(&menu_widget, "Copy Out...").is_some());
+        menu.popdown();
+        pump();
+        assert!(all_widgets(ui.window.upcast_ref()).into_iter().all(|w| w.widget_name() != "zip-member-open" && w.widget_name() != "zip-copy-out"), "both targets go with the popover");
+
+        ui.window.destroy();
+        pump();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
@@ -19000,7 +19403,7 @@ Broken: Either state is wrong.\n";
     fn guide_target_names_are_exact_d50() {
         let registry: serde_json::Value = serde_json::from_str(include_str!("guide-names.json")).unwrap();
         let keys: Vec<String> = registry.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 17);
+        assert_eq!(keys.len(), 25);
         let old_env = std::env::var("WF_GUIDE_FILE").ok();
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d50-{}", std::process::id()));
@@ -19055,7 +19458,19 @@ Broken: Either state is wrong.\n";
             assert_eq!((b.is_focusable(), b.can_target()), (twin.is_focusable(), twin.can_target()));
             assert_eq!(b.width(), toolbar_button("Copy")[0].width(), "naming moved nothing");
         }
-        assert_eq!(named(ui.window.upcast_ref()), vec!["rename-in-place", "terminal-here-folder", "trash-and-restore-file"]);
+        assert_eq!(
+            named(ui.window.upcast_ref()),
+            vec![
+                "details-columns",
+                "rename-in-place",
+                "terminal-here-folder",
+                "toolbar-redo",
+                "toolbar-undo",
+                "transfer-cancel",
+                "transfer-progress",
+                "trash-and-restore-file",
+            ]
+        );
 
         // Open With: the real connected opener in the item menu.
         let has_right_click = |w: &gtk::Widget| {
@@ -19158,6 +19573,11 @@ Broken: Either state is wrong.\n";
         // "alias" field to the real "trash-and-restore-file" button, which
         // is already covered above.
         seen.insert("delete-speed".to_string());
+        // D-194: no .zip fixture exists in this folder and no member menu is opened here;
+        // those three are covered by their own focused guide tests.
+        seen.insert("zip-archive-row".to_string());
+        seen.insert("zip-member-open".to_string());
+        seen.insert("zip-copy-out".to_string());
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), { let mut k = keys.clone(); k.sort(); k }, "every registry key is either on its own real control or a covered alias");
         for w in all_widgets(sidebar_row.upcast_ref()) {
             assert!(!keys.contains(&w.widget_name().to_string()) || w.is::<gtk::Popover>() || w.is::<gtk::Button>(), "the sidebar row is not named");

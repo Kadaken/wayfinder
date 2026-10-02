@@ -6339,6 +6339,7 @@ mod tests {
             keys,
             [
                 "delete-speed",
+                "details-columns",
                 "drive-eject-stick",
                 "drive-mounted-again-crucial",
                 "drive-open-crucial",
@@ -6354,7 +6355,14 @@ mod tests {
                 "open-with-other-app",
                 "rename-in-place",
                 "terminal-here-folder",
+                "toolbar-redo",
+                "toolbar-undo",
+                "transfer-cancel",
+                "transfer-progress",
                 "trash-and-restore-file",
+                "zip-archive-row",
+                "zip-copy-out",
+                "zip-member-open",
             ]
         );
         for (name, entry) in obj {
@@ -6380,13 +6388,28 @@ mod tests {
         let mut circles: Vec<&str> =
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("circle")).map(|(k, _)| k.as_str()).collect();
         circles.sort_unstable();
-        assert_eq!(circles, ["delete-speed", "open-file-other-app", "rename-in-place", "terminal-here-folder", "trash-and-restore-file"], "the toolbar entries and the fixture file item choose circle");
+        assert_eq!(
+            circles,
+            [
+                "delete-speed",
+                "open-file-other-app",
+                "rename-in-place",
+                "terminal-here-folder",
+                "toolbar-redo",
+                "toolbar-undo",
+                "transfer-cancel",
+                "trash-and-restore-file",
+                "zip-archive-row",
+            ],
+            "the toolbar entries and the fixture file item choose circle"
+        );
         let mut arrows: Vec<&str> =
             obj.iter().filter(|(_, e)| e["mark"].as_str() == Some("arrow")).map(|(k, _)| k.as_str()).collect();
         arrows.sort_unstable();
         assert_eq!(
             arrows,
             [
+                "details-columns",
                 "drive-eject-stick",
                 "drive-mounted-again-crucial",
                 "drive-open-crucial",
@@ -6399,6 +6422,9 @@ mod tests {
                 "item-menu-cap-d56",
                 "item-menu-full-d60",
                 "open-with-other-app",
+                "transfer-progress",
+                "zip-copy-out",
+                "zip-member-open",
             ],
             "every row entry chooses arrow"
         );
