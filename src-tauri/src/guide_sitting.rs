@@ -42,14 +42,19 @@
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const CARD_W: i32 = 460;
 const CARD_H: i32 = 640;
+/// D-196: the token-gated internal press protocol's schema tag. Carried
+/// verbatim in every request and reply so a mismatched or outdated caller
+/// is a plain refusal rather than a misread.
+const INVOKE_SCHEMA: &str = "wayfinder-guide-invoke/1";
 pub(crate) const POLL_MS: u64 = 40;
 /// A move is asked for again every poll while the card's observed origin
 /// disagrees with the desired seam. Past this many consecutive unmatched
@@ -1526,11 +1531,20 @@ pub struct GtkAdapter {
     /// surface through `parent_geometry_changed` instead of being lost.
     refused: bool,
     cell: SittingCell,
+    /// D-196 internal-press poll, owned by this one card/sitting only. `None`
+    /// when no `invoke_path` was accepted for this sitting.
+    invoke_poll: Option<glib::SourceId>,
 }
 
 impl GtkAdapter {
     fn stop_poll(&mut self) {
         if let Some(id) = self.poll.take() {
+            id.remove();
+        }
+    }
+
+    fn stop_invoke_poll(&mut self) {
+        if let Some(id) = self.invoke_poll.take() {
             id.remove();
         }
     }
@@ -1690,6 +1704,7 @@ impl Adapter for GtkAdapter {
 
     fn close_card(&mut self, _card_key: &str) -> Result<(), String> {
         self.stop_poll();
+        self.stop_invoke_poll();
         if let Some(ui) = self.card.take() {
             ui.window.destroy();
         }
@@ -1703,6 +1718,7 @@ impl Adapter for GtkAdapter {
 
     fn close_app(&mut self, _app_key: &str) -> Result<(), String> {
         self.stop_poll();
+        self.stop_invoke_poll();
         let state = self.state.upgrade().ok_or("app state gone")?;
         match ui_for_state(&state) {
             // Same state, but its registered window is no longer this exact
@@ -1730,6 +1746,164 @@ thread_local! {
 #[allow(dead_code)]
 pub fn live_sittings() -> Vec<Rc<RefCell<Sitting<GtkAdapter>>>> {
     LIVE_SITTING.with(|l| l.borrow().clone())
+}
+
+/// D-196: accepts `invoke_path` from the descriptor only when it is an
+/// absolute, exact sibling of a mode-0600 descriptor. Any other shape
+/// installs no poller at all, so an unopted-in sitting has no invoke handler.
+fn validated_invoke_path(descriptor: &Path) -> Option<PathBuf> {
+    let mode = fs::metadata(descriptor).ok()?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return None;
+    }
+    let d = super::guide_read_descriptor(descriptor)?;
+    let raw = d["invoke_path"].as_str()?;
+    let candidate = PathBuf::from(raw);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    if candidate != side_path(descriptor, "invoke") {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Every `gtk::Button` under `root` whose widget name is exactly `name`.
+/// Production search, not a test-only helper: the invoke protocol must find
+/// the real named button or refuse, never guess at a near match.
+fn find_named_buttons(root: &gtk::Widget, name: &str) -> Vec<gtk::Button> {
+    fn walk(node: &gtk::Widget, name: &str, out: &mut Vec<gtk::Button>) {
+        if node.widget_name() == name {
+            if let Some(b) = node.downcast_ref::<gtk::Button>() {
+                out.push(b.clone());
+            }
+        }
+        let mut child = node.first_child();
+        while let Some(c) = child {
+            walk(&c, name, out);
+            child = c.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, name, &mut out);
+    out
+}
+
+/// Writes an `ok:false` invoke reply. Every refusal reason passed here must
+/// already end with "nothing was written" — the one phrase the brief
+/// requires every refusal to end on.
+fn invoke_refuse(reply_path: &Path, nonce: &str, widget: &str, why: &str) {
+    let body = json!({"schema": INVOKE_SCHEMA, "nonce": nonce, "widget": widget, "ok": false, "error": why});
+    let _ = atomic_write(reply_path, &body.to_string());
+}
+
+/// One poll tick of the D-196 invoke protocol. Reads at most one request from
+/// `invoke_path`, consumes it immediately so it is never replayed by being
+/// re-read, and replies atomically beside it. Never calls `CardUi::point` or
+/// `Sitting::show_me_where` directly: activation always goes through the
+/// real button's `emit_clicked()`, so the production clicked signal is what
+/// moves the ring.
+fn invoke_tick(cell: &SittingCell, token: &str, invoke_path: &Path, seen_nonces: &Rc<RefCell<HashSet<String>>>) {
+    let Ok(text) = fs::read_to_string(invoke_path) else { return };
+    if text.trim().is_empty() {
+        return;
+    }
+    let _ = fs::remove_file(invoke_path);
+    let reply_path = side_path(invoke_path, "reply");
+    let req: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => {
+            invoke_refuse(&reply_path, "", "", "malformed invoke request; nothing was written");
+            return;
+        }
+    };
+    let (Some(nonce), Some(widget)) =
+        (req["nonce"].as_str().map(str::to_owned), req["widget"].as_str().map(str::to_owned))
+    else {
+        invoke_refuse(&reply_path, "", "", "malformed invoke request; nothing was written");
+        return;
+    };
+    if req["schema"].as_str() != Some(INVOKE_SCHEMA) {
+        invoke_refuse(&reply_path, &nonce, &widget, "unknown invoke schema; nothing was written");
+        return;
+    }
+    if seen_nonces.borrow().contains(&nonce) {
+        invoke_refuse(&reply_path, &nonce, &widget, "nonce already used; nothing was written");
+        return;
+    }
+    if req["token"].as_str() != Some(token) {
+        invoke_refuse(&reply_path, &nonce, &widget, "stale token; nothing was written");
+        return;
+    }
+    // Remembered before action, so a replay of this exact nonce can never
+    // cause a second activation even if the first reply was lost.
+    seen_nonces.borrow_mut().insert(nonce.clone());
+
+    let setup = with_sitting(cell, |s| -> Result<(gtk::Button, usize), String> {
+        if !s.is_open() || !s.live() {
+            return Err("descriptor/ack/live verification failed; nothing was written".into());
+        }
+        let card = s.adapter.card.clone().ok_or_else(|| "no card is open; nothing was written".to_string())?;
+        let root: gtk::Widget = card.window.clone().upcast();
+        let matches = find_named_buttons(&root, &widget);
+        let button = match matches.len() {
+            0 => return Err(format!("{widget} was not found; nothing was written")),
+            1 => matches[0].clone(),
+            _ => return Err(format!("{widget} is not a unique widget; nothing was written")),
+        };
+        if !button.is_visible() || !button.is_mapped() {
+            return Err(format!("{widget} is hidden; nothing was written"));
+        }
+        if !button.is_sensitive() {
+            return Err(format!("{widget} is disabled; nothing was written"));
+        }
+        let idx = card
+            .steps
+            .iter()
+            .position(|st| st.show.as_ref() == Some(&button))
+            .ok_or_else(|| format!("{widget} names no step; nothing was written"))?;
+        Ok((button, idx))
+    });
+    let (button, idx) = match setup {
+        Some(Ok(v)) => v,
+        Some(Err(why)) => {
+            invoke_refuse(&reply_path, &nonce, &widget, &why);
+            return;
+        }
+        None => {
+            invoke_refuse(&reply_path, &nonce, &widget, "sitting is gone; nothing was written");
+            return;
+        }
+    };
+
+    // Never call `point`/`show_me_where` directly: this reaches the exact
+    // signal a real pointer click would, from inside the owning process.
+    // Must happen outside any `with_sitting` borrow: the clicked handler
+    // re-enters `with_sitting` on the same cell.
+    button.emit_clicked();
+
+    let outcome = with_sitting(cell, |s| -> Result<(String, String), String> {
+        let card = s.adapter.card.clone().ok_or_else(|| "no card is open; nothing was written".to_string())?;
+        if card.marked.get() != Some(idx) {
+            return Err("the clicked path refused the ring; nothing was written".into());
+        }
+        let label = card.steps[idx].show.as_ref().and_then(|b| b.label()).map(|g| g.to_string()).unwrap_or_default();
+        if label != "Showing in the app" {
+            return Err(format!("the ring did not confirm (label was \"{label}\"); nothing was written"));
+        }
+        Ok((label, card.steps[idx].tag.clone()))
+    });
+    match outcome {
+        Some(Ok((label, target))) => {
+            let body = json!({
+                "schema": INVOKE_SCHEMA, "nonce": nonce, "widget": widget,
+                "ok": true, "label": label, "target": target,
+            });
+            let _ = atomic_write(&reply_path, &body.to_string());
+        }
+        Some(Err(why)) => invoke_refuse(&reply_path, &nonce, &widget, &why),
+        None => invoke_refuse(&reply_path, &nonce, &widget, "sitting is gone; nothing was written"),
+    }
 }
 
 /// Builds and opens the sitting once checkrun has published its session
@@ -1777,6 +1951,7 @@ pub fn start(state: &Rc<RefCell<AppState>>, window_key: usize) {
                 stall: 0,
                 refused: false,
                 cell: cell.clone(),
+                invoke_poll: None,
             };
             let checklist = payload["checklist"].clone();
             let (d2, t2, c2) = (descriptor.clone(), token.clone(), checklist.clone());
@@ -1799,6 +1974,18 @@ pub fn start(state: &Rc<RefCell<AppState>>, window_key: usize) {
             *cell.borrow_mut() = Some(Rc::downgrade(&sitting));
             let opened = sitting.borrow_mut().open();
             if opened.is_ok() {
+                if let Some(invoke_path) = validated_invoke_path(&descriptor) {
+                    let cell2 = cell.clone();
+                    let token2 = token.clone();
+                    let seen_nonces: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+                    let src = glib::timeout_add_local(Duration::from_millis(POLL_MS), move || {
+                        invoke_tick(&cell2, &token2, &invoke_path, &seen_nonces);
+                        glib::ControlFlow::Continue
+                    });
+                    with_sitting(&cell, |s| {
+                        s.adapter.invoke_poll = Some(src);
+                    });
+                }
                 LIVE_SITTING.with(|l| l.borrow_mut().push(sitting));
             }
             glib::ControlFlow::Break

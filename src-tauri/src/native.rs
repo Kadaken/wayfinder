@@ -13184,6 +13184,157 @@ Choose Worked, Broken or Skipped for each step, then press Submit.\n";
         wait_for("clean-shape card abandons", || cards().is_empty() && !clean.ui.window.is_visible());
         finish_child(clean, 4);
 
+        // ---- Dedicated D-196 invoke protocol: token-gated internal press, proved
+        // through the real clicked signal, never a direct emit_clicked(). ----
+        let add_invoke_path = |desc: &std::path::Path| -> PathBuf {
+            let mut v = read_json(desc);
+            let invoke_path = crate::guide_sitting::side_path(desc, "invoke");
+            v["invoke_path"] = serde_json::json!(invoke_path.to_string_lossy());
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(desc).unwrap();
+            use std::io::Write as _;
+            f.write_all(v.to_string().as_bytes()).unwrap();
+            invoke_path
+        };
+        let invoke_press = |invoke_path: &std::path::Path, token: &str, nonce: &str, widget: &str| -> serde_json::Value {
+            let reply_path = crate::guide_sitting::side_path(invoke_path, "reply");
+            let _ = std::fs::remove_file(&reply_path);
+            let body = serde_json::json!({"schema": "wayfinder-guide-invoke/1", "token": token, "nonce": nonce, "widget": widget});
+            crate::guide_sitting::atomic_write(invoke_path, &body.to_string()).unwrap();
+            for _ in 0..200 {
+                if let Ok(t) = std::fs::read_to_string(&reply_path) {
+                    if !t.trim().is_empty() {
+                        return serde_json::from_str(&t).unwrap();
+                    }
+                }
+                pump();
+            }
+            panic!("no invoke reply for nonce {nonce} on {widget}");
+        };
+        let invoke_checklist = "About 2 minutes.\n\
+1. The terminal opens in this folder. [#terminal-here-folder]\n\
+- Right-click: an empty spot in the file list\n\
+- Click: Terminal Here\n\
+Works: a terminal window opens.\n\
+Broken: nothing opens.\n\
+2. Undo returns the file. [#toolbar-undo]\n\
+- Click: Undo\n\
+Works: file returns.\n\
+Broken: nothing happens.\n";
+        let iv = open_sitting("invoke", invoke_checklist);
+        let invoke_path = add_invoke_path(&iv.desc);
+        let card = wait_card();
+        let request_path = PathBuf::from(read_json(&iv.desc)["request_path"].as_str().unwrap());
+        let seeded_request = std::fs::read(&request_path).unwrap_or_default();
+
+        // The first named Show activation reaches the ordinary clicked path.
+        let r1 = invoke_press(&invoke_path, "tok-invoke", "nonce-1", "guide-card-show-1");
+        assert_eq!(r1["ok"], true, "{r1}");
+        assert_eq!(r1["label"], "Showing in the app");
+        assert_eq!(r1["target"], "terminal-here-folder");
+        assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
+        assert!(iv.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+            .is_some_and(|w| w.widget_name() == "terminal-here-folder" && w.is_mapped() && w.is_visible()),
+            "invoke protocol rang the real mapped, visible terminal-here-folder control");
+
+        // A second named Show moves the ring to its own exact target.
+        let r2 = invoke_press(&invoke_path, "tok-invoke", "nonce-2", "guide-card-show-2");
+        assert_eq!(r2["ok"], true, "{r2}");
+        assert_eq!(r2["label"], "Showing in the app");
+        assert_eq!(r2["target"], "toolbar-undo");
+        assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Show me where"), "first ring cleared");
+        assert_eq!(button(&card, "guide-card-show-2").label().as_deref(), Some("Showing in the app"));
+        assert!(iv.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+            .is_some_and(|w| w.widget_name() == "toolbar-undo" && w.is_mapped() && w.is_visible()),
+            "second invoke rang its own exact target");
+
+        // One nonce activates at most once, even replayed after moving on.
+        let replay = invoke_press(&invoke_path, "tok-invoke", "nonce-1", "guide-card-show-1");
+        assert_eq!(replay["ok"], false, "{replay}");
+        assert!(replay["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(button(&card, "guide-card-show-2").label().as_deref(), Some("Showing in the app"), "replay did not move the ring back");
+
+        // Malformed request.
+        {
+            let reply_path = crate::guide_sitting::side_path(&invoke_path, "reply");
+            let _ = std::fs::remove_file(&reply_path);
+            crate::guide_sitting::atomic_write(&invoke_path, "not json").unwrap();
+            let mut got = None;
+            for _ in 0..200 {
+                if let Ok(t) = std::fs::read_to_string(&reply_path) {
+                    if !t.trim().is_empty() {
+                        got = Some(serde_json::from_str::<serde_json::Value>(&t).unwrap());
+                        break;
+                    }
+                }
+                pump();
+            }
+            let reply = got.expect("malformed request still gets a reply");
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert!(reply["error"].as_str().unwrap().ends_with("nothing was written"));
+        }
+
+        // Unknown widget.
+        let unknown = invoke_press(&invoke_path, "tok-invoke", "nonce-3", "guide-card-show-9");
+        assert_eq!(unknown["ok"], false, "{unknown}");
+        assert!(unknown["error"].as_str().unwrap().contains("not found"));
+        assert!(unknown["error"].as_str().unwrap().ends_with("nothing was written"));
+
+        // Duplicate widget: a forced, immediately reverted name collision.
+        let show1 = button(&card, "guide-card-show-1");
+        show1.set_widget_name("guide-card-show-2");
+        let dup = invoke_press(&invoke_path, "tok-invoke", "nonce-4", "guide-card-show-2");
+        show1.set_widget_name("guide-card-show-1");
+        assert_eq!(dup["ok"], false, "{dup}");
+        assert!(dup["error"].as_str().unwrap().contains("not a unique"));
+        assert!(dup["error"].as_str().unwrap().ends_with("nothing was written"));
+
+        // Hidden widget.
+        let show2 = button(&card, "guide-card-show-2");
+        show2.set_visible(false);
+        pump();
+        let hidden = invoke_press(&invoke_path, "tok-invoke", "nonce-5", "guide-card-show-2");
+        show2.set_visible(true);
+        pump();
+        assert_eq!(hidden["ok"], false, "{hidden}");
+        assert!(hidden["error"].as_str().unwrap().contains("hidden"));
+        assert!(hidden["error"].as_str().unwrap().ends_with("nothing was written"));
+
+        // Disabled widget.
+        show2.set_sensitive(false);
+        pump();
+        let disabled = invoke_press(&invoke_path, "tok-invoke", "nonce-6", "guide-card-show-2");
+        show2.set_sensitive(true);
+        pump();
+        assert_eq!(disabled["ok"], false, "{disabled}");
+        assert!(disabled["error"].as_str().unwrap().contains("disabled"));
+        assert!(disabled["error"].as_str().unwrap().ends_with("nothing was written"));
+
+        // Stale token.
+        let stale = invoke_press(&invoke_path, "tok-not-the-real-one", "nonce-7", "guide-card-show-1");
+        assert_eq!(stale["ok"], false, "{stale}");
+        assert!(stale["error"].as_str().unwrap().contains("stale token"));
+        assert!(stale["error"].as_str().unwrap().ends_with("nothing was written"));
+
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "every invoke refusal and replay left the app guide request untouched");
+
+        // Failed descriptor/ack/live verification: the same stale-ack technique
+        // Sitting 4 uses against a direct click, now against the invoke path.
+        let ack = crate::guide_sitting::side_path(&iv.desc, "ack");
+        let mut bad = read_json(&ack);
+        bad["pid"] = serde_json::json!(1);
+        std::fs::write(&ack, bad.to_string()).unwrap();
+        let unverified = invoke_press(&invoke_path, "tok-invoke", "nonce-8", "guide-card-show-1");
+        assert_eq!(unverified["ok"], false, "{unverified}");
+        assert!(unverified["error"].as_str().unwrap().contains("verification failed"));
+        assert!(unverified["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "stale-ack refusal left the app guide request untouched");
+
+        card.close();
+        wait_for("invoke card closes", || cards().is_empty() && !iv.ui.window.is_visible());
+        finish_child(iv, 3);
+
         // ---- Sitting 3: the full card, on a checklist that has saved progress. ----
         std::fs::write(cl.join("three_PROGRESS.md"), &saved_progress).unwrap();
         let s3 = open_sitting("three", checklist_text);
