@@ -13998,6 +13998,32 @@ Broken: Either state is wrong.\n";
         wait_for("abandon closed both", || cards().is_empty() && !s6.ui.window.is_visible());
         finish_child(s6, 4);
 
+        // ---- Sitting seven (D-199): an unrelated attached Back failure
+        // keeps its original pre-198 suffix. Only the byte-exact approved
+        // sentence from sitting six may skip it. ----
+        let s7 = open_sitting("seven", checklist_text);
+        let card = wait_card();
+        wait_for("card on the left edge", || adjacent(&s7.ui.window, &card));
+        click_radio(&toggle(&card, "guide-card-broken-1"));
+        pump();
+        let back7 = cl.join("seven_START.sh");
+        std::fs::write(&back7,
+            "#!/bin/bash\n# Back to: the start.\n\
+             echo 'CHECKRUN_BACK_ERROR: the companion refused for an unrelated reason' >&2\n\
+             exit 1\n",
+        ).unwrap();
+        std::fs::set_permissions(&back7, std::fs::Permissions::from_mode(0o755)).unwrap();
+        button(&card, "guide-card-back").emit_clicked();
+        const UNRELATED: &str = "the companion refused for an unrelated reason \
+            Your answers were saved; this card and app are still open.";
+        wait_for("unrelated Back failure answered", || label_text(&card, "guide-card-back-says") == UNRELATED);
+        assert_eq!(label_text(&card, "guide-card-back-says"), UNRELATED);
+        assert!(!button(&card, "guide-card-back").is_sensitive(), "Back alone disables on refusal");
+        assert!(card.is_visible() && s7.ui.window.is_visible(), "card and app stay open on refusal");
+        card.close();
+        wait_for("abandon closed both", || cards().is_empty() && !s7.ui.window.is_visible());
+        finish_child(s7, 4);
+
         dui.window.destroy();
         for k in ["WF_GUIDE_DESCRIPTOR", "WF_GUIDE_VERIFIER", "CHECKRUN_NO_HANDOFF", "CHECKRUN_WAIT_APP", "CHECKRUN_COPY_CMD", "CHECKRUN_SHOT_CMD"] {
             std::env::remove_var(k);
