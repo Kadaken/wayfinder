@@ -12878,11 +12878,11 @@ mod tests {
 - Click: Terminal Here\n\
 Works: a terminal window opens.\n\
 Broken: nothing opens.\n\
-2. Open the file with another app. [#open-with-other-app]\n\
+2. Open the file with another app.\n\
 - Right-click: a.txt\n\
 Works: a side menu opens.\n\
 Broken: no menu.\n\
-3. Type \"ls -la\" and it lists files. [#transfer-cancel]\n\
+3. Type \"ls -la\" and it lists files.\n\
 - Type: \"ls -la\"\n\
 - Press: Enter\n\
 Works: files listed.\n\
@@ -13084,6 +13084,102 @@ Broken: error.\n";
         let saved_progress = progress.clone();
         finish_child(s2, 0);
 
+        // ---- Dedicated D-195 Cancel cards: refusal at rest, ring during a real copy. ----
+        let cancel_checklist = "About 1 minute.\n\
+1. Cancel the copy while it is running. [#transfer-cancel]\n\
+- Click: Cancel\n\
+- Look at: the copy progress area\n\
+Works: the copy stops.\n\
+Broken: the copy keeps running.\n";
+        let transfer_src = root.join("transfer-source");
+        std::fs::create_dir_all(&transfer_src).unwrap();
+        std::fs::write(transfer_src.join("big-1.bin"), vec![0x5Au8; 20 * 1024 * 1024]).unwrap();
+        let slow_copy = script(
+            "d195-slow-copy.sh",
+            "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
+             while [ $i -lt 20 ]; do\n\
+             dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
+             i=$((i+1)); sleep 0.5; done\n",
+        );
+
+        let cancel_rest = open_sitting("cancel-rest", cancel_checklist);
+        let card = wait_card();
+        button(&card, "guide-card-show-1").emit_clicked();
+        pump();
+        assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Show me where"),
+                   "an invisible control never reports that it is showing");
+        assert!(label_text(&card, "guide-card-notice").contains(
+            "Cancel appears only while a copy is running. Start the copy first."));
+        assert!(cancel_rest.state.borrow().guide_visual.is_none(), "an invisible target paints no ring");
+        card.close();
+        wait_for("rest-refusal card abandons", || cards().is_empty() && !cancel_rest.ui.window.is_visible());
+        finish_child(cancel_rest, 4);
+
+        let cancel_live = open_sitting("cancel-live", cancel_checklist);
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow_copy.to_string_lossy().to_string()));
+        run_transfer(
+            cancel_live.state.clone(),
+            cancel_live.ui.clone(),
+            Transfer {
+                srcs: vec![transfer_src.join("big-1.bin")],
+                dest: dir.clone(),
+                is_copy: true,
+                clear_cut_after: false,
+                style: TransferStyle::Paste,
+            },
+            native_core::PasteConflict::KeepBoth,
+        );
+        wait_for("real copy maps Cancel", || cancel_live.ui.transfer_cancel.is_visible() && cancel_live.ui.transfer_cancel.is_sensitive());
+        let card = wait_card();
+        button(&card, "guide-card-show-1").emit_clicked();
+        wait_for("card paints live Cancel", || {
+            cancel_live.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+                .is_some_and(|w| w.widget_name() == "transfer-cancel")
+        });
+        assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
+        cancel_live.ui.transfer_cancel.emit_clicked();
+        wait_for("real copy stops after Cancel", || cancel_live.state.borrow().active_transfer.is_none());
+        assert!(!dir.join("big-1.bin").exists(), "cancelled copy publishes no destination file");
+        TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+        card.close();
+        wait_for("live-Cancel card abandons", || cards().is_empty() && !cancel_live.ui.window.is_visible());
+        finish_child(cancel_live, 4);
+
+        // The clean owner-card shape has no Show button on the Cancel step and
+        // exactly one on the later Undo step; press that one and prove it rings
+        // the real, already-visible toolbar Undo button.
+        let clean_shape = "About 3 minutes.\n\
+Only use Wayfinder.\n\n\
+1. Cancel a copy before it finishes.\n\
+- DRAG: big-1.bin from the source folder onto the destination folder\n\
+- CLICK: Cancel while progress is showing\n\
+- LOOK AT: the destination folder\n\
+Works: Progress appears, stops cleanly, and the destination folder has no partly copied big-1.bin.\n\
+Broken: Progress or Cancel is missing or stuck, or the destination folder contains a partly copied big-1.bin.\n\n\
+2. big-2.bin disappears with Undo and returns with Redo. [#toolbar-undo]\n\
+- DRAG: big-2.bin from the source folder onto the destination folder and let it finish\n\
+- CLICK: Undo\n\
+- CLICK: Redo\n\
+- LOOK AT: the destination folder\n\
+Works: big-2.bin disappears from the destination folder after Undo and returns after Redo.\n\
+Broken: big-2.bin does not finish copying to the destination folder, stays after Undo, or does not return after Redo.\n\n\
+Choose Worked, Broken or Skipped for each step, then press Submit.\n";
+        let clean = open_sitting("clean-shape", clean_shape);
+        let card = wait_card();
+        assert!(find(card.upcast_ref(), "guide-card-show-1").is_none(),
+                "the early Cancel step offers no Show button");
+        assert!(find(card.upcast_ref(), "guide-card-show-2").is_some(),
+                "the visible Undo step has the card's one Show button");
+        button(&card, "guide-card-show-2").emit_clicked();
+        wait_for("clean card paints toolbar Undo", || {
+            clean.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+                .is_some_and(|w| w.widget_name() == "toolbar-undo")
+        });
+        assert_eq!(button(&card, "guide-card-show-2").label().as_deref(), Some("Showing in the app"));
+        card.close();
+        wait_for("clean-shape card abandons", || cards().is_empty() && !clean.ui.window.is_visible());
+        finish_child(clean, 4);
+
         // ---- Sitting 3: the full card, on a checklist that has saved progress. ----
         std::fs::write(cl.join("three_PROGRESS.md"), &saved_progress).unwrap();
         let s3 = open_sitting("three", checklist_text);
@@ -13111,15 +13207,8 @@ Broken: error.\n";
         }
         assert!(find(card.upcast_ref(), "guide-card-step-4").is_none());
         assert!(find(card.upcast_ref(), "guide-card-show-1").is_some());
-        assert!(find(card.upcast_ref(), "guide-card-show-2").is_some());
-        assert!(find(card.upcast_ref(), "guide-card-show-3").is_some());
-        button(&card, "guide-card-show-3").emit_clicked();
-        pump();
-        assert_eq!(button(&card, "guide-card-show-3").label().as_deref(), Some("Show me where"),
-                   "an invisible control never reports that it is showing");
-        assert!(label_text(&card, "guide-card-notice").contains(
-            "Cancel appears only while a copy is running. Start the copy first."));
-        assert!(s3.state.borrow().guide_visual.is_none(), "an invisible target paints no ring");
+        assert!(find(card.upcast_ref(), "guide-card-show-2").is_none(), "no Show button before its menu control exists");
+        assert!(find(card.upcast_ref(), "guide-card-show-3").is_none(), "no Show button before Cancel exists");
         let all_text: String = {
             fn texts(w: &gtk::Widget, out: &mut String) {
                 if let Ok(l) = w.clone().downcast::<gtk::Label>() {
@@ -13248,15 +13337,18 @@ Broken: error.\n";
         button(&card, "guide-card-show-1").emit_clicked();
         pump();
         assert!(matches!(&s3.state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == "terminal-here-folder"));
-        assert!(s3.state.borrow().guide_target.as_ref().is_some_and(|t| t.upgrade().is_some()), "the bound window rings its control");
+        assert!(s3.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+            .is_some_and(|w| w.widget_name() == "terminal-here-folder" && w.is_mapped() && w.is_visible()),
+            "the bound window rings the real mapped, visible terminal-here-folder control");
         assert!(matches!(dstate.borrow().guide_pending, GuideRequest::Clear), "decoy request untouched");
         assert!(dstate.borrow().guide_target.is_none(), "decoy rings nothing");
         assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
-        // Answering step 1 moves the ring to step 2's control.
+        // No later step offers a ring before its control exists, so answering
+        // step 1 clears the one card-owned ring.
         click_radio(&toggle(&card, "guide-card-worked-1"));
         pump();
         assert!(toggle(&card, "guide-card-worked-1").is_active() && !toggle(&card, "guide-card-broken-1").is_active(), "one answer per step");
-        assert!(matches!(&s3.state.borrow().guide_pending, GuideRequest::Known { name, .. } if name == "open-with-other-app"));
+        assert!(matches!(&s3.state.borrow().guide_pending, GuideRequest::Clear));
         assert!(matches!(dstate.borrow().guide_pending, GuideRequest::Clear));
         // Choosing the same answer again takes it back off.
         click_radio(&toggle(&card, "guide-card-worked-1"));
@@ -17458,14 +17550,23 @@ Broken: Either state is wrong.\n";
         );
         wait_for("bar and Cancel become visible", || ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible());
         assert_eq!(by_name("transfer-progress").len(), 1, "exactly one transfer-progress target once live");
-        assert!(by_name("transfer-progress")[0].clone().downcast::<gtk::ProgressBar>().is_ok(), "the real progress bar");
-        wait_for("ring paints once the bar is mapped", || !guide_marked(tree()).is_empty());
+        let progress_bar = by_name("transfer-progress")[0].clone();
+        assert!(progress_bar.clone().downcast::<gtk::ProgressBar>().is_ok(), "the real progress bar");
+        wait_for("exactly one mark equal to the real mapped visible progress bar", || {
+            let marked = guide_marked(tree());
+            marked.len() == 1 && marked[0] == progress_bar && progress_bar.is_mapped() && progress_bar.is_visible()
+        });
 
         put("transfer-cancel", "cancel");
         assert_eq!(by_name("transfer-cancel").len(), 1, "exactly one transfer-cancel target once live");
         let cancel_button = by_name("transfer-cancel")[0].clone().downcast::<gtk::Button>().expect("the real Cancel button");
         assert!(cancel_button.is_sensitive(), "Cancel stays sensitive while named");
-        wait_for("ring paints on the live Cancel", || !guide_marked(tree()).is_empty());
+        let cancel_widget = cancel_button.clone().upcast::<gtk::Widget>();
+        wait_for("exactly one mark equal to the real mapped visible sensitive Cancel button", || {
+            let marked = guide_marked(tree());
+            marked.len() == 1 && marked[0] == cancel_widget && cancel_widget.is_mapped() && cancel_widget.is_visible()
+                && cancel_button.is_sensitive()
+        });
         // Clicking Cancel still routes to the real handler: the transfer actually cancels.
         cancel_button.emit_clicked();
         wait_for("transfer ends after the real Cancel click", || state.borrow().active_transfer.is_none());
@@ -17532,6 +17633,28 @@ Broken: Either state is wrong.\n";
         let by_name = |n: &str| -> Vec<gtk::Widget> { all_widgets(ui.window.upcast_ref()).into_iter().filter(|w| w.widget_name() == n).collect() };
         wait_for("exactly one zip-archive-row target, never the decoy", || by_name("zip-archive-row").len() == 1);
         assert!(by_name("zip-archive-row")[0].is_mapped(), "the archive row is mapped");
+
+        // Submit the real zip-archive-row request and require the exact mapped
+        // real row, never the decoy, to be the sole painted target.
+        let known = |n: &str, l: &str| GuideRequest::Known { name: n.into(), label: l.into() };
+        let put = |name: &str, label: &str| {
+            let tmp = gfile.with_extension("json.tmp");
+            std::fs::write(&tmp, format!(r#"{{"highlight":"{name}","label":"{label}"}}"#)).unwrap();
+            std::fs::rename(&tmp, &gfile).unwrap();
+            let want = if name.is_empty() { GuideRequest::Clear } else { known(name, label) };
+            wait_for("guide request", || state.borrow().guide_pending == want);
+            pump();
+        };
+        put("zip-archive-row", "The real archive");
+        wait_for("card paints the real zip-archive-row", || {
+            state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade()).is_some()
+        });
+        let archive_row = by_name("zip-archive-row");
+        assert_eq!(archive_row.len(), 1, "still exactly one real row, never the decoy");
+        let painted = state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade()).expect("painted target");
+        assert_eq!(painted, archive_row[0], "the painted target is the exact mapped real row, not the decoy");
+        assert!(painted.is_mapped() && painted.is_visible(), "the painted archive row is mapped and visible");
+        put("", "");
 
         // ---- Browse into the archive: the row name must not survive the navigation.
         let zip_entry = state.borrow().visible_entries.iter().find(|e| e.name == "fixture.zip").cloned().unwrap();
