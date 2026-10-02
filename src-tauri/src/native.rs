@@ -2034,6 +2034,55 @@ fn guide_alias_target(name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// D-197: resolves `tag`'s aliased real widget in `window`'s own tree, using
+/// the same alias/search/uniqueness rules as `guide_resolve`, but touches no
+/// state -- a read for a preflight gate, never a bind.
+#[cfg(feature = "guide")]
+fn guide_resolve_tag(window: &gtk::Widget, tag: &str) -> Option<gtk::Widget> {
+    let mut found = Vec::new();
+    guide_find(window, &guide_alias_target(tag), &mut found);
+    (found.len() == 1).then(|| found[0].clone())
+}
+
+/// Every widget in `root`'s own tree, `root` itself included.
+#[cfg(feature = "guide")]
+fn guide_all_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    fn walk(node: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        out.push(node.clone());
+        let mut child = node.first_child();
+        while let Some(c) = child {
+            walk(&c, out);
+            child = c.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
+
+/// The real painted targets already present in `tree`: the ones carrying the
+/// circle class, plus the parent of every arrow-class popover. The one place
+/// this is decided, shared by the production D-197 proof and the
+/// `guide_marked` test helper so both agree on what "painted" means.
+#[cfg(feature = "guide")]
+fn guide_painted_in_tree(tree: &[gtk::Widget]) -> Vec<gtk::Widget> {
+    let mut out: Vec<gtk::Widget> = tree.iter().filter(|w| w.has_css_class("wf-guide-circle")).cloned().collect();
+    for w in tree {
+        if let Some(p) = w.downcast_ref::<gtk::Popover>() {
+            if p.has_css_class("wf-guide-arrow") {
+                out.extend(p.parent());
+            }
+        }
+    }
+    out
+}
+
+/// The real painted targets in `root`'s own tree. See `guide_painted_in_tree`.
+#[cfg(feature = "guide")]
+fn guide_painted_targets(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    guide_painted_in_tree(&guide_all_widgets(root))
+}
+
 /// Binds the pending request to its one real widget. Clear and unknown requests
 /// leave no target; a known one binds only when exactly one live widget carries
 /// the name (none: stays pending; several: fails closed).
@@ -13232,9 +13281,13 @@ Broken: nothing happens.\n";
         assert_eq!(r1["label"], "Showing in the app");
         assert_eq!(r1["target"], "terminal-here-folder");
         assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
-        assert!(iv.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
-            .is_some_and(|w| w.widget_name() == "terminal-here-folder" && w.is_mapped() && w.is_visible()),
+        let w1 = iv.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+            .expect("invoke protocol rang a real target");
+        assert!(w1.widget_name() == "terminal-here-folder" && w1.is_mapped() && w1.is_visible(),
             "invoke protocol rang the real mapped, visible terminal-here-folder control");
+        let marked1 = guide_marked(all_widgets(iv.ui.window.upcast_ref()));
+        assert!(marked1.len() == 1 && marked1[0] == w1,
+            "the upgraded target is the bound window's sole painted target, exact-equal");
 
         // A second named Show moves the ring to its own exact target.
         let r2 = invoke_press(&invoke_path, "tok-invoke", "nonce-2", "guide-card-show-2");
@@ -13243,9 +13296,13 @@ Broken: nothing happens.\n";
         assert_eq!(r2["target"], "toolbar-undo");
         assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Show me where"), "first ring cleared");
         assert_eq!(button(&card, "guide-card-show-2").label().as_deref(), Some("Showing in the app"));
-        assert!(iv.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
-            .is_some_and(|w| w.widget_name() == "toolbar-undo" && w.is_mapped() && w.is_visible()),
+        let w2 = iv.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
+            .expect("second invoke rang a real target");
+        assert!(w2.widget_name() == "toolbar-undo" && w2.is_mapped() && w2.is_visible(),
             "second invoke rang its own exact target");
+        let marked2 = guide_marked(all_widgets(iv.ui.window.upcast_ref()));
+        assert!(marked2.len() == 1 && marked2[0] == w2,
+            "the second upgraded target is also the sole painted target, exact-equal");
 
         // One nonce activates at most once, even replayed after moving on.
         let replay = invoke_press(&invoke_path, "tok-invoke", "nonce-1", "guide-card-show-1");
@@ -13314,6 +13371,85 @@ Broken: nothing happens.\n";
         assert_eq!(stale["ok"], false, "{stale}");
         assert!(stale["error"].as_str().unwrap().contains("stale token"));
         assert!(stale["error"].as_str().unwrap().ends_with("nothing was written"));
+
+        // ---- D-197: each missing preflight leg must refuse before the real
+        // button's clicked signal ever fires. A counter on the real signal,
+        // not an inference from `marked`/label, proves no press happened. ----
+        let click_count: Rc<std::cell::Cell<u32>> = Rc::new(std::cell::Cell::new(0));
+        {
+            let cc = click_count.clone();
+            button(&card, "guide-card-show-1").connect_clicked(move |_| cc.set(cc.get() + 1));
+        }
+        let target1 = find(iv.ui.window.upcast_ref(), "terminal-here-folder").expect("real target widget");
+
+        // Leg 1: missing/wrong name -- the step's tag no longer resolves to
+        // any live widget once the real target is renamed out from under it.
+        target1.set_widget_name("terminal-here-folder-renamed");
+        let before = click_count.get();
+        let missing = invoke_press(&invoke_path, "tok-invoke", "nonce-9", "guide-card-show-1");
+        target1.set_widget_name("terminal-here-folder");
+        assert_eq!(missing["ok"], false, "{missing}");
+        assert!(missing["error"].as_str().unwrap().contains("does not resolve"));
+        assert!(missing["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(click_count.get(), before, "a missing-leg refusal never reached the real button's clicked signal");
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "missing-leg refusal left the app guide request untouched");
+
+        // Leg 2 and leg 3: unmapped and invisible. An ordinary widget's own
+        // `visible` property and its runtime mapped state move together, so
+        // hiding it exercises both legs of the same preflight check at once;
+        // either reported alone, it already refuses before any press.
+        target1.set_visible(false);
+        pump();
+        assert!(!target1.is_mapped() && !target1.is_visible(), "the hidden target is neither mapped nor visible");
+        let before = click_count.get();
+        let hidden_target = invoke_press(&invoke_path, "tok-invoke", "nonce-10", "guide-card-show-1");
+        target1.set_visible(true);
+        pump();
+        assert_eq!(hidden_target["ok"], false, "{hidden_target}");
+        assert!(hidden_target["error"].as_str().unwrap().contains("mapped and visible"));
+        assert!(hidden_target["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(click_count.get(), before, "an unmapped/invisible-leg refusal never reached the real button's clicked signal");
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "unmapped/invisible-leg refusal left the app guide request untouched");
+
+        // Leg 4: a second marked target in the same window. toolbar-undo is
+        // still the one real painted target from nonce-2; forcing the circle
+        // class onto a second, unrelated widget makes the pre-press paint
+        // state dirty, and the integrity gate must refuse before any press.
+        let target_undo = find(iv.ui.window.upcast_ref(), "toolbar-undo").expect("toolbar-undo widget");
+        assert!(target_undo.has_css_class("wf-guide-circle"), "toolbar-undo is the one currently painted target");
+        target1.add_css_class("wf-guide-circle");
+        let before = click_count.get();
+        let multi = invoke_press(&invoke_path, "tok-invoke", "nonce-11", "guide-card-show-1");
+        target1.remove_css_class("wf-guide-circle");
+        assert_eq!(multi["ok"], false, "{multi}");
+        assert!(multi["error"].as_str().unwrap().contains("paint state is not clean"));
+        assert!(multi["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(click_count.get(), before, "a dirty-paint refusal never reached the real button's clicked signal");
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "dirty-paint refusal left the app guide request untouched");
+
+        // ---- D-197: the post-click readback, not `marked`/label/tag, is what
+        // decides success. A test-only seam rips the painted class off the
+        // target the instant after the real clicked signal fires but before
+        // the handler reads it back, so production must still refuse. ----
+        crate::guide_sitting::GUIDE_RIP_PAINT_AFTER_CLICK.with(|r| *r.borrow_mut() = Some(target_undo.downgrade()));
+        let before = click_count.get();
+        let ripped = invoke_press(&invoke_path, "tok-invoke", "nonce-12", "guide-card-show-2");
+        crate::guide_sitting::GUIDE_RIP_PAINT_AFTER_CLICK.with(|r| *r.borrow_mut() = None);
+        assert_eq!(ripped["ok"], false, "{ripped}");
+        assert!(ripped["target"].is_null(), "a refused press never claims a target");
+        assert!(ripped["error"].as_str().unwrap().contains("painted target"));
+        assert!(ripped["error"].as_str().unwrap().ends_with("nothing was written"));
+        assert_eq!(click_count.get(), before, "the ordinary clicked-handler click count is unaffected by the readback refusal");
+        assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
+            "post-readback refusal left the app guide request untouched");
+        // The seam only ripped the CSS class off the still-live target; nothing
+        // else repaints it on its own, so the next real request is what moves
+        // the ring again. Restore it directly so the state this test leaves
+        // behind is the same clean one every other invoke test assumed.
+        target_undo.add_css_class("wf-guide-circle");
 
         assert_eq!(std::fs::read(&request_path).unwrap_or_default(), seeded_request,
             "every invoke refusal and replay left the app guide request untouched");
@@ -18159,15 +18295,7 @@ Broken: Either state is wrong.\n";
     #[cfg(feature = "guide")]
     fn guide_marked(tree: Vec<gtk::Widget>) -> Vec<gtk::Widget> {
         assert!(tree.iter().all(|w| !w.has_css_class("wf-guide-ring")), "the retired ring class is on a widget");
-        let mut out: Vec<gtk::Widget> = tree.iter().filter(|w| w.has_css_class("wf-guide-circle")).cloned().collect();
-        for w in &tree {
-            if let Some(p) = w.downcast_ref::<gtk::Popover>() {
-                if p.has_css_class("wf-guide-arrow") {
-                    out.extend(p.parent());
-                }
-            }
-        }
-        out
+        guide_painted_in_tree(&tree)
     }
 
     #[cfg(feature = "guide")]
@@ -25872,5 +26000,103 @@ Broken: Either state is wrong.\n";
              the locked drag line is at byte {drag_idx}) — row_drag_beats_selection_box_locked can no longer \
              see the production drag code; move the seam down to the test-seam cluster starting at drive_scan"
         );
+    }
+
+    /// D-197: a default (non-`guide`) build must never read the descriptor,
+    /// the invoke sibling file or the app guide request at all — not because
+    /// no handler fires, but because `mod guide_sitting` and every guide-only
+    /// field/function are entirely absent from this binary. Proved against
+    /// real on-disk state from a real registered window, not a source-text
+    /// search or an external no-listener helper: seed a descriptor plus its
+    /// sibling `.invoke` file and the app guide request exactly as the guide
+    /// build's internal protocol would, start a real default window, pump
+    /// well past the guide poll interval (40ms) several times over, then
+    /// prove every seeded file is byte-identical/unconsumed, no invoke reply
+    /// exists, and no guide card ever appeared.
+    #[cfg(not(feature = "guide"))]
+    #[test]
+    fn default_build_never_reads_guide_invoke_or_request_d197() {
+        gtk::init().expect("gtk init on the virtual display");
+        let root = crate::native_core::scratch_root().join(format!("wf-d197-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let desc = root.join("sitting.json");
+        let request_path = root.join("sitting.request-path-target.json");
+        std::fs::write(&request_path, b"{\"request\":\"seed\"}").unwrap();
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&desc).unwrap();
+            f.write_all(
+                serde_json::json!({"token": "tok-default", "request_path": request_path.to_string_lossy()})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        }
+        // Same sibling-naming rule as guide_sitting::side_path (descriptor-only
+        // function, absent from this build): the descriptor's file name plus a
+        // "." and the extension.
+        let mut invoke_name = desc.file_name().unwrap().to_os_string();
+        invoke_name.push(".invoke");
+        let invoke_path = desc.with_file_name(invoke_name);
+        let invoke_body = serde_json::json!({
+            "schema": "wayfinder-guide-invoke/1",
+            "token": "tok-default",
+            "nonce": "nonce-default-1",
+            "widget": "toolbar-undo",
+        })
+        .to_string();
+        std::fs::write(&invoke_path, &invoke_body).unwrap();
+        let mut reply_name = invoke_path.file_name().unwrap().to_os_string();
+        reply_name.push(".reply");
+        let reply_path = invoke_path.with_file_name(reply_name);
+        let _ = std::fs::remove_file(&reply_path);
+
+        let seeded_request = std::fs::read(&request_path).unwrap();
+        let seeded_invoke = std::fs::read(&invoke_path).unwrap();
+
+        std::env::set_var("WF_GUIDE_DESCRIPTOR", &desc);
+        std::env::remove_var("WF_GUIDE_FILE");
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d197default")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (_, ui) = WINDOWS.with(|w| w.borrow().windows().pop()).expect("default window");
+        ui.window.present();
+
+        // Each pump() already sleeps 40 x 5ms = 200ms of real wall time, five
+        // times the guide build's 40ms poll interval; run it twice over.
+        pump();
+        pump();
+
+        std::env::remove_var("WF_GUIDE_DESCRIPTOR");
+
+        assert_eq!(
+            std::fs::read(&invoke_path).unwrap(),
+            seeded_invoke,
+            "a default build must never consume the invoke request"
+        );
+        assert!(!reply_path.exists(), "a default build must never write an invoke reply or claim activation");
+        assert_eq!(
+            std::fs::read(&request_path).unwrap(),
+            seeded_request,
+            "a default build must never touch the app guide request file"
+        );
+        let cards: Vec<gtk::Window> = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .filter(|w| w.widget_name() == "guide-card")
+            .collect();
+        assert!(cards.is_empty(), "a default build must never show a guide card");
+
+        ui.window.destroy();
+        pump();
     }
 }
