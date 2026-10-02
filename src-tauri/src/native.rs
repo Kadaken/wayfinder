@@ -13133,8 +13133,10 @@ Broken: the copy keeps running.\n";
         let card = wait_card();
         button(&card, "guide-card-show-1").emit_clicked();
         wait_for("card paints live Cancel", || {
-            cancel_live.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
-                .is_some_and(|w| w.widget_name() == "transfer-cancel")
+            let Some(w) = cancel_live.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade()) else { return false };
+            if w.widget_name() != "transfer-cancel" || !w.is_mapped() || !w.is_visible() { return false }
+            let marked = guide_marked(all_widgets(cancel_live.ui.window.upcast_ref()));
+            marked.len() == 1 && marked[0] == w
         });
         assert_eq!(button(&card, "guide-card-show-1").label().as_deref(), Some("Showing in the app"));
         cancel_live.ui.transfer_cancel.emit_clicked();
@@ -13172,8 +13174,10 @@ Choose Worked, Broken or Skipped for each step, then press Submit.\n";
                 "the visible Undo step has the card's one Show button");
         button(&card, "guide-card-show-2").emit_clicked();
         wait_for("clean card paints toolbar Undo", || {
-            clean.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade())
-                .is_some_and(|w| w.widget_name() == "toolbar-undo")
+            let Some(w) = clean.state.borrow().guide_visual.as_ref().and_then(|v| v.target.upgrade()) else { return false };
+            if w.widget_name() != "toolbar-undo" || !w.is_mapped() || !w.is_visible() { return false }
+            let marked = guide_marked(all_widgets(clean.ui.window.upcast_ref()));
+            marked.len() == 1 && marked[0] == w
         });
         assert_eq!(button(&card, "guide-card-show-2").label().as_deref(), Some("Showing in the app"));
         card.close();
