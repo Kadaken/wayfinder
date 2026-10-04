@@ -916,6 +916,78 @@ struct AppConfig {
     sort_ascending: bool,
 }
 
+/// Mirrors `portal_service::WireFilter`. Defined separately rather than
+/// imported -- this file must never import `portal_service`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct WireFilterNative {
+    name: String,
+    #[serde(default)]
+    rules: Vec<(u32, String)>,
+}
+
+/// Mirrors `portal_service::WireChoice`.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct WireChoiceNative {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    options: Vec<(String, String)>,
+    #[serde(default)]
+    initial: String,
+}
+
+/// Mirrors `portal_service::WireRequest`: the decoded per-request data
+/// read from `--request <path>`. Absent or malformed means every field
+/// defaults empty/false, matching an ordinary pre-D-222 pick.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct WireRequestNative {
+    #[serde(default)]
+    multiple: bool,
+    #[serde(default)]
+    filters: Vec<WireFilterNative>,
+    #[serde(default)]
+    current_filter: Option<WireFilterNative>,
+    #[serde(default)]
+    choices: Vec<WireChoiceNative>,
+}
+
+/// Mirrors `portal_service::WireResultMeta`, written back by this process
+/// as `result.meta.json` next to the existing path-only result file.
+#[derive(Clone, Debug, Default, Serialize)]
+struct WireResultMetaNative {
+    current_filter: Option<WireFilterNative>,
+    choices: Vec<(String, String)>,
+}
+
+/// The live GTK control for one supplied choice: a boolean choice
+/// (`options` empty) gets a `CheckButton`; an enumerated choice gets a
+/// `DropDown` whose model order matches `options` order, so an index
+/// maps directly back to an option id.
+#[derive(Clone, Debug)]
+enum ChoiceWidget {
+    Boolean(gtk::CheckButton),
+    Enumerated(gtk::DropDown, Vec<String>),
+}
+
+impl ChoiceWidget {
+    fn selected_value(&self) -> String {
+        match self {
+            ChoiceWidget::Boolean(check) => {
+                if check.is_active() {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            ChoiceWidget::Enumerated(dropdown, option_ids) => {
+                let index = dropdown.selected() as usize;
+                option_ids.get(index).cloned().unwrap_or_default()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PickerConfig {
     multiple: bool,
@@ -923,12 +995,29 @@ struct PickerConfig {
     starting_dir: Option<String>,
     filter: Option<String>,
     window: Option<PickerWindow>,
+    request: WireRequestNative,
 }
 
 #[derive(Clone, Debug)]
 struct PickerState {
     config: PickerConfig,
     out_file: String,
+    meta_path: Option<String>,
+    /// Index into `config.request.filters` currently active, or `None`
+    /// when there are no supplied filters (every entry allowed, matching
+    /// pre-D-222 behavior unless the legacy `filter` string is set).
+    active_filter: Rc<RefCell<Option<usize>>>,
+    /// Current selection per supplied choice, keyed by the choice's `id`,
+    /// seeded from each choice's already-resolved `initial`.
+    ///
+    /// Both fields are wrapped in `Rc` (not plain `RefCell`) because
+    /// `PickerState` is cloned at every `state.borrow().picker.clone()`
+    /// call site; a plain `RefCell` clone copies the *value* into an
+    /// independent cell, so a write through one clone (e.g. from a
+    /// widget's change handler) would never be visible to a later clone
+    /// (e.g. at submit time). Sharing via `Rc` makes every clone alias
+    /// the same cell.
+    choice_selections: Rc<RefCell<HashMap<String, String>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -968,6 +1057,37 @@ fn parse_picker_window(value: &str) -> Option<PickerWindow> {
     }
 }
 
+fn parse_wire_request(path: &str) -> WireRequestNative {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Resolves the index of `request.current_filter` within
+/// `request.filters` by name, falling back to the first filter when the
+/// name doesn't match any -- the request is already-resolved by the time
+/// it reaches here, but a defensive default keeps a malformed/edited file
+/// from ever producing an out-of-range index.
+fn initial_active_filter(request: &WireRequestNative) -> Option<usize> {
+    if request.filters.is_empty() {
+        return None;
+    }
+    let by_name = request
+        .current_filter
+        .as_ref()
+        .and_then(|cf| request.filters.iter().position(|f| f.name == cf.name));
+    Some(by_name.unwrap_or(0))
+}
+
+fn initial_choice_selections(request: &WireRequestNative) -> HashMap<String, String> {
+    request
+        .choices
+        .iter()
+        .map(|c| (c.id.clone(), c.initial.clone()))
+        .collect()
+}
+
 fn parse_picker_state() -> Option<PickerState> {
     let mut args = std::env::args().skip(1);
     let mut pick = false;
@@ -977,6 +1097,8 @@ fn parse_picker_state() -> Option<PickerState> {
     let mut filter = None;
     let mut out_file = None;
     let mut window = None;
+    let mut request = WireRequestNative::default();
+    let mut meta_path = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -986,6 +1108,12 @@ fn parse_picker_state() -> Option<PickerState> {
             "--out" => out_file = args.next(),
             "--starting-dir" => starting_dir = args.next(),
             "--filter" => filter = args.next(),
+            "--request" => {
+                if let Some(path) = args.next() {
+                    request = parse_wire_request(&path);
+                    meta_path = Some(result_meta_path_for(&path));
+                }
+            }
             "--picker-size" => {
                 if let Some(value) = args.next() {
                     window = parse_picker_size(&value);
@@ -1004,28 +1132,154 @@ fn parse_picker_state() -> Option<PickerState> {
         return None;
     }
 
+    let active_filter = initial_active_filter(&request);
+    let choice_selections = initial_choice_selections(&request);
+
     Some(PickerState {
         config: PickerConfig {
-            multiple,
+            multiple: multiple || request.multiple,
             directory,
             starting_dir,
             filter,
             window,
+            request,
         },
         out_file: out_file?,
+        meta_path,
+        active_filter: Rc::new(RefCell::new(active_filter)),
+        choice_selections: Rc::new(RefCell::new(choice_selections)),
     })
+}
+
+/// `--request <path>` names `request.json` inside the owned `RequestRoot`;
+/// the sibling result-meta file lives in the same directory under the
+/// fixed name the portal side reads back, never a caller-chosen path.
+fn result_meta_path_for(request_path: &str) -> String {
+    Path::new(request_path)
+        .parent()
+        .map(|dir| dir.join("result.meta.json").to_string_lossy().to_string())
+        .unwrap_or_else(|| "result.meta.json".to_string())
+}
+
+/// Ordered glob/MIME rule match against one supplied filter, matching the
+/// real `org.freedesktop.portal.FileChooser` contract: `kind` `0` is a
+/// glob pattern (case-sensitive, `*`/`?` wildcards only), `kind` `1` is a
+/// MIME type (`type/subtype`, `subtype` may be `*`). The filter matches an
+/// entry when ANY of its rules match.
+fn wire_filter_allows(filter: &WireFilterNative, entry: &Entry) -> bool {
+    if filter.rules.is_empty() {
+        return true;
+    }
+    let name = Path::new(&entry.name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| entry.name.clone());
+    filter.rules.iter().any(|(kind, pattern)| match kind {
+        0 => glob_match(pattern, &name),
+        1 => mime_match(pattern, entry),
+        _ => false,
+    })
+}
+
+/// Minimal glob matcher supporting `*` (any run of characters) and `?`
+/// (exactly one character); no character classes, no escaping -- the
+/// portal's own filter contract defines nothing beyond this.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..])),
+            Some('?') => !t.is_empty() && inner(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    inner(&p, &t)
+}
+
+/// `Entry` carries no MIME type, only an extension; this guesses a MIME
+/// type from the extension for the common cases a filter is likely to
+/// name, and falls back to `application/octet-stream` otherwise -- a
+/// best-effort match, never a crash or a panic on an unknown extension.
+fn guess_mime_from_name(name: &str) -> &'static str {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+fn mime_match(pattern: &str, entry: &Entry) -> bool {
+    let entry_mime = guess_mime_from_name(&entry.name);
+    let (Some((p_type, p_sub)), Some((e_type, e_sub))) =
+        (pattern.split_once('/'), entry_mime.split_once('/'))
+    else {
+        return pattern == entry_mime;
+    };
+    p_type == e_type && (p_sub == "*" || p_sub == e_sub)
 }
 
 fn picker_filter_allows(picker: Option<&PickerState>, entry: &Entry) -> bool {
     let Some(picker) = picker else {
         return true;
     };
+    if let Some(index) = *picker.active_filter.borrow() {
+        if let Some(active) = picker.config.request.filters.get(index) {
+            return entry.is_dir || wire_filter_allows(active, entry);
+        }
+    }
     let Some(filter) = picker.config.filter.as_deref() else {
         return true;
     };
     match filter {
         "images" => entry.is_dir || entry.is_image,
         _ => true,
+    }
+}
+
+/// Writes the optional `result.meta.json` the portal side may read back:
+/// the currently active filter (if any were supplied) and every choice's
+/// final `(id, selected_id)` pair, in `config.request.choices` order.
+/// Only written on a successful pick (`code == 0`); a cancel or failure
+/// leaves no meta file, matching the existing path-only result contract.
+fn picker_write_result_meta(picker: &PickerState) {
+    let Some(meta_path) = picker.meta_path.as_deref() else {
+        return;
+    };
+    let current_filter = picker
+        .active_filter
+        .borrow()
+        .and_then(|i| picker.config.request.filters.get(i).cloned());
+    let selections = picker.choice_selections.borrow();
+    let choices = picker
+        .config
+        .request
+        .choices
+        .iter()
+        .map(|c| {
+            let selected = selections.get(&c.id).cloned().unwrap_or_else(|| c.initial.clone());
+            (c.id.clone(), selected)
+        })
+        .collect();
+    let meta = WireResultMetaNative { current_filter, choices };
+    if let Ok(bytes) = serde_json::to_vec(&meta) {
+        let _ = fs::write(meta_path, bytes);
     }
 }
 
@@ -1045,6 +1299,9 @@ fn picker_write_and_exit(picker: &PickerState, paths: Vec<String>, code: i32) ->
     } else {
         format!("{output}\n")
     };
+    if code == 0 {
+        picker_write_result_meta(picker);
+    }
     let _ = fs::write(&picker.out_file, output);
     std::process::exit(code);
 }
@@ -1511,6 +1768,11 @@ struct Ui {
     transfer_bar: gtk::ProgressBar,
     transfer_cancel: gtk::Button,
     picker_open: Option<gtk::Button>,
+    /// Present only when the request supplied 2+ filters; switches
+    /// `PickerState::active_filter`.
+    picker_filter_dropdown: Option<gtk::DropDown>,
+    /// One live control per supplied choice, in request order.
+    picker_choice_widgets: Vec<(String, ChoiceWidget)>,
     /// Exists only in the non-default `picker-test-driver` feature build; the
     /// ordinary shipped binary has no field, no clone and no reader for this.
     #[cfg(feature = "picker-test-driver")]
@@ -3367,10 +3629,53 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     #[cfg(feature = "picker-test-driver")]
     let mut picker_cancel_for_driver: Option<gtk::Button> = None;
+    let mut picker_filter_dropdown: Option<gtk::DropDown> = None;
+    let mut picker_choice_widgets: Vec<(String, ChoiceWidget)> = Vec::new();
     let picker_open = if picker.is_some() {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         actions.add_css_class("wf-picker-actions");
         actions.set_halign(gtk::Align::Fill);
+
+        if let Some(picker_state) = picker.as_ref() {
+            let filters = &picker_state.config.request.filters;
+            if filters.len() >= 2 {
+                let names: Vec<&str> = filters.iter().map(|f| f.name.as_str()).collect();
+                let dropdown = gtk::DropDown::from_strings(&names);
+                dropdown.add_css_class("wf-picker-filter");
+                if let Some(index) = *picker_state.active_filter.borrow() {
+                    dropdown.set_selected(index as u32);
+                }
+                actions.append(&dropdown);
+                picker_filter_dropdown = Some(dropdown);
+            }
+
+            for choice in &picker_state.config.request.choices {
+                let selections = &picker_state.choice_selections;
+                let initial_selected = selections
+                    .borrow()
+                    .get(&choice.id)
+                    .cloned()
+                    .unwrap_or_else(|| choice.initial.clone());
+                let widget = if choice.options.is_empty() {
+                    let check = gtk::CheckButton::builder().label(&choice.label).build();
+                    check.set_active(initial_selected == "true");
+                    actions.append(&check);
+                    ChoiceWidget::Boolean(check)
+                } else {
+                    let option_ids: Vec<String> =
+                        choice.options.iter().map(|(id, _)| id.clone()).collect();
+                    let labels: Vec<&str> =
+                        choice.options.iter().map(|(_, label)| label.as_str()).collect();
+                    let dropdown = gtk::DropDown::from_strings(&labels);
+                    if let Some(index) = option_ids.iter().position(|id| id == &initial_selected) {
+                        dropdown.set_selected(index as u32);
+                    }
+                    actions.append(&dropdown);
+                    ChoiceWidget::Enumerated(dropdown, option_ids)
+                };
+                picker_choice_widgets.push((choice.id.clone(), widget));
+            }
+        }
 
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -3479,6 +3784,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         transfer_bar: transfer_bar.clone(),
         transfer_cancel: transfer_cancel.clone(),
         picker_open: picker_open.clone(),
+        picker_filter_dropdown: picker_filter_dropdown.clone(),
+        picker_choice_widgets: picker_choice_widgets.clone(),
         #[cfg(feature = "picker-test-driver")]
         picker_cancel: picker_cancel_for_driver.clone(),
         new_folder: new_folder.clone(),
@@ -3742,10 +4049,49 @@ fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         if state.borrow().visible_entries.is_empty() {
             return glib::ControlFlow::Continue;
         }
-        // The round-owned fixture is the only entry in the picker's
-        // starting directory, so the real folder model's first row is it;
-        // this reuses the real selection + Open callback, not a new seam.
-        ui.list_selection.select_item(0, true);
+        let Some(picker) = state.borrow().picker.clone() else {
+            return glib::ControlFlow::Continue;
+        };
+        // Selects every currently filter-eligible fixture row (up to two
+        // when `multiple` is set), the real `picker_entry_can_submit` /
+        // `picker_filter_allows` guard a real click would also obey, so a
+        // nonmatching fixture never gets selected here either.
+        let matching_indices: Vec<usize> = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| picker_entry_can_submit(&picker, entry))
+            .map(|(index, _)| index)
+            .collect();
+        if matching_indices.is_empty() {
+            return glib::ControlFlow::Continue;
+        }
+        let take = if picker.config.multiple { 2 } else { 1 };
+        for (position, &index) in matching_indices.iter().take(take).enumerate() {
+            ui.list_selection.select_item(index as u32, position == 0);
+        }
+        // Exercises the real filter/choice controls through their own
+        // widget APIs -- never a synthetic pointer event -- so the result
+        // meta this round writes reflects live widget state, not just
+        // each control's already-resolved initial value.
+        if let Some(dropdown) = ui.picker_filter_dropdown.clone() {
+            let filters_len = picker.config.request.filters.len() as u32;
+            if filters_len > 0 {
+                dropdown.set_selected((dropdown.selected() + 1) % filters_len);
+            }
+        }
+        for (_, widget) in &ui.picker_choice_widgets {
+            match widget {
+                ChoiceWidget::Boolean(check) => check.set_active(!check.is_active()),
+                ChoiceWidget::Enumerated(dropdown, option_ids) => {
+                    let len = option_ids.len() as u32;
+                    if len > 0 {
+                        dropdown.set_selected((dropdown.selected() + 1) % len);
+                    }
+                }
+            }
+        }
         if let Some(open) = ui.picker_open.clone() {
             open.emit_clicked();
         }
@@ -8155,7 +8501,35 @@ fn update_picker_open_button(state: &Rc<RefCell<AppState>>, ui: &Ui, entries: &[
     }
 }
 
+/// Copies the live GTK filter/choice widget state into the `PickerState`'s
+/// `RefCell`s, so whatever is read at submit time (`picker_write_and_exit`
+/// -> `picker_write_result_meta`) and whatever `picker_filter_allows` reads
+/// for the open-button sensitivity check are the same, current values.
+fn sync_picker_widget_state(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let Some(picker) = state.borrow().picker.clone() else {
+        return;
+    };
+    if let Some(dropdown) = &ui.picker_filter_dropdown {
+        *picker.active_filter.borrow_mut() = Some(dropdown.selected() as usize);
+    }
+    if !ui.picker_choice_widgets.is_empty() {
+        let mut selections = picker.choice_selections.borrow_mut();
+        for (id, widget) in &ui.picker_choice_widgets {
+            selections.insert(id.clone(), widget.selected_value());
+        }
+    }
+}
+
 fn connect_picker_actions(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    if let Some(dropdown) = &ui.picker_filter_dropdown {
+        let state = state.clone();
+        let ui = ui.clone();
+        dropdown.connect_selected_notify(move |_| {
+            sync_picker_widget_state(&state, &ui);
+            let entries = selected_entries(&state, &ui);
+            update_picker_open_button(&state, &ui, &entries);
+        });
+    }
     let Some(button) = ui.picker_open.clone() else {
         return;
     };
@@ -8164,6 +8538,7 @@ fn connect_picker_actions(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         let state = state.clone();
         let ui = ui.clone();
         button.connect_clicked(move |_| {
+            sync_picker_widget_state(&state, &ui);
             let Some(picker) = state.borrow().picker.clone() else {
                 return;
             };
@@ -14473,8 +14848,11 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.status.label(), refusal, "Terminal refused inside a ZIP");
         {
             state.borrow_mut().picker = Some(PickerState {
-                config: PickerConfig { multiple: false, directory: false, starting_dir: None, filter: None, window: None },
+                config: PickerConfig { multiple: false, directory: false, starting_dir: None, filter: None, window: None, request: WireRequestNative::default() },
                 out_file: dir.join("picker-zip.out").to_string_lossy().to_string(),
+                meta_path: None,
+                active_filter: Rc::new(RefCell::new(None)),
+                choice_selections: Rc::new(RefCell::new(HashMap::new())),
             });
             let picker_entry = state.borrow().visible_entries.iter().find(|e| !e.is_dir).cloned().unwrap();
             assert!(
@@ -18388,7 +18766,10 @@ Broken: Either state is wrong.\n";
         still_pending("failed open_path");
         // Picker mode (directory picker, so a file is refused and nothing exits).
         state.borrow_mut().picker = Some(PickerState {
-            config: PickerConfig { multiple: false, directory: true, starting_dir: None, filter: None, window: None },
+            config: PickerConfig { multiple: false, directory: true, starting_dir: None, filter: None, window: None, request: WireRequestNative::default() },
+            meta_path: None,
+            active_filter: Rc::new(RefCell::new(None)),
+            choice_selections: Rc::new(RefCell::new(HashMap::new())),
             out_file: root.join("picker.out").to_string_lossy().to_string(),
         });
         open_entry(&state, &ui, entry.clone());
