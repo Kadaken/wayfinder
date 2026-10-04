@@ -199,6 +199,7 @@ impl PortalService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::fs;
     use std::io::{BufRead, BufReader};
@@ -229,6 +230,10 @@ mod tests {
         daemon: Child,
         old_tmpdir: Option<String>,
         old_xdg_runtime_dir: Option<String>,
+        /// Set once `finish_private_bus` has explicitly removed `root`, so
+        /// `Drop` never attempts a second removal of a path that may since
+        /// have been reused.
+        root_removed: Cell<bool>,
     }
 
     impl PrivateBus {
@@ -278,6 +283,7 @@ mod tests {
                 daemon,
                 old_tmpdir,
                 old_xdg_runtime_dir,
+                root_removed: Cell::new(false),
             }
         }
 
@@ -315,11 +321,12 @@ mod tests {
         }
     }
 
-    /// Kills the daemon and restores `TMPDIR`/`XDG_RUNTIME_DIR` -- never
-    /// touches disk, so it is safe as an unwind-safe fallback on panic.
-    /// Removing the scratch root is a separate, explicit step every test
-    /// performs itself (see `finish_private_bus`) so a removal failure
-    /// fails the test instead of being silently ignored.
+    /// Kills the daemon, restores `TMPDIR`/`XDG_RUNTIME_DIR`, and -- unless
+    /// `finish_private_bus` already removed it explicitly -- makes a
+    /// bounded best-effort removal of `root` itself, ignoring the result.
+    /// That fallback is what recovers the root when a test panics before
+    /// reaching `finish_private_bus`; it never panics itself, so a second
+    /// panic during unwind can never turn into a process abort.
     impl Drop for PrivateBus {
         fn drop(&mut self) {
             let _ = self.daemon.kill();
@@ -332,26 +339,35 @@ mod tests {
                 Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
                 None => std::env::remove_var("XDG_RUNTIME_DIR"),
             }
+            if !self.root_removed.get() {
+                let _ = fs::remove_dir_all(&self.root);
+            }
         }
     }
 
-    /// Closes the connections and the private bus, then removes its
-    /// round-owned scratch root. Failure to remove it fails the test.
+    /// Closes the connections and the private bus, then explicitly removes
+    /// its round-owned scratch root. Failure to remove it fails the test;
+    /// `Drop`'s own fallback removal is skipped afterward since
+    /// `root_removed` is set first.
     fn finish_private_bus(bus: PrivateBus, server: Connection, client: Connection) {
         let root = bus.root().to_path_buf();
         drop(client);
         drop(server);
-        drop(bus);
         fs::remove_dir_all(&root).expect("remove the round-owned scratch root");
+        bus.root_removed.set(true);
+        drop(bus);
     }
 
     /// A small round-owned scratch fixture for pure `decide()` tests that
     /// need one real file to exist, created under `~/Projects/Scratch/`
-    /// (never `/tmp`). Callers must call `remove()` explicitly so a
-    /// cleanup failure fails the test rather than being ignored.
+    /// (never `/tmp`). Callers normally call `remove()` explicitly so a
+    /// cleanup failure fails the test rather than being ignored; `Drop`
+    /// makes a bounded best-effort removal otherwise, which is what
+    /// recovers the fixture dir if the test panics first.
     struct ScratchFile {
         dir: PathBuf,
         path: PathBuf,
+        removed: Cell<bool>,
     }
 
     impl ScratchFile {
@@ -367,16 +383,105 @@ mod tests {
             fs::create_dir_all(&dir).expect("create scratch fixture dir");
             let path = dir.join("picked.txt");
             fs::write(&path, b"d202 fixture").expect("write scratch fixture file");
-            Self { dir, path }
+            Self {
+                dir,
+                path,
+                removed: Cell::new(false),
+            }
         }
 
         fn path(&self) -> &Path {
             &self.path
         }
 
+        /// Explicitly, observably removes the fixture dir. Failure fails
+        /// the test; `Drop`'s fallback removal is skipped afterward since
+        /// `removed` is set first.
         fn remove(self) {
             fs::remove_dir_all(&self.dir).expect("remove the round-owned scratch fixture dir");
+            self.removed.set(true);
         }
+    }
+
+    /// Unwind-safe fallback: a bounded best-effort removal, ignored if it
+    /// fails, and skipped entirely when `remove()` already removed it. Never
+    /// panics, so it never turns an in-flight panic into a double panic.
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            if !self.removed.get() {
+                let _ = fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
+    /// D-203 oracle: panics inside the `PrivateBus` fixture's own scope
+    /// (before any explicit `finish_private_bus` call), then proves the
+    /// unwind-safe `Drop` fallback removed the exact captured root, reaped
+    /// the private daemon, and restored `TMPDIR`/`XDG_RUNTIME_DIR`.
+    #[test]
+    fn private_bus_drop_recovers_root_on_panic() {
+        let _guard = env_lock();
+        let old_tmpdir = std::env::var("TMPDIR").ok();
+        let old_xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+        let captured: Arc<Mutex<Option<(PathBuf, u32)>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bus = PrivateBus::start();
+            *captured_clone.lock().unwrap() = Some((bus.root().to_path_buf(), bus.daemon.id()));
+            panic!("deliberate panic inside the PrivateBus fixture scope, before finish_private_bus");
+        }));
+        assert!(result.is_err(), "the deliberate panic must actually unwind");
+
+        let (root, daemon_pid) = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("root and daemon pid captured before the panic");
+        assert!(
+            !root.exists(),
+            "PrivateBus::drop must remove its exact root on unwind"
+        );
+        assert!(
+            !PathBuf::from(format!("/proc/{daemon_pid}")).exists(),
+            "PrivateBus::drop must reap the private dbus-daemon on unwind"
+        );
+        assert_eq!(
+            std::env::var("TMPDIR").ok(),
+            old_tmpdir,
+            "TMPDIR must be restored after the unwind"
+        );
+        assert_eq!(
+            std::env::var("XDG_RUNTIME_DIR").ok(),
+            old_xdg_runtime_dir,
+            "XDG_RUNTIME_DIR must be restored after the unwind"
+        );
+    }
+
+    /// D-203 oracle: panics inside the `ScratchFile` fixture's own scope
+    /// (before any explicit `remove()` call), then proves the unwind-safe
+    /// `Drop` fallback removed the exact captured fixture dir.
+    #[test]
+    fn scratch_file_drop_recovers_dir_on_panic() {
+        let captured: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fixture = ScratchFile::create();
+            *captured_clone.lock().unwrap() = Some(fixture.dir.clone());
+            panic!("deliberate panic inside the ScratchFile fixture scope, before remove()");
+        }));
+        assert!(result.is_err(), "the deliberate panic must actually unwind");
+
+        let dir = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("fixture dir captured before the panic");
+        assert!(
+            !dir.exists(),
+            "ScratchFile::drop must remove its exact fixture dir on unwind"
+        );
     }
 
     /// Hands back exactly the scripted outcomes, in order, and counts calls
