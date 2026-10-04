@@ -2698,8 +2698,30 @@ mod tests {
             }
         }
 
+        /// D-208: the owner exists -- and its unwind-safe `Drop` fallback
+        /// is live -- before the directory is created, not after. Callers
+        /// that build a round-owned root must use this instead of calling
+        /// `fs::create_dir_all` and then `adopt`, which leaves the interval
+        /// between the two calls unowned.
+        fn create(dir: PathBuf) -> Self {
+            let owner = Self {
+                dir,
+                removed: Cell::new(false),
+            };
+            fs::create_dir_all(owner.path()).expect("create owned scratch dir");
+            owner
+        }
+
         fn path(&self) -> &Path {
             &self.dir
+        }
+
+        /// D-208 test seam: lets a test observe this still-live owner's
+        /// exact root before removal. Unlike `mem::forget`, this never
+        /// gives up ownership, so a panic, timeout or other unwind during
+        /// `f` still passes through `Drop`'s fallback removal.
+        fn peek_while_live<T>(&self, f: impl FnOnce() -> T) -> T {
+            f()
         }
 
         /// Explicitly, observably removes the exact dir. Failure fails
@@ -2919,12 +2941,11 @@ mod tests {
             "WAYLAND_DISPLAY",
         ];
 
-        /// A standalone private env with its own exact fresh root. The
-        /// root is created and immediately adopted by `OwnedScratchDir`
-        /// -- establishing its unwind-safe owner -- before any further
-        /// subdirectory is created or any environment variable is
-        /// overridden, so no panic interval in between can leave either
-        /// the files or the process-wide vars unowned.
+        /// A standalone private env with its own exact fresh root. D-208:
+        /// the owner exists, and its unwind-safe `Drop` fallback is live,
+        /// before the root itself is created, so no panic interval in
+        /// between can leave either the files or the process-wide vars
+        /// unowned.
         fn start() -> Self {
             let home_var = std::env::var("HOME").expect("HOME must be set");
             let stamp = SystemTime::now()
@@ -2937,8 +2958,7 @@ mod tests {
                 stamp,
                 next_unique_id()
             ));
-            fs::create_dir_all(&root).expect("create private portal-env root");
-            let owner = OwnedScratchDir::adopt(root);
+            let owner = OwnedScratchDir::create(root);
             let env_root = owner.path().to_path_buf();
             Self::build(owner, env_root)
         }
@@ -3163,8 +3183,7 @@ mod tests {
         // the way other, non-socket-bearing `scratch_base()` callers do.
         let short_feature = feature.replace("picker-test-driver-", "ptd-");
         let round_root = scratch_base(&format!("pat-{short_feature}"));
-        fs::create_dir_all(&round_root).expect("create round-owned activation build root");
-        let round_root = OwnedScratchDir::adopt(round_root);
+        let round_root = OwnedScratchDir::create(round_root);
         let target_dir = round_root.path().join("target");
         let status = Command::new("cargo")
             .arg("build")
@@ -3242,8 +3261,7 @@ mod tests {
         let token = d206_fresh_token();
         let home = std::env::var("HOME").expect("HOME must be set");
         let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
-        fs::create_dir_all(&root_path).expect("create D-206 oracle round root");
-        let owner = OwnedScratchDir::adopt(root_path);
+        let owner = OwnedScratchDir::create(root_path);
         d206_populate_target_shaped_subtree(owner.path());
 
         owner.finish();
@@ -3306,8 +3324,7 @@ mod tests {
         let token = d206_fresh_token();
         let home = std::env::var("HOME").expect("HOME must be set");
         let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
-        fs::create_dir_all(&root_path).expect("create D-206 forced-unwind round root");
-        let owner = OwnedScratchDir::adopt(root_path.clone());
+        let owner = OwnedScratchDir::create(root_path);
         d206_populate_target_shaped_subtree(owner.path());
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -3382,39 +3399,51 @@ mod tests {
             .expect("write env-shaped evidence marker");
     }
 
-    /// Round 217 (D-207) proof 2: the paired owner-removal-bypass proof,
+    /// A fresh, unique D-208 token for one bypass run, in its own
+    /// namespace -- never `d206-` or `d207-`, so this proof never borrows
+    /// another round's prefix.
+    fn d208_fresh_token() -> String {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        format!("d208-one-root-bypass-{}-{}-{}", std::process::id(), stamp, next_unique_id())
+    }
+
+    /// Round 218 (D-208) proof 2: the paired owner-removal-bypass proof,
     /// built on the same one-root shape (a `target/` and an `env/` child
-    /// under one fresh owner) as proof 1, but bypassing only this run's
-    /// owner removal (`mem::forget`) to prove the same exact-prefix
-    /// oracle actually detects a real survivor. Cleans up only its own
-    /// captured exact path afterward.
+    /// under one fresh owner) as proof 1, rewritten so there is never an
+    /// unowned interval. The owner stays live throughout: the exact-prefix
+    /// oracle observes the survivor through `peek_while_live` while the
+    /// owner's unwind-safe `Drop` fallback is still armed, then checked
+    /// `finish()` removes it normally. No `mem::forget` anywhere, and any
+    /// panic, timeout or other unwind during the peek would still be
+    /// reaped by `Drop`.
     #[test]
-    fn d207_one_root_bypass_proves_oracle_detects_survivor() {
+    fn d208_one_root_bypass_proves_oracle_detects_survivor_without_unowned_interval() {
         let _guard = env_lock();
-        let token = d206_fresh_token();
+        let token = d208_fresh_token();
         let home = std::env::var("HOME").expect("HOME must be set");
         let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
-        fs::create_dir_all(&root_path).expect("create D-207 bypass one-root");
-        let owner = OwnedScratchDir::adopt(root_path.clone());
+        let owner = OwnedScratchDir::create(root_path);
         d206_populate_target_shaped_subtree(owner.path());
         d207_populate_env_shaped_subtree(owner.path());
 
         assert!(owner.path().join("env").join("home").is_dir(), "env child must nest under <one-root>/env/");
 
-        // Bypass only this run's owner removal -- `mem::forget` skips both
-        // the checked `finish()` path and the `Drop` fallback (which
-        // would otherwise reap the whole one-root, target and env children
-        // both), without touching any other object or entry.
-        std::mem::forget(owner);
+        // The owner is still live here -- no `mem::forget`, no early
+        // `finish()` -- so `Drop` would still reap the whole one-root if
+        // this peek itself panicked or timed out.
+        owner.peek_while_live(|| {
+            assert_eq!(
+                d206_prefix_count(&token),
+                1,
+                "with the owner still live and unremoved, the oracle must detect the one-root survivor"
+            );
+        });
 
-        assert_eq!(
-            d206_prefix_count(&token),
-            1,
-            "with this run's owner removal bypassed, the oracle must detect the one-root survivor"
-        );
-
-        fs::remove_dir_all(&root_path).expect("checked cleanup of the captured bypass one-root");
-        assert_eq!(d206_prefix_count(&token), 0, "the bypass proof itself must leave nothing behind");
+        owner.finish();
+        assert_eq!(d206_prefix_count(&token), 0, "the proof's own checked finish() must leave nothing behind");
     }
 
     /// Round 217 (D-207) proof 3: forced-unwind coverage taken only after
@@ -3428,8 +3457,7 @@ mod tests {
         let token = d206_fresh_token();
         let home = std::env::var("HOME").expect("HOME must be set");
         let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
-        fs::create_dir_all(&root_path).expect("create D-207 forced-unwind one-root");
-        let owner = OwnedScratchDir::adopt(root_path.clone());
+        let owner = OwnedScratchDir::create(root_path);
         d206_populate_target_shaped_subtree(owner.path());
         d207_populate_env_shaped_subtree(owner.path());
         // Both children -- `target/` and `env/` -- already exist by this
