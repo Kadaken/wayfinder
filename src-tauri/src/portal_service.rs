@@ -6,6 +6,7 @@
 
 use adw::gtk::gio;
 use adw::prelude::FileExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -16,6 +17,67 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+
+/// One supplied filter's user-visible name and ordered glob/MIME rules.
+/// `kind` is `0` for a glob pattern, `1` for a MIME type (matching the
+/// real `org.freedesktop.portal.FileChooser` `filters` wire shape
+/// `a(sa(us))`); wire-identical in `native.rs`, which defines its own copy
+/// rather than importing this file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireFilter {
+    pub name: String,
+    pub rules: Vec<(u32, String)>,
+}
+
+/// One supplied choice: an empty `options` list is the contract's boolean
+/// choice: a nonempty list is enumerated. `initial` is always a concrete,
+/// already-resolved valid value by the time this reaches the native picker
+/// -- never empty, never an id absent from `options` for an enumerated
+/// choice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireChoice {
+    pub id: String,
+    pub label: String,
+    pub options: Vec<(String, String)>,
+    pub initial: String,
+}
+
+/// The one per-request protocol file this round adds: written by the
+/// portal into the already-owned `RequestRoot` before the native child is
+/// spawned, read by `wayfinder-native` via `--request <path>`. Carries
+/// exactly the decoded, already-resolved request data; never an env var,
+/// never a global file, never a caller-chosen path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireRequest {
+    pub multiple: bool,
+    pub filters: Vec<WireFilter>,
+    pub current_filter: Option<WireFilter>,
+    pub choices: Vec<WireChoice>,
+}
+
+impl Default for WireRequest {
+    fn default() -> Self {
+        Self {
+            multiple: false,
+            filters: Vec::new(),
+            current_filter: None,
+            choices: Vec::new(),
+        }
+    }
+}
+
+/// The native picker's response metadata beyond the picked paths
+/// themselves: the filter actually active, and every choice's final
+/// `(id, selected_id)` pair. Read from a second, separately-optional
+/// `result.meta.json` file in the same `RequestRoot`; the existing
+/// strict path-only `read_result_strict` parser is untouched by this.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WireResultMeta {
+    #[serde(default)]
+    pub current_filter: Option<WireFilter>,
+    #[serde(default)]
+    pub choices: Vec<(String, String)>,
+}
 
 pub const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.wayfinder";
 pub const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -39,6 +101,37 @@ pub enum ChooserOutcome {
 
 pub trait Chooser: Send + Sync {
     fn pick_single(&self, app_id: &str, parent_window: &str, title: &str) -> ChooserOutcome;
+
+    /// Additive seam for D-222: carries the decoded `multiple`/`filters`/
+    /// `current_filter`/`choices` request to the chooser. The default body
+    /// delegates to `pick_single` and reports no filter/choice metadata, so
+    /// every existing `Chooser` impl and every existing `pick_single` call
+    /// site in this file's own tests is unaffected; only `ProcessChooser`
+    /// overrides it with real behavior, and only `decide()`'s own call site
+    /// uses it.
+    fn pick(&self, app_id: &str, parent_window: &str, title: &str, request: &WireRequest) -> PickOutcome {
+        let _ = request;
+        PickOutcome::from(self.pick_single(app_id, parent_window, title))
+    }
+}
+
+/// `ChooserOutcome` plus whatever filter/choice metadata the chooser
+/// resolved, if any. `From<ChooserOutcome>` gives it empty metadata, so
+/// every pre-existing direct `decide()` test (which builds a bare
+/// `ChooserOutcome`) only has to add `.into()` at its one closure call site.
+#[derive(Debug, Clone)]
+pub struct PickOutcome {
+    pub outcome: ChooserOutcome,
+    pub meta: WireResultMeta,
+}
+
+impl From<ChooserOutcome> for PickOutcome {
+    fn from(outcome: ChooserOutcome) -> Self {
+        Self {
+            outcome,
+            meta: WireResultMeta::default(),
+        }
+    }
 }
 
 /// A fresh, owner-only (mode 0700) directory holding exactly one
@@ -68,6 +161,48 @@ impl RequestRoot {
     fn result_path(&self) -> PathBuf {
         self.dir.join("result")
     }
+
+    fn request_path(&self) -> PathBuf {
+        self.dir.join("request.json")
+    }
+
+    fn result_meta_path(&self) -> PathBuf {
+        self.dir.join("result.meta.json")
+    }
+}
+
+/// The largest request/result-meta file either side will write or read.
+/// Same bound as `MAX_RESULT_BYTES`; a request this large is malformed.
+const MAX_WIRE_JSON_BYTES: u64 = 64 * 1024;
+
+/// Writes the decoded request as owner-only (mode 0600) JSON so
+/// `wayfinder-native` can read it via `--request <path>`. Never partial:
+/// any serialization or I/O failure removes nothing written so far and
+/// is reported to the caller, which fails the whole pick closed.
+fn write_request_file(path: &Path, request: &WireRequest) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(path, bytes)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Reads the optional `result.meta.json` the native picker may have
+/// written. Every failure mode -- absent, oversized, unreadable, not
+/// valid JSON, wrong shape -- returns an empty default rather than
+/// erroring; this file is advisory metadata, never load-bearing for
+/// whether the pick itself succeeded.
+fn read_result_meta(path: &Path) -> WireResultMeta {
+    let Ok(metadata) = fs::metadata(path) else {
+        return WireResultMeta::default();
+    };
+    if metadata.len() > MAX_WIRE_JSON_BYTES {
+        return WireResultMeta::default();
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return WireResultMeta::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 impl Drop for RequestRoot {
@@ -307,16 +442,33 @@ fn production_scratch_base() -> Option<PathBuf> {
 }
 
 impl Chooser for ProcessChooser {
-    fn pick_single(&self, _app_id: &str, _parent_window: &str, _title: &str) -> ChooserOutcome {
+    fn pick_single(&self, app_id: &str, parent_window: &str, title: &str) -> ChooserOutcome {
+        self.pick(app_id, parent_window, title, &WireRequest::default())
+            .outcome
+    }
+
+    fn pick(
+        &self,
+        _app_id: &str,
+        _parent_window: &str,
+        _title: &str,
+        request: &WireRequest,
+    ) -> PickOutcome {
         let base = match &self.scratch_base {
             Some(base) => base,
-            None => return ChooserOutcome::Failed,
+            None => return PickOutcome::from(ChooserOutcome::Failed),
         };
         let root = match RequestRoot::create_under(base) {
             Ok(root) => root,
-            Err(_) => return ChooserOutcome::Failed,
+            Err(_) => return PickOutcome::from(ChooserOutcome::Failed),
         };
         let result_path = root.result_path();
+        let request_path = root.request_path();
+        let meta_path = root.result_meta_path();
+
+        if write_request_file(&request_path, request).is_err() {
+            return PickOutcome::from(ChooserOutcome::Failed);
+        }
 
         let child = {
             let mut command = Command::new(&self.executable);
@@ -324,9 +476,14 @@ impl Chooser for ProcessChooser {
                 .arg("--pick")
                 .arg("--out")
                 .arg(&result_path)
+                .arg("--request")
+                .arg(&request_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            if request.multiple {
+                command.arg("--multiple");
+            }
             // Place the child in its own new process group (pgid == its
             // own pid), so a timeout kill can target that exact group --
             // covering any descendant it spawns -- without ever touching
@@ -346,11 +503,11 @@ impl Chooser for ProcessChooser {
             Ok(child) => child,
             Err(_) => {
                 if self.should_treat_spawn_error_as_success() {
-                    return ChooserOutcome::Picked(vec![PathBuf::from(
+                    return PickOutcome::from(ChooserOutcome::Picked(vec![PathBuf::from(
                         "test-override-spawn-error-sentinel",
-                    )]);
+                    )]));
                 }
-                return ChooserOutcome::Failed;
+                return PickOutcome::from(ChooserOutcome::Failed);
             }
         };
 
@@ -391,6 +548,12 @@ impl Chooser for ProcessChooser {
             }
         };
 
+        let meta = if matches!(outcome, ChooserOutcome::Picked(_)) {
+            read_result_meta(&meta_path)
+        } else {
+            WireResultMeta::default()
+        };
+
         if self.should_skip_cleanup() {
             // Same completed request, but the cleanup guard removed: do
             // not let `RequestRoot::drop` run, so the exact root that
@@ -398,7 +561,7 @@ impl Chooser for ProcessChooser {
             std::mem::forget(root);
         }
 
-        outcome
+        PickOutcome { outcome, meta }
     }
 }
 
@@ -413,65 +576,187 @@ fn option_is_true(options: &HashMap<String, OwnedValue>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn success_result(uri: String) -> (u32, HashMap<String, OwnedValue>) {
+/// Builds the final `OpenFile` results map for one or more picked URIs,
+/// adding `results.current_filter`/`results.choices` only when the request
+/// actually supplied filters/choices (an empty-filters request must never
+/// grow a `current_filter` key, and likewise for choices).
+fn build_success_results(
+    uris: Vec<String>,
+    meta: &WireResultMeta,
+) -> (u32, HashMap<String, OwnedValue>) {
     let mut results = HashMap::new();
-    let value = Value::from(vec![uri]);
     results.insert(
         "uris".to_string(),
-        OwnedValue::try_from(value).expect("Vec<String> always encodes"),
+        OwnedValue::try_from(Value::from(uris)).expect("Vec<String> always encodes"),
     );
+    if let Some(filter) = &meta.current_filter {
+        let encoded = (filter.name.clone(), filter.rules.clone());
+        results.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(encoded)).expect("filter struct always encodes"),
+        );
+    }
+    if !meta.choices.is_empty() {
+        results.insert(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(meta.choices.clone()))
+                .expect("choice pairs always encode"),
+        );
+    }
     (RESPONSE_SUCCESS, results)
 }
 
-/// Every stage-one option/result refusal is named here so a mutation
-/// proof can force exactly one of them off at a time and show the
-/// request then wrongly succeeds -- proving that guard, and only that
-/// guard, is what was blocking it. Production's one real call site
+/// Decodes the real `a(sa(us))` `filters` wire value. `Ok(vec![])` when
+/// the key is absent; `Err(())` only when the key is present but
+/// structurally malformed -- never a panic.
+fn decode_filters(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireFilter>, ()> {
+    let Some(value) = options.get("filters") else {
+        return Ok(Vec::new());
+    };
+    let raw: Vec<(String, Vec<(u32, String)>)> =
+        Vec::try_from(value.clone()).map_err(|_| ())?;
+    Ok(raw
+        .into_iter()
+        .map(|(name, rules)| WireFilter { name, rules })
+        .collect())
+}
+
+/// Decodes the real `(sa(us))` `current_filter` wire value and resolves it
+/// against the supplied `filters`: an exact match selects that filter;
+/// anything else (absent, malformed-but-filters-present is caught earlier,
+/// or simply not found) falls back to the first supplied filter, or `None`
+/// when no filters were supplied at all. Returns `Err(())` only when the
+/// key is present but structurally malformed.
+fn decode_current_filter(
+    options: &HashMap<String, OwnedValue>,
+    filters: &[WireFilter],
+) -> Result<Option<WireFilter>, ()> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+    let resolved = match options.get("current_filter") {
+        None => None,
+        Some(value) => {
+            let (name, rules): (String, Vec<(u32, String)>) =
+                <(String, Vec<(u32, String)>)>::try_from(value.clone()).map_err(|_| ())?;
+            filters.iter().find(|f| f.name == name && f.rules == rules).cloned()
+        }
+    };
+    Ok(Some(resolved.unwrap_or_else(|| filters[0].clone())))
+}
+
+/// Decodes the real `a(ssa(ss)s)` `choices` wire value, resolving each
+/// entry's initial selection to a concrete valid value: a boolean choice
+/// (empty `options`) resolves to `"true"`/`"false"`, defaulting to
+/// `"false"`; an enumerated choice resolves to its given `initial` only
+/// when that id is one of its own options, defaulting to the first option
+/// otherwise. `Ok(vec![])` when the key is absent; `Err(())` only when the
+/// key is present but structurally malformed.
+fn decode_choices(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireChoice>, ()> {
+    let Some(value) = options.get("choices") else {
+        return Ok(Vec::new());
+    };
+    let raw: Vec<(String, String, Vec<(String, String)>, String)> =
+        Vec::try_from(value.clone()).map_err(|_| ())?;
+    Ok(raw
+        .into_iter()
+        .map(|(id, label, options, initial)| {
+            let resolved_initial = if options.is_empty() {
+                if initial == "true" { "true".to_string() } else { "false".to_string() }
+            } else if options.iter().any(|(oid, _)| *oid == initial) {
+                initial
+            } else {
+                options[0].0.clone()
+            };
+            WireChoice { id, label, options, initial: resolved_initial }
+        })
+        .collect())
+}
+
+/// Every remaining stage-one option/result refusal is named here so a
+/// mutation proof can force exactly one of them off at a time and show
+/// the request then wrongly succeeds -- proving that guard, and only
+/// that guard, is what was blocking it. Production's one real call site
 /// always passes `GuardOverride::None`; nothing reachable from a D-Bus
 /// caller, an option value or an environment variable can set anything
 /// else, so this is not a backdoor, only a named decision point for
-/// tests calling the Rust function directly.
+/// tests calling the Rust function directly. `multiple`, `filters`,
+/// `current_filter` and `choices` are decoded and honored as of D-222 and
+/// no longer have guards here; `directory` remains refused outright.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GuardOverride {
     None,
-    SkipMultiple,
     SkipDirectory,
-    SkipFilters,
-    SkipCurrentFilter,
-    SkipChoices,
     SkipCardinality,
     SkipMissingPath,
     SkipInvalidOutput,
 }
 
 /// `pick` is called at most once, and only after every option guard has
-/// passed -- so a refused request never invokes the chooser seam.
+/// passed and the request has been fully decoded -- so a refused or
+/// malformed request never invokes the chooser seam.
 pub fn decide(
     options: &HashMap<String, OwnedValue>,
-    pick: impl FnOnce() -> ChooserOutcome,
+    pick: impl FnOnce(&WireRequest) -> PickOutcome,
     override_guard: GuardOverride,
 ) -> (u32, HashMap<String, OwnedValue>) {
-    if override_guard != GuardOverride::SkipMultiple && option_is_true(options, "multiple") {
-        return refuse();
-    }
     if override_guard != GuardOverride::SkipDirectory && option_is_true(options, "directory") {
         return refuse();
     }
-    if override_guard != GuardOverride::SkipFilters && options.contains_key("filters") {
-        return refuse();
-    }
-    if override_guard != GuardOverride::SkipCurrentFilter
-        && options.contains_key("current_filter")
-    {
-        return refuse();
-    }
-    if override_guard != GuardOverride::SkipChoices && options.contains_key("choices") {
-        return refuse();
-    }
 
-    match pick() {
+    let multiple = option_is_true(options, "multiple");
+    let Ok(filters) = decode_filters(options) else {
+        return refuse();
+    };
+    let Ok(current_filter) = decode_current_filter(options, &filters) else {
+        return refuse();
+    };
+    let Ok(choices) = decode_choices(options) else {
+        return refuse();
+    };
+
+    let request = WireRequest { multiple, filters, current_filter, choices };
+    let pick_outcome = pick(&request);
+    // The chooser's own reported meta wins when present (a real picker may
+    // let the user switch the active filter or a choice away from its
+    // resolved default); otherwise this falls back to the request's own
+    // already-resolved default, so even a chooser that only implements the
+    // older `pick_single` seam still returns a correct `current_filter`/
+    // `choices` for a request that supplied them.
+    let meta = WireResultMeta {
+        current_filter: pick_outcome.meta.current_filter.clone().or_else(|| request.current_filter.clone()),
+        choices: if pick_outcome.meta.choices.is_empty() {
+            request.choices.iter().map(|c| (c.id.clone(), c.initial.clone())).collect()
+        } else {
+            pick_outcome.meta.choices.clone()
+        },
+    };
+
+    match pick_outcome.outcome {
         ChooserOutcome::Cancelled => (RESPONSE_CANCELLED, HashMap::new()),
         ChooserOutcome::Failed => refuse(),
+        ChooserOutcome::Picked(paths) if multiple => {
+            if paths.is_empty() {
+                return refuse();
+            }
+            let mut uris = Vec::with_capacity(paths.len());
+            for candidate in &paths {
+                if override_guard != GuardOverride::SkipMissingPath
+                    && candidate.is_absolute()
+                    && !candidate.is_file()
+                {
+                    return refuse();
+                }
+                match normalize_to_single_file_uri(candidate) {
+                    Some(uri) => uris.push(uri),
+                    None if override_guard == GuardOverride::SkipInvalidOutput => {
+                        uris.push("file:///forced-bypass-proof".to_string());
+                    }
+                    None => return refuse(),
+                }
+            }
+            build_success_results(uris, &meta)
+        }
         ChooserOutcome::Picked(paths) => {
             if override_guard != GuardOverride::SkipCardinality && paths.len() != 1 {
                 return refuse();
@@ -497,10 +782,10 @@ pub fn decide(
             if override_guard == GuardOverride::SkipInvalidOutput {
                 let uri = normalize_to_single_file_uri(&candidate)
                     .unwrap_or_else(|| "file:///forced-bypass-proof".to_string());
-                return success_result(uri);
+                return build_success_results(vec![uri], &meta);
             }
             match normalize_to_single_file_uri(&candidate) {
-                Some(uri) => success_result(uri),
+                Some(uri) => build_success_results(vec![uri], &meta),
                 None => refuse(),
             }
         }
@@ -549,7 +834,7 @@ impl PortalService {
         let chooser = &self.chooser;
         decide(
             &options,
-            || chooser.pick_single(&app_id, &parent_window, &title),
+            |request| chooser.pick(&app_id, &parent_window, &title, request),
             GuardOverride::None,
         )
     }
@@ -1145,7 +1430,7 @@ mod tests {
         let chooser = ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
         let (response, results) = decide(
             &HashMap::new(),
-            || chooser.pick_single("app", "", "title"),
+            |_| chooser.pick_single("app", "", "title").into(),
             GuardOverride::None,
         );
         assert_eq!(response, RESPONSE_OTHER);
@@ -1160,7 +1445,7 @@ mod tests {
         let chooser = ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
         let (response, results) = decide(
             &HashMap::new(),
-            || chooser.pick_single("app", "", "title"),
+            |_| chooser.pick_single("app", "", "title").into(),
             GuardOverride::None,
         );
         assert_eq!(response, RESPONSE_OTHER);
@@ -1172,7 +1457,7 @@ mod tests {
         let chooser2 = ProcessChooser::for_test(native2.path().to_path_buf(), Duration::from_secs(5), base2.clone());
         let (response2, _) = decide(
             &HashMap::new(),
-            || chooser2.pick_single("app", "", "title"),
+            |_| chooser2.pick_single("app", "", "title").into(),
             GuardOverride::SkipMissingPath,
         );
         assert_eq!(
@@ -1191,7 +1476,7 @@ mod tests {
         let chooser = ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
         let (response, results) = decide(
             &HashMap::new(),
-            || chooser.pick_single("app", "", "title"),
+            |_| chooser.pick_single("app", "", "title").into(),
             GuardOverride::None,
         );
         assert_eq!(response, RESPONSE_OTHER);
@@ -1211,7 +1496,7 @@ mod tests {
         let chooser = ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
         let (response, results) = decide(
             &HashMap::new(),
-            || chooser.pick_single("app", "", "title"),
+            |_| chooser.pick_single("app", "", "title").into(),
             GuardOverride::None,
         );
         assert_eq!(response, RESPONSE_OTHER);
@@ -1882,12 +2167,6 @@ mod tests {
         options
     }
 
-    fn with_present_key(key: &str) -> HashMap<String, OwnedValue> {
-        let mut options = HashMap::new();
-        options.insert(key.to_string(), OwnedValue::from(0u8));
-        options
-    }
-
     // --- decide(): pure guard proofs, no bus involved. ---
 
     #[test]
@@ -1895,7 +2174,7 @@ mod tests {
         let fixture = ScratchFile::create();
         let expected_uri = gio::File::for_path(fixture.path()).uri().to_string();
         let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
-        let (response, results) = decide(&HashMap::new(), || outcome, GuardOverride::None);
+        let (response, results) = decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::None);
         assert_eq!(response, RESPONSE_SUCCESS);
         let uris = uris_of(&results);
         assert_eq!(uris, vec![expected_uri]);
@@ -1904,14 +2183,14 @@ mod tests {
 
     #[test]
     fn decide_cancelled_returns_response_one_and_no_uri() {
-        let (response, results) = decide(&HashMap::new(), || ChooserOutcome::Cancelled, GuardOverride::None);
+        let (response, results) = decide(&HashMap::new(), |_| ChooserOutcome::Cancelled.into(), GuardOverride::None);
         assert_eq!(response, RESPONSE_CANCELLED);
         assert!(results.is_empty());
     }
 
     #[test]
     fn decide_failed_returns_response_other_and_no_uri() {
-        let (response, results) = decide(&HashMap::new(), || ChooserOutcome::Failed, GuardOverride::None);
+        let (response, results) = decide(&HashMap::new(), |_| ChooserOutcome::Failed.into(), GuardOverride::None);
         assert_eq!(response, RESPONSE_OTHER);
         assert!(results.is_empty());
     }
@@ -1922,7 +2201,7 @@ mod tests {
             fn $red() {
                 let fixture = ScratchFile::create();
                 let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
-                let (response, _) = decide(&$options, || outcome, GuardOverride::None);
+                let (response, _) = decide(&$options, |_| outcome.clone().into(), GuardOverride::None);
                 assert_eq!(response, RESPONSE_OTHER);
                 fixture.remove();
             }
@@ -1931,7 +2210,7 @@ mod tests {
             fn $bypassed() {
                 let fixture = ScratchFile::create();
                 let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
-                let (response, _) = decide(&$options, || outcome, $override);
+                let (response, _) = decide(&$options, |_| outcome.clone().into(), $override);
                 assert_eq!(
                     response, RESPONSE_SUCCESS,
                     "bypassing this guard must turn the request's own refusal into success"
@@ -1942,35 +2221,120 @@ mod tests {
     }
 
     guard_proof!(
-        decide_refuses_multiple_true,
-        decide_bypassing_multiple_guard_then_succeeds,
-        with_option("multiple", true),
-        GuardOverride::SkipMultiple
-    );
-    guard_proof!(
         decide_refuses_directory_true,
         decide_bypassing_directory_guard_then_succeeds,
         with_option("directory", true),
         GuardOverride::SkipDirectory
     );
-    guard_proof!(
-        decide_refuses_filters_present,
-        decide_bypassing_filters_guard_then_succeeds,
-        with_present_key("filters"),
-        GuardOverride::SkipFilters
-    );
-    guard_proof!(
-        decide_refuses_current_filter_present,
-        decide_bypassing_current_filter_guard_then_succeeds,
-        with_present_key("current_filter"),
-        GuardOverride::SkipCurrentFilter
-    );
-    guard_proof!(
-        decide_refuses_choices_present,
-        decide_bypassing_choices_guard_then_succeeds,
-        with_present_key("choices"),
-        GuardOverride::SkipChoices
-    );
+
+    /// [D-222 replacement for `decide_refuses_multiple_true` /
+    /// `decide_bypassing_multiple_guard_then_succeeds`]: `multiple` is no
+    /// longer refused outright -- a single real picked path still succeeds
+    /// as a one-element `uris` list even when the caller asked for
+    /// `multiple=true`.
+    #[test]
+    fn decide_honors_multiple_true_with_one_picked_path() {
+        let fixture = ScratchFile::create();
+        let expected_uri = gio::File::for_path(fixture.path()).uri().to_string();
+        let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
+        let (response, results) = decide(
+            &with_option("multiple", true),
+            |_| outcome.clone().into(),
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+        fixture.remove();
+    }
+
+    /// [D-222 replacement for `decide_refuses_filters_present` /
+    /// `decide_bypassing_filters_guard_then_succeeds`]: a well-formed
+    /// `filters` value is decoded and honored, not refused.
+    #[test]
+    fn decide_honors_filters_present_well_formed() {
+        let fixture = ScratchFile::create();
+        let mut options = HashMap::new();
+        options.insert(
+            "filters".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "Text".to_string(),
+                vec![(0u32, "*.txt".to_string())],
+            )]))
+            .expect("filters encodes"),
+        );
+        let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
+        let (response, results) = decide(&options, |_| outcome.clone().into(), GuardOverride::None);
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert!(!uris_of(&results).is_empty());
+        fixture.remove();
+    }
+
+    /// [D-222 replacement for `decide_refuses_current_filter_present` /
+    /// `decide_bypassing_current_filter_guard_then_succeeds`]: a
+    /// `current_filter` matching a supplied `filters` entry resolves to
+    /// that same entry in `results.current_filter`, not a refusal.
+    #[test]
+    fn decide_honors_matching_current_filter() {
+        let fixture = ScratchFile::create();
+        let filter_value = (
+            "Text".to_string(),
+            vec![(0u32, "*.txt".to_string())],
+        );
+        let mut options = HashMap::new();
+        options.insert(
+            "filters".to_string(),
+            OwnedValue::try_from(Value::from(vec![filter_value.clone()])).expect("filters encodes"),
+        );
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(filter_value)).expect("current_filter encodes"),
+        );
+        let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
+        let (response, results) = decide(&options, |_| outcome.clone().into(), GuardOverride::None);
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert!(results.contains_key("current_filter"));
+        fixture.remove();
+    }
+
+    /// [D-222 replacement for `decide_refuses_choices_present` /
+    /// `decide_bypassing_choices_guard_then_succeeds`]: a well-formed
+    /// `choices` value is decoded, its default resolved, and returned in
+    /// `results.choices`, not refused.
+    #[test]
+    fn decide_honors_choices_present_well_formed() {
+        let fixture = ScratchFile::create();
+        let mut options = HashMap::new();
+        options.insert(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "readonly".to_string(),
+                "Read only".to_string(),
+                Vec::<(String, String)>::new(),
+                String::new(),
+            )]))
+            .expect("choices encodes"),
+        );
+        let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
+        let (response, results) = decide(&options, |_| outcome.clone().into(), GuardOverride::None);
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert!(results.contains_key("choices"));
+        fixture.remove();
+    }
+
+    /// [D-222]: a malformed `filters` value (wrong inner shape) still
+    /// fails closed with a plain refusal, never a panic, and never
+    /// reaching the chooser.
+    #[test]
+    fn decide_refuses_malformed_filters_without_panic() {
+        let mut options = HashMap::new();
+        options.insert("filters".to_string(), OwnedValue::from(7u32));
+        let (response, _) = decide(
+            &options,
+            |_| panic!("a malformed filters value must never reach the chooser"),
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_OTHER);
+    }
 
     #[test]
     fn decide_refuses_more_than_one_picked_path() {
@@ -1979,7 +2343,7 @@ mod tests {
             fixture.path().to_path_buf(),
             PathBuf::from("/nonexistent-round212-path/second.txt"),
         ]);
-        let (response, _) = decide(&HashMap::new(), || outcome, GuardOverride::None);
+        let (response, _) = decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::None);
         assert_eq!(response, RESPONSE_OTHER);
         fixture.remove();
     }
@@ -1992,7 +2356,7 @@ mod tests {
             fixture.path().to_path_buf(),
             PathBuf::from("/nonexistent-round212-path/second.txt"),
         ]);
-        let (response, results) = decide(&HashMap::new(), || outcome, GuardOverride::SkipCardinality);
+        let (response, results) = decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::SkipCardinality);
         assert_eq!(response, RESPONSE_SUCCESS);
         assert_eq!(uris_of(&results), vec![expected_uri], "only the first path is normalized");
         fixture.remove();
@@ -2001,7 +2365,7 @@ mod tests {
     #[test]
     fn decide_refuses_non_local_output() {
         let outcome = ChooserOutcome::Picked(vec![PathBuf::from("relative/not-absolute.txt")]);
-        let (response, _) = decide(&HashMap::new(), || outcome, GuardOverride::None);
+        let (response, _) = decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::None);
         assert_eq!(response, RESPONSE_OTHER);
     }
 
@@ -2009,7 +2373,7 @@ mod tests {
     fn decide_bypassing_invalid_output_guard_then_succeeds_on_non_local_path() {
         let outcome = ChooserOutcome::Picked(vec![PathBuf::from("relative/not-absolute.txt")]);
         let (response, results) =
-            decide(&HashMap::new(), || outcome, GuardOverride::SkipInvalidOutput);
+            decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::SkipInvalidOutput);
         assert_eq!(response, RESPONSE_SUCCESS);
         assert_eq!(uris_of(&results), vec!["file:///forced-bypass-proof".to_string()]);
     }
@@ -2018,7 +2382,7 @@ mod tests {
     fn decide_refuses_missing_absolute_path() {
         let outcome =
             ChooserOutcome::Picked(vec![PathBuf::from("/nonexistent-round212-path/missing.txt")]);
-        let (response, results) = decide(&HashMap::new(), || outcome, GuardOverride::None);
+        let (response, results) = decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::None);
         assert_eq!(response, RESPONSE_OTHER);
         assert!(uris_of(&results).is_empty());
     }
@@ -2029,7 +2393,7 @@ mod tests {
         let expected_uri = gio::File::for_path(&missing).uri().to_string();
         let outcome = ChooserOutcome::Picked(vec![missing]);
         let (response, results) =
-            decide(&HashMap::new(), || outcome, GuardOverride::SkipMissingPath);
+            decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::SkipMissingPath);
         assert_eq!(
             response, RESPONSE_SUCCESS,
             "bypassing only the missing-path guard must turn this same request's refusal into success"
@@ -2041,7 +2405,7 @@ mod tests {
     fn decide_bypassing_missing_path_guard_still_refuses_non_local_path() {
         let outcome = ChooserOutcome::Picked(vec![PathBuf::from("relative/not-absolute.txt")]);
         let (response, results) =
-            decide(&HashMap::new(), || outcome, GuardOverride::SkipMissingPath);
+            decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::SkipMissingPath);
         assert_eq!(
             response, RESPONSE_OTHER,
             "a relative candidate is never caught by the missing-path guard, so waiving it must not make this succeed"
@@ -2054,7 +2418,7 @@ mod tests {
         let outcome =
             ChooserOutcome::Picked(vec![PathBuf::from("/nonexistent-round212-path/missing.txt")]);
         let (response, results) =
-            decide(&HashMap::new(), || outcome, GuardOverride::SkipInvalidOutput);
+            decide(&HashMap::new(), |_| outcome.clone().into(), GuardOverride::SkipInvalidOutput);
         assert_eq!(
             response, RESPONSE_OTHER,
             "waiving only invalid-output normalization must not also waive the missing-path guard"
@@ -2330,7 +2694,10 @@ mod tests {
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
-        let (response, _) = call_open_file(&client, with_option("multiple", true)).expect("OpenFile call");
+        // D-222 moved `multiple` from a pre-pick refusal to an honored
+        // option, so this proof is now keyed on `directory=true`, the one
+        // pre-pick refusal this round leaves unchanged.
+        let (response, _) = call_open_file(&client, with_option("directory", true)).expect("OpenFile call");
         assert_eq!(response, RESPONSE_OTHER);
         assert!(
             !marker.exists(),
@@ -2367,14 +2734,52 @@ mod tests {
         };
     }
 
-    dbus_option_refusal!(dbus_openfile_refuses_multiple_true, with_option("multiple", true));
     dbus_option_refusal!(dbus_openfile_refuses_directory_true, with_option("directory", true));
-    dbus_option_refusal!(dbus_openfile_refuses_filters_present, with_present_key("filters"));
-    dbus_option_refusal!(
-        dbus_openfile_refuses_current_filter_present,
-        with_present_key("current_filter")
-    );
-    dbus_option_refusal!(dbus_openfile_refuses_choices_present, with_present_key("choices"));
+
+    /// [D-222 replacement for `dbus_openfile_refuses_multiple_true`]:
+    /// `multiple=true` over the real D-Bus boundary now reaches the
+    /// chooser and succeeds, rather than being refused before it.
+    #[test]
+    fn dbus_openfile_honors_multiple_true() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let fixture = bus.create_fixture_file("multiple-honored.txt");
+        let expected_uri = gio::File::for_path(&fixture).uri().to_string();
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![fixture])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, results) =
+            call_open_file(&client, with_option("multiple", true)).expect("OpenFile call");
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+        assert_eq!(chooser.call_count(), 1);
+        finish_private_bus(bus, server, client);
+    }
+
+    /// [D-222 replacement for `dbus_openfile_refuses_filters_present`,
+    /// `dbus_openfile_refuses_current_filter_present` and
+    /// `dbus_openfile_refuses_choices_present`]: a well-formed
+    /// `filters`/`current_filter`/`choices` request over the real D-Bus
+    /// boundary now reaches the chooser and succeeds, with the resolved
+    /// filter and choices coming back in the results.
+    #[test]
+    fn dbus_openfile_honors_filters_current_filter_and_choices() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let fixture = bus.create_fixture_file("filters-honored.txt");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![fixture])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, results) =
+            call_open_file(&client, browser_shaped_options()).expect("OpenFile call");
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(chooser.call_count(), 1);
+        assert!(results.contains_key("current_filter"));
+        assert!(results.contains_key("choices"));
+        finish_private_bus(bus, server, client);
+    }
 
     #[test]
     fn dbus_savefile_is_an_unknown_method() {
@@ -2876,6 +3281,183 @@ mod tests {
             fs::read_dir(&base).unwrap().count(),
             0,
             "the request root must be gone after a completed real cancel"
+        );
+        finish_base(base);
+        driver_target.finish();
+    }
+
+    /// Browser-shaped `filters` value: `a(sa(us))`, one named filter per
+    /// entry, each rule a `(type, pattern)` pair (`0` = glob, `1` = mime).
+    fn browser_filters() -> Vec<(String, Vec<(u32, String)>)> {
+        vec![
+            ("Text files".to_string(), vec![(0u32, "*.txt".to_string())]),
+            ("All files".to_string(), vec![(0u32, "*".to_string())]),
+        ]
+    }
+
+    /// Browser-shaped `current_filter` value: `(sa(us))`, exactly matching
+    /// the first entry `browser_filters` returns.
+    fn browser_current_filter() -> (String, Vec<(u32, String)>) {
+        browser_filters().into_iter().next().expect("at least one filter")
+    }
+
+    /// Browser-shaped `choices` value: `a(ssa(ss)s)` -- one enumerated
+    /// choice (nonempty option list) and one boolean choice (empty option
+    /// list, initial `"false"`).
+    fn browser_choices() -> Vec<(String, String, Vec<(String, String)>, String)> {
+        vec![
+            (
+                "encoding".to_string(),
+                "Encoding".to_string(),
+                vec![
+                    ("utf8".to_string(), "UTF-8".to_string()),
+                    ("latin1".to_string(), "Latin-1".to_string()),
+                ],
+                "utf8".to_string(),
+            ),
+            (
+                "readonly".to_string(),
+                "Read only".to_string(),
+                Vec::new(),
+                "false".to_string(),
+            ),
+        ]
+    }
+
+    fn browser_shaped_options() -> HashMap<String, OwnedValue> {
+        let mut options = HashMap::new();
+        options.insert("multiple".to_string(), OwnedValue::from(true));
+        options.insert(
+            "filters".to_string(),
+            OwnedValue::try_from(Value::from(browser_filters())).expect("filters encodes"),
+        );
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(browser_current_filter()))
+                .expect("current_filter encodes"),
+        );
+        options.insert(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(browser_choices())).expect("choices encodes"),
+        );
+        options
+    }
+
+    /// [D-222 GREEN]: a real browser-shaped `OpenFile` request --
+    /// `multiple`, a two-entry `filters` list, a matching `current_filter`,
+    /// and both an enumerated and a boolean `choices` entry -- sent over a
+    /// private bus through the exported `OpenFile` method, backed by the
+    /// real `ProcessChooser` and the real native picker driver binary built
+    /// with the extended `picker-test-driver-pick` feature. The driver
+    /// selects every currently filter-eligible fixture row (the two `.txt`
+    /// fixtures, never the `.bin` one), then cycles the real filter
+    /// dropdown and both real choice controls by one position each before
+    /// clicking the real Open button -- proving the whole wire protocol
+    /// (`--request <path>` in, `result.meta.json` out) round-trips through
+    /// the real GTK controls, not just `decide()`'s own ScriptedChooser
+    /// path (see `dbus_openfile_honors_multiple_true` and
+    /// `dbus_openfile_honors_filters_current_filter_and_choices`, which
+    /// only prove that narrower layer). Historically this exact request
+    /// was refused pre-pick against unmodified `f1f8324`; see git history
+    /// for that recorded RED evidence.
+    #[test]
+    fn dbus_openfile_browser_shaped_multi_filter_choice_request_picks_through_real_native_child() {
+        let _guard = env_lock();
+        let (driver, driver_target) = build_picker_test_driver("picker-test-driver-pick");
+        let xvfb = PrivateXvfb::start();
+        let old_display = std::env::var("DISPLAY").ok();
+        let old_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        std::env::set_var("DISPLAY", &xvfb.display);
+        std::env::remove_var("WAYLAND_DISPLAY");
+
+        let bus = PrivateBus::start();
+        let base = scratch_base("browser-shaped-pick-base");
+        let fixture_dir_root =
+            OwnedScratchDir::create(scratch_base("browser-shaped-pick-fixture-home"));
+        let fixture_one = fixture_dir_root.path().join("d222-matching-one.txt");
+        let fixture_two = fixture_dir_root.path().join("d222-matching-two.txt");
+        fs::write(&fixture_one, b"d222 matching fixture one\n").expect("write matching fixture one");
+        fs::write(&fixture_two, b"d222 matching fixture two\n").expect("write matching fixture two");
+        fs::write(
+            fixture_dir_root.path().join("d222-nonmatching.bin"),
+            b"d222 nonmatching fixture\n",
+        )
+        .expect("write nonmatching fixture");
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fixture_dir_root.path());
+
+        let chooser: Arc<dyn Chooser> =
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+        let server = bus.connect_server(chooser);
+        let client = bus.connect_client();
+
+        let (response, results) =
+            call_open_file(&client, browser_shaped_options()).expect("OpenFile call");
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(response, RESPONSE_SUCCESS, "real pick must report success");
+        let expected_uris = vec![
+            gio::File::for_path(&fixture_one).uri().to_string(),
+            gio::File::for_path(&fixture_two).uri().to_string(),
+        ];
+        assert_eq!(
+            uris_of(&results),
+            expected_uris,
+            "must pick exactly the two filter-eligible fixtures, never the nonmatching one"
+        );
+        // The driver cycles the dropdown forward by one from its initial
+        // `current_filter`-resolved index (0, "Text files"), landing on
+        // the second supplied filter ("All files").
+        let expected_filter = browser_filters()
+            .into_iter()
+            .nth(1)
+            .expect("browser_filters has a second entry");
+        let current_filter: (String, Vec<(u32, String)>) = results
+            .get("current_filter")
+            .cloned()
+            .map(|v| <(String, Vec<(u32, String)>)>::try_from(v).expect("current_filter decodes"))
+            .expect("current_filter present");
+        assert_eq!(
+            current_filter, expected_filter,
+            "the real filter dropdown's final selection must round-trip back"
+        );
+        let choices: Vec<(String, String)> = results
+            .get("choices")
+            .cloned()
+            .map(|v| Vec::<(String, String)>::try_from(v).expect("choices decodes"))
+            .expect("choices present");
+        // The driver cycles each real choice control forward by one from
+        // its already-resolved initial: the enumerated "encoding" choice
+        // from "utf8" to "latin1", the boolean "readonly" choice from
+        // "false" to "true".
+        assert_eq!(
+            choices,
+            vec![
+                ("encoding".to_string(), "latin1".to_string()),
+                ("readonly".to_string(), "true".to_string()),
+            ],
+            "both real choice controls' cycled selections must round-trip back"
+        );
+
+        finish_private_bus(bus, server, client);
+        match old_display {
+            Some(v) => std::env::set_var("DISPLAY", v),
+            None => std::env::remove_var("DISPLAY"),
+        }
+        match old_wayland {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+        xvfb.finish();
+        fixture_dir_root.finish();
+        assert_eq!(
+            fs::read_dir(&base).unwrap().count(),
+            0,
+            "the request root must be gone after a completed real pick"
         );
         finish_base(base);
         driver_target.finish();
