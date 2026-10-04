@@ -2870,4 +2870,1001 @@ mod tests {
         finish_base(base);
         driver_target.finish();
     }
+
+    // --- Round 215: cold D-Bus activation of the real backend through the
+    // real `/usr/libexec/xdg-desktop-portal` frontend, driven by on-disk
+    // `.portal`/`.service` integration files materialized under a fully
+    // private `HOME`/XDG environment, never the owner's real one. ---
+
+    const TEST_APP_INFO_KIND_HOST: &str = "host";
+    const TEST_HOST_APP_ID: &str = "org.wayfinder.round215.test";
+    const FRONTEND_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
+    const FRONTEND_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+    const FRONTEND_INTERFACE: &str = "org.freedesktop.portal.FileChooser";
+    const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
+
+    /// Owns one fresh, uniquely named root below `~/Projects/Scratch/`
+    /// holding a private `HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME` and
+    /// `XDG_RUNTIME_DIR` (each mode `0700`), and materializes the
+    /// `.portal`/`.service` integration files beneath it. Every relevant
+    /// environment variable is saved before being overridden and restored
+    /// on `finish()`/`Drop`; `Drop` alone never panics, so it is safe
+    /// during unwind.
+    struct PrivatePortalEnv {
+        root: PathBuf,
+        data_home: PathBuf,
+        desktop_id: String,
+        saved: Vec<(&'static str, Option<String>)>,
+        removed: Cell<bool>,
+    }
+
+    impl PrivatePortalEnv {
+        const VARS: &'static [&'static str] = &[
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_DESKTOP_PORTAL_DIR",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND",
+            "XDG_DESKTOP_PORTAL_TEST_HOST_APPID",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+        ];
+
+        fn start() -> Self {
+            let home_var = std::env::var("HOME").expect("HOME must be set");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos();
+            let root = PathBuf::from(home_var).join("Projects/Scratch").join(format!(
+                "d215-portal-env-{}-{}-{}",
+                std::process::id(),
+                stamp,
+                next_unique_id()
+            ));
+            let home = root.join("home");
+            let data_home = home.join(".local/share");
+            let config_home = home.join(".config");
+            let runtime_dir = root.join("run");
+            let portals_dir = data_home.join("xdg-desktop-portal/portals");
+            let services_dir = data_home.join("dbus-1/services");
+            for dir in [&root, &home, &data_home, &config_home, &runtime_dir, &portals_dir, &services_dir] {
+                fs::create_dir_all(dir).expect("create private portal-env directory");
+            }
+            for dir in [&home, &data_home, &config_home, &runtime_dir] {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                    .expect("restrict private portal-env directory");
+            }
+
+            let desktop_id = format!("WayfinderTest{}", next_unique_id());
+            let saved: Vec<(&'static str, Option<String>)> = Self::VARS
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+            std::env::set_var("XDG_DESKTOP_PORTAL_DIR", &portals_dir);
+            std::env::set_var("XDG_CURRENT_DESKTOP", &desktop_id);
+            std::env::set_var("XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND", TEST_APP_INFO_KIND_HOST);
+            std::env::set_var("XDG_DESKTOP_PORTAL_TEST_HOST_APPID", TEST_HOST_APP_ID);
+
+            Self {
+                root,
+                data_home,
+                desktop_id,
+                saved,
+                removed: Cell::new(false),
+            }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn runtime_dir(&self) -> PathBuf {
+            self.root.join("run")
+        }
+
+        fn portals_dir(&self) -> PathBuf {
+            self.data_home.join("xdg-desktop-portal/portals")
+        }
+
+        fn services_dir(&self) -> PathBuf {
+            self.data_home.join("dbus-1/services")
+        }
+
+        fn desktop_id(&self) -> &str {
+            &self.desktop_id
+        }
+
+        /// Points `DISPLAY` at the private Xvfb and clears `WAYLAND_DISPLAY`,
+        /// process-wide, so the exact ambient environment any later-spawned
+        /// process inherits -- most importantly the activation
+        /// `dbus-daemon`, which hands this same environment to whatever it
+        /// cold-activates -- can only ever reach the private display, never
+        /// Zito's real one. Must be called after the private Xvfb is up and
+        /// before the private activation bus (or anything else) starts; the
+        /// prior real value was already captured by `start()`'s own save,
+        /// so `finish()`/`Drop` restore it like every other private var.
+        fn activate_private_display(&self, display: &str) {
+            std::env::set_var("DISPLAY", display);
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+
+        /// Writes `wayfinder.portal` naming only the `FileChooser`
+        /// interface and this env's own unique `UseIn` value, so no other
+        /// desktop session on the machine could ever select it.
+        fn write_portal_descriptor(&self) {
+            let contents = format!(
+                "[portal]\nDBusName={}\nInterfaces=org.freedesktop.impl.portal.FileChooser;\nUseIn={}\n",
+                BUS_NAME, self.desktop_id
+            );
+            fs::write(self.portals_dir().join("wayfinder.portal"), contents)
+                .expect("write the private .portal descriptor");
+        }
+
+        /// Writes `wayfinder.portal` with the given field overridden with
+        /// `value`, for a named refusal/bypass pair.
+        fn write_portal_descriptor_with(&self, field: &str, value: &str) {
+            let contents = format!(
+                "[portal]\n{}\n",
+                [
+                    ("DBusName", BUS_NAME.to_string()),
+                    (
+                        "Interfaces",
+                        "org.freedesktop.impl.portal.FileChooser;".to_string()
+                    ),
+                    ("UseIn", self.desktop_id.clone()),
+                ]
+                .into_iter()
+                .map(|(key, default)| {
+                    let v = if key == field { value.to_string() } else { default };
+                    format!("{key}={v}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+            );
+            fs::write(self.portals_dir().join("wayfinder.portal"), contents)
+                .expect("write the private .portal descriptor");
+        }
+
+        /// Writes the `.service` activation file whose `Exec` resolves
+        /// directly to the round-owned `wayfinder-portal` test artifact --
+        /// no shell, no systemd user unit.
+        fn write_service_file(&self, exec_path: &Path) {
+            self.write_service_file_with("Name", BUS_NAME, exec_path);
+        }
+
+        fn write_service_file_with(&self, field: &str, value: &str, exec_path: &Path) {
+            let contents = format!(
+                "[D-BUS Service]\n{}\n",
+                [
+                    ("Name", BUS_NAME.to_string()),
+                    ("Exec", exec_path.display().to_string()),
+                ]
+                .into_iter()
+                .map(|(key, default)| {
+                    let v = if key == field { value.to_string() } else { default };
+                    format!("{key}={v}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+            );
+            fs::write(
+                self.services_dir()
+                    .join("org.freedesktop.impl.portal.desktop.wayfinder.service"),
+                contents,
+            )
+            .expect("write the private .service activation file");
+        }
+
+        /// Explicitly, observably removes the exact root and restores
+        /// every saved environment variable. Failure to remove fails the
+        /// test; `Drop`'s fallback is skipped afterward.
+        fn finish(self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+            fs::remove_dir_all(&self.root).expect("remove the private portal-env root");
+            self.removed.set(true);
+        }
+    }
+
+    impl Drop for PrivatePortalEnv {
+        fn drop(&mut self) {
+            if self.removed.get() {
+                return;
+            }
+            for (name, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Builds `wayfinder-portal` and `wayfinder-native` together into one
+    /// round-owned target dir below `~/Projects/Scratch/`, with `feature`
+    /// (one of the `picker-test-driver-{pick,cancel}` sub-features) baked
+    /// into the `wayfinder-native` sibling. `ProcessChooser::production()`
+    /// resolves `wayfinder-native` by looking next to its own exe, so
+    /// placing both binaries in the same directory is what lets the
+    /// unmodified production chooser find the feature-built driver.
+    fn build_portal_activation_artifacts(feature: &str) -> (PathBuf, PathBuf) {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let target_dir = scratch_base(&format!("portal-activation-target-{feature}"));
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("wayfinder-portal")
+            .arg("--bin")
+            .arg("wayfinder-native")
+            .arg("--features")
+            .arg(feature)
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .current_dir(manifest_dir)
+            .status()
+            .expect("run cargo build for the round-owned portal/native artifacts");
+        assert!(status.success(), "building the {feature} portal/native artifacts failed");
+        let portal_bin = target_dir.join("debug").join("wayfinder-portal");
+        assert!(portal_bin.exists(), "expected portal binary at {}", portal_bin.display());
+        let native_bin = target_dir.join("debug").join("wayfinder-native");
+        assert!(native_bin.exists(), "expected native binary at {}", native_bin.display());
+        (portal_bin, target_dir)
+    }
+
+    /// A private, round-owned session bus for activation: unlike
+    /// `PrivateBus`, it does not touch `TMPDIR`/`HOME` itself (the caller's
+    /// `PrivatePortalEnv` already owns that); it only spawns the daemon
+    /// under the already-private environment (so the daemon's own
+    /// `XDG_DATA_HOME` is the private one, letting its standard session
+    /// service-activation directories resolve to our private
+    /// `.service` file) and owns reaping it.
+    struct PrivateActivationBus {
+        address: String,
+        daemon: Child,
+        reaped: Cell<bool>,
+    }
+
+    impl PrivateActivationBus {
+        fn start(root: &Path) -> Self {
+            let socket_path = root.join("activation-bus.sock");
+            let mut daemon = Command::new("dbus-daemon")
+                .arg("--session")
+                .arg(format!("--address=unix:path={}", socket_path.display()))
+                .arg("--nofork")
+                .arg("--print-address")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a private activation dbus-daemon");
+            let mut reader = BufReader::new(daemon.stdout.take().expect("daemon stdout piped"));
+            let mut address = String::new();
+            reader
+                .read_line(&mut address)
+                .expect("read private activation bus address");
+            let address = address.trim().to_string();
+            assert!(!address.is_empty(), "private activation dbus-daemon printed no address");
+            Self {
+                address,
+                daemon,
+                reaped: Cell::new(false),
+            }
+        }
+
+        fn address(&self) -> &str {
+            &self.address
+        }
+
+        fn connect(&self) -> Connection {
+            Builder::address(self.address.as_str())
+                .expect("valid private activation bus address")
+                .build()
+                .expect("build the activation-bus client connection")
+        }
+
+        fn finish(mut self) {
+            let pid = self.daemon.id() as i32;
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match self.daemon.try_wait().expect("poll the private activation daemon") {
+                    Some(_) => break,
+                    None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                    None => {
+                        let _ = self.daemon.kill();
+                        self.daemon.wait().expect("reap private activation daemon after SIGKILL");
+                        break;
+                    }
+                }
+            }
+            self.reaped.set(true);
+            assert!(
+                !PathBuf::from(format!("/proc/{pid}")).exists(),
+                "private activation dbus-daemon must be gone after finish()"
+            );
+        }
+    }
+
+    impl Drop for PrivateActivationBus {
+        fn drop(&mut self) {
+            if self.reaped.get() {
+                return;
+            }
+            let pid = self.daemon.id() as i32;
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            for _ in 0..50 {
+                if matches!(self.daemon.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+        }
+    }
+
+    fn name_has_owner(conn: &Connection, name: &str) -> bool {
+        let proxy = zbus::blocking::fdo::DBusProxy::new(conn).expect("build the private bus's DBus proxy");
+        proxy
+            .name_has_owner(zbus::names::BusName::try_from(name).expect("valid bus name"))
+            .unwrap_or(false)
+    }
+
+    fn wait_for_name_owner(conn: &Connection, name: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !name_has_owner(conn, name) {
+            assert!(Instant::now() < deadline, "{name} never acquired an owner in time");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn connection_unix_process_id(conn: &Connection, name: &str) -> Option<u32> {
+        let proxy = zbus::blocking::fdo::DBusProxy::new(conn).ok()?;
+        proxy
+            .get_connection_unix_process_id(zbus::names::BusName::try_from(name).ok()?)
+            .ok()
+    }
+
+    /// Spawns the real `/usr/libexec/xdg-desktop-portal` frontend inside
+    /// the given private bus/display, with `XDG_DESKTOP_PORTAL_DIR`
+    /// already pointed at the private portals dir (via `PrivatePortalEnv`)
+    /// so no installed backend can be selected for this process.
+    fn spawn_portal_frontend(display: &str, bus_address: &str) -> Child {
+        Command::new("/usr/libexec/xdg-desktop-portal")
+            .env("DISPLAY", display)
+            .env_remove("WAYLAND_DISPLAY")
+            .env("DBUS_SESSION_BUS_ADDRESS", bus_address)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the real xdg-desktop-portal frontend")
+    }
+
+    fn terminate_and_reap(child: &mut Child) {
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn terminate_and_reap_pid(pid: u32) {
+        let pid = pid as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while PathBuf::from(format!("/proc/{pid}")).exists() {
+            if Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Calls the real frontend's public `OpenFile`, then waits on the
+    /// returned request object's own `Response` signal -- the real public
+    /// two-step protocol, not the single-call backend shortcut the other
+    /// tests in this file use directly.
+    fn call_frontend_open_file(conn: &Connection) -> (u32, HashMap<String, OwnedValue>) {
+        let proxy = zbus::blocking::Proxy::new(
+            conn,
+            FRONTEND_BUS_NAME,
+            FRONTEND_OBJECT_PATH,
+            FRONTEND_INTERFACE,
+        )
+        .expect("build the frontend FileChooser proxy");
+        let options: HashMap<String, OwnedValue> = HashMap::new();
+        let handle: zbus::zvariant::OwnedObjectPath = proxy
+            .call("OpenFile", &("", "d215 round-215 cold activation", options))
+            .expect("call the real frontend's OpenFile");
+
+        let request = zbus::blocking::Proxy::new(conn, FRONTEND_BUS_NAME, handle.as_str(), REQUEST_INTERFACE)
+            .expect("build the Request proxy for the returned handle");
+        let mut signals = request.receive_signal("Response").expect("subscribe to Request::Response");
+        let message = signals
+            .next()
+            .expect("the real frontend must emit exactly one Response signal");
+        message
+            .body()
+            .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+            .expect("deserialize the real Response signal body")
+    }
+
+    #[test]
+    fn cold_activation_real_pick_through_real_frontend() {
+        let _guard = env_lock();
+        let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-pick");
+        let target_dir = OwnedScratchDir::adopt(target_dir);
+
+        let env = PrivatePortalEnv::start();
+        let xvfb = PrivateXvfb::start();
+        env.activate_private_display(&xvfb.display);
+
+        let fixture_file = env.root().join("home").join("d215-cold-pick-fixture.txt");
+        fs::write(&fixture_file, b"d215 round 215 cold-activation fixture\n").expect("write fixture file");
+        env.write_portal_descriptor();
+        env.write_service_file(&portal_bin);
+
+        let bus = PrivateActivationBus::start(env.root());
+        let client = bus.connect();
+
+        assert!(
+            !name_has_owner(&client, BUS_NAME),
+            "the backend bus name must have no owner before the first request"
+        );
+
+        let mut frontend = spawn_portal_frontend(&xvfb.display, bus.address());
+        wait_for_name_owner(&client, FRONTEND_BUS_NAME, Duration::from_secs(10));
+
+        let (response, results) = call_frontend_open_file(&client);
+        let backend_pid = connection_unix_process_id(&client, BUS_NAME);
+
+        let expected_uri = gio::File::for_path(&fixture_file).uri().to_string();
+        assert_eq!(response, RESPONSE_SUCCESS, "cold-activated real pick must report success");
+        assert_eq!(
+            uris_of(&results),
+            vec![expected_uri],
+            "the exported URI must be the real driver's exact selected fixture, via real activation"
+        );
+
+        drop(client);
+        terminate_and_reap(&mut frontend);
+        if let Some(pid) = backend_pid {
+            terminate_and_reap_pid(pid);
+        }
+        bus.finish();
+        xvfb.finish();
+        env.finish();
+        target_dir.finish();
+    }
+
+    #[test]
+    fn cold_activation_real_cancel_through_real_frontend() {
+        let _guard = env_lock();
+        let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-cancel");
+        let target_dir = OwnedScratchDir::adopt(target_dir);
+
+        let env = PrivatePortalEnv::start();
+        let xvfb = PrivateXvfb::start();
+        env.activate_private_display(&xvfb.display);
+
+        fs::write(
+            env.root().join("home").join("d215-cold-cancel-fixture.txt"),
+            b"d215 round 215 cold-activation fixture\n",
+        )
+        .expect("write fixture file");
+        env.write_portal_descriptor();
+        env.write_service_file(&portal_bin);
+
+        let bus = PrivateActivationBus::start(env.root());
+        let client = bus.connect();
+
+        assert!(
+            !name_has_owner(&client, BUS_NAME),
+            "the backend bus name must have no owner before the first request"
+        );
+
+        let mut frontend = spawn_portal_frontend(&xvfb.display, bus.address());
+        wait_for_name_owner(&client, FRONTEND_BUS_NAME, Duration::from_secs(10));
+
+        let (response, results) = call_frontend_open_file(&client);
+        let backend_pid = connection_unix_process_id(&client, BUS_NAME);
+
+        assert_eq!(response, RESPONSE_CANCELLED, "cold-activated real Cancel must report cancelled");
+        assert!(uris_of(&results).is_empty(), "a real Cancel must carry no uri");
+
+        drop(client);
+        terminate_and_reap(&mut frontend);
+        if let Some(pid) = backend_pid {
+            terminate_and_reap_pid(pid);
+        }
+        bus.finish();
+        xvfb.finish();
+        env.finish();
+        target_dir.finish();
+    }
+
+    // --- Round 215 item 6: named same-evidence refusal/bypass pairs at
+    // every new routing/activation decision. Each refusal test changes
+    // only the one named field/file and proves the public frontend
+    // request refuses without a false pick and without activating the
+    // real backend; its paired bypass restores only that one decision,
+    // holding bus/binaries/request/fixture fixed, and proves routing
+    // succeeds. ---
+
+    #[derive(Debug)]
+    enum FrontendAttempt {
+        Responded(u32, HashMap<String, OwnedValue>),
+        CallFailed(String),
+        TimedOut,
+    }
+
+    /// Runs the real public `OpenFile` round trip entirely inside its own
+    /// thread, owning its own bus connection, and bounds the whole attempt
+    /// (including the initial call) by `timeout` so a refusal that never
+    /// replies can never hang the test. Killing the frontend after this
+    /// returns unblocks any leftover thread still waiting on the signal.
+    fn attempt_frontend_open_file_bounded(bus_address: String, timeout: Duration) -> FrontendAttempt {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = (|| -> FrontendAttempt {
+                let conn = match Builder::address(bus_address.as_str()).and_then(|b| b.build()) {
+                    Ok(conn) => conn,
+                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                };
+                let proxy = match zbus::blocking::Proxy::new(
+                    &conn,
+                    FRONTEND_BUS_NAME,
+                    FRONTEND_OBJECT_PATH,
+                    FRONTEND_INTERFACE,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                };
+                let options: HashMap<String, OwnedValue> = HashMap::new();
+                let handle: Result<zbus::zvariant::OwnedObjectPath, zbus::Error> =
+                    proxy.call("OpenFile", &("", "d215 routing probe", options));
+                let handle = match handle {
+                    Ok(h) => h,
+                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                };
+                let request =
+                    match zbus::blocking::Proxy::new(&conn, FRONTEND_BUS_NAME, handle.as_str(), REQUEST_INTERFACE) {
+                        Ok(p) => p,
+                        Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                    };
+                let mut signals = match request.receive_signal("Response") {
+                    Ok(s) => s,
+                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                };
+                match signals.next() {
+                    Some(message) => match message.body().deserialize::<(u32, HashMap<String, OwnedValue>)>() {
+                        Ok((response, results)) => FrontendAttempt::Responded(response, results),
+                        Err(e) => FrontendAttempt::CallFailed(e.to_string()),
+                    },
+                    None => FrontendAttempt::CallFailed("no Response signal arrived".to_string()),
+                }
+            })();
+            let _ = tx.send(outcome);
+        });
+        rx.recv_timeout(timeout).unwrap_or(FrontendAttempt::TimedOut)
+    }
+
+    /// Owns everything one routing-decision case needs: a built real
+    /// pick-driver pair, a private Xvfb, a private HOME/XDG environment
+    /// and a private activation bus, all freshly created per case so
+    /// every ordinary/bypass pair is evaluated from true cold state.
+    struct RoutingCase {
+        env: PrivatePortalEnv,
+        xvfb: PrivateXvfb,
+        bus: PrivateActivationBus,
+        client: Connection,
+        target_dir: OwnedScratchDir,
+    }
+
+    // The descriptor/service files must exist before the private
+    // activation `dbus-daemon` is started: a running daemon does not
+    // discover a `.service` file that appears in its service directory
+    // only after it is already up, so every routing field (the normal
+    // bypass defaults, or a refusal's deliberately broken field) has to
+    // be written by `write_fn` before `PrivateActivationBus::start` runs.
+    fn setup_routing_case(write_fn: impl FnOnce(&PrivatePortalEnv, &Path)) -> (RoutingCase, PathBuf) {
+        let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-pick");
+        let target_dir = OwnedScratchDir::adopt(target_dir);
+        let env = PrivatePortalEnv::start();
+        let xvfb = PrivateXvfb::start();
+        env.activate_private_display(&xvfb.display);
+        fs::write(
+            env.root().join("home").join("d215-routing-fixture.txt"),
+            b"d215 round 215 routing-decision fixture\n",
+        )
+        .expect("write routing-case fixture file");
+        write_fn(&env, &portal_bin);
+        let bus = PrivateActivationBus::start(env.root());
+        let client = bus.connect();
+        (
+            RoutingCase {
+                env,
+                xvfb,
+                bus,
+                client,
+                target_dir,
+            },
+            portal_bin,
+        )
+    }
+
+    fn teardown_routing_case(case: RoutingCase, mut frontend: Child, backend_pid: Option<u32>) {
+        drop(case.client);
+        terminate_and_reap(&mut frontend);
+        if let Some(pid) = backend_pid {
+            terminate_and_reap_pid(pid);
+        }
+        case.bus.finish();
+        case.xvfb.finish();
+        case.env.finish();
+        case.target_dir.finish();
+    }
+
+    fn assert_no_false_pick(outcome: &FrontendAttempt) {
+        if let FrontendAttempt::Responded(response, results) = outcome {
+            assert_ne!(*response, RESPONSE_SUCCESS, "a refused routing decision must never yield a false pick");
+            assert!(uris_of(results).is_empty(), "a refused routing decision must carry no uri");
+        }
+    }
+
+    fn assert_real_pick(outcome: FrontendAttempt, label: &str) {
+        match outcome {
+            FrontendAttempt::Responded(response, results) => {
+                assert_eq!(response, RESPONSE_SUCCESS, "{label}: bypass must restore a real successful pick");
+                assert!(!uris_of(&results).is_empty(), "{label}: bypass's successful pick must carry a uri");
+            }
+            other => panic!("{label}: bypass must restore successful routing, got {other:?}"),
+        }
+    }
+
+    macro_rules! routing_pair {
+        ($refusal_name:ident, $bypass_name:ident, $deny_activation:expr, $break_fn:expr) => {
+            #[test]
+            fn $refusal_name() {
+                let _guard = env_lock();
+                let break_fn: fn(&PrivatePortalEnv, &Path) = $break_fn;
+                let (case, _portal_bin) = setup_routing_case(|env, portal_bin| break_fn(env, portal_bin));
+                assert!(
+                    !name_has_owner(&case.client, BUS_NAME),
+                    "the backend bus name must have no owner before the first request"
+                );
+                let frontend = spawn_portal_frontend(&case.xvfb.display, case.bus.address());
+                wait_for_name_owner(&case.client, FRONTEND_BUS_NAME, Duration::from_secs(10));
+                let outcome = attempt_frontend_open_file_bounded(case.bus.address().to_string(), Duration::from_secs(8));
+                assert_no_false_pick(&outcome);
+                let deny_activation: bool = $deny_activation;
+                let activated = name_has_owner(&case.client, BUS_NAME);
+                if deny_activation {
+                    assert!(
+                        !activated,
+                        "this routing decision must make activation of the real backend itself impossible, not just refuse the pick"
+                    );
+                }
+                // Whether or not this decision happens to still activate the
+                // backend on its way to refusing (e.g. a real D-Bus method
+                // lookup failure discovered only after activation), the
+                // activated process -- if any -- is still ours to reap.
+                let backend_pid = connection_unix_process_id(&case.client, BUS_NAME);
+                teardown_routing_case(case, frontend, backend_pid);
+            }
+
+            #[test]
+            fn $bypass_name() {
+                let _guard = env_lock();
+                let (case, _portal_bin) = setup_routing_case(|env, portal_bin| {
+                    env.write_portal_descriptor();
+                    env.write_service_file(portal_bin);
+                });
+                assert!(
+                    !name_has_owner(&case.client, BUS_NAME),
+                    "the backend bus name must have no owner before the first request"
+                );
+                let frontend = spawn_portal_frontend(&case.xvfb.display, case.bus.address());
+                wait_for_name_owner(&case.client, FRONTEND_BUS_NAME, Duration::from_secs(10));
+                let outcome = attempt_frontend_open_file_bounded(case.bus.address().to_string(), Duration::from_secs(10));
+                let backend_pid = connection_unix_process_id(&case.client, BUS_NAME);
+                assert_real_pick(outcome, stringify!($bypass_name));
+                teardown_routing_case(case, frontend, backend_pid);
+            }
+        };
+    }
+
+    routing_pair!(
+        routing_refusal_descriptor_discovery_missing,
+        routing_bypass_descriptor_discovery_restored,
+        true,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            // No `.portal` descriptor at all: the frontend has nothing
+            // naming our interface, so discovery itself must fail closed.
+            env.write_service_file(portal_bin);
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_use_in_mismatch,
+        routing_bypass_use_in_restored,
+        true,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            env.write_portal_descriptor_with("UseIn", "SomeOtherUnrelatedTestDesktop");
+            env.write_service_file(portal_bin);
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_interfaces_mismatch,
+        routing_bypass_interfaces_restored,
+        // Observed against the real installed frontend: a descriptor that
+        // advertises a different interface can still be cold-activated on
+        // the way to discovering the real backend does not expose the
+        // requested method there -- the refusal is real (no false pick),
+        // the activation is just not where it's prevented.
+        false,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            env
+                .write_portal_descriptor_with("Interfaces", "org.freedesktop.impl.portal.Notification;");
+            env.write_service_file(portal_bin);
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_descriptor_dbus_name_mismatch,
+        routing_bypass_descriptor_dbus_name_restored,
+        true,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            env
+                .write_portal_descriptor_with("DBusName", "org.freedesktop.impl.portal.desktop.wrongname");
+            env.write_service_file(portal_bin);
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_service_discovery_missing,
+        routing_bypass_service_discovery_restored,
+        true,
+        |env: &PrivatePortalEnv, _portal_bin: &Path| {
+            // Descriptor correct, but no `.service` file at all: the bus
+            // has nothing to activate even once the backend is selected.
+            env.write_portal_descriptor();
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_service_name_mismatch,
+        routing_bypass_service_name_restored,
+        true,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            env.write_portal_descriptor();
+            env
+                .write_service_file_with("Name", "org.freedesktop.impl.portal.desktop.wrongname", portal_bin);
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_exec_missing_target,
+        routing_bypass_exec_missing_target_restored,
+        true,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            env.write_portal_descriptor();
+            env.write_service_file_with(
+                "Exec",
+                "/nonexistent/d215/wayfinder-portal-missing",
+                portal_bin,
+            );
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_exec_non_executable_target,
+        routing_bypass_exec_non_executable_target_restored,
+        true,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            let bogus = env.root().join("not-executable.txt");
+            fs::write(&bogus, b"not a real executable\n").expect("write non-executable decoy target");
+            env.write_portal_descriptor();
+            env.write_service_file_with("Exec", &bogus.display().to_string(), portal_bin);
+        }
+    );
+
+    routing_pair!(
+        routing_refusal_exec_early_dying_target,
+        routing_bypass_exec_early_dying_target_restored,
+        // An early-dying process may briefly claim the bus name before it
+        // exits, so this decision only guarantees no false pick, not that
+        // activation itself never happens.
+        false,
+        |env: &PrivatePortalEnv, portal_bin: &Path| {
+            let dying = env.root().join("early-dying.sh");
+            fs::write(&dying, b"#!/bin/sh\nexit 7\n").expect("write early-dying decoy target");
+            fs::set_permissions(&dying, fs::Permissions::from_mode(0o700))
+                .expect("make early-dying decoy executable");
+            env.write_portal_descriptor();
+            env.write_service_file_with("Exec", &dying.display().to_string(), portal_bin);
+        }
+    );
+
+    /// A malformed/non-executable/early-dying/missing activation target
+    /// must never leave an installed, real backend to answer in its
+    /// place: with every real backend hidden behind our own private
+    /// `XDG_DESKTOP_PORTAL_DIR`/`XDG_CURRENT_DESKTOP`, the only way an
+    /// installed backend could still answer is if the frontend fell back
+    /// past our broken descriptor/service to something outside our
+    /// private root -- which the refusal cases above already prove does
+    /// not happen, since none of them ever yields a real pick.
+    #[test]
+    fn routing_refusal_never_falls_through_to_installed_backend() {
+        let _guard = env_lock();
+        let (case, _portal_bin) = setup_routing_case(|env, portal_bin| {
+            env.write_portal_descriptor_with("DBusName", "org.freedesktop.impl.portal.desktop.wrongname");
+            env.write_service_file(portal_bin);
+        });
+        assert!(!name_has_owner(&case.client, BUS_NAME));
+        let frontend = spawn_portal_frontend(&case.xvfb.display, case.bus.address());
+        wait_for_name_owner(&case.client, FRONTEND_BUS_NAME, Duration::from_secs(10));
+        let outcome = attempt_frontend_open_file_bounded(case.bus.address().to_string(), Duration::from_secs(8));
+        assert_no_false_pick(&outcome);
+        assert!(
+            !name_has_owner(&case.client, BUS_NAME),
+            "our own backend must never be activated by a mismatched descriptor"
+        );
+        let installed_file_chooser_backend_names = [
+            "org.freedesktop.impl.portal.desktop.gtk",
+            "org.freedesktop.impl.portal.desktop.kde",
+        ];
+        for name in installed_file_chooser_backend_names {
+            assert!(
+                !name_has_owner(&case.client, name),
+                "no installed backend may ever be activated on our private bus"
+            );
+        }
+        teardown_routing_case(case, frontend, None);
+    }
+
+    /// Round 215 item 7 forced-unwind oracle: panics inside a
+    /// `PrivatePortalEnv`'s own scope (before any explicit `finish()`
+    /// call), then proves the unwind-safe `Drop` fallback removed the
+    /// exact captured root and restored every saved environment variable.
+    #[test]
+    fn private_portal_env_drop_recovers_root_and_env_on_panic() {
+        let _guard = env_lock();
+        let old_xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+        let old_display = std::env::var("DISPLAY").ok();
+        let captured: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = PrivatePortalEnv::start();
+            *captured_clone.lock().unwrap() = Some(env.root().to_path_buf());
+            panic!("deliberate panic inside the PrivatePortalEnv fixture scope, before finish()");
+        }));
+        assert!(result.is_err(), "the deliberate panic must actually unwind");
+
+        let root = captured.lock().unwrap().clone().expect("root captured before the panic");
+        assert!(!root.exists(), "PrivatePortalEnv::drop must remove its exact root on unwind");
+        assert_eq!(
+            std::env::var("XDG_CURRENT_DESKTOP").ok(),
+            old_xdg_current_desktop,
+            "XDG_CURRENT_DESKTOP must be restored after the unwind"
+        );
+        assert_eq!(
+            std::env::var("DISPLAY").ok(),
+            old_display,
+            "DISPLAY must be restored after the unwind"
+        );
+    }
+
+    /// Round 215 item 7 forced normal-path cleanup-failure oracle: proves
+    /// `PrivatePortalEnv::finish`'s checked removal is actually live.
+    #[test]
+    fn private_portal_env_finish_panics_when_normal_cleanup_actually_fails() {
+        let _guard = env_lock();
+        let env = PrivatePortalEnv::start();
+        let root = env.root().to_path_buf();
+        let blocker = root.join("blocked");
+        fs::create_dir(&blocker).expect("create nested dir");
+        fs::set_permissions(&blocker, fs::Permissions::from_mode(0o000)).expect("lock nested dir");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.finish();
+        }));
+        assert!(
+            result.is_err(),
+            "PrivatePortalEnv::finish must panic, not silently swallow, when the checked removal actually fails"
+        );
+        fs::set_permissions(&blocker, fs::Permissions::from_mode(0o700)).expect("unlock nested dir for real cleanup");
+        fs::remove_dir_all(&root).expect("real cleanup after the forced-failure oracle");
+    }
+
+    /// Round 215 item 7 forced-unwind oracle: panics inside a
+    /// `PrivateActivationBus`'s own scope (before any explicit `finish()`
+    /// call), then proves the unwind-safe `Drop` fallback reaped the
+    /// exact private activation daemon.
+    #[test]
+    fn private_activation_bus_drop_recovers_daemon_on_panic() {
+        let _guard = env_lock();
+        let env = PrivatePortalEnv::start();
+        let captured: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bus = PrivateActivationBus::start(env.root());
+            *captured_clone.lock().unwrap() = Some(bus.daemon.id());
+            panic!("deliberate panic inside the PrivateActivationBus fixture scope, before finish()");
+        }));
+        assert!(result.is_err(), "the deliberate panic must actually unwind");
+
+        let daemon_pid = captured.lock().unwrap().clone().expect("daemon pid captured before the panic");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while PathBuf::from(format!("/proc/{daemon_pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "PrivateActivationBus::drop must reap the exact daemon process on unwind"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        env.finish();
+    }
+
+    /// Round 215 item 7 decoy-survival proof: a file sitting directly
+    /// under `~/Projects/Scratch/` that is not owned by any round-215
+    /// fixture must survive a full private-env start/finish cycle --
+    /// cleanup must only ever touch the exact root it owns, never sweep
+    /// its parent directory.
+    #[test]
+    fn private_portal_env_finish_never_touches_sibling_scratch_entries() {
+        let _guard = env_lock();
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let scratch_root = PathBuf::from(&home).join("Projects/Scratch");
+        fs::create_dir_all(&scratch_root).expect("ensure Scratch root exists");
+        let decoy = scratch_root.join(format!("d215-decoy-{}", next_unique_id()));
+        fs::write(&decoy, b"not owned by any round-215 fixture\n").expect("write decoy sibling file");
+
+        let env = PrivatePortalEnv::start();
+        let root = env.root().to_path_buf();
+        env.finish();
+
+        assert!(!root.exists(), "the owned root must be gone after finish()");
+        assert!(
+            decoy.exists(),
+            "finish() must never remove a sibling scratch entry it does not own"
+        );
+        fs::remove_file(&decoy).expect("remove decoy sibling file");
+    }
 }
