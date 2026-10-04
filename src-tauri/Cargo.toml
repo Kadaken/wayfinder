@@ -25,6 +25,7 @@ gstreamer = "0.25"
 gstreamer-app = "0.25"
 sha2 = "0.10"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zbus = "5.19.0"
 
 [features]
 default = []
@@ -33,3 +34,7 @@ guide = []
 [[bin]]
 name = "wayfinder-native"
 path = "src/native.rs"
+
+[[bin]]
+name = "wayfinder-portal"
+path = "src/portal_main.rs"
