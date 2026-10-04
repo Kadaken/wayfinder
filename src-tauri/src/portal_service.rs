@@ -3100,9 +3100,20 @@ mod tests {
     /// resolves `wayfinder-native` by looking next to its own exe, so
     /// placing both binaries in the same directory is what lets the
     /// unmodified production chooser find the feature-built driver.
-    fn build_portal_activation_artifacts(feature: &str) -> (PathBuf, PathBuf) {
+    ///
+    /// D-206: the round root is created and wrapped in `OwnedScratchDir`
+    /// -- establishing its unwind-safe owner -- *before* `cargo` ever
+    /// runs, and the actual Cargo target lives as a `target` subdir
+    /// inside that already-owned root. There is no setup, spawn,
+    /// status-check or assertion interval in which the round root (or
+    /// anything Cargo creates under it) exists without an owner: a panic
+    /// from any `assert!`/`.expect(...)` below is caught by `Drop`.
+    fn build_portal_activation_artifacts(feature: &str) -> (PathBuf, OwnedScratchDir) {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let target_dir = scratch_base(&format!("portal-activation-target-{feature}"));
+        let round_root = scratch_base(&format!("portal-activation-target-{feature}"));
+        fs::create_dir_all(&round_root).expect("create round-owned activation build root");
+        let round_root = OwnedScratchDir::adopt(round_root);
+        let target_dir = round_root.path().join("target");
         let status = Command::new("cargo")
             .arg("build")
             .arg("--quiet")
@@ -3122,7 +3133,141 @@ mod tests {
         assert!(portal_bin.exists(), "expected portal binary at {}", portal_bin.display());
         let native_bin = target_dir.join("debug").join("wayfinder-native");
         assert!(native_bin.exists(), "expected native binary at {}", native_bin.display());
-        (portal_bin, target_dir)
+        (portal_bin, round_root)
+    }
+
+    /// A fresh, unique D-206 token for one oracle run, and the exact
+    /// top-level `~/Projects/Scratch` prefix built from it. Exact-prefix
+    /// only: never a broad glob, so a pre-existing entry (e.g. the
+    /// rejected-215 `d205-portal-activation-target-...` directory) can
+    /// never match.
+    fn d206_fresh_token() -> String {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        format!("d206-owner-oracle-{}-{}-{}", std::process::id(), stamp, next_unique_id())
+    }
+
+    /// Counts only top-level `~/Projects/Scratch` entries whose file name
+    /// is exactly this fresh token's directory name -- never a glob over
+    /// `d206-*`, so it cannot see any other run's or round's entries.
+    fn d206_prefix_count(token: &str) -> usize {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let scratch = PathBuf::from(home).join("Projects/Scratch");
+        fs::read_dir(&scratch)
+            .expect("read Scratch root")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy() == token)
+            .count()
+    }
+
+    /// Builds the same nontrivial, Cargo-target-shaped evidence subtree
+    /// every D-206 oracle below creates: a `target/debug/` directory
+    /// holding a stand-in binary and a build fingerprint file, proving
+    /// the oracle is exercised against real build-shaped output and not
+    /// an empty directory.
+    fn d206_populate_target_shaped_subtree(root: &Path) {
+        let debug_dir = root.join("target").join("debug");
+        fs::create_dir_all(&debug_dir).expect("create target-shaped evidence subtree");
+        fs::write(debug_dir.join("wayfinder-portal"), b"d206 evidence stand-in binary\n")
+            .expect("write evidence stand-in binary");
+        fs::write(debug_dir.join(".fingerprint-marker"), b"d206 evidence build fingerprint\n")
+            .expect("write evidence build fingerprint");
+    }
+
+    /// Round 216 (D-206) item 3: the named exact-prefix survival oracle.
+    /// A fresh, run-unique token names a round root that is created,
+    /// wrapped in `OwnedScratchDir` (the same owner `build_portal_activation_artifacts`
+    /// now establishes before Cargo ever runs), populated with a
+    /// nontrivial Cargo-target-shaped subtree, and explicitly finished.
+    /// The oracle then enumerates Scratch by that exact token and
+    /// requires zero matches.
+    #[test]
+    fn d206_owner_exact_prefix_leaves_zero_entries_after_finish() {
+        let _guard = env_lock();
+        let token = d206_fresh_token();
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
+        fs::create_dir_all(&root_path).expect("create D-206 oracle round root");
+        let owner = OwnedScratchDir::adopt(root_path);
+        d206_populate_target_shaped_subtree(owner.path());
+
+        owner.finish();
+
+        assert_eq!(
+            d206_prefix_count(&token),
+            0,
+            "the owner's finish() must leave zero entries for its exact fresh prefix"
+        );
+    }
+
+    /// Round 216 (D-206) item 3: the paired deletion-bypass proof. Builds
+    /// the identical created tree and evidence as the oracle above, under
+    /// its own fresh token, but bypasses only the owner's removal (via
+    /// `mem::forget`, never touching any other entry) to prove the exact
+    /// same oracle actually detects a real survivor rather than passing
+    /// unconditionally. The proof then removes only its own newly created
+    /// bypass fixture by its captured exact path, via checked cleanup, so
+    /// the proof itself leaves nothing behind. Pre-existing `d205-*`
+    /// entries are never enumerated, inspected or touched by this test.
+    #[test]
+    fn d206_owner_exact_prefix_bypass_proves_oracle_detects_survivor() {
+        let _guard = env_lock();
+        let token = d206_fresh_token();
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
+        fs::create_dir_all(&root_path).expect("create D-206 bypass fixture round root");
+        let owner = OwnedScratchDir::adopt(root_path.clone());
+        d206_populate_target_shaped_subtree(owner.path());
+
+        // Bypass only this owner's removal -- `mem::forget` skips both
+        // the checked `finish()` path and the `Drop` fallback, without
+        // touching any other object or any other Scratch entry.
+        std::mem::forget(owner);
+
+        assert_eq!(
+            d206_prefix_count(&token),
+            1,
+            "with the owner's own removal bypassed, the identical oracle must detect the survivor"
+        );
+
+        fs::remove_dir_all(&root_path).expect("checked cleanup of the captured bypass fixture root");
+        assert_eq!(
+            d206_prefix_count(&token),
+            0,
+            "the bypass proof itself must leave nothing behind"
+        );
+    }
+
+    /// Round 216 (D-206) item 4: forced-unwind coverage. An already-created
+    /// owner -- holding a nontrivial Cargo-target-shaped subtree, the same
+    /// shape `build_portal_activation_artifacts` leaves behind -- is moved
+    /// into a panicking closure. Proves the unwind-safe `Drop` fallback
+    /// removes the exact fresh root even though the panic happens after
+    /// the Cargo-shaped tree already exists, mirroring a real assertion
+    /// failure partway through `build_portal_activation_artifacts`.
+    #[test]
+    fn d206_owner_drop_recovers_populated_target_root_on_panic() {
+        let _guard = env_lock();
+        let token = d206_fresh_token();
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
+        fs::create_dir_all(&root_path).expect("create D-206 forced-unwind round root");
+        let owner = OwnedScratchDir::adopt(root_path.clone());
+        d206_populate_target_shaped_subtree(owner.path());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owner = owner;
+            panic!("deliberate panic after the Cargo-target-shaped subtree already exists, before finish()");
+        }));
+        assert!(result.is_err(), "the deliberate panic must actually unwind");
+
+        assert_eq!(
+            d206_prefix_count(&token),
+            0,
+            "Drop must reap the exact fresh root, populated subtree included, on unwind"
+        );
     }
 
     /// A private, round-owned session bus for activation: unlike
@@ -3327,7 +3472,6 @@ mod tests {
     fn cold_activation_real_pick_through_real_frontend() {
         let _guard = env_lock();
         let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-pick");
-        let target_dir = OwnedScratchDir::adopt(target_dir);
 
         let env = PrivatePortalEnv::start();
         let xvfb = PrivateXvfb::start();
@@ -3375,7 +3519,6 @@ mod tests {
     fn cold_activation_real_cancel_through_real_frontend() {
         let _guard = env_lock();
         let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-cancel");
-        let target_dir = OwnedScratchDir::adopt(target_dir);
 
         let env = PrivatePortalEnv::start();
         let xvfb = PrivateXvfb::start();
@@ -3503,7 +3646,6 @@ mod tests {
     // be written by `write_fn` before `PrivateActivationBus::start` runs.
     fn setup_routing_case(write_fn: impl FnOnce(&PrivatePortalEnv, &Path)) -> (RoutingCase, PathBuf) {
         let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-pick");
-        let target_dir = OwnedScratchDir::adopt(target_dir);
         let env = PrivatePortalEnv::start();
         let xvfb = PrivateXvfb::start();
         env.activate_private_display(&xvfb.display);
