@@ -87,6 +87,7 @@ pub enum GuardOverride {
     SkipCurrentFilter,
     SkipChoices,
     SkipCardinality,
+    SkipMissingPath,
     SkipInvalidOutput,
 }
 
@@ -123,6 +124,17 @@ pub fn decide(
                 return refuse();
             }
             let candidate = paths.first().cloned().unwrap_or_default();
+
+            // The missing-path guard is its own decision point, checked
+            // before URI normalization, so a relative/non-local refusal can
+            // never incidentally cover for it (or vice versa).
+            if override_guard != GuardOverride::SkipMissingPath
+                && override_guard != GuardOverride::SkipInvalidOutput
+                && !candidate.is_file()
+            {
+                return refuse();
+            }
+
             if override_guard == GuardOverride::SkipInvalidOutput {
                 let uri = normalize_to_single_file_uri(&candidate)
                     .unwrap_or_else(|| "file:///forced-bypass-proof".to_string());
@@ -139,8 +151,9 @@ pub fn decide(
 /// Normalizes one picked local path to exactly one `file://` URI using
 /// GIO URI construction (never string-prefixing), so spaces and
 /// non-ASCII bytes are percent-encoded by the platform API rather than
-/// this code. `None` for anything that is missing, non-local, relative
-/// or otherwise unnormalizable.
+/// this code. `None` for anything non-local, relative or otherwise
+/// unnormalizable. Existence is checked by its own guard in `decide`,
+/// not here.
 fn normalize_to_single_file_uri(path: &Path) -> Option<String> {
     if !path.is_absolute() {
         return None;
@@ -288,6 +301,25 @@ mod tests {
         }
     }
 
+    impl PrivateBus {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// Writes a real, round-owned fixture file inside this bus's own
+        /// scratch root and returns its path. Never under `/tmp`.
+        fn create_fixture_file(&self, name: &str) -> PathBuf {
+            let path = self.root.join(name);
+            fs::write(&path, b"d202 fixture").expect("write round-owned fixture file");
+            path
+        }
+    }
+
+    /// Kills the daemon and restores `TMPDIR`/`XDG_RUNTIME_DIR` -- never
+    /// touches disk, so it is safe as an unwind-safe fallback on panic.
+    /// Removing the scratch root is a separate, explicit step every test
+    /// performs itself (see `finish_private_bus`) so a removal failure
+    /// fails the test instead of being silently ignored.
     impl Drop for PrivateBus {
         fn drop(&mut self) {
             let _ = self.daemon.kill();
@@ -300,7 +332,50 @@ mod tests {
                 Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
                 None => std::env::remove_var("XDG_RUNTIME_DIR"),
             }
-            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Closes the connections and the private bus, then removes its
+    /// round-owned scratch root. Failure to remove it fails the test.
+    fn finish_private_bus(bus: PrivateBus, server: Connection, client: Connection) {
+        let root = bus.root().to_path_buf();
+        drop(client);
+        drop(server);
+        drop(bus);
+        fs::remove_dir_all(&root).expect("remove the round-owned scratch root");
+    }
+
+    /// A small round-owned scratch fixture for pure `decide()` tests that
+    /// need one real file to exist, created under `~/Projects/Scratch/`
+    /// (never `/tmp`). Callers must call `remove()` explicitly so a
+    /// cleanup failure fails the test rather than being ignored.
+    struct ScratchFile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl ScratchFile {
+        fn create() -> Self {
+            let home = std::env::var("HOME").expect("HOME must be set");
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos();
+            let dir = PathBuf::from(home)
+                .join("Projects/Scratch")
+                .join(format!("d202-fixture-{}-{}", std::process::id(), stamp));
+            fs::create_dir_all(&dir).expect("create scratch fixture dir");
+            let path = dir.join("picked.txt");
+            fs::write(&path, b"d202 fixture").expect("write scratch fixture file");
+            Self { dir, path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn remove(self) {
+            fs::remove_dir_all(&self.dir).expect("remove the round-owned scratch fixture dir");
         }
     }
 
@@ -386,12 +461,14 @@ mod tests {
 
     #[test]
     fn decide_success_one_local_path_returns_response_zero_and_one_uri() {
-        let outcome = ChooserOutcome::Picked(vec![PathBuf::from("/tmp/round211-example.txt")]);
+        let fixture = ScratchFile::create();
+        let expected_uri = gio::File::for_path(fixture.path()).uri().to_string();
+        let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
         let (response, results) = decide(&HashMap::new(), || outcome, GuardOverride::None);
         assert_eq!(response, RESPONSE_SUCCESS);
         let uris = uris_of(&results);
-        assert_eq!(uris.len(), 1);
-        assert!(uris[0].starts_with("file://"));
+        assert_eq!(uris, vec![expected_uri]);
+        fixture.remove();
     }
 
     #[test]
@@ -412,19 +489,23 @@ mod tests {
         ($red:ident, $bypassed:ident, $options:expr, $override:expr) => {
             #[test]
             fn $red() {
-                let outcome = ChooserOutcome::Picked(vec![PathBuf::from("/tmp/round211.txt")]);
+                let fixture = ScratchFile::create();
+                let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
                 let (response, _) = decide(&$options, || outcome, GuardOverride::None);
                 assert_eq!(response, RESPONSE_OTHER);
+                fixture.remove();
             }
 
             #[test]
             fn $bypassed() {
-                let outcome = ChooserOutcome::Picked(vec![PathBuf::from("/tmp/round211.txt")]);
+                let fixture = ScratchFile::create();
+                let outcome = ChooserOutcome::Picked(vec![fixture.path().to_path_buf()]);
                 let (response, _) = decide(&$options, || outcome, $override);
                 assert_eq!(
                     response, RESPONSE_SUCCESS,
                     "bypassing this guard must turn the request's own refusal into success"
                 );
+                fixture.remove();
             }
         };
     }
@@ -462,23 +543,28 @@ mod tests {
 
     #[test]
     fn decide_refuses_more_than_one_picked_path() {
+        let fixture = ScratchFile::create();
         let outcome = ChooserOutcome::Picked(vec![
-            PathBuf::from("/tmp/round211-a.txt"),
-            PathBuf::from("/tmp/round211-b.txt"),
+            fixture.path().to_path_buf(),
+            PathBuf::from("/nonexistent-round212-path/second.txt"),
         ]);
         let (response, _) = decide(&HashMap::new(), || outcome, GuardOverride::None);
         assert_eq!(response, RESPONSE_OTHER);
+        fixture.remove();
     }
 
     #[test]
     fn decide_bypassing_cardinality_guard_then_succeeds_on_two_paths() {
+        let fixture = ScratchFile::create();
+        let expected_uri = gio::File::for_path(fixture.path()).uri().to_string();
         let outcome = ChooserOutcome::Picked(vec![
-            PathBuf::from("/tmp/round211-a.txt"),
-            PathBuf::from("/tmp/round211-b.txt"),
+            fixture.path().to_path_buf(),
+            PathBuf::from("/nonexistent-round212-path/second.txt"),
         ]);
         let (response, results) = decide(&HashMap::new(), || outcome, GuardOverride::SkipCardinality);
         assert_eq!(response, RESPONSE_SUCCESS);
-        assert_eq!(uris_of(&results).len(), 1, "only the first path is normalized");
+        assert_eq!(uris_of(&results), vec![expected_uri], "only the first path is normalized");
+        fixture.remove();
     }
 
     #[test]
@@ -497,24 +583,62 @@ mod tests {
         assert_eq!(uris_of(&results), vec!["file:///forced-bypass-proof".to_string()]);
     }
 
+    #[test]
+    fn decide_refuses_missing_absolute_path() {
+        let outcome =
+            ChooserOutcome::Picked(vec![PathBuf::from("/nonexistent-round212-path/missing.txt")]);
+        let (response, results) = decide(&HashMap::new(), || outcome, GuardOverride::None);
+        assert_eq!(response, RESPONSE_OTHER);
+        assert!(uris_of(&results).is_empty());
+    }
+
+    #[test]
+    fn decide_bypassing_missing_path_guard_then_succeeds_on_missing_file() {
+        let missing = PathBuf::from("/nonexistent-round212-path/missing.txt");
+        let expected_uri = gio::File::for_path(&missing).uri().to_string();
+        let outcome = ChooserOutcome::Picked(vec![missing]);
+        let (response, results) =
+            decide(&HashMap::new(), || outcome, GuardOverride::SkipMissingPath);
+        assert_eq!(
+            response, RESPONSE_SUCCESS,
+            "bypassing only the missing-path guard must turn this same request's refusal into success"
+        );
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+    }
+
     // --- Real D-Bus calls on a private session bus. ---
 
     #[test]
     fn dbus_openfile_success_returns_one_normalized_uri() {
         let _guard = env_lock();
         let bus = PrivateBus::start();
-        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![PathBuf::from(
-            "/tmp/round211-dbus-success.txt",
-        )])]);
-        let _server = bus.connect_server(chooser.clone());
+        let fixture = bus.create_fixture_file("picked.txt");
+        let expected_uri = gio::File::for_path(&fixture).uri().to_string();
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![fixture])]);
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
 
         let (response, results) = call_open_file(&client, HashMap::new()).expect("OpenFile call");
         assert_eq!(response, RESPONSE_SUCCESS);
-        let uris = uris_of(&results);
-        assert_eq!(uris.len(), 1);
-        assert!(uris[0].starts_with("file://"));
+        assert_eq!(uris_of(&results), vec![expected_uri]);
         assert_eq!(chooser.call_count(), 1);
+        finish_private_bus(bus, server, client);
+    }
+
+    #[test]
+    fn dbus_openfile_missing_path_returns_response_other_no_uri() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let missing = bus.root().join("never-created.txt");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![missing])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, results) = call_open_file(&client, HashMap::new()).expect("OpenFile call");
+        assert_eq!(response, RESPONSE_OTHER);
+        assert!(uris_of(&results).is_empty());
+        assert_eq!(chooser.call_count(), 1);
+        finish_private_bus(bus, server, client);
     }
 
     #[test]
@@ -522,12 +646,13 @@ mod tests {
         let _guard = env_lock();
         let bus = PrivateBus::start();
         let chooser = ScriptedChooser::new(vec![ChooserOutcome::Cancelled]);
-        let _server = bus.connect_server(chooser.clone());
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
 
         let (response, results) = call_open_file(&client, HashMap::new()).expect("OpenFile call");
         assert_eq!(response, RESPONSE_CANCELLED);
         assert!(uris_of(&results).is_empty());
+        finish_private_bus(bus, server, client);
     }
 
     #[test]
@@ -535,12 +660,13 @@ mod tests {
         let _guard = env_lock();
         let bus = PrivateBus::start();
         let chooser = ScriptedChooser::new(vec![ChooserOutcome::Failed]);
-        let _server = bus.connect_server(chooser.clone());
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
 
         let (response, results) = call_open_file(&client, HashMap::new()).expect("OpenFile call");
         assert_eq!(response, RESPONSE_OTHER);
         assert!(uris_of(&results).is_empty());
+        finish_private_bus(bus, server, client);
     }
 
     macro_rules! dbus_option_refusal {
@@ -549,10 +675,9 @@ mod tests {
             fn $name() {
                 let _guard = env_lock();
                 let bus = PrivateBus::start();
-                let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![
-                    PathBuf::from("/tmp/round211-should-not-be-read.txt"),
-                ])]);
-                let _server = bus.connect_server(chooser.clone());
+                let fixture = bus.create_fixture_file("should-not-be-read.txt");
+                let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![fixture])]);
+                let server = bus.connect_server(chooser.clone());
                 let client = bus.connect_client();
 
                 let (response, _) = call_open_file(&client, $options).expect("OpenFile call");
@@ -562,6 +687,7 @@ mod tests {
                     0,
                     "this option must refuse before the chooser seam is ever invoked"
                 );
+                finish_private_bus(bus, server, client);
             }
         };
     }
@@ -580,7 +706,7 @@ mod tests {
         let _guard = env_lock();
         let bus = PrivateBus::start();
         let chooser = ScriptedChooser::new(vec![]);
-        let _server = bus.connect_server(chooser);
+        let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
         let err = client
@@ -598,6 +724,7 @@ mod tests {
             }
             other => panic!("expected UnknownMethod, got {other:?}"),
         }
+        finish_private_bus(bus, server, client);
     }
 
     #[test]
@@ -605,7 +732,7 @@ mod tests {
         let _guard = env_lock();
         let bus = PrivateBus::start();
         let chooser = ScriptedChooser::new(vec![]);
-        let _server = bus.connect_server(chooser);
+        let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
         let err = client
@@ -623,6 +750,7 @@ mod tests {
             }
             other => panic!("expected UnknownMethod, got {other:?}"),
         }
+        finish_private_bus(bus, server, client);
     }
 
     #[test]
@@ -630,7 +758,7 @@ mod tests {
         let _guard = env_lock();
         let bus = PrivateBus::start();
         let chooser = ScriptedChooser::new(vec![]);
-        let _server = bus.connect_server(chooser);
+        let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
         let message = client
@@ -658,29 +786,33 @@ mod tests {
         assert_eq!(open_file_block.matches("type=\"s\"").count(), 3);
         assert_eq!(open_file_block.matches("type=\"a{sv}\"").count(), 2);
         assert_eq!(open_file_block.matches("type=\"u\"").count(), 1);
+        finish_private_bus(bus, server, client);
     }
 
     #[test]
     fn dbus_second_sequential_call_is_independent_no_state_leak() {
         let _guard = env_lock();
         let bus = PrivateBus::start();
+        let fixture = bus.create_fixture_file("first.txt");
+        let expected_uri = gio::File::for_path(&fixture).uri().to_string();
         let chooser = ScriptedChooser::new(vec![
-            ChooserOutcome::Picked(vec![PathBuf::from("/tmp/round211-first.txt")]),
+            ChooserOutcome::Picked(vec![fixture]),
             ChooserOutcome::Cancelled,
         ]);
-        let _server = bus.connect_server(chooser.clone());
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
 
         let (first_response, first_results) =
             call_open_file(&client, HashMap::new()).expect("first OpenFile call");
         assert_eq!(first_response, RESPONSE_SUCCESS);
-        assert_eq!(uris_of(&first_results).len(), 1);
+        assert_eq!(uris_of(&first_results), vec![expected_uri]);
 
         let (second_response, second_results) =
             call_open_file(&client, HashMap::new()).expect("second OpenFile call");
         assert_eq!(second_response, RESPONSE_CANCELLED);
         assert!(uris_of(&second_results).is_empty());
         assert_eq!(chooser.call_count(), 2);
+        finish_private_bus(bus, server, client);
     }
 
     #[test]
@@ -696,10 +828,9 @@ mod tests {
         let before = count_desktop_processes();
 
         let bus = PrivateBus::start();
-        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![PathBuf::from(
-            "/tmp/round211-no-desktop.txt",
-        )])]);
-        let _server = bus.connect_server(chooser.clone());
+        let fixture = bus.create_fixture_file("no-desktop.txt");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![fixture])]);
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
         let (response, _) = call_open_file(&client, HashMap::new()).expect("OpenFile call");
         assert_eq!(response, RESPONSE_SUCCESS);
@@ -710,7 +841,7 @@ mod tests {
             "no wayfinder-native, GTK window or xdg-desktop-portal process may start"
         );
 
-        drop(bus);
+        finish_private_bus(bus, server, client);
         match old_display {
             Some(v) => std::env::set_var("DISPLAY", v),
             None => std::env::remove_var("DISPLAY"),
