@@ -30,6 +30,12 @@ zbus = "5.19.0"
 [features]
 default = []
 guide = []
+# Test-only picker driver (D-205 round 214). Absent from the default/shipped
+# binary: with no feature flag passed, none of this code is even compiled in.
+# Built only into a separate round-owned artifact for the private harness.
+picker-test-driver = []
+picker-test-driver-pick = ["picker-test-driver"]
+picker-test-driver-cancel = ["picker-test-driver"]
 
 [[bin]]
 name = "wayfinder-native"

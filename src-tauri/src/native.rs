@@ -1511,6 +1511,10 @@ struct Ui {
     transfer_bar: gtk::ProgressBar,
     transfer_cancel: gtk::Button,
     picker_open: Option<gtk::Button>,
+    /// Exists only in the non-default `picker-test-driver` feature build; the
+    /// ordinary shipped binary has no field, no clone and no reader for this.
+    #[cfg(feature = "picker-test-driver")]
+    picker_cancel: Option<gtk::Button>,
     /// D-188 REJECT 2: the production command bar must itself go ZIP-aware
     /// (hidden/insensitive inside a ZIP cwd), not just refuse in the handler.
     new_folder: gtk::Button,
@@ -3361,6 +3365,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     body.append(&command_bar);
     body.append(&main);
 
+    #[cfg(feature = "picker-test-driver")]
+    let mut picker_cancel_for_driver: Option<gtk::Button> = None;
     let picker_open = if picker.is_some() {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         actions.add_css_class("wf-picker-actions");
@@ -3382,6 +3388,11 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
         if let Some(picker_state) = picker.clone() {
             cancel.connect_clicked(move |_| picker_write_and_exit(&picker_state, Vec::new(), 1));
+        }
+
+        #[cfg(feature = "picker-test-driver")]
+        {
+            picker_cancel_for_driver = Some(cancel.clone());
         }
 
         Some(open)
@@ -3468,6 +3479,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         transfer_bar: transfer_bar.clone(),
         transfer_cancel: transfer_cancel.clone(),
         picker_open: picker_open.clone(),
+        #[cfg(feature = "picker-test-driver")]
+        picker_cancel: picker_cancel_for_driver.clone(),
         new_folder: new_folder.clone(),
         new_file: new_file.clone(),
         cut: cut.clone(),
@@ -3694,6 +3707,50 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     }
 
     ui.window.present();
+
+    #[cfg(feature = "picker-test-driver")]
+    if ui.picker_open.is_some() {
+        schedule_picker_test_driver(&state, &ui);
+    }
+}
+
+/// Exists only in the non-default `picker-test-driver` feature build. Fires
+/// one existing picker callback -- the real Open button or the real Cancel
+/// button -- with no pointer/xdotool/synthetic input, but only once the real
+/// window is actually mapped (`ui.window.is_mapped()`) and, for the pick
+/// case, the real folder model actually holds the one fixture row
+/// (`state.visible_entries` non-empty). A one-shot idle fired right after
+/// `present()` is not proof of either, so this polls on the GTK main context
+/// every 20ms and only acts once both are true. Which callback fires is
+/// fixed at compile time by the mutually exclusive `picker-test-driver-pick`
+/// / `picker-test-driver-cancel` sub-features; the ordinary shipped binary
+/// has neither this function nor any selector reachable at runtime.
+#[cfg(feature = "picker-test-driver")]
+fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let state = state.clone();
+    let ui = ui.clone();
+    glib::timeout_add_local(Duration::from_millis(20), move || {
+        if !ui.window.is_mapped() {
+            return glib::ControlFlow::Continue;
+        }
+        if cfg!(feature = "picker-test-driver-cancel") {
+            if let Some(cancel) = ui.picker_cancel.clone() {
+                cancel.emit_clicked();
+            }
+            return glib::ControlFlow::Break;
+        }
+        if state.borrow().visible_entries.is_empty() {
+            return glib::ControlFlow::Continue;
+        }
+        // The round-owned fixture is the only entry in the picker's
+        // starting directory, so the real folder model's first row is it;
+        // this reuses the real selection + Open callback, not a new seam.
+        ui.list_selection.select_item(0, true);
+        if let Some(open) = ui.picker_open.clone() {
+            open.emit_clicked();
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 /// Select+focus the row for `path` in the current listing, if it is present.

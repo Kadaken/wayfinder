@@ -6,11 +6,11 @@
 
 mod portal_service;
 
-use portal_service::{PortalService, UnavailableChooser, BUS_NAME, OBJECT_PATH};
+use portal_service::{PortalService, ProcessChooser, BUS_NAME, OBJECT_PATH};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let chooser = Arc::new(UnavailableChooser);
+    let chooser = Arc::new(ProcessChooser::production());
     let service = PortalService::new(chooser);
 
     let _connection = zbus::blocking::connection::Builder::session()?
