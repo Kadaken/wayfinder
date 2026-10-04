@@ -1736,8 +1736,7 @@ mod tests {
         let captured_clone = captured.clone();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let owned = OwnedScratchDir::adopt(scratch_base("owned-dir-forced-unwind"));
-            fs::create_dir_all(owned.path()).expect("create owned dir");
+            let owned = OwnedScratchDir::create(scratch_base("owned-dir-forced-unwind"));
             *captured_clone.lock().unwrap() = Some(owned.path().to_path_buf());
             panic!("deliberate panic inside the OwnedScratchDir scope, before finish()");
         }));
@@ -1759,11 +1758,10 @@ mod tests {
     #[test]
     fn owned_scratch_dir_finish_panics_when_normal_cleanup_actually_fails() {
         let dir = scratch_base("owned-dir-forced-cleanup-failure");
-        fs::create_dir_all(&dir).expect("create dir");
+        let owned = OwnedScratchDir::create(dir.clone());
         let blocker = dir.join("blocked");
         fs::create_dir(&blocker).expect("create nested dir");
         fs::set_permissions(&blocker, fs::Permissions::from_mode(0o000)).expect("lock nested dir");
-        let owned = OwnedScratchDir::adopt(dir.clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             owned.finish();
         }));
@@ -2691,13 +2689,6 @@ mod tests {
     }
 
     impl OwnedScratchDir {
-        fn adopt(dir: PathBuf) -> Self {
-            Self {
-                dir,
-                removed: Cell::new(false),
-            }
-        }
-
         /// D-208: the owner exists -- and its unwind-safe `Drop` fallback
         /// is live -- before the directory is created, not after. Callers
         /// that build a round-owned root must use this instead of calling
@@ -2746,9 +2737,10 @@ mod tests {
     /// shared project `target/`. Returns the built binary's exact path.
     /// This feature does not exist in the default/shipped `wayfinder-native`
     /// build -- see `Cargo.toml`.
-    fn build_picker_test_driver(feature: &str) -> (PathBuf, PathBuf) {
+    fn build_picker_test_driver(feature: &str) -> (PathBuf, OwnedScratchDir) {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let target_dir = scratch_base(&format!("native-driver-target-{feature}"));
+        let target_dir = OwnedScratchDir::create(target_dir);
         let status = Command::new("cargo")
             .arg("build")
             .arg("--quiet")
@@ -2757,12 +2749,12 @@ mod tests {
             .arg("--features")
             .arg(feature)
             .arg("--target-dir")
-            .arg(&target_dir)
+            .arg(target_dir.path())
             .current_dir(manifest_dir)
             .status()
             .expect("run cargo build for the test-only native driver");
         assert!(status.success(), "building the {feature} native driver failed");
-        let binary = target_dir.join("debug").join("wayfinder-native");
+        let binary = target_dir.path().join("debug").join("wayfinder-native");
         assert!(binary.exists(), "expected driver binary at {}", binary.display());
         (binary, target_dir)
     }
@@ -2771,7 +2763,6 @@ mod tests {
     fn native_picker_real_pick_through_exported_open_file() {
         let _guard = env_lock();
         let (driver, driver_target) = build_picker_test_driver("picker-test-driver-pick");
-        let driver_target = OwnedScratchDir::adopt(driver_target);
         let xvfb = PrivateXvfb::start();
         let old_display = std::env::var("DISPLAY").ok();
         let old_wayland = std::env::var("WAYLAND_DISPLAY").ok();
@@ -2782,8 +2773,7 @@ mod tests {
         // roots, so they must run before `$HOME` is overridden below.
         let bus = PrivateBus::start();
         let base = scratch_base("native-pick-base");
-        let fixture_dir_root = OwnedScratchDir::adopt(scratch_base("native-pick-fixture-home"));
-        fs::create_dir_all(fixture_dir_root.path()).expect("create fixture HOME dir");
+        let fixture_dir_root = OwnedScratchDir::create(scratch_base("native-pick-fixture-home"));
         let fixture_file = fixture_dir_root.path().join("d205-native-picker-fixture.txt");
         fs::write(&fixture_file, b"d205 round 214 real-picker fixture\n").expect("write fixture file");
 
@@ -2839,7 +2829,6 @@ mod tests {
     fn native_picker_real_cancel_through_exported_open_file() {
         let _guard = env_lock();
         let (driver, driver_target) = build_picker_test_driver("picker-test-driver-cancel");
-        let driver_target = OwnedScratchDir::adopt(driver_target);
         let xvfb = PrivateXvfb::start();
         let old_display = std::env::var("DISPLAY").ok();
         let old_wayland = std::env::var("WAYLAND_DISPLAY").ok();
@@ -2848,8 +2837,7 @@ mod tests {
 
         let bus = PrivateBus::start();
         let base = scratch_base("native-cancel-base");
-        let fixture_dir_root = OwnedScratchDir::adopt(scratch_base("native-cancel-fixture-home"));
-        fs::create_dir_all(fixture_dir_root.path()).expect("create fixture HOME dir");
+        let fixture_dir_root = OwnedScratchDir::create(scratch_base("native-cancel-fixture-home"));
         fs::write(
             fixture_dir_root.path().join("d205-native-picker-fixture.txt"),
             b"d205 round 214 real-picker fixture\n",
@@ -3273,41 +3261,42 @@ mod tests {
         );
     }
 
-    /// Round 216 (D-206) item 3: the paired deletion-bypass proof. Builds
-    /// the identical created tree and evidence as the oracle above, under
-    /// its own fresh token, but bypasses only the owner's removal (via
-    /// `mem::forget`, never touching any other entry) to prove the exact
-    /// same oracle actually detects a real survivor rather than passing
-    /// unconditionally. The proof then removes only its own newly created
-    /// bypass fixture by its captured exact path, via checked cleanup, so
-    /// the proof itself leaves nothing behind. Pre-existing `d205-*`
-    /// entries are never enumerated, inspected or touched by this test.
+    /// Round 219 item 1: the paired deletion-bypass proof. Builds the
+    /// identical created tree and evidence as the oracle above, under its
+    /// own fresh token, but observes the live owner's survivor through
+    /// `peek_while_live` -- never `mem::forget` -- to prove the exact same
+    /// oracle actually detects a real survivor rather than passing
+    /// unconditionally, while the owner's unwind-safe `Drop` fallback
+    /// stays armed throughout. The proof then calls checked `finish()`,
+    /// so the proof itself leaves nothing behind, and there is never an
+    /// unowned interval. Mechanically equivalent to the D-208 bypass
+    /// proof below (same owner, same shapes), kept because no test
+    /// deletion is authorized.
     #[test]
     fn d206_owner_exact_prefix_bypass_proves_oracle_detects_survivor() {
         let _guard = env_lock();
         let token = d206_fresh_token();
         let home = std::env::var("HOME").expect("HOME must be set");
         let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
-        fs::create_dir_all(&root_path).expect("create D-206 bypass fixture round root");
-        let owner = OwnedScratchDir::adopt(root_path.clone());
+        let owner = OwnedScratchDir::create(root_path);
         d206_populate_target_shaped_subtree(owner.path());
 
-        // Bypass only this owner's removal -- `mem::forget` skips both
-        // the checked `finish()` path and the `Drop` fallback, without
-        // touching any other object or any other Scratch entry.
-        std::mem::forget(owner);
+        // The owner is still live here -- no `mem::forget`, no early
+        // `finish()` -- so `Drop` would still reap the exact root if this
+        // peek itself panicked or timed out.
+        owner.peek_while_live(|| {
+            assert_eq!(
+                d206_prefix_count(&token),
+                1,
+                "with the owner still live and unremoved, the oracle must detect the survivor"
+            );
+        });
 
-        assert_eq!(
-            d206_prefix_count(&token),
-            1,
-            "with the owner's own removal bypassed, the identical oracle must detect the survivor"
-        );
-
-        fs::remove_dir_all(&root_path).expect("checked cleanup of the captured bypass fixture root");
+        owner.finish();
         assert_eq!(
             d206_prefix_count(&token),
             0,
-            "the bypass proof itself must leave nothing behind"
+            "the bypass proof's own checked finish() must leave nothing behind"
         );
     }
 
