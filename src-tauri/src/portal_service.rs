@@ -2891,11 +2891,18 @@ mod tests {
     /// on `finish()`/`Drop`; `Drop` alone never panics, so it is safe
     /// during unwind.
     struct PrivatePortalEnv {
-        root: PathBuf,
+        // D-207: owns the one exact fresh activation root -- whatever the
+        // caller already placed in it (such as a Cargo `target/` sibling
+        // from `build_portal_activation_artifacts`) plus this env's own
+        // `env/` child -- so Cargo output and the private HOME/XDG/
+        // runtime/descriptor/service fixture live beneath a single
+        // unwind-safe owner instead of two separately owned roots.
+        owner: Option<OwnedScratchDir>,
+        env_root: PathBuf,
         data_home: PathBuf,
         desktop_id: String,
         saved: Vec<(&'static str, Option<String>)>,
-        removed: Cell<bool>,
+        restored: Cell<bool>,
     }
 
     impl PrivatePortalEnv {
@@ -2912,6 +2919,12 @@ mod tests {
             "WAYLAND_DISPLAY",
         ];
 
+        /// A standalone private env with its own exact fresh root. The
+        /// root is created and immediately adopted by `OwnedScratchDir`
+        /// -- establishing its unwind-safe owner -- before any further
+        /// subdirectory is created or any environment variable is
+        /// overridden, so no panic interval in between can leave either
+        /// the files or the process-wide vars unowned.
         fn start() -> Self {
             let home_var = std::env::var("HOME").expect("HOME must be set");
             let stamp = SystemTime::now()
@@ -2924,13 +2937,30 @@ mod tests {
                 stamp,
                 next_unique_id()
             ));
-            let home = root.join("home");
+            fs::create_dir_all(&root).expect("create private portal-env root");
+            let owner = OwnedScratchDir::adopt(root);
+            let env_root = owner.path().to_path_buf();
+            Self::build(owner, env_root)
+        }
+
+        /// D-207: nests this env's `env/` fixture tree inside `owner`'s
+        /// already-created exact root, transferring ownership of that
+        /// whole root -- Cargo `target/` sibling included -- into this
+        /// `PrivatePortalEnv`. `owner` already exists before this method
+        /// writes a single file or touches a single environment variable.
+        fn start_under(owner: OwnedScratchDir) -> Self {
+            let env_root = owner.path().join("env");
+            Self::build(owner, env_root)
+        }
+
+        fn build(owner: OwnedScratchDir, env_root: PathBuf) -> Self {
+            let home = env_root.join("home");
             let data_home = home.join(".local/share");
             let config_home = home.join(".config");
-            let runtime_dir = root.join("run");
+            let runtime_dir = env_root.join("run");
             let portals_dir = data_home.join("xdg-desktop-portal/portals");
             let services_dir = data_home.join("dbus-1/services");
-            for dir in [&root, &home, &data_home, &config_home, &runtime_dir, &portals_dir, &services_dir] {
+            for dir in [&env_root, &home, &data_home, &config_home, &runtime_dir, &portals_dir, &services_dir] {
                 fs::create_dir_all(dir).expect("create private portal-env directory");
             }
             for dir in [&home, &data_home, &config_home, &runtime_dir] {
@@ -2954,20 +2984,33 @@ mod tests {
             std::env::set_var("XDG_DESKTOP_PORTAL_TEST_HOST_APPID", TEST_HOST_APP_ID);
 
             Self {
-                root,
+                owner: Some(owner),
+                env_root,
                 data_home,
                 desktop_id,
                 saved,
-                removed: Cell::new(false),
+                restored: Cell::new(false),
             }
         }
 
         fn root(&self) -> &Path {
-            &self.root
+            &self.env_root
+        }
+
+        /// The one shared round root itself (the parent of this env's own
+        /// `env/` child and of the build's `target/` sibling), one path
+        /// segment shorter than `root()`. D-207: `AF_UNIX` socket paths
+        /// are capped at `sun_path`'s ~108 bytes, and nesting the
+        /// activation-bus socket under the deeper `root()` (`env/`) on
+        /// top of the merged one-root's longer label pushed real runs
+        /// over that cap, so the private activation bus binds here
+        /// instead, directly under the shorter shared root.
+        fn round_root(&self) -> &Path {
+            self.owner.as_ref().expect("owner present until finish").path()
         }
 
         fn runtime_dir(&self) -> PathBuf {
-            self.root.join("run")
+            self.env_root.join("run")
         }
 
         fn portals_dir(&self) -> PathBuf {
@@ -3063,24 +3106,25 @@ mod tests {
             .expect("write the private .service activation file");
         }
 
-        /// Explicitly, observably removes the exact root and restores
-        /// every saved environment variable. Failure to remove fails the
-        /// test; `Drop`'s fallback is skipped afterward.
-        fn finish(self) {
+        /// Explicitly, observably removes the one exact owned root
+        /// (Cargo `target/` sibling included, when there is one) and
+        /// restores every saved environment variable. Failure to remove
+        /// fails the test; `Drop`'s fallback is skipped afterward.
+        fn finish(mut self) {
             for (name, value) in &self.saved {
                 match value {
                     Some(v) => std::env::set_var(name, v),
                     None => std::env::remove_var(name),
                 }
             }
-            fs::remove_dir_all(&self.root).expect("remove the private portal-env root");
-            self.removed.set(true);
+            self.restored.set(true);
+            self.owner.take().expect("owner present until finish").finish();
         }
     }
 
     impl Drop for PrivatePortalEnv {
         fn drop(&mut self) {
-            if self.removed.get() {
+            if self.restored.get() {
                 return;
             }
             for (name, value) in &self.saved {
@@ -3089,7 +3133,9 @@ mod tests {
                     None => std::env::remove_var(name),
                 }
             }
-            let _ = fs::remove_dir_all(&self.root);
+            // `self.owner`'s own `Drop` runs right after this function
+            // returns (field drop order), performing the bounded,
+            // non-panicking unwind removal of the one exact root.
         }
     }
 
@@ -3108,9 +3154,15 @@ mod tests {
     /// status-check or assertion interval in which the round root (or
     /// anything Cargo creates under it) exists without an owner: a panic
     /// from any `assert!`/`.expect(...)` below is caught by `Drop`.
-    fn build_portal_activation_artifacts(feature: &str) -> (PathBuf, OwnedScratchDir) {
+    fn build_portal_activation_artifacts(feature: &str) -> (PathBuf, PrivatePortalEnv) {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let round_root = scratch_base(&format!("portal-activation-target-{feature}"));
+        // D-207: the merged one-root now also carries the private
+        // activation bus's `AF_UNIX` socket (see `round_root()`), whose
+        // `sun_path` is capped at ~108 bytes, so the round-root label
+        // stays short here rather than spelling out the full feature name
+        // the way other, non-socket-bearing `scratch_base()` callers do.
+        let short_feature = feature.replace("picker-test-driver-", "ptd-");
+        let round_root = scratch_base(&format!("pat-{short_feature}"));
         fs::create_dir_all(&round_root).expect("create round-owned activation build root");
         let round_root = OwnedScratchDir::adopt(round_root);
         let target_dir = round_root.path().join("target");
@@ -3133,7 +3185,8 @@ mod tests {
         assert!(portal_bin.exists(), "expected portal binary at {}", portal_bin.display());
         let native_bin = target_dir.join("debug").join("wayfinder-native");
         assert!(native_bin.exists(), "expected native binary at {}", native_bin.display());
-        (portal_bin, round_root)
+        let env = PrivatePortalEnv::start_under(round_root);
+        (portal_bin, env)
     }
 
     /// A fresh, unique D-206 token for one oracle run, and the exact
@@ -3267,6 +3320,133 @@ mod tests {
             d206_prefix_count(&token),
             0,
             "Drop must reap the exact fresh root, populated subtree included, on unwind"
+        );
+    }
+
+    /// Round 217 (D-207) proof 1: drives the real
+    /// `build_portal_activation_artifacts`/`PrivatePortalEnv::start_under`
+    /// path (not a synthetic stand-in) and proves the one real round root
+    /// is the single shared owner of both children. The returned portal
+    /// binary must sit beneath `<one-root>/target/`, and the returned
+    /// env's own root must sit beneath `<one-root>/env/` -- the exact
+    /// nesting the D-207 blueprint requires. After a checked `finish()`,
+    /// the oracle enumerates Scratch by that one root's own exact
+    /// top-level name and requires zero.
+    #[test]
+    fn d207_real_activation_setup_shares_one_root_and_leaves_zero_entries() {
+        let _guard = env_lock();
+        let (portal_bin, env) = build_portal_activation_artifacts("picker-test-driver-pick");
+
+        let target_dir = portal_bin.parent().expect("portal bin has a parent dir");
+        let one_root = target_dir
+            .parent()
+            .expect("target/debug has a parent")
+            .parent()
+            .expect("target has a parent: the one shared round root");
+        let token = one_root
+            .file_name()
+            .expect("one-root has a file name")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            portal_bin.starts_with(one_root.join("target")),
+            "the real portal binary must sit beneath <one-root>/target/"
+        );
+        assert!(
+            env.root().starts_with(one_root.join("env")),
+            "the real env's own root must sit beneath <one-root>/env/"
+        );
+
+        env.finish();
+
+        assert_eq!(
+            d206_prefix_count(&token),
+            0,
+            "finishing the one shared owner must leave zero entries for the real round root's exact name"
+        );
+    }
+
+    /// Builds the same `env/home/...` HOME/XDG-shaped evidence the real
+    /// `PrivatePortalEnv::build()` writes beneath `<one-root>/env/`, but
+    /// without mutating any real process-wide environment variable --
+    /// these two proofs are about the one-root *directory* ownership, not
+    /// about variable restoration (already covered by proof 1 and the
+    /// unchanged 215 proofs), so they must not leave real `HOME`/`XDG_*`
+    /// pointed at a root they are about to remove.
+    fn d207_populate_env_shaped_subtree(root: &Path) {
+        let home_dir = root.join("env").join("home");
+        let data_home = home_dir.join(".local/share");
+        fs::create_dir_all(&data_home).expect("create env-shaped HOME/XDG evidence subtree");
+        fs::write(data_home.join("marker"), b"d207 evidence HOME/XDG fixture\n")
+            .expect("write env-shaped evidence marker");
+    }
+
+    /// Round 217 (D-207) proof 2: the paired owner-removal-bypass proof,
+    /// built on the same one-root shape (a `target/` and an `env/` child
+    /// under one fresh owner) as proof 1, but bypassing only this run's
+    /// owner removal (`mem::forget`) to prove the same exact-prefix
+    /// oracle actually detects a real survivor. Cleans up only its own
+    /// captured exact path afterward.
+    #[test]
+    fn d207_one_root_bypass_proves_oracle_detects_survivor() {
+        let _guard = env_lock();
+        let token = d206_fresh_token();
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
+        fs::create_dir_all(&root_path).expect("create D-207 bypass one-root");
+        let owner = OwnedScratchDir::adopt(root_path.clone());
+        d206_populate_target_shaped_subtree(owner.path());
+        d207_populate_env_shaped_subtree(owner.path());
+
+        assert!(owner.path().join("env").join("home").is_dir(), "env child must nest under <one-root>/env/");
+
+        // Bypass only this run's owner removal -- `mem::forget` skips both
+        // the checked `finish()` path and the `Drop` fallback (which
+        // would otherwise reap the whole one-root, target and env children
+        // both), without touching any other object or entry.
+        std::mem::forget(owner);
+
+        assert_eq!(
+            d206_prefix_count(&token),
+            1,
+            "with this run's owner removal bypassed, the oracle must detect the one-root survivor"
+        );
+
+        fs::remove_dir_all(&root_path).expect("checked cleanup of the captured bypass one-root");
+        assert_eq!(d206_prefix_count(&token), 0, "the bypass proof itself must leave nothing behind");
+    }
+
+    /// Round 217 (D-207) proof 3: forced-unwind coverage taken only after
+    /// BOTH the Cargo-target-shaped output and the HOME/XDG-shaped private
+    /// env fixtures already exist under the one shared root, proving the
+    /// whole one-root -- target and env children both -- is reaped by
+    /// `Drop` on unwind, not just whichever child existed first.
+    #[test]
+    fn d207_one_root_drop_recovers_whole_root_on_panic_after_both_children_exist() {
+        let _guard = env_lock();
+        let token = d206_fresh_token();
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let root_path = PathBuf::from(&home).join("Projects/Scratch").join(&token);
+        fs::create_dir_all(&root_path).expect("create D-207 forced-unwind one-root");
+        let owner = OwnedScratchDir::adopt(root_path.clone());
+        d206_populate_target_shaped_subtree(owner.path());
+        d207_populate_env_shaped_subtree(owner.path());
+        // Both children -- `target/` and `env/` -- already exist by this
+        // point, mirroring the real one-root shape after a build and a
+        // `PrivatePortalEnv::start_under` call.
+        assert!(owner.path().join("env").join("home").is_dir(), "the env child must already exist");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owner = owner;
+            panic!("deliberate panic after both the target- and env-shaped children already exist");
+        }));
+        assert!(result.is_err(), "the deliberate panic must actually unwind");
+
+        assert_eq!(
+            d206_prefix_count(&token),
+            0,
+            "Drop must reap the whole one-root, target and env children both, on unwind"
         );
     }
 
@@ -3471,9 +3651,8 @@ mod tests {
     #[test]
     fn cold_activation_real_pick_through_real_frontend() {
         let _guard = env_lock();
-        let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-pick");
+        let (portal_bin, env) = build_portal_activation_artifacts("picker-test-driver-pick");
 
-        let env = PrivatePortalEnv::start();
         let xvfb = PrivateXvfb::start();
         env.activate_private_display(&xvfb.display);
 
@@ -3482,7 +3661,7 @@ mod tests {
         env.write_portal_descriptor();
         env.write_service_file(&portal_bin);
 
-        let bus = PrivateActivationBus::start(env.root());
+        let bus = PrivateActivationBus::start(env.round_root());
         let client = bus.connect();
 
         assert!(
@@ -3512,15 +3691,13 @@ mod tests {
         bus.finish();
         xvfb.finish();
         env.finish();
-        target_dir.finish();
     }
 
     #[test]
     fn cold_activation_real_cancel_through_real_frontend() {
         let _guard = env_lock();
-        let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-cancel");
+        let (portal_bin, env) = build_portal_activation_artifacts("picker-test-driver-cancel");
 
-        let env = PrivatePortalEnv::start();
         let xvfb = PrivateXvfb::start();
         env.activate_private_display(&xvfb.display);
 
@@ -3532,7 +3709,7 @@ mod tests {
         env.write_portal_descriptor();
         env.write_service_file(&portal_bin);
 
-        let bus = PrivateActivationBus::start(env.root());
+        let bus = PrivateActivationBus::start(env.round_root());
         let client = bus.connect();
 
         assert!(
@@ -3557,7 +3734,6 @@ mod tests {
         bus.finish();
         xvfb.finish();
         env.finish();
-        target_dir.finish();
     }
 
     // --- Round 215 item 6: named same-evidence refusal/bypass pairs at
@@ -3635,7 +3811,6 @@ mod tests {
         xvfb: PrivateXvfb,
         bus: PrivateActivationBus,
         client: Connection,
-        target_dir: OwnedScratchDir,
     }
 
     // The descriptor/service files must exist before the private
@@ -3645,8 +3820,7 @@ mod tests {
     // bypass defaults, or a refusal's deliberately broken field) has to
     // be written by `write_fn` before `PrivateActivationBus::start` runs.
     fn setup_routing_case(write_fn: impl FnOnce(&PrivatePortalEnv, &Path)) -> (RoutingCase, PathBuf) {
-        let (portal_bin, target_dir) = build_portal_activation_artifacts("picker-test-driver-pick");
-        let env = PrivatePortalEnv::start();
+        let (portal_bin, env) = build_portal_activation_artifacts("picker-test-driver-pick");
         let xvfb = PrivateXvfb::start();
         env.activate_private_display(&xvfb.display);
         fs::write(
@@ -3655,7 +3829,7 @@ mod tests {
         )
         .expect("write routing-case fixture file");
         write_fn(&env, &portal_bin);
-        let bus = PrivateActivationBus::start(env.root());
+        let bus = PrivateActivationBus::start(env.round_root());
         let client = bus.connect();
         (
             RoutingCase {
@@ -3663,7 +3837,6 @@ mod tests {
                 xvfb,
                 bus,
                 client,
-                target_dir,
             },
             portal_bin,
         )
@@ -3678,7 +3851,6 @@ mod tests {
         case.bus.finish();
         case.xvfb.finish();
         case.env.finish();
-        case.target_dir.finish();
     }
 
     fn assert_no_false_pick(outcome: &FrontendAttempt) {
