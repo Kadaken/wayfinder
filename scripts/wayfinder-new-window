@@ -1,0 +1,20 @@
+#!/bin/bash
+# Opens one more independent Wayfinder window, starting the app when it is
+# not already running. The taskbar's "New Window" desktop action calls this.
+#
+# The app exports an `open-window` action (see src-tauri/src/native.rs,
+# connect_startup), which is the same path Ctrl+N takes. Activating it over
+# D-Bus gives a real second window instead of raising the existing one,
+# which is what a plain re-launch of a single-instance GApplication does.
+set -u
+dir="${1:-$HOME}"
+
+if gdbus call --session --dest com.kadaken.wayfinder \
+      --object-path /com/kadaken/wayfinder \
+      --method org.gtk.Actions.Activate \
+      open-window "[<'$dir'>]" "{}" >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Not running: a plain launch gives the first window.
+exec wayfinder "$dir"
