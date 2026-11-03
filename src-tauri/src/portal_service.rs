@@ -182,6 +182,12 @@ const MAX_WIRE_JSON_BYTES: u64 = 64 * 1024;
 fn write_request_file(path: &Path, request: &WireRequest) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(request)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if bytes.len() as u64 > MAX_WIRE_JSON_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request exceeds the wire size limit",
+        ));
+    }
     fs::write(path, bytes)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
@@ -441,6 +447,29 @@ fn production_scratch_base() -> Option<PathBuf> {
     Some(PathBuf::from(runtime_dir).join("wayfinder-portal-picker"))
 }
 
+/// The two `parent_window` handle shapes the xdg-desktop-portal wire
+/// protocol defines: `wayland:<xdg-foreign handle>` and `x11:<xid>`.
+/// Empty (the app passed no parent) and any other shape are refused, so
+/// nothing unvalidated from a D-Bus caller ever reaches the child's
+/// argv.
+fn is_forwardable_parent_handle(handle: &str) -> bool {
+    let body = match handle
+        .strip_prefix("wayland:")
+        .or_else(|| handle.strip_prefix("x11:"))
+    {
+        Some(body) => body,
+        None => return false,
+    };
+    !body.is_empty()
+        // Never a value that reads as a flag if the child's argument
+        // parser is ever changed to scan loosely.
+        && !body.starts_with('-')
+        && body.len() <= 128
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
 impl Chooser for ProcessChooser {
     fn pick_single(&self, app_id: &str, parent_window: &str, title: &str) -> ChooserOutcome {
         self.pick(app_id, parent_window, title, &WireRequest::default())
@@ -450,7 +479,7 @@ impl Chooser for ProcessChooser {
     fn pick(
         &self,
         _app_id: &str,
-        _parent_window: &str,
+        parent_window: &str,
         _title: &str,
         request: &WireRequest,
     ) -> PickOutcome {
@@ -483,6 +512,16 @@ impl Chooser for ProcessChooser {
                 .stderr(Stdio::null());
             if request.multiple {
                 command.arg("--multiple");
+            }
+            // The calling app's exported toplevel handle, straight from
+            // the FileChooser request. Without it the picker is a
+            // parentless toplevel and the compositor has nothing to
+            // stack it against, so it opens behind the app that asked
+            // for it. Only a handle the wire protocol actually defines
+            // is forwarded; anything else is dropped rather than passed
+            // to the child as an opaque string.
+            if is_forwardable_parent_handle(parent_window) {
+                command.arg("--parent-window").arg(parent_window);
             }
             // Place the child in its own new process group (pgid == its
             // own pid), so a timeout kill can target that exact group --
@@ -621,56 +660,76 @@ fn decode_filters(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireFilte
         .collect())
 }
 
-/// Decodes the real `(sa(us))` `current_filter` wire value and resolves it
-/// against the supplied `filters`: an exact match selects that filter;
-/// anything else (absent, malformed-but-filters-present is caught earlier,
-/// or simply not found) falls back to the first supplied filter, or `None`
-/// when no filters were supplied at all. Returns `Err(())` only when the
-/// key is present but structurally malformed.
+/// Decodes the real `(sa(us))` `current_filter` wire value. When `filters`
+/// is nonempty, resolves it against that list: an exact match selects that
+/// filter, anything else (absent, or simply not found) falls back to the
+/// first supplied filter. When `filters` is empty, `current_filter` is
+/// decoded and returned on its own -- the caller supplied exactly one
+/// filter via `current_filter` alone, which becomes the effective active
+/// filter without a fake entry ever appearing in `filters` -- or `None`
+/// when the key itself is absent. Returns `Err(())` only when the key is
+/// present but structurally malformed.
 fn decode_current_filter(
     options: &HashMap<String, OwnedValue>,
     filters: &[WireFilter],
 ) -> Result<Option<WireFilter>, ()> {
-    if filters.is_empty() {
-        return Ok(None);
-    }
-    let resolved = match options.get("current_filter") {
+    let decoded: Option<WireFilter> = match options.get("current_filter") {
         None => None,
         Some(value) => {
             let (name, rules): (String, Vec<(u32, String)>) =
                 <(String, Vec<(u32, String)>)>::try_from(value.clone()).map_err(|_| ())?;
-            filters.iter().find(|f| f.name == name && f.rules == rules).cloned()
+            Some(WireFilter { name, rules })
         }
     };
+    if filters.is_empty() {
+        return Ok(decoded);
+    }
+    let resolved = decoded
+        .and_then(|cf| filters.iter().find(|f| f.name == cf.name && f.rules == cf.rules).cloned());
     Ok(Some(resolved.unwrap_or_else(|| filters[0].clone())))
 }
 
-/// Decodes the real `a(ssa(ss)s)` `choices` wire value, resolving each
-/// entry's initial selection to a concrete valid value: a boolean choice
-/// (empty `options`) resolves to `"true"`/`"false"`, defaulting to
-/// `"false"`; an enumerated choice resolves to its given `initial` only
-/// when that id is one of its own options, defaulting to the first option
-/// otherwise. `Ok(vec![])` when the key is absent; `Err(())` only when the
-/// key is present but structurally malformed.
+/// Decodes the real `a(ssa(ss)s)` `choices` wire value, enforcing the
+/// installed shape rather than silently inventing values: a choice's `id`
+/// and `label` must be nonempty, and so must every option's id and label.
+/// `initial` of `""` means the portal chooses -- the first option for an
+/// enumerated choice, `"false"` for a boolean one. A nonempty enumerated
+/// `initial` must name one of that choice's own option ids; a boolean
+/// `initial` must be `""`, `"true"` or `"false"`. Any violation is
+/// `Err(())`, refusing the whole request before the chooser is ever
+/// called -- never a default standing in for a caller's bad input.
+/// `Ok(vec![])` when the key is absent; result pairs stay in request
+/// order.
 fn decode_choices(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireChoice>, ()> {
     let Some(value) = options.get("choices") else {
         return Ok(Vec::new());
     };
     let raw: Vec<(String, String, Vec<(String, String)>, String)> =
         Vec::try_from(value.clone()).map_err(|_| ())?;
-    Ok(raw
-        .into_iter()
+    raw.into_iter()
         .map(|(id, label, options, initial)| {
+            if id.is_empty() || label.is_empty() {
+                return Err(());
+            }
+            if options.iter().any(|(oid, olabel)| oid.is_empty() || olabel.is_empty()) {
+                return Err(());
+            }
             let resolved_initial = if options.is_empty() {
-                if initial == "true" { "true".to_string() } else { "false".to_string() }
+                match initial.as_str() {
+                    "" | "false" => "false".to_string(),
+                    "true" => "true".to_string(),
+                    _ => return Err(()),
+                }
+            } else if initial.is_empty() {
+                options[0].0.clone()
             } else if options.iter().any(|(oid, _)| *oid == initial) {
                 initial
             } else {
-                options[0].0.clone()
+                return Err(());
             };
-            WireChoice { id, label, options, initial: resolved_initial }
+            Ok(WireChoice { id, label, options, initial: resolved_initial })
         })
-        .collect())
+        .collect()
 }
 
 /// Every remaining stage-one option/result refusal is named here so a
@@ -1408,6 +1467,96 @@ mod tests {
             "an exit-0 result file that cannot be opened must fail closed, got {outcome:?}"
         );
         finish_base(base);
+    }
+
+    /// The portal receives the caller's exported toplevel handle and
+    /// must hand it to the picker child, or the picker is a parentless
+    /// toplevel that the compositor leaves behind the app that asked.
+    /// Records the child's real argv and asserts the flag and value are
+    /// both there, adjacent.
+    #[test]
+    fn process_chooser_forwards_wayland_parent_handle_to_the_child() {
+        let native = FakeNative::scripted(
+            "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\nprintf '/tmp/x\\n' > \"$3\"\nexit 0\n",
+        );
+        let base = scratch_base("parent-handle-forwarded");
+        let chooser =
+            ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
+        let outcome = chooser.pick_single("app", "wayland:handle-42", "title");
+        assert!(matches!(outcome, ChooserOutcome::Picked(_)), "got {outcome:?}");
+        let argv = read_recorded_argv(&native);
+        let flag = argv
+            .iter()
+            .position(|a| a == "--parent-window")
+            .expect("the child argv must carry --parent-window");
+        assert_eq!(
+            argv.get(flag + 1).map(String::as_str),
+            Some("wayland:handle-42"),
+            "the handle must follow its flag unchanged, argv was {argv:?}"
+        );
+        finish_base(base);
+    }
+
+    /// An app that passes no parent (the empty handle) must not make the
+    /// child receive a flag with nothing behind it, which the child would
+    /// then have to guess at.
+    #[test]
+    fn process_chooser_omits_parent_window_flag_when_there_is_no_parent() {
+        let native = FakeNative::scripted(
+            "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\nprintf '/tmp/x\\n' > \"$3\"\nexit 0\n",
+        );
+        let base = scratch_base("parent-handle-absent");
+        let chooser =
+            ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
+        let outcome = chooser.pick_single("app", "", "title");
+        assert!(matches!(outcome, ChooserOutcome::Picked(_)), "got {outcome:?}");
+        let argv = read_recorded_argv(&native);
+        assert!(
+            !argv.iter().any(|a| a == "--parent-window"),
+            "no parent means no flag at all, argv was {argv:?}"
+        );
+        finish_base(base);
+    }
+
+    /// Only the two shapes the wire protocol defines are forwarded;
+    /// anything else a D-Bus caller invents is dropped rather than
+    /// handed to the child as an opaque argv value.
+    #[test]
+    fn only_protocol_shaped_parent_handles_are_forwardable() {
+        for good in ["wayland:h", "x11:0x1400003", "wayland:a-b_c.d/e"] {
+            assert!(is_forwardable_parent_handle(good), "{good} must be forwardable");
+        }
+        for bad in [
+            "",
+            "wayland:",
+            "x11:",
+            "handle-42",
+            "wayland:h;rm -rf /",
+            "wayland:h ",
+            "wayland:--out",
+        ] {
+            assert!(!is_forwardable_parent_handle(bad), "{bad:?} must be refused");
+        }
+        assert!(
+            !is_forwardable_parent_handle(&format!("wayland:{}", "h".repeat(129))),
+            "an over-long handle must be refused"
+        );
+    }
+
+    /// Reads the argv the fake native recorded beside its own script.
+    /// It is recorded there, not in the request root, because the
+    /// chooser deletes that root as soon as the pick returns.
+    fn read_recorded_argv(native: &FakeNative) -> Vec<String> {
+        let path = native
+            .path()
+            .parent()
+            .expect("the fake native script has a directory")
+            .join("argv");
+        fs::read_to_string(&path)
+            .expect("the fake native must have recorded its argv")
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
@@ -3288,8 +3437,14 @@ mod tests {
 
     /// Browser-shaped `filters` value: `a(sa(us))`, one named filter per
     /// entry, each rule a `(type, pattern)` pair (`0` = glob, `1` = mime).
+    /// Three entries, not two: the initial (`current_filter`) entry here
+    /// must admit a *different* fixture than the one the driver cycles
+    /// to, or a regression that ignores filtering entirely and a
+    /// regression that filters correctly produce the same picked set --
+    /// see round 223.
     fn browser_filters() -> Vec<(String, Vec<(u32, String)>)> {
         vec![
+            ("Markdown files".to_string(), vec![(0u32, "*.md".to_string())]),
             ("Text files".to_string(), vec![(0u32, "*.txt".to_string())]),
             ("All files".to_string(), vec![(0u32, "*".to_string())]),
         ]
@@ -3343,23 +3498,79 @@ mod tests {
         options
     }
 
-    /// [D-222 GREEN]: a real browser-shaped `OpenFile` request --
-    /// `multiple`, a two-entry `filters` list, a matching `current_filter`,
-    /// and both an enumerated and a boolean `choices` entry -- sent over a
-    /// private bus through the exported `OpenFile` method, backed by the
-    /// real `ProcessChooser` and the real native picker driver binary built
-    /// with the extended `picker-test-driver-pick` feature. The driver
-    /// selects every currently filter-eligible fixture row (the two `.txt`
-    /// fixtures, never the `.bin` one), then cycles the real filter
-    /// dropdown and both real choice controls by one position each before
-    /// clicking the real Open button -- proving the whole wire protocol
-    /// (`--request <path>` in, `result.meta.json` out) round-trips through
-    /// the real GTK controls, not just `decide()`'s own ScriptedChooser
-    /// path (see `dbus_openfile_honors_multiple_true` and
+    /// Admitted only when "Markdown files" (`*.md`, supported by every
+    /// glob implementation ever shipped) is the *active* filter.
+    fn markdown_filter() -> (String, Vec<(u32, String)>) {
+        ("Markdown files".to_string(), vec![(0u32, "*.md".to_string())])
+    }
+
+    /// Admitted only when "Text files (strict case)" is active, using the
+    /// installed portal contract's bracket character-class form
+    /// (`*.[iI][cC][oO]` is the installed example this mirrors). Committed
+    /// `75ca650`'s `glob_match` supports only `*`/`?` and treats `[`/`]` as
+    /// literal characters, so this pattern matches no real filename under
+    /// it -- a truthful red against the rejected implementation, not a
+    /// synthetic forced failure. Round 224 must make this pattern work.
+    fn charclass_text_filter() -> (String, Vec<(u32, String)>) {
+        (
+            "Text files (strict case)".to_string(),
+            vec![(0u32, "*.[tT][xX][tT]".to_string())],
+        )
+    }
+
+    /// Builds one `OpenFile` options map for the real-child regression:
+    /// `multiple`, the two filters above in the given order (so the test
+    /// controls which one the driver's forward-by-one cycle lands on),
+    /// `current_filter` matching `filters[0]`, and the shared `choices`.
+    fn real_child_filter_options(
+        filters: Vec<(String, Vec<(u32, String)>)>,
+    ) -> HashMap<String, OwnedValue> {
+        let current_filter = filters.first().cloned().expect("at least one filter");
+        let mut options = HashMap::new();
+        options.insert("multiple".to_string(), OwnedValue::from(true));
+        options.insert(
+            "filters".to_string(),
+            OwnedValue::try_from(Value::from(filters)).expect("filters encodes"),
+        );
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(current_filter)).expect("current_filter encodes"),
+        );
+        options.insert(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(browser_choices())).expect("choices encodes"),
+        );
+        options
+    }
+
+    /// [D-222/223]: the real-child filter regression, corrected per round
+    /// 223 to be able to fail. Exercises the real native picker driver
+    /// binary (`picker-test-driver-pick` feature), the real filter
+    /// dropdown and both real choice controls, over a private D-Bus
+    /// `OpenFile` call backed by the real `ProcessChooser` -- proving the
+    /// whole wire protocol round-trips through actual GTK controls, not
+    /// just `decide()`'s own `ScriptedChooser` path (see
+    /// `dbus_openfile_honors_multiple_true` and
     /// `dbus_openfile_honors_filters_current_filter_and_choices`, which
-    /// only prove that narrower layer). Historically this exact request
-    /// was refused pre-pick against unmodified `f1f8324`; see git history
-    /// for that recorded RED evidence.
+    /// only prove that narrower layer).
+    ///
+    /// Round 222's shape of this test cycled the dropdown *after*
+    /// selecting, with three fixtures that happened to sort so the two
+    /// lexically-first eligible rows were always the two intended
+    /// "matching" files regardless of whether filtering ran at all -- a
+    /// false green. `native.rs`'s driver now cycles before selecting (see
+    /// `schedule_picker_test_driver`), which fixes the ordering half of
+    /// the defect but is not sufficient alone: with only an ordinary
+    /// `*.txt` second filter, `75ca650`'s real (if falsely-ordered->now
+    /// correctly-ordered) matcher already implements that pattern, so the
+    /// test would pass today regardless of whether round-222's defect was
+    /// ever present. Round 223 makes the *second* filter exercise a
+    /// pattern shape (`*.[tT][xX][tT]`) that `75ca650` cannot match at
+    /// all, and makes the real child run twice in the same test with the
+    /// two filters reordered between runs, so each fixture's admission
+    /// under one filter and refusal under the other is proven by the real
+    /// native process itself in the same test, not by a suffix check on a
+    /// filename or a direct call into a copied matcher.
     #[test]
     fn dbus_openfile_browser_shaped_multi_filter_choice_request_picks_through_real_native_child() {
         let _guard = env_lock();
@@ -3374,15 +3585,25 @@ mod tests {
         let base = scratch_base("browser-shaped-pick-base");
         let fixture_dir_root =
             OwnedScratchDir::create(scratch_base("browser-shaped-pick-fixture-home"));
-        let fixture_one = fixture_dir_root.path().join("d222-matching-one.txt");
-        let fixture_two = fixture_dir_root.path().join("d222-matching-two.txt");
-        fs::write(&fixture_one, b"d222 matching fixture one\n").expect("write matching fixture one");
-        fs::write(&fixture_two, b"d222 matching fixture two\n").expect("write matching fixture two");
-        fs::write(
-            fixture_dir_root.path().join("d222-nonmatching.bin"),
-            b"d222 nonmatching fixture\n",
-        )
-        .expect("write nonmatching fixture");
+        // Admitted only by `markdown_filter` -- sorts lexically first, so
+        // an implementation that ignores filtering (or that only fixes
+        // the cycle-order half of round 222's defect) would wrongly keep
+        // including it whenever it is the first two "eligible" rows.
+        let fixture_initial_only = fixture_dir_root.path().join("a-document.md");
+        // Admitted only by `charclass_text_filter`, under a correct
+        // bracket-class matcher.
+        let fixture_one = fixture_dir_root.path().join("m-note-one.txt");
+        let fixture_two = fixture_dir_root.path().join("z-note-two.txt");
+        // Admitted by neither filter exercised in this test. Sorts
+        // between `fixture_one` and `fixture_two`, so an unfiltered or
+        // unswitched "take the first two eligible rows" cannot produce
+        // the same pair either call below expects.
+        let fixture_unmatched = fixture_dir_root.path().join("q-archive.bin");
+        fs::write(&fixture_initial_only, b"d223 initial-filter-only fixture\n")
+            .expect("write initial-filter-only fixture");
+        fs::write(&fixture_one, b"d223 matching fixture one\n").expect("write matching fixture one");
+        fs::write(&fixture_two, b"d223 matching fixture two\n").expect("write matching fixture two");
+        fs::write(&fixture_unmatched, b"d223 unmatched fixture\n").expect("write unmatched fixture");
 
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fixture_dir_root.path());
@@ -3392,57 +3613,52 @@ mod tests {
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
-        let (response, results) =
-            call_open_file(&client, browser_shaped_options()).expect("OpenFile call");
+        // Expected URIs, computed while the fixture paths are still owned
+        // -- never derived after `fixture_dir_root.finish()` below.
+        let first_expected_uris = vec![gio::File::for_path(&fixture_initial_only).uri().to_string()];
+        let second_expected_uris = vec![
+            gio::File::for_path(&fixture_one).uri().to_string(),
+            gio::File::for_path(&fixture_two).uri().to_string(),
+        ];
+
+        // First real call: filters ordered `[charclass, markdown]`, so
+        // `current_filter` resolves to index 0 (`charclass_text_filter`,
+        // never exercised against a fixture here) and the driver's
+        // forward-by-one cycle lands on index 1 (`markdown_filter`),
+        // which admits exactly `fixture_initial_only`.
+        let (first_response, first_results) = call_open_file(
+            &client,
+            real_child_filter_options(vec![charclass_text_filter(), markdown_filter()]),
+        )
+        .expect("first OpenFile call");
+
+        // Second real call, same test, filters reordered to
+        // `[markdown, charclass]`: `current_filter` now resolves to index
+        // 0 (`markdown_filter`), and the same forward-by-one cycle lands
+        // on index 1 (`charclass_text_filter`), which must admit exactly
+        // `fixture_one`/`fixture_two` and refuse `fixture_initial_only` --
+        // the same fixture the first call just proved that filter admits
+        // under the *other* ordering. Against `75ca650`'s literal-bracket
+        // matcher this filter admits nothing at all, so the real child
+        // finds no eligible row, the driver never clicks Open, the
+        // deadline expires, and this call reports failure instead of the
+        // success asserted below: the truthful red this round proves.
+        //
+        // No assertion runs between the two calls, or between this call
+        // and the full teardown below: an expected (red) panic here must
+        // still restore `HOME`, close the private bus, restore
+        // `DISPLAY`/`WAYLAND_DISPLAY`, stop Xvfb and remove every owned
+        // root, not leave them live for whichever portal test runs next.
+        let (second_response, second_results) = call_open_file(
+            &client,
+            real_child_filter_options(vec![markdown_filter(), charclass_text_filter()]),
+        )
+        .expect("second OpenFile call");
 
         match old_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
-        assert_eq!(response, RESPONSE_SUCCESS, "real pick must report success");
-        let expected_uris = vec![
-            gio::File::for_path(&fixture_one).uri().to_string(),
-            gio::File::for_path(&fixture_two).uri().to_string(),
-        ];
-        assert_eq!(
-            uris_of(&results),
-            expected_uris,
-            "must pick exactly the two filter-eligible fixtures, never the nonmatching one"
-        );
-        // The driver cycles the dropdown forward by one from its initial
-        // `current_filter`-resolved index (0, "Text files"), landing on
-        // the second supplied filter ("All files").
-        let expected_filter = browser_filters()
-            .into_iter()
-            .nth(1)
-            .expect("browser_filters has a second entry");
-        let current_filter: (String, Vec<(u32, String)>) = results
-            .get("current_filter")
-            .cloned()
-            .map(|v| <(String, Vec<(u32, String)>)>::try_from(v).expect("current_filter decodes"))
-            .expect("current_filter present");
-        assert_eq!(
-            current_filter, expected_filter,
-            "the real filter dropdown's final selection must round-trip back"
-        );
-        let choices: Vec<(String, String)> = results
-            .get("choices")
-            .cloned()
-            .map(|v| Vec::<(String, String)>::try_from(v).expect("choices decodes"))
-            .expect("choices present");
-        // The driver cycles each real choice control forward by one from
-        // its already-resolved initial: the enumerated "encoding" choice
-        // from "utf8" to "latin1", the boolean "readonly" choice from
-        // "false" to "true".
-        assert_eq!(
-            choices,
-            vec![
-                ("encoding".to_string(), "latin1".to_string()),
-                ("readonly".to_string(), "true".to_string()),
-            ],
-            "both real choice controls' cycled selections must round-trip back"
-        );
-
         finish_private_bus(bus, server, client);
         match old_display {
             Some(v) => std::env::set_var("DISPLAY", v),
@@ -3457,10 +3673,502 @@ mod tests {
         assert_eq!(
             fs::read_dir(&base).unwrap().count(),
             0,
-            "the request root must be gone after a completed real pick"
+            "the request root must be gone after both completed real picks"
         );
         finish_base(base);
         driver_target.finish();
+
+        // Only now, with every environment variable and owned root back to
+        // its exact prior state, does this test assert what either real
+        // call actually returned.
+        assert_eq!(
+            first_response, RESPONSE_SUCCESS,
+            "real pick cycled onto the Markdown filter must report success"
+        );
+        assert_eq!(
+            uris_of(&first_results),
+            first_expected_uris,
+            "cycled onto Markdown, the real native child must pick exactly \
+             fixture_initial_only -- never the unmatched or Text fixtures"
+        );
+        let first_current_filter: (String, Vec<(u32, String)>) = first_results
+            .get("current_filter")
+            .cloned()
+            .map(|v| <(String, Vec<(u32, String)>)>::try_from(v).expect("current_filter decodes"))
+            .expect("current_filter present");
+        assert_eq!(
+            first_current_filter,
+            markdown_filter(),
+            "the real dropdown's cycled-to selection must round-trip back"
+        );
+        let first_choices: Vec<(String, String)> = first_results
+            .get("choices")
+            .cloned()
+            .map(|v| Vec::<(String, String)>::try_from(v).expect("choices decodes"))
+            .expect("choices present");
+        assert_eq!(
+            first_choices,
+            vec![
+                ("encoding".to_string(), "latin1".to_string()),
+                ("readonly".to_string(), "true".to_string()),
+            ],
+            "both real choice controls' cycled selections must round-trip back"
+        );
+
+        assert_eq!(
+            second_response, RESPONSE_SUCCESS,
+            "real pick cycled onto the strict-case Text filter must report success"
+        );
+        assert_eq!(
+            uris_of(&second_results),
+            second_expected_uris,
+            "cycled onto the strict-case Text filter, the real native child must pick \
+             exactly fixture_one and fixture_two -- never fixture_initial_only (proven \
+             admitted under Markdown by the first call above) or the unmatched fixture"
+        );
+        let second_current_filter: (String, Vec<(u32, String)>) = second_results
+            .get("current_filter")
+            .cloned()
+            .map(|v| <(String, Vec<(u32, String)>)>::try_from(v).expect("current_filter decodes"))
+            .expect("current_filter present");
+        assert_eq!(
+            second_current_filter,
+            charclass_text_filter(),
+            "the real dropdown's cycled-to selection must round-trip back"
+        );
+        let second_choices: Vec<(String, String)> = second_results
+            .get("choices")
+            .cloned()
+            .map(|v| Vec::<(String, String)>::try_from(v).expect("choices decodes"))
+            .expect("choices present");
+        assert_eq!(
+            second_choices,
+            vec![
+                ("encoding".to_string(), "latin1".to_string()),
+                ("readonly".to_string(), "true".to_string()),
+            ],
+            "both real choice controls' cycled selections must round-trip back"
+        );
+    }
+
+    /// D-224/D-225: a `current_filter` supplied alone, with `filters`
+    /// empty, must become the real admission filter through the actual
+    /// native child -- never the unconstrained picker `75ca650`'s
+    /// `decode_current_filter` produced by returning `None` whenever
+    /// `filters` was empty -- and must round-trip back in
+    /// `results.current_filter` without a fake second entry ever
+    /// appearing in a (nonexistent, since `filters.len() < 2`) dropdown.
+    ///
+    /// D-225: the excluded fixture (`a-archive.bin`) sorts and lists
+    /// *before* the admitted one (`b-note.txt`), so an unconstrained
+    /// selection -- one row's worth, taken from whichever rows the test
+    /// driver's own `picker_entry_can_submit` guard says match, in listing
+    /// order -- would pick the excluded fixture first if that guard ever
+    /// stopped actually filtering. Round 224's fixture order (matching
+    /// fixture first) could not have told the two cases apart; this order
+    /// can and does -- confirmed by a focused mutation run with native
+    /// lone-filter admission disabled, which fails on exactly this
+    /// assertion, retained in the round's gate report rather than in this
+    /// file.
+    #[test]
+    fn dbus_openfile_lone_current_filter_without_filters_list_filters_real_native_child_and_round_trips() {
+        let _guard = env_lock();
+        let (driver, driver_target) = build_picker_test_driver("picker-test-driver-pick");
+        let xvfb = PrivateXvfb::start();
+        let old_display = std::env::var("DISPLAY").ok();
+        let old_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        std::env::set_var("DISPLAY", &xvfb.display);
+        std::env::remove_var("WAYLAND_DISPLAY");
+
+        let bus = PrivateBus::start();
+        let base = scratch_base("lone-current-filter-pick-base");
+        let fixture_dir_root =
+            OwnedScratchDir::create(scratch_base("lone-current-filter-pick-fixture-home"));
+        // Excluded fixture sorts first; admitted fixture sorts second --
+        // see the D-225 doc comment above for why the order matters now.
+        let fixture_unmatched = fixture_dir_root.path().join("a-archive.bin");
+        let fixture_matching = fixture_dir_root.path().join("b-note.txt");
+        fs::write(&fixture_unmatched, b"d224 lone current_filter unmatched fixture\n")
+            .expect("write unmatched fixture");
+        fs::write(&fixture_matching, b"d224 lone current_filter matching fixture\n")
+            .expect("write matching fixture");
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fixture_dir_root.path());
+
+        let chooser: Arc<dyn Chooser> =
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+        let server = bus.connect_server(chooser);
+        let client = bus.connect_client();
+
+        let expected_uris = vec![gio::File::for_path(&fixture_matching).uri().to_string()];
+        let lone_filter = ("Text only".to_string(), vec![(0u32, "*.txt".to_string())]);
+
+        let mut options = HashMap::new();
+        options.insert("multiple".to_string(), OwnedValue::from(false));
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(lone_filter.clone())).expect("current_filter encodes"),
+        );
+        // No "filters" key at all: the caller supplied exactly one filter
+        // through `current_filter` alone.
+
+        let (response, results) = call_open_file(&client, options).expect("OpenFile call");
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        finish_private_bus(bus, server, client);
+        match old_display {
+            Some(v) => std::env::set_var("DISPLAY", v),
+            None => std::env::remove_var("DISPLAY"),
+        }
+        match old_wayland {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+        xvfb.finish();
+        fixture_dir_root.finish();
+        assert_eq!(
+            fs::read_dir(&base).unwrap().count(),
+            0,
+            "the request root must be gone after the completed real pick"
+        );
+        finish_base(base);
+        driver_target.finish();
+
+        assert_eq!(
+            response, RESPONSE_SUCCESS,
+            "a lone current_filter with no dropdown to cycle must still filter and succeed"
+        );
+        assert_eq!(
+            uris_of(&results),
+            expected_uris,
+            "the real native child must admit only the matching fixture under the lone \
+             current_filter, never the unmatched one"
+        );
+        let round_tripped: (String, Vec<(u32, String)>) = results
+            .get("current_filter")
+            .cloned()
+            .map(|v| <(String, Vec<(u32, String)>)>::try_from(v).expect("current_filter decodes"))
+            .expect("current_filter present even though filters was empty");
+        assert_eq!(
+            round_tripped, lone_filter,
+            "the lone supplied filter must round-trip back as the effective active filter"
+        );
+    }
+
+    /// D-224: `decode_current_filter` must decode and return
+    /// `current_filter` even when `filters` is empty -- `75ca650` returned
+    /// `None` before decoding in that branch, which silently dropped the
+    /// caller's only filter and produced an unconstrained picker.
+    #[test]
+    fn decode_current_filter_decodes_lone_filter_when_filters_list_is_empty() {
+        let mut options = HashMap::new();
+        let lone_filter = ("Text".to_string(), vec![(0u32, "*.txt".to_string())]);
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(lone_filter.clone())).expect("current_filter encodes"),
+        );
+        let decoded = decode_current_filter(&options, &[]).expect("well-formed current_filter decodes");
+        assert_eq!(
+            decoded,
+            Some(WireFilter {
+                name: lone_filter.0,
+                rules: lone_filter.1
+            }),
+            "a lone current_filter must decode to itself, never None, when filters is empty"
+        );
+    }
+
+    /// D-224: when `filters` is nonempty, `decode_current_filter` keeps
+    /// resolving against it exactly as before -- an exact match wins, an
+    /// absent/non-matching value falls back to the first supplied filter.
+    #[test]
+    fn decode_current_filter_still_resolves_against_nonempty_filters_list() {
+        let filters = vec![
+            WireFilter { name: "Markdown".to_string(), rules: vec![(0, "*.md".to_string())] },
+            WireFilter { name: "Text".to_string(), rules: vec![(0, "*.txt".to_string())] },
+        ];
+        let mut matching_options = HashMap::new();
+        matching_options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(("Text".to_string(), vec![(0u32, "*.txt".to_string())])))
+                .expect("current_filter encodes"),
+        );
+        assert_eq!(
+            decode_current_filter(&matching_options, &filters).expect("decodes"),
+            Some(filters[1].clone()),
+            "an exact match against a nonempty filters list must select that entry"
+        );
+
+        let empty_options = HashMap::new();
+        assert_eq!(
+            decode_current_filter(&empty_options, &filters).expect("decodes"),
+            Some(filters[0].clone()),
+            "an absent current_filter against a nonempty filters list must fall back to the first"
+        );
+    }
+
+    /// D-224: `write_request_file` must refuse to write when the
+    /// serialized request exceeds `MAX_WIRE_JSON_BYTES`, leaving no file
+    /// behind -- `75ca650` applied this same bound only in
+    /// `read_result_meta`, never here, so an oversized request was written
+    /// and accepted instead of refused.
+    #[test]
+    fn write_request_file_refuses_over_limit_write_and_leaves_no_file() {
+        let dir_root = OwnedScratchDir::create(scratch_base("write-request-file-over-limit"));
+        let path = dir_root.path().join("request.json");
+        let oversized_name = "x".repeat(MAX_WIRE_JSON_BYTES as usize + 1);
+        let request = WireRequest {
+            multiple: false,
+            filters: vec![WireFilter { name: oversized_name, rules: Vec::new() }],
+            current_filter: None,
+            choices: Vec::new(),
+        };
+        let result = write_request_file(&path, &request);
+        assert!(result.is_err(), "an over-limit request must be refused, not written");
+        assert!(!path.exists(), "a refused write must leave no file behind");
+        dir_root.finish();
+    }
+
+    /// D-224: `write_request_file` still writes a well-formed,
+    /// within-bound request normally -- the size check must refuse only
+    /// what actually exceeds the bound.
+    #[test]
+    fn write_request_file_accepts_within_limit_request() {
+        let dir_root = OwnedScratchDir::create(scratch_base("write-request-file-within-limit"));
+        let path = dir_root.path().join("request.json");
+        let request = WireRequest::default();
+        write_request_file(&path, &request).expect("a well-formed request within bound must write");
+        assert!(path.exists(), "an accepted write must leave the file behind");
+        dir_root.finish();
+    }
+
+    /// D-224: `decode_choices` must refuse, before the chooser is ever
+    /// called, every one of the installed shape's forbidden empty fields
+    /// and invalid nonempty initials -- `75ca650` had no such validation at
+    /// all.
+    #[test]
+    fn decode_choices_refuses_every_forbidden_empty_field_and_invalid_initial() {
+        let empty_choice_id = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "".to_string(),
+                "Label".to_string(),
+                Vec::<(String, String)>::new(),
+                "".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        assert!(decode_choices(&empty_choice_id).is_err(), "an empty choice id must be refused");
+
+        let empty_choice_label = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "".to_string(),
+                Vec::<(String, String)>::new(),
+                "".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        assert!(decode_choices(&empty_choice_label).is_err(), "an empty choice label must be refused");
+
+        let empty_option_id = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "Label".to_string(),
+                vec![("".to_string(), "Option".to_string())],
+                "".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        assert!(decode_choices(&empty_option_id).is_err(), "an empty option id must be refused");
+
+        let empty_option_label = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "Label".to_string(),
+                vec![("opt".to_string(), "".to_string())],
+                "".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        assert!(decode_choices(&empty_option_label).is_err(), "an empty option label must be refused");
+
+        let bad_enum_initial = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "Label".to_string(),
+                vec![("opt".to_string(), "Option".to_string())],
+                "not-an-option-id".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        assert!(
+            decode_choices(&bad_enum_initial).is_err(),
+            "an enumerated initial naming no real option id must be refused"
+        );
+
+        let bad_bool_initial = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "Label".to_string(),
+                Vec::<(String, String)>::new(),
+                "maybe".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        assert!(
+            decode_choices(&bad_bool_initial).is_err(),
+            "a boolean initial other than \"\"/\"true\"/\"false\" must be refused"
+        );
+    }
+
+    /// D-225: every malformed-choices case above must refuse *through
+    /// `decide`*, before the chooser closure is ever invoked -- the
+    /// no-chooser-call invariant lives in `decide`'s early `?`-style
+    /// returns, not in `decode_choices` alone, so this calls the real
+    /// `decide` with a closure that records its own invocation count and
+    /// asserts both the refusal response and zero calls, for each case.
+    #[test]
+    fn decide_refuses_every_malformed_choices_case_without_ever_calling_the_chooser() {
+        let cases: Vec<(&str, HashMap<String, OwnedValue>)> = vec![
+            (
+                "empty choice id",
+                HashMap::from([(
+                    "choices".to_string(),
+                    OwnedValue::try_from(Value::from(vec![(
+                        "".to_string(),
+                        "Label".to_string(),
+                        Vec::<(String, String)>::new(),
+                        "".to_string(),
+                    )]))
+                    .expect("encodes"),
+                )]),
+            ),
+            (
+                "empty choice label",
+                HashMap::from([(
+                    "choices".to_string(),
+                    OwnedValue::try_from(Value::from(vec![(
+                        "id".to_string(),
+                        "".to_string(),
+                        Vec::<(String, String)>::new(),
+                        "".to_string(),
+                    )]))
+                    .expect("encodes"),
+                )]),
+            ),
+            (
+                "empty option id",
+                HashMap::from([(
+                    "choices".to_string(),
+                    OwnedValue::try_from(Value::from(vec![(
+                        "id".to_string(),
+                        "Label".to_string(),
+                        vec![("".to_string(), "Option".to_string())],
+                        "".to_string(),
+                    )]))
+                    .expect("encodes"),
+                )]),
+            ),
+            (
+                "empty option label",
+                HashMap::from([(
+                    "choices".to_string(),
+                    OwnedValue::try_from(Value::from(vec![(
+                        "id".to_string(),
+                        "Label".to_string(),
+                        vec![("opt".to_string(), "".to_string())],
+                        "".to_string(),
+                    )]))
+                    .expect("encodes"),
+                )]),
+            ),
+            (
+                "bad enum initial",
+                HashMap::from([(
+                    "choices".to_string(),
+                    OwnedValue::try_from(Value::from(vec![(
+                        "id".to_string(),
+                        "Label".to_string(),
+                        vec![("opt".to_string(), "Option".to_string())],
+                        "not-an-option-id".to_string(),
+                    )]))
+                    .expect("encodes"),
+                )]),
+            ),
+            (
+                "bad bool initial",
+                HashMap::from([(
+                    "choices".to_string(),
+                    OwnedValue::try_from(Value::from(vec![(
+                        "id".to_string(),
+                        "Label".to_string(),
+                        Vec::<(String, String)>::new(),
+                        "maybe".to_string(),
+                    )]))
+                    .expect("encodes"),
+                )]),
+            ),
+        ];
+
+        for (label, options) in cases {
+            let calls = std::cell::Cell::new(0u32);
+            let (response, results) = decide(
+                &options,
+                |_request| {
+                    calls.set(calls.get() + 1);
+                    ChooserOutcome::Cancelled.into()
+                },
+                GuardOverride::None,
+            );
+            assert_eq!(calls.get(), 0, "{label}: the chooser must never be called for a malformed choices request");
+            assert_eq!(response, RESPONSE_OTHER, "{label}: decide must refuse, not cancel or succeed");
+            assert!(results.is_empty(), "{label}: a refusal carries no results");
+        }
+    }
+
+    /// D-224: an empty `initial` resolves to the portal's own choice --
+    /// the first option for an enumerated choice, `"false"` for a
+    /// boolean one -- rather than being refused.
+    #[test]
+    fn decode_choices_resolves_empty_initial_to_portal_chosen_value() {
+        let enumerated = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "Label".to_string(),
+                vec![
+                    ("first".to_string(), "First".to_string()),
+                    ("second".to_string(), "Second".to_string()),
+                ],
+                "".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        let decoded = decode_choices(&enumerated).expect("well-formed choice decodes");
+        assert_eq!(decoded[0].initial, "first", "empty enumerated initial must resolve to the first option");
+
+        let boolean = HashMap::from([(
+            "choices".to_string(),
+            OwnedValue::try_from(Value::from(vec![(
+                "id".to_string(),
+                "Label".to_string(),
+                Vec::<(String, String)>::new(),
+                "".to_string(),
+            )]))
+            .expect("encodes"),
+        )]);
+        let decoded = decode_choices(&boolean).expect("well-formed choice decodes");
+        assert_eq!(decoded[0].initial, "false", "empty boolean initial must resolve to \"false\"");
     }
 
     // --- Round 215: cold D-Bus activation of the real backend through the
