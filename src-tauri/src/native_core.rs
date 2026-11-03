@@ -84,7 +84,7 @@ pub struct FileProperties {
     pub items: i64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Drive {
     pub name: String,
     pub path: String,
@@ -327,6 +327,183 @@ impl ClipboardSource {
             Self::Real(path) => path,
         }
     }
+}
+
+/// D-232: the three clipboard formats file Copy, Cut and Paste share with other
+/// windows and other programs.
+pub const CLIP_URI_LIST: &str = "text/uri-list";
+pub const CLIP_GNOME_FILES: &str = "x-special/gnome-copied-files";
+pub const CLIP_KDE_CUT: &str = "application/x-kde-cutselection";
+/// The most bytes one paste reads from the clipboard for one format.
+pub const CLIP_READ_LIMIT: usize = 4 * 1024 * 1024;
+
+/// What a paste does with the files on the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipIntent {
+    Copy,
+    Cut,
+}
+
+impl ClipIntent {
+    /// The word the GNOME form and the status line use.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+        }
+    }
+}
+
+/// One file Copy or Cut in the three forms, offered together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipPayload {
+    pub gnome: Vec<u8>,
+    pub uri_list: Vec<u8>,
+    pub kde_cut: Vec<u8>,
+}
+
+/// Encode real paths for the clipboard. The URIs come from GIO, so a space, a
+/// percent sign, `#`, a newline or a non-ASCII name survives the trip.
+pub fn clip_encode(paths: &[PathBuf], intent: ClipIntent) -> Result<ClipPayload, String> {
+    if paths.is_empty() {
+        return Err("there is nothing to put on the clipboard".to_string());
+    }
+    let mut uris = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(format!("{} is not a full path", path.display()));
+        }
+        uris.push(gio::File::for_path(path).uri().to_string());
+    }
+    let uri_list: String = uris.iter().map(|uri| format!("{uri}\r\n")).collect();
+    Ok(ClipPayload {
+        gnome: format!("{}\n{}", intent.word(), uris.join("\n")).into_bytes(),
+        uri_list: uri_list.into_bytes(),
+        kde_cut: match intent {
+            ClipIntent::Copy => b"0".to_vec(),
+            ClipIntent::Cut => b"1".to_vec(),
+        },
+    })
+}
+
+/// The files a paste found on the clipboard, and what to do with them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipFiles {
+    pub intent: ClipIntent,
+    pub paths: Vec<PathBuf>,
+}
+
+/// What one paste read from the clipboard, by the form it found. The GNOME form
+/// is used whenever it is offered. Without it the URI list is used, with the
+/// KDE marker when one is offered. A URI list alone is a Copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipRead {
+    /// The GNOME form, and the KDE marker when the same offer carries one.
+    Gnome { gnome: Vec<u8>, kde_cut: Option<Vec<u8>> },
+    /// A URI list with the KDE marker, read once before the list and once after.
+    Kde { cut_before: Vec<u8>, uris: Vec<u8>, cut_after: Vec<u8> },
+    /// A URI list and nothing else.
+    UriOnly { uris: Vec<u8> },
+}
+
+/// Turn what a paste read into local paths and an intent, or say why not. One
+/// entry that is not a plain local file refuses the whole paste, and a marker
+/// that is missing its value, malformed or in disagreement is never guessed.
+pub fn clip_decode(read: &ClipRead) -> Result<ClipFiles, String> {
+    match read {
+        ClipRead::Gnome { gnome, kde_cut } => {
+            let text = clip_text(gnome)?;
+            let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+            let intent = match first.trim_end_matches('\r') {
+                "copy" => ClipIntent::Copy,
+                "cut" => ClipIntent::Cut,
+                _ => return Err("the clipboard does not say copy or cut".to_string()),
+            };
+            if let Some(marker) = kde_cut {
+                if clip_kde_intent(marker)? != intent {
+                    return Err("the clipboard's copy and cut markers disagree".to_string());
+                }
+            }
+            Ok(ClipFiles { intent, paths: clip_paths(rest, false)? })
+        }
+        ClipRead::Kde { cut_before, uris, cut_after } => {
+            if cut_before != cut_after {
+                return Err("the clipboard changed while it was read".to_string());
+            }
+            let intent = clip_kde_intent(cut_before)?;
+            Ok(ClipFiles { intent, paths: clip_paths(clip_text(uris)?, true)? })
+        }
+        ClipRead::UriOnly { uris } => {
+            Ok(ClipFiles { intent: ClipIntent::Copy, paths: clip_paths(clip_text(uris)?, true)? })
+        }
+    }
+}
+
+/// Clipboard bytes as text. Some programs end the data with a zero byte.
+fn clip_text(data: &[u8]) -> Result<&str, String> {
+    let end = data.iter().rposition(|byte| *byte != 0).map_or(0, |last| last + 1);
+    std::str::from_utf8(&data[..end]).map_err(|_| "the clipboard data is not text".to_string())
+}
+
+/// KDE writes `1` for a cut and `0` for a copy. Anything else is refused.
+fn clip_kde_intent(marker: &[u8]) -> Result<ClipIntent, String> {
+    match clip_text(marker).map(str::trim) {
+        Ok("0") => Ok(ClipIntent::Copy),
+        Ok("1") => Ok(ClipIntent::Cut),
+        _ => Err("the clipboard's cut marker is not 0 or 1".to_string()),
+    }
+}
+
+/// One URI per line. `comments` is the `text/uri-list` rule that a line starting
+/// with `#` is a note. The same file listed twice is kept once.
+fn clip_paths(text: &str, comments: bool) -> Result<Vec<PathBuf>, String> {
+    let own_host = glib::host_name();
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for line in text.split('\n') {
+        let uri = line.trim();
+        if uri.is_empty() || (comments && uri.starts_with('#')) {
+            continue;
+        }
+        let path = clip_local_path(uri, own_host.as_str())?;
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Err("the clipboard holds no files".to_string());
+    }
+    Ok(paths)
+}
+
+/// The local path one clipboard URI names. Only `file` addresses on this
+/// computer are accepted; nothing is mounted, fetched or looked up.
+fn clip_local_path(uri: &str, own_host: &str) -> Result<PathBuf, String> {
+    // What the status line names: short, and never a control character.
+    let shown: String = uri.chars().take(80).map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect();
+    // GLib drops everything from a bare `#` or `?` on, which would name a
+    // different file. A real `#` or `?` in a name arrives percent-encoded.
+    if uri.contains(['\0', '#', '?']) {
+        return Err(format!("{shown} is not a valid file address"));
+    }
+    let Some(scheme) = glib::uri_parse_scheme(uri) else {
+        return Err(format!("{shown} is not a file address"));
+    };
+    if !scheme.eq_ignore_ascii_case("file") {
+        return Err(format!("{shown} is not a local file ({scheme} is not supported)"));
+    }
+    let Ok((path, host)) = glib::filename_from_uri(uri) else {
+        return Err(format!("{shown} is not a valid file address"));
+    };
+    if let Some(host) = host.as_deref().filter(|host| !host.is_empty()) {
+        if !host.eq_ignore_ascii_case("localhost") && !host.eq_ignore_ascii_case(own_host) {
+            return Err(format!("{shown} is on another computer"));
+        }
+    }
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(format!("{shown} does not name a file or folder"));
+    }
+    Ok(path)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1329,6 +1506,34 @@ impl Drive {
             return space_view(None);
         }
         space_view(self.space)
+    }
+}
+
+/// How a newer drive scan differs from the one the sidebar is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveChange {
+    /// Every drive, every field, in the same order.
+    Same,
+    /// Only `space` differs on one or more drives; the rows and what their
+    /// menus act on are the same.
+    SpaceOnly,
+    /// A drive came, went or moved, or a field a row or its menu uses changed.
+    Structural,
+}
+
+/// Compares the exact values, in order. Everything but `space` counts as
+/// structural, so a field added to `Drive` later is covered without a change here.
+pub fn drive_change(shown: &[Drive], scanned: &[Drive]) -> DriveChange {
+    if shown == scanned {
+        return DriveChange::Same;
+    }
+    let apart_from_space = |drive: &Drive| Drive { space: None, ..drive.clone() };
+    if shown.len() == scanned.len()
+        && shown.iter().zip(scanned).all(|(a, b)| apart_from_space(a) == apart_from_space(b))
+    {
+        DriveChange::SpaceOnly
+    } else {
+        DriveChange::Structural
     }
 }
 
@@ -2548,42 +2753,253 @@ pub struct TrashReceipt {
 #[cfg(test)]
 pub static REAL_TRASH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn trash_files_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
-    Ok(Path::new(&home).join(".local/share/Trash/files"))
-}
+/// D-231: a Trash of a test's own. While one is installed, the exact batch's
+/// move and its Trash folder are this fixture's, not GIO's and the home Trash,
+/// so the test never reads or changes the real Trash. The move is a real one:
+/// the `.trashinfo` is written, then the item is renamed into `<dir>/files`,
+/// the way the real Trash does it. A fault is asked for by the item's file
+/// name. Installing holds REAL_TRASH_TEST_LOCK, so no real-Trash test runs
+/// meanwhile.
+#[cfg(test)]
+pub mod fixture_trash {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
 
-fn files_dir_stems(files_dir: &Path) -> HashSet<std::ffi::OsString> {
-    fs::read_dir(files_dir)
-        .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default()
-}
-
-/// Trashes each path one at a time, diffing `Trash/files` before and after
-/// each individual move to capture the exact stem GIO gave it. Fails closed
-/// (and trashes nothing further) if a single trash call does not yield
-/// exactly one new entry, rather than guessing.
-pub fn trash_paths_exact(paths: &[String]) -> Result<Vec<TrashReceipt>, String> {
-    let files_dir = trash_files_dir()?;
-    let mut receipts = Vec::with_capacity(paths.len());
-    for path in paths {
-        let before = files_dir_stems(&files_dir);
-        gio::File::for_path(path)
-            .trash(gio::Cancellable::NONE)
-            .map_err(|err| format!("{path}: {err}"))?;
-        let after = files_dir_stems(&files_dir);
-        let mut new: Vec<_> = after.difference(&before).collect();
-        if new.len() != 1 {
-            return Err(format!(
-                "{path}: trashed, but could not identify its exact Trash entry ({} new, expected 1)",
-                new.len()
-            ));
-        }
-        let stem = new.remove(0);
-        let selector = files_dir.join(stem).to_string_lossy().to_string();
-        receipts.push(TrashReceipt { original: path.clone(), selector });
+    #[derive(Default)]
+    struct Active {
+        dir: PathBuf,
+        refuse: Vec<OsString>,
+        twin: Vec<OsString>,
+        blind_after: Vec<OsString>,
+        asked: Vec<String>,
     }
-    Ok(receipts)
+
+    static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
+
+    fn active() -> MutexGuard<'static, Option<Active>> {
+        ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The fixture stays installed for as long as this lives.
+    pub struct Installed {
+        _real_trash: MutexGuard<'static, ()>,
+    }
+
+    pub fn install(dir: &Path) -> Installed {
+        let real_trash = super::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active() = Some(Active { dir: dir.to_path_buf(), ..Default::default() });
+        Installed { _real_trash: real_trash }
+    }
+
+    impl Installed {
+        fn with<T>(&self, change: impl FnOnce(&mut Active) -> T) -> T {
+            change(active().as_mut().expect("the fixture Trash is installed"))
+        }
+
+        /// The move of an item with this file name fails and leaves it in place.
+        pub fn refuse(&self, name: &str) {
+            self.with(|a| a.refuse.push(name.into()));
+        }
+
+        /// A second new entry lands in the Trash together with this item.
+        pub fn twin(&self, name: &str) {
+            self.with(|a| a.twin.push(name.into()));
+        }
+
+        /// Once this item is in it, the Trash `files` folder cannot be listed.
+        pub fn blind_after(&self, name: &str) {
+            self.with(|a| a.blind_after.push(name.into()));
+        }
+
+        /// Takes the `files` folder's read access away, or gives it back.
+        pub fn blind(&self, blind: bool) {
+            let files = self.with(|a| a.dir.join("files"));
+            fs::set_permissions(files, fs::Permissions::from_mode(if blind { 0o300 } else { 0o700 })).unwrap();
+        }
+
+        pub fn clear_faults(&self) {
+            self.with(|a| {
+                a.refuse.clear();
+                a.twin.clear();
+                a.blind_after.clear();
+            });
+        }
+
+        /// Every path the move was asked for since the last call, in order.
+        pub fn asked(&self) -> Vec<String> {
+            self.with(|a| std::mem::take(&mut a.asked))
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            if let Some(a) = active().take() {
+                let _ = fs::set_permissions(a.dir.join("files"), fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    pub(super) fn dir() -> Option<PathBuf> {
+        active().as_ref().map(|a| a.dir.clone())
+    }
+
+    fn trashinfo(original: &str) -> String {
+        let encoded: String = original
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        format!("[Trash Info]\nPath={encoded}\nDeletionDate=2026-10-05T00:00:00\n")
+    }
+
+    /// None when no fixture is installed. While one is, the answer is always
+    /// the fixture's own, so nothing can fall through to the real Trash.
+    pub(super) fn move_item(path: &str) -> Option<Result<(), String>> {
+        let mut guard = active();
+        let a = guard.as_mut()?;
+        a.asked.push(path.to_string());
+        let Some(name) = Path::new(path).file_name().map(|name| name.to_os_string()) else {
+            return Some(Err("the fixture Trash needs a file name".to_string()));
+        };
+        if a.refuse.contains(&name) {
+            return Some(Err("the fixture Trash refused this item".to_string()));
+        }
+        let (files, info) = (a.dir.join("files"), a.dir.join("info"));
+        let moved = (|| -> std::io::Result<()> {
+            fs::create_dir_all(&files)?;
+            fs::create_dir_all(&info)?;
+            // The first free stem, the way the real Trash numbers a taken name.
+            let mut stem = name.clone();
+            let mut n = 1;
+            while fs::symlink_metadata(files.join(&stem)).is_ok() {
+                n += 1;
+                stem = format!("{}.{n}", name.to_string_lossy()).into();
+            }
+            let info_file = info.join(format!("{}.trashinfo", stem.to_string_lossy()));
+            fs::write(&info_file, trashinfo(path))?;
+            if let Err(err) = fs::rename(path, files.join(&stem)) {
+                let _ = fs::remove_file(&info_file);
+                return Err(err);
+            }
+            if a.twin.contains(&name) {
+                let twin = format!("{}.twin", stem.to_string_lossy());
+                fs::write(info.join(format!("{twin}.trashinfo")), trashinfo("/someone/elses/item"))?;
+                fs::write(files.join(&twin), "someone else's item")?;
+            }
+            if a.blind_after.contains(&name) {
+                fs::set_permissions(&files, fs::Permissions::from_mode(0o300))?;
+            }
+            Ok(())
+        })();
+        Some(moved.map_err(|err| err.to_string()))
+    }
+}
+
+/// The Trash folder the exact batch and the exact restore work in.
+fn trash_dir() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(dir) = fixture_trash::dir() {
+        return Ok(dir);
+    }
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    Ok(Path::new(&home).join(".local/share/Trash"))
+}
+
+/// The one call that moves an item to Trash. The reason comes back bare.
+fn trash_move(path: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(moved) = fixture_trash::move_item(path) {
+        return moved;
+    }
+    gio::File::for_path(path)
+        .trash(gio::Cancellable::NONE)
+        .map_err(|err| err.to_string())
+}
+
+/// D-231: one item the exact batch moved: where it now sits in Trash, and the
+/// content guard taken from the item itself just before its move.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrashedItem {
+    pub receipt: TrashReceipt,
+    pub fingerprint: Fingerprint,
+}
+
+/// D-231: the item an exact batch stopped at, and the state it was left in.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrashStop {
+    /// The item is where it was; nothing about it changed.
+    NotMoved { path: String, reason: String },
+    /// The item is in Trash, but its entry there could not be told apart from
+    /// any other, so it has no receipt and no Undo.
+    MovedUnidentified { path: String, reason: String },
+}
+
+/// D-231: what one exact batch did, in the order it was asked. The moved items
+/// are kept whatever happened to a later one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrashBatch {
+    pub done: Vec<TrashedItem>,
+    pub stopped: Option<TrashStop>,
+    pub not_attempted: Vec<String>,
+}
+
+/// The entry names in `Trash/files`. A folder or an entry that cannot be read
+/// is an error, never an empty answer.
+fn files_dir_stems(files_dir: &Path) -> std::io::Result<HashSet<std::ffi::OsString>> {
+    fs::read_dir(files_dir)?.map(|entry| entry.map(|entry| entry.file_name())).collect()
+}
+
+/// Trashes each path one at a time and stops at the first one that fails;
+/// the items before it stay recorded and the items after it are not tried.
+pub fn trash_paths_exact(paths: &[String]) -> TrashBatch {
+    let mut batch = TrashBatch { done: Vec::with_capacity(paths.len()), stopped: None, not_attempted: Vec::new() };
+    for (index, path) in paths.iter().enumerate() {
+        match trash_one_exact(path) {
+            Ok(item) => batch.done.push(item),
+            Err(stop) => {
+                batch.stopped = Some(stop);
+                batch.not_attempted = paths[index + 1..].to_vec();
+                break;
+            }
+        }
+    }
+    batch
+}
+
+/// One item: its content guard first, then the move, with `Trash/files` listed
+/// before and after to capture the exact stem the move gave it. Anything that
+/// fails before the move leaves the item untouched. After the move, a listing
+/// that fails or does not show exactly one new entry is reported as moved but
+/// not identified, rather than guessing which entry it is.
+fn trash_one_exact(path: &str) -> Result<TrashedItem, TrashStop> {
+    let not_moved = |reason: String| TrashStop::NotMoved { path: path.to_string(), reason };
+    let unidentified = |reason: String| TrashStop::MovedUnidentified { path: path.to_string(), reason };
+    let unlisted = |err: std::io::Error| format!("cannot read the Trash folder: {err}");
+    let files_dir = trash_dir().map_err(not_moved)?.join("files");
+    let fingerprint = fingerprint(path)
+        .map_err(|err| not_moved(err.strip_prefix(&format!("{path}: ")).unwrap_or(&err).to_string()))?;
+    let before = match files_dir_stems(&files_dir) {
+        Ok(stems) => stems,
+        // A Trash that has never held anything: the first move makes the folder.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(err) => return Err(not_moved(unlisted(err))),
+    };
+    trash_move(path).map_err(not_moved)?;
+    let after = files_dir_stems(&files_dir).map_err(|err| unidentified(unlisted(err)))?;
+    let new: Vec<_> = after.difference(&before).collect();
+    let [stem] = new[..] else {
+        return Err(unidentified(format!("{} new Trash entries, expected 1", new.len())));
+    };
+    let selector = files_dir.join(stem).to_string_lossy().to_string();
+    Ok(TrashedItem { receipt: TrashReceipt { original: path.to_string(), selector }, fingerprint })
 }
 
 /// Restores each receipt's exact payload, never "the newest item for this
@@ -2591,8 +3007,7 @@ pub fn trash_paths_exact(paths: &[String]) -> Result<Vec<TrashReceipt>, String> 
 /// already restored in this call is put back in Trash under the same
 /// selector before returning the error.
 pub fn restore_from_trash_exact(receipts: &[TrashReceipt]) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
-    let trash = Path::new(&home).join(".local/share/Trash");
+    let trash = trash_dir()?;
     let mut restored = Vec::new();
     for receipt in receipts {
         match restore_from_trash_in(&trash, &receipt.selector) {
@@ -2709,10 +3124,24 @@ fn resolve_trash_entry(trash: &Path, selector: &str) -> Result<TrashEntry, Strin
 /// Moves `from` to `to` without ever replacing an existing file, directory or
 /// dangling symlink at `to` (one atomic kernel call, no exists-then-rename race).
 fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
+    rename_no_replace_io(from, to).map_err(|err| match err.raw_os_error() {
+        Some(libc::EEXIST) => format!("already exists: {}", to.display()),
+        Some(_) => format!("{}: {err}", to.display()),
+        None => err.to_string(),
+    })
+}
+
+/// The same move with the system's own error kept, so a caller can tell a taken
+/// name (`EEXIST`) from a real failure without reading message text (D-230).
+fn rename_no_replace_io(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = |path: &Path| {
-        std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| format!("path contains a NUL byte: {}", path.display()))
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains a NUL byte: {}", path.display()),
+            )
+        })
     };
     let (from_c, to_c) = (c(from)?, c(to)?);
     // SAFETY: both C strings are NUL-terminated and stay alive for the whole call.
@@ -2726,13 +3155,9 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
         )
     };
     if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
-        Err(format!("already exists: {}", to.display()))
+        Ok(())
     } else {
-        Err(format!("{}: {err}", to.display()))
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -3675,7 +4100,22 @@ pub fn compress_zip(paths: &[String], dest_dir: &str) -> Result<String, String> 
     }
 }
 
+/// Decodes straight into `dest_dir` with whatever the tools do to what is
+/// already there. Only for a folder made for this call; Extract Here goes
+/// through `extract_archive_here`.
 pub fn extract_archive(path: &str, dest_dir: &str) -> Result<(), String> {
+    decode_archive(path, &run_cmd_capture, &mut || Ok(dest_dir.to_string())).map(|_| ())
+}
+
+/// The one place that knows which tool reads which archive type, and which tool
+/// is tried next when the first fails. `out` names the folder each attempt
+/// writes into, asked once per attempt; the folder of the attempt that
+/// succeeded is returned.
+fn decode_archive(
+    path: &str,
+    run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
+    out: &mut dyn FnMut() -> Result<String, String>,
+) -> Result<String, String> {
     let lower = path.to_lowercase();
     if lower.ends_with(".tar")
         || lower.ends_with(".tar.gz")
@@ -3686,18 +4126,28 @@ pub fn extract_archive(path: &str, dest_dir: &str) -> Result<(), String> {
         || lower.ends_with(".tar.zst")
         || lower.ends_with(".tzst")
     {
-        run_cmd_capture("tar", &["-xf", path, "-C", dest_dir])
+        let dir = out()?;
+        run("tar", &["-xf", path, "-C", &dir]).map(|()| dir)
     } else if lower.ends_with(".zip") {
-        run_cmd_capture("unzip", &["-o", path, "-d", dest_dir])
-            .or_else(|_| run_cmd_capture("7z", &["x", "-y", &format!("-o{dest_dir}"), path]))
+        let dir = out()?;
+        match run("unzip", &["-o", path, "-d", &dir]) {
+            Ok(()) => Ok(dir),
+            Err(_) => {
+                let dir = out()?;
+                run("7z", &["x", "-y", &format!("-o{dir}"), path]).map(|()| dir)
+            }
+        }
     } else if is_archive_path(path) {
-        run_cmd_capture("7z", &["x", "-y", &format!("-o{dest_dir}"), path]).or_else(|first| {
-            run_cmd_capture(
-                "unar",
-                &["-force-overwrite", "-output-directory", dest_dir, path],
-            )
-            .map_err(|second| format!("{first}; {second}"))
-        })
+        let dir = out()?;
+        match run("7z", &["x", "-y", &format!("-o{dir}"), path]) {
+            Ok(()) => Ok(dir),
+            Err(first) => {
+                let dir = out()?;
+                run("unar", &["-force-overwrite", "-output-directory", &dir, path])
+                    .map(|()| dir)
+                    .map_err(|second| format!("{first}; {second}"))
+            }
+        }
     } else {
         Err("unsupported archive type".to_string())
     }
@@ -3743,6 +4193,244 @@ pub fn extract_archive_into_new_dir(path: &str, dest_dir: &str) -> Result<String
             // Do not leave an empty folder behind after a failed extraction.
             let _ = fs::remove_dir(&target);
             Err(err)
+        }
+    }
+}
+
+/// One name Extract Here left alone because something already had it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractSkip {
+    pub name: String,
+    /// The archive's entry is a folder: nothing inside it was extracted either.
+    pub folder: bool,
+}
+
+/// What one Extract Here did, by top-level name (D-230). Nothing is ever
+/// replaced, so each name from the archive is in exactly one of the lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtractHereOutcome {
+    /// Moved into the destination.
+    pub published: Vec<String>,
+    /// The name was taken; what was there is as it was.
+    pub skipped: Vec<ExtractSkip>,
+    /// Could not be moved for any other reason: the name and the system's error.
+    pub failed: Vec<(String, String)>,
+    /// The temporary folder, when it could not be removed: where it is and why.
+    pub leftover: Option<(String, String)>,
+}
+
+impl ExtractHereOutcome {
+    /// The line the status bar keeps after the folder refreshes. Only a result
+    /// with nothing skipped, failed or left behind gets the plain message.
+    pub fn summary(&self) -> String {
+        if self.skipped.is_empty() && self.failed.is_empty() && self.leftover.is_none() {
+            return if self.published.is_empty() {
+                "Nothing to extract: the archive is empty".to_string()
+            } else {
+                "Extracted archive".to_string()
+            };
+        }
+        let mut parts = vec![match self.published.len() {
+            0 => "Nothing extracted".to_string(),
+            1 => "Extracted 1 item".to_string(),
+            n => format!("Extracted {n} items"),
+        }];
+        if !self.skipped.is_empty() {
+            let names: Vec<String> = self
+                .skipped
+                .iter()
+                .map(|skip| if skip.folder { format!("{} (whole folder)", skip.name) } else { skip.name.clone() })
+                .collect();
+            let exist = if names.len() == 1 { "exists" } else { "exist" };
+            parts.push(format!("Skipped {} that already {exist}: {}", names.len(), names.join(", ")));
+        }
+        if !self.failed.is_empty() {
+            let names: Vec<String> = self.failed.iter().map(|(name, why)| format!("{name} ({why})")).collect();
+            parts.push(format!("Failed on {}: {}", names.len(), names.join(", ")));
+        }
+        if let Some((path, why)) = &self.leftover {
+            parts.push(format!("Temporary folder not removed: {path} ({why})"));
+        }
+        parts.join(". ")
+    }
+}
+
+/// Extract Here (D-230). The archive is decoded into a temporary folder of this
+/// call's own inside `dest_dir`, and only a complete decode is moved out, one
+/// top-level entry at a time, with a move that cannot replace anything. A name
+/// that is taken is skipped whole, folder or not, and reported: what is there
+/// is never opened, added to or removed. A failed decode moves nothing.
+pub fn extract_archive_here(path: &str, dest_dir: &str) -> Result<ExtractHereOutcome, String> {
+    extract_here_with(path, dest_dir, &run_cmd_capture, &rename_no_replace_io)
+}
+
+/// `run` starts one tool and `publish` moves one decoded entry into place. They
+/// are parameters so a test can fail a tool or take a name at the last moment.
+fn extract_here_with(
+    path: &str,
+    dest_dir: &str,
+    run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
+    publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<ExtractHereOutcome, String> {
+    let dest = Path::new(dest_dir);
+    let mut stage: Option<ExtractStage> = None;
+    let mut attempts = 0u32;
+    // Every tool gets a new, empty folder: one that fails part-way cannot leave
+    // files in what the next tool's output is moved out of.
+    let decoded = decode_archive(path, run, &mut || {
+        if stage.is_none() {
+            stage = Some(ExtractStage::reserve(dest)?);
+        }
+        let stage = stage.as_ref().expect("reserved just above");
+        attempts += 1;
+        let out = stage.path.join(format!("attempt-{attempts}"));
+        fs::create_dir(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(out.to_string_lossy().into_owned())
+    });
+    let listed = decoded.and_then(|out| {
+        use std::os::unix::fs::PermissionsExt;
+        let out = PathBuf::from(out);
+        // A tar of "." gives its folder's own mode to the folder it writes into.
+        // That folder is ours: keep it listable and emptiable whatever it was given.
+        let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o700));
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&out).map_err(|e| format!("{}: {e}", out.display()))? {
+            names.push(entry.map_err(|e| format!("{}: {e}", out.display()))?.file_name());
+        }
+        names.sort();
+        Ok((out, names))
+    });
+    let (out, names) = match listed {
+        Ok(found) => found,
+        Err(err) => {
+            // Nothing has been moved, so the temporary folder is all there is to undo.
+            return Err(match stage.map(ExtractStage::remove) {
+                Some(Err((left, why))) => format!("{err}. Temporary folder not removed: {left} ({why})"),
+                _ => err,
+            });
+        }
+    };
+    let mut outcome = ExtractHereOutcome::default();
+    for name in names {
+        let (from, to) = (out.join(&name), dest.join(&name));
+        let shown = name.to_string_lossy().into_owned();
+        match publish_staged_entry(&from, &to, publish) {
+            Ok(()) => outcome.published.push(shown),
+            // The name is taken, whether it was there all along or arrived a moment ago.
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                let folder = fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_dir());
+                outcome.skipped.push(ExtractSkip { name: shown, folder });
+            }
+            // A real failure is that entry's alone: the rest are still tried.
+            Err(e) => outcome.failed.push((shown, e.to_string())),
+        }
+    }
+    if let Some(Err(left)) = stage.map(ExtractStage::remove) {
+        outcome.leftover = Some(left);
+    }
+    Ok(outcome)
+}
+
+/// Moves one decoded entry into place through `publish`. A folder can only
+/// change parent when its owner may write to it (its ".." entry is rewritten),
+/// so a read-only folder from the archive gets owner access for the move and
+/// its own mode back afterwards, through an open handle rather than by name.
+fn publish_staged_entry(
+    from: &Path,
+    to: &Path,
+    publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(from)?;
+    let mode = meta.permissions().mode() & 0o7777;
+    if !meta.is_dir() || mode & 0o200 != 0 {
+        return publish(from, to);
+    }
+    fs::set_permissions(from, fs::Permissions::from_mode(mode | 0o700))?;
+    let handle = match fs::File::open(from) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let _ = fs::set_permissions(from, fs::Permissions::from_mode(mode));
+            return Err(e);
+        }
+    };
+    let moved = publish(from, to);
+    let restored = handle.set_permissions(fs::Permissions::from_mode(mode));
+    moved?;
+    restored.map_err(|e| std::io::Error::other(format!("extracted, but its permissions could not be put back: {e}")))
+}
+
+static EXTRACT_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The temporary folder one Extract Here decodes into: made new inside the
+/// destination, so every move out of it stays on one filesystem, private to the
+/// user, and remembered by identity so cleanup removes this folder and no other.
+struct ExtractStage {
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+impl ExtractStage {
+    /// Creating the folder fails when the name is taken by anything at all, a
+    /// dangling link included, so nothing is ever adopted: the next name is tried.
+    fn reserve(dest: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        for _ in 0..10_000 {
+            let n = EXTRACT_STAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = dest.join(format!(".wf-extract-{}-{n}", std::process::id()));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {
+                    return match fs::symlink_metadata(&path) {
+                        Ok(meta) => Ok(Self { path, identity: (meta.dev(), meta.ino()) }),
+                        Err(e) => {
+                            let _ = fs::remove_dir(&path);
+                            Err(format!("{}: {e}", path.display()))
+                        }
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot create a temporary folder in {}: {e}", dest.display())),
+            }
+        }
+        Err(format!("cannot create a temporary folder in {}: every name tried is taken", dest.display()))
+    }
+
+    /// Removes the folder and whatever is left in it, only while its name still
+    /// holds the folder made here. `Err` is where it is and why it is still there.
+    fn remove(self) -> Result<(), (String, String)> {
+        use std::os::unix::fs::MetadataExt;
+        let left = |why: String| (self.path.display().to_string(), why);
+        match fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.is_dir() && (meta.dev(), meta.ino()) == self.identity => {
+                remove_owned_tree(&self.path).map_err(|e| left(e.to_string()))
+            }
+            Ok(_) => Err(left("something else now has its name".to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(left("it was moved or removed by something else".to_string()))
+            }
+            Err(e) => Err(left(e.to_string())),
+        }
+    }
+}
+
+/// Removes a folder this operation made, never following a link. An archive can
+/// hold folders their owner may not write to or list; those get owner access
+/// first, or what is inside them could not be removed.
+fn remove_owned_tree(root: &Path) -> std::io::Result<()> {
+    if fs::remove_dir_all(root).is_ok() {
+        return Ok(());
+    }
+    grant_owner_access(root);
+    fs::remove_dir_all(root)
+}
+
+fn grant_owner_access(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            grant_owner_access(&entry.path());
         }
     }
 }
@@ -5327,10 +6015,19 @@ mod tests {
         let trash_files = PathBuf::from(&home).join(".local/share/Trash/files");
         let trash_info = PathBuf::from(&home).join(".local/share/Trash/info");
         let mut cleanup: Vec<String> = Vec::new();
+        // The receipts of a batch that moved everything; a batch that stopped
+        // is this test's error, as it was when the batch returned one.
+        let trash_whole = |path: String| -> Result<Vec<TrashReceipt>, String> {
+            let batch = trash_paths_exact(&[path]);
+            match batch.stopped {
+                None => Ok(batch.done.into_iter().map(|item| item.receipt).collect()),
+                Some(stop) => Err(format!("{stop:?}")),
+            }
+        };
 
         let mut run = || -> Result<(), String> {
             fs::write(&original, b"first").unwrap();
-            let first = trash_paths_exact(&[original.to_string_lossy().to_string()])?;
+            let first = trash_whole(original.to_string_lossy().to_string())?;
             assert_eq!(first.len(), 1);
             cleanup.push(
                 Path::new(&first[0].selector)
@@ -5341,7 +6038,7 @@ mod tests {
             );
 
             fs::write(&original, b"second").unwrap();
-            let second = trash_paths_exact(&[original.to_string_lossy().to_string()])?;
+            let second = trash_whole(original.to_string_lossy().to_string())?;
             assert_eq!(second.len(), 1);
             cleanup.push(
                 Path::new(&second[0].selector)
@@ -7208,5 +7905,1555 @@ mod zip_extraction_tests_d188 {
             .filter(|n| n.contains("-wf-zip-"))
             .collect();
         assert!(leftovers.is_empty(), "no owned stage may survive a failed transaction, found {leftovers:?}");
+    }
+}
+
+#[cfg(test)]
+mod drive_change_tests_d229 {
+    use super::*;
+
+    fn drive(name: &str, space: Option<Space>) -> Drive {
+        Drive {
+            name: name.to_string(),
+            path: format!("/dev/{name}"),
+            mountpoint: format!("/mnt/{name}"),
+            size: 100,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable: false,
+            space,
+        }
+    }
+
+    /// D-229: a drive scan is the same, differs in space alone, or would change the rows.
+    #[test]
+    fn drive_change_tells_same_space_only_and_structural_apart_d229() {
+        let some = |total, available| Some(Space { total, available });
+        let a = drive("a", some(100, 25));
+        let b = drive("b", None);
+        let shown = vec![a.clone(), b.clone()];
+
+        assert_eq!(drive_change(&[], &[]), DriveChange::Same);
+        assert_eq!(drive_change(&shown, &shown.clone()), DriveChange::Same);
+
+        // Space alone, in every direction it can move.
+        for space in [some(100, 40), some(200, 25), some(0, 0), None] {
+            let scanned = vec![Drive { space, ..a.clone() }, b.clone()];
+            assert_eq!(drive_change(&shown, &scanned), DriveChange::SpaceOnly, "space {space:?}");
+            assert_eq!(drive_change(&scanned, &shown), DriveChange::SpaceOnly, "space {space:?} back");
+        }
+        let appeared = vec![a.clone(), Drive { space: some(50, 25), ..b.clone() }];
+        assert_eq!(drive_change(&shown, &appeared), DriveChange::SpaceOnly);
+
+        // Every other field changes what a row shows or what its menu acts on.
+        let other_fields: [(&str, Drive); 7] = [
+            ("name", Drive { name: "z".into(), ..a.clone() }),
+            ("path", Drive { path: "/dev/z".into(), ..a.clone() }),
+            ("mountpoint", Drive { mountpoint: String::new(), ..a.clone() }),
+            ("size", Drive { size: 200, ..a.clone() }),
+            ("fstype", Drive { fstype: "ntfs".into(), ..a.clone() }),
+            ("kind", Drive { kind: "optical".into(), ..a.clone() }),
+            ("removable", Drive { removable: true, ..a.clone() }),
+        ];
+        for (field, changed) in other_fields {
+            let scanned = vec![changed.clone(), b.clone()];
+            assert_eq!(drive_change(&shown, &scanned), DriveChange::Structural, "{field}");
+            // A change in space on top does not make it a space-only change.
+            let scanned = vec![Drive { space: some(100, 1), ..changed }, b.clone()];
+            assert_eq!(drive_change(&shown, &scanned), DriveChange::Structural, "{field} with space");
+        }
+
+        // Order, arrival and removal.
+        assert_eq!(drive_change(&shown, &[b.clone(), a.clone()]), DriveChange::Structural);
+        assert_eq!(drive_change(&shown, &[a.clone(), b.clone(), drive("c", None)]), DriveChange::Structural);
+        assert_eq!(drive_change(&shown, &[a.clone()]), DriveChange::Structural);
+        assert_eq!(drive_change(&shown, &[]), DriveChange::Structural);
+        assert_eq!(drive_change(&[], &shown), DriveChange::Structural);
+    }
+}
+
+#[cfg(test)]
+mod extract_here_tests_d230 {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    /// Extract Here as the app runs it, reduced to the names it says it extracted
+    /// and the names it says it skipped (true marks a whole folder). Its own
+    /// function so the same test text also builds on a tree from before the
+    /// repair, where the old route reports nothing.
+    pub(super) fn extract_here_d230(archive: &Path, dest: &Path) -> Result<(Vec<String>, Vec<(String, bool)>), String> {
+        extract_archive_here(archive.to_str().unwrap(), dest.to_str().unwrap())
+            .map(|done| (done.published, done.skipped.into_iter().map(|skip| (skip.name, skip.folder)).collect()))
+    }
+
+    /// A folder of this test's own under the scratch root, made new and removed on
+    /// drop, also when an assertion fails. Anything a case made read-only is
+    /// opened up first so nothing is left behind.
+    pub(super) struct Owned(pub(super) PathBuf);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            open_up(&self.0);
+            let _ = fs::remove_dir_all(&self.0);
+            if let Some(root) = self.0.parent() {
+                let _ = fs::remove_dir(root); // fails unless empty
+            }
+        }
+    }
+
+    pub(super) fn owned(tag: &str) -> Owned {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!("wf-d230-{tag}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst));
+        // Another test's cleanup may remove the shared root while it is empty.
+        for _ in 0..50 {
+            let dir = scratch_root().join(&name);
+            match fs::create_dir(&dir) {
+                Ok(()) => return Owned(dir),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => panic!("a new folder of this test's own, {}: {e}", dir.display()),
+            }
+        }
+        panic!("the scratch root kept disappearing");
+    }
+
+    /// Owner access back on every real folder under `dir`; links are not followed.
+    pub(super) fn open_up(dir: &Path) {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    open_up(&entry.path());
+                }
+            }
+        }
+    }
+
+    /// Every entry under `dir` by relative path, sorted: a folder ends in '/', a
+    /// link shows its target, a file its bytes (a count when they are not short
+    /// text). Links are never followed.
+    pub(super) fn tree(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(base).unwrap().display().to_string();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    out.push(format!("{rel} -> {}", fs::read_link(&path).unwrap().display()));
+                } else if meta.is_dir() {
+                    out.push(format!("{rel}/"));
+                    walk(base, &path, out);
+                } else {
+                    let bytes = fs::read(&path).unwrap();
+                    match std::str::from_utf8(&bytes) {
+                        Ok(text) if bytes.len() <= 80 => out.push(format!("{rel} = {text}")),
+                        _ => out.push(format!("{rel} = <{} bytes>", bytes.len())),
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Packs `names` from `src` with the real tool for `kind`.
+    pub(super) fn pack(kind: &str, src: &Path, names: &[&str], archive: &Path) {
+        let (tool, lead): (&str, &[&str]) = match kind {
+            "zip" => ("zip", &["-r", "-q"]),
+            "tar" => ("tar", &["-cf"]),
+            "7z" => ("7z", &["a"]),
+            other => panic!("no packer for {other}"),
+        };
+        let out = Command::new(tool)
+            .args(lead)
+            .arg(archive)
+            .args(names)
+            .current_dir(src)
+            .output()
+            .expect("run the packer");
+        assert!(out.status.success(), "{tool} could not pack: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    const OLD_NOTE: &str = "OLD note: the user's own bytes";
+    const OLD_KEEP: &str = "OLD keep";
+    const OLD_OWN: &str = "OLD own";
+    const BYSTANDER: &str = "not in the archive";
+    const OUTSIDE: &str = "outside sentinel";
+
+    /// The top-level names every archive below holds.
+    pub(super) const PACKED: [&str; 6] = ["dangling", "fresh-dir", "fresh.txt", "link-name", "note.txt", "photos"];
+
+    pub(super) fn write_source(src: &Path) {
+        fs::create_dir(src).unwrap();
+        fs::write(src.join("note.txt"), "NEW note").unwrap();
+        fs::write(src.join("link-name"), "NEW link-name").unwrap();
+        fs::write(src.join("dangling"), "NEW dangling").unwrap();
+        fs::create_dir(src.join("photos")).unwrap();
+        fs::write(src.join("photos/new.jpg"), "NEW photo").unwrap();
+        fs::write(src.join("photos/keep.txt"), "NEW keep").unwrap();
+        fs::write(src.join("fresh.txt"), "fresh file").unwrap();
+        fs::create_dir(src.join("fresh-dir")).unwrap();
+        fs::write(src.join("fresh-dir/inner.txt"), "fresh inner").unwrap();
+    }
+
+    fn id(path: &Path) -> (u64, u64) {
+        let meta = fs::symlink_metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    /// A destination that already holds a file, a link, a dangling link and a
+    /// folder under names the archive also has, plus a file it does not have.
+    fn clashes_are_kept_and_reported(kind: &str) {
+        let root = owned(&format!("clash-{kind}"));
+        let (src, dest, outside) = (root.0.join("src"), root.0.join("dest"), root.0.join("outside-sentinel.txt"));
+        write_source(&src);
+        fs::write(&outside, OUTSIDE).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("note.txt"), OLD_NOTE).unwrap();
+        symlink(&outside, dest.join("link-name")).unwrap();
+        symlink("no-such-target", dest.join("dangling")).unwrap();
+        fs::create_dir(dest.join("photos")).unwrap();
+        fs::write(dest.join("photos/keep.txt"), OLD_KEEP).unwrap();
+        fs::write(dest.join("photos/own.txt"), OLD_OWN).unwrap();
+        fs::write(dest.join("bystander.txt"), BYSTANDER).unwrap();
+        let archive = dest.join(format!("pack.{kind}"));
+        pack(kind, &src, &PACKED, &archive);
+        let archive_bytes = fs::read(&archive).unwrap();
+        let before = tree(&dest);
+        let kept = ["note.txt", "link-name", "dangling", "photos", "photos/keep.txt", "photos/own.txt", "bystander.txt"];
+        let ids: Vec<(u64, u64)> = kept.iter().map(|name| id(&dest.join(name))).collect();
+
+        let result = extract_here_d230(&archive, &dest);
+
+        // The user's own bytes first: this is what the old route replaced.
+        assert_eq!(fs::read_to_string(dest.join("note.txt")).unwrap(), OLD_NOTE, "{kind}: the existing note.txt was replaced");
+        // An existing link stays that link, and nothing is written through it.
+        assert_eq!(fs::read_link(dest.join("link-name")).unwrap(), outside, "{kind}: link-name is no longer the same link");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), OUTSIDE, "{kind}: the file behind link-name was changed");
+        assert_eq!(
+            fs::read_link(dest.join("dangling")).unwrap(),
+            Path::new("no-such-target"),
+            "{kind}: the dangling link was replaced"
+        );
+        assert!(
+            fs::symlink_metadata(dest.join("no-such-target")).is_err(),
+            "{kind}: something was written through the dangling link"
+        );
+        // The existing folder is exactly as it was: nothing merged in, nothing replaced.
+        assert_eq!(
+            tree(&dest.join("photos")),
+            [format!("keep.txt = {OLD_KEEP}"), format!("own.txt = {OLD_OWN}")],
+            "{kind}: the existing photos folder"
+        );
+        assert_eq!(fs::read_to_string(dest.join("bystander.txt")).unwrap(), BYSTANDER);
+        for (name, before) in kept.iter().zip(&ids) {
+            assert_eq!(id(&dest.join(name)), *before, "{kind}: {name} is not the same entry as before");
+        }
+        // What does not clash is extracted as usual.
+        assert_eq!(fs::read_to_string(dest.join("fresh.txt")).unwrap(), "fresh file");
+        assert_eq!(tree(&dest.join("fresh-dir")), ["inner.txt = fresh inner"]);
+        // And the result says so, name by name; the folder is marked as skipped whole.
+        let (published, skipped) = result.unwrap_or_else(|err| panic!("{kind}: {err}"));
+        assert_eq!(published, ["fresh-dir", "fresh.txt"], "{kind}: extracted");
+        let skipped: Vec<(&str, bool)> = skipped.iter().map(|(name, folder)| (name.as_str(), *folder)).collect();
+        assert_eq!(
+            skipped,
+            [("dangling", false), ("link-name", false), ("note.txt", false), ("photos", true)],
+            "{kind}: skipped"
+        );
+        // The archive is untouched and nothing else was added, hidden or not.
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes, "{kind}: the archive changed");
+        let mut expected = before.clone();
+        expected.extend([
+            "fresh-dir/".to_string(),
+            "fresh-dir/inner.txt = fresh inner".to_string(),
+            "fresh.txt = fresh file".to_string(),
+        ]);
+        expected.sort();
+        assert_eq!(tree(&dest), expected, "{kind}: the folder afterwards");
+    }
+
+    /// D-230: Extract Here leaves every existing entry as it was and names what it
+    /// skipped. One test per archive type, each packed by the real tool.
+    #[test]
+    fn extract_here_keeps_existing_entries_zip_d230() {
+        clashes_are_kept_and_reported("zip");
+    }
+
+    #[test]
+    fn extract_here_keeps_existing_entries_tar_d230() {
+        clashes_are_kept_and_reported("tar");
+    }
+
+    #[test]
+    fn extract_here_keeps_existing_entries_7z_d230() {
+        clashes_are_kept_and_reported("7z");
+    }
+
+    /// With nothing in the way, every entry arrives with its bytes and nothing
+    /// else is left in the folder.
+    fn empty_destination_gets_everything(kind: &str) {
+        let root = owned(&format!("empty-{kind}"));
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        write_source(&src);
+        fs::create_dir(&dest).unwrap();
+        let archive = dest.join(format!("pack.{kind}"));
+        pack(kind, &src, &PACKED, &archive);
+        let archive_bytes = fs::read(&archive).unwrap();
+
+        let result = extract_here_d230(&archive, &dest);
+
+        assert!(result.is_ok(), "{kind}: {result:?}");
+        let mut expected = tree(&src);
+        expected.push(format!("pack.{kind} = <{} bytes>", archive_bytes.len()));
+        expected.sort();
+        assert_eq!(tree(&dest), expected, "{kind}: every entry, and nothing else");
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes, "{kind}: the archive changed");
+    }
+
+    #[test]
+    fn extract_here_into_an_empty_folder_zip_d230() {
+        empty_destination_gets_everything("zip");
+    }
+
+    #[test]
+    fn extract_here_into_an_empty_folder_tar_d230() {
+        empty_destination_gets_everything("tar");
+    }
+
+    #[test]
+    fn extract_here_into_an_empty_folder_7z_d230() {
+        empty_destination_gets_everything("7z");
+    }
+}
+
+#[cfg(test)]
+mod no_replace_move_wording_d230 {
+    use super::*;
+
+    /// D-230 leaves the shared no-replace move as it was for Trash and transfers:
+    /// the same three error texts, on a tree from before the repair and after it.
+    #[test]
+    fn no_replace_move_keeps_its_error_texts_d230() {
+        let dir = scratch_root().join(format!("wf-d230-wording-{}", std::process::id()));
+        fs::create_dir(&dir).expect("a new folder of this test's own");
+        struct Gone(PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _gone = Gone(dir.clone());
+        let (a, b, missing) = (dir.join("a.txt"), dir.join("b.txt"), dir.join("missing.txt"));
+        fs::write(&a, "A").unwrap();
+        fs::write(&b, "B").unwrap();
+
+        assert_eq!(rename_no_replace(&a, &b), Err(format!("already exists: {}", b.display())));
+        assert_eq!((fs::read_to_string(&a).unwrap(), fs::read_to_string(&b).unwrap()), ("A".to_string(), "B".to_string()));
+        let target = dir.join("c.txt");
+        assert_eq!(
+            rename_no_replace(&missing, &target),
+            Err(format!("{}: {}", target.display(), std::io::Error::from_raw_os_error(libc::ENOENT)))
+        );
+        let nul = dir.join("has\0nul");
+        assert_eq!(rename_no_replace(&a, &nul), Err(format!("path contains a NUL byte: {}", nul.display())));
+        assert_eq!(rename_no_replace(&a, &target), Ok(()));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "A");
+    }
+}
+
+#[cfg(test)]
+mod extract_here_seam_tests_d230 {
+    use super::extract_here_tests_d230::{owned, pack, tree, write_source, PACKED};
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn text(path: &Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn skip(name: &str, folder: bool) -> ExtractSkip {
+        ExtractSkip { name: name.to_string(), folder }
+    }
+
+    fn sorted(mut lines: Vec<String>) -> Vec<String> {
+        lines.sort();
+        lines
+    }
+
+    /// `name = <n bytes>`, the way `tree` shows an archive.
+    fn sized(archive: &Path) -> String {
+        format!(
+            "{} = <{} bytes>",
+            archive.file_name().unwrap().to_string_lossy(),
+            fs::metadata(archive).unwrap().len()
+        )
+    }
+
+    /// The temporary folders of Extract Here that are directly in `dir`.
+    fn stages(dir: &Path) -> Vec<String> {
+        sorted(
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".wf-extract-"))
+                .collect(),
+        )
+    }
+
+    /// The folder a tool was told to write into.
+    fn out_dir(cmd: &str, args: &[&str]) -> PathBuf {
+        let after = |flag: &str| args.iter().position(|arg| *arg == flag).map(|i| args[i + 1]);
+        let dir = match cmd {
+            "tar" => after("-C"),
+            "unzip" => after("-d"),
+            "unar" => after("-output-directory"),
+            "7z" => args.iter().find_map(|arg| arg.strip_prefix("-o")),
+            _ => None,
+        };
+        PathBuf::from(dir.unwrap_or_else(|| panic!("no output folder in {cmd} {args:?}")))
+    }
+
+    /// With nothing in the way the result lists every entry, for each archive
+    /// type, and only then is the message the plain one.
+    #[test]
+    fn a_clean_result_lists_every_entry_d230() {
+        let root = owned("clean");
+        let src = root.0.join("src");
+        write_source(&src);
+        for kind in ["zip", "tar", "7z"] {
+            let dest = root.0.join(format!("dest-{kind}"));
+            fs::create_dir(&dest).unwrap();
+            let archive = dest.join(format!("pack.{kind}"));
+            pack(kind, &src, &PACKED, &archive);
+            let done = extract_archive_here(text(&archive), text(&dest)).unwrap();
+            assert_eq!(done, ExtractHereOutcome { published: names(&PACKED), ..Default::default() }, "{kind}");
+            assert_eq!(done.summary(), "Extracted archive", "{kind}");
+            assert!(stages(&dest).is_empty(), "{kind}");
+        }
+    }
+
+    /// A tool that fails part-way leaves nothing in what the next tool's output is
+    /// taken from. A zip: unzip fails after it wrote, the real 7z follows, and a
+    /// name that is taken stays out of reach of 7z's own overwrite switch.
+    #[test]
+    fn a_failed_tool_leaves_nothing_in_the_result_zip_d230() {
+        let root = owned("fallback-zip");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        write_source(&src);
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("note.txt"), "OLD note").unwrap();
+        let archive = dest.join("pack.zip");
+        pack("zip", &src, &["fresh.txt", "note.txt"], &archive);
+        let used = RefCell::new(Vec::new());
+        let run = |cmd: &str, args: &[&str]| -> Result<(), String> {
+            let out = out_dir(cmd, args);
+            used.borrow_mut().push((cmd.to_string(), out.clone()));
+            if cmd == "unzip" {
+                fs::write(out.join("JUNK.txt"), "left by the failed tool").unwrap();
+                fs::write(out.join("fresh.txt"), "HALF").unwrap();
+                return Err("unzip failed on purpose".to_string());
+            }
+            run_cmd_capture(cmd, args)
+        };
+
+        let done = extract_here_with(text(&archive), text(&dest), &run, &rename_no_replace_io).unwrap();
+
+        assert_eq!(
+            done,
+            ExtractHereOutcome {
+                published: names(&["fresh.txt"]),
+                skipped: vec![skip("note.txt", false)],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            tree(&dest),
+            sorted(vec!["fresh.txt = fresh file".to_string(), "note.txt = OLD note".to_string(), sized(&archive)]),
+            "the second tool's output alone, and the taken name as it was"
+        );
+        // Each tool wrote into a folder of its own inside the temporary folder, never the destination.
+        let used = used.into_inner();
+        assert_eq!(used.iter().map(|(cmd, _)| cmd.as_str()).collect::<Vec<_>>(), ["unzip", "7z"]);
+        assert_ne!(used[0].1, used[1].1, "each attempt gets its own folder");
+        for (cmd, out) in &used {
+            let stage = out.parent().unwrap();
+            assert_eq!(stage.parent(), Some(dest.as_path()), "{cmd} wrote into {}", out.display());
+            assert!(stage.file_name().unwrap().to_string_lossy().starts_with(".wf-extract-"), "{cmd}: {}", out.display());
+        }
+    }
+
+    /// The same for a .7z: 7z fails after it wrote and the real unar follows.
+    /// Once with the name free, and once with it taken, where unar's own
+    /// overwrite switch must not reach the existing file.
+    #[test]
+    fn a_failed_tool_leaves_nothing_in_the_result_7z_d230() {
+        let root = owned("fallback-7z");
+        let src = root.0.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("solo.txt"), "solo from the archive").unwrap();
+        for taken in [false, true] {
+            let dest = root.0.join(if taken { "dest-taken" } else { "dest-free" });
+            fs::create_dir(&dest).unwrap();
+            if taken {
+                fs::write(dest.join("solo.txt"), "OLD solo").unwrap();
+            }
+            let archive = dest.join("one.7z");
+            pack("7z", &src, &["solo.txt"], &archive);
+            let tools = RefCell::new(Vec::new());
+            let run = |cmd: &str, args: &[&str]| -> Result<(), String> {
+                tools.borrow_mut().push(cmd.to_string());
+                if cmd == "7z" {
+                    let out = out_dir(cmd, args);
+                    fs::write(out.join("JUNK.txt"), "left by the failed tool").unwrap();
+                    fs::write(out.join("solo.txt"), "HALF").unwrap();
+                    return Err("7z failed on purpose".to_string());
+                }
+                run_cmd_capture(cmd, args)
+            };
+
+            let done = extract_here_with(text(&archive), text(&dest), &run, &rename_no_replace_io).unwrap();
+
+            assert_eq!(tools.into_inner(), ["7z", "unar"], "taken={taken}");
+            let solo = if taken {
+                assert_eq!(done, ExtractHereOutcome { skipped: vec![skip("solo.txt", false)], ..Default::default() });
+                "OLD solo"
+            } else {
+                assert_eq!(done, ExtractHereOutcome { published: names(&["solo.txt"]), ..Default::default() });
+                "solo from the archive"
+            };
+            assert_eq!(tree(&dest), sorted(vec![sized(&archive), format!("solo.txt = {solo}")]), "taken={taken}");
+        }
+    }
+
+    /// When every tool fails, nothing is moved and the folder is as it was,
+    /// whatever the tools wrote first. The error is the one the old route gave.
+    #[test]
+    fn nothing_is_moved_when_every_tool_fails_d230() {
+        let root = owned("all-fail");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        write_source(&src);
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("note.txt"), "OLD note").unwrap();
+        for (kind, error) in [
+            ("zip", "7z failed on purpose"),
+            ("7z", "7z failed on purpose; unar failed on purpose"),
+            ("tar", "tar failed on purpose"),
+        ] {
+            let archive = dest.join(format!("pack.{kind}"));
+            pack(kind, &src, &PACKED, &archive);
+            let before = tree(&dest);
+            let run = |cmd: &str, args: &[&str]| -> Result<(), String> {
+                fs::write(out_dir(cmd, args).join("note.txt"), "written by a tool that then failed").unwrap();
+                Err(format!("{cmd} failed on purpose"))
+            };
+
+            let result = extract_here_with(text(&archive), text(&dest), &run, &rename_no_replace_io);
+
+            assert_eq!(result, Err(error.to_string()), "{kind}");
+            assert_eq!(tree(&dest), before, "{kind}: the folder is as it was");
+        }
+    }
+
+    /// Real damaged archives, real tools. What a tool wrote before it gave up
+    /// (the new bytes for a name that is taken among it) never reaches the folder.
+    #[test]
+    fn a_damaged_archive_moves_nothing_d230() {
+        let root = owned("damaged");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("note.txt"), "NEW note").unwrap();
+        // Bytes that do not compress, so cutting the archive short cuts this entry.
+        let mut x = 0x2545_F491_4F6C_DD1D_u64;
+        let noise: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        fs::write(src.join("z-big.bin"), noise).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("note.txt"), "OLD note").unwrap();
+        let cut = |archive: &Path, len: u64| {
+            assert!(fs::metadata(archive).unwrap().len() > 60_000, "{} is too small to cut", archive.display());
+            fs::OpenOptions::new().write(true).open(archive).unwrap().set_len(len).unwrap();
+        };
+        // Cut inside the second entry: tar writes note.txt and part of the next, then fails.
+        let cut_tar = dest.join("cut.tar");
+        pack("tar", &src, &["note.txt", "z-big.bin"], &cut_tar);
+        cut(&cut_tar, 4096);
+        // Cut the same way: unzip refuses it, and the 7z that follows writes what it can, then fails.
+        let cut_zip = dest.join("cut.zip");
+        pack("zip", &src, &["note.txt", "z-big.bin"], &cut_zip);
+        cut(&cut_zip, 3000);
+        // Not an archive at all: 7z and unar both refuse it.
+        let junk = dest.join("junk.7z");
+        fs::write(&junk, b"this is not an archive at all\n".repeat(64)).unwrap();
+        let before = tree(&dest);
+
+        let cases: [(&Path, &[(&str, Option<&str>)]); 3] = [
+            (&cut_tar, &[("tar", Some("NEW note"))]),
+            (&cut_zip, &[("unzip", None), ("7z", Some("NEW note"))]),
+            (&junk, &[("7z", None), ("unar", None)]),
+        ];
+        for (archive, expected) in cases {
+            // Each real tool, and the note.txt it left in its own folder when it stopped.
+            let wrote = RefCell::new(Vec::new());
+            let run = |cmd: &str, args: &[&str]| -> Result<(), String> {
+                let result = run_cmd_capture(cmd, args);
+                assert!(result.is_err(), "{cmd} accepted {}", archive.display());
+                wrote
+                    .borrow_mut()
+                    .push((cmd.to_string(), fs::read_to_string(out_dir(cmd, args).join("note.txt")).ok()));
+                result
+            };
+
+            let result = extract_here_with(text(archive), text(&dest), &run, &rename_no_replace_io);
+
+            assert!(result.is_err(), "{}: {result:?}", archive.display());
+            let wrote = wrote.into_inner();
+            let wrote: Vec<(&str, Option<&str>)> = wrote.iter().map(|(cmd, note)| (cmd.as_str(), note.as_deref())).collect();
+            assert_eq!(wrote, expected, "{}", archive.display());
+            assert_eq!(tree(&dest), before, "{}: the folder is as it was", archive.display());
+        }
+    }
+
+    /// A name that is free when the move is decided and taken when it happens is
+    /// kept all the same: the move itself refuses, and the entry is reported as
+    /// skipped. A file and a folder.
+    #[test]
+    fn a_name_taken_at_the_last_moment_is_kept_d230() {
+        let root = owned("late");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        write_source(&src);
+        fs::create_dir(&dest).unwrap();
+        let archive = dest.join("pack.tar");
+        pack("tar", &src, &PACKED, &archive);
+        // Just before the real move of these two names, something else takes them.
+        let publish = |from: &Path, to: &Path| -> std::io::Result<()> {
+            match to.file_name().and_then(|name| name.to_str()) {
+                Some("fresh.txt") => fs::write(to, "ARRIVED FIRST").unwrap(),
+                Some("fresh-dir") => {
+                    fs::create_dir(to).unwrap();
+                    fs::write(to.join("theirs.txt"), "ARRIVED FIRST").unwrap();
+                }
+                _ => {}
+            }
+            rename_no_replace_io(from, to)
+        };
+
+        let done = extract_here_with(text(&archive), text(&dest), &run_cmd_capture, &publish).unwrap();
+
+        assert_eq!(
+            done,
+            ExtractHereOutcome {
+                published: names(&["dangling", "link-name", "note.txt", "photos"]),
+                skipped: vec![skip("fresh-dir", true), skip("fresh.txt", false)],
+                ..Default::default()
+            }
+        );
+        assert_eq!(fs::read_to_string(dest.join("fresh.txt")).unwrap(), "ARRIVED FIRST");
+        assert_eq!(tree(&dest.join("fresh-dir")), ["theirs.txt = ARRIVED FIRST"]);
+        assert_eq!(
+            done.summary(),
+            "Extracted 4 items. Skipped 2 that already exist: fresh-dir (whole folder), fresh.txt"
+        );
+        assert!(stages(&dest).is_empty());
+    }
+
+    /// A move that fails for a real reason is that entry's alone: what was moved
+    /// before it stays and is reported, and the entries after it are still moved.
+    #[test]
+    fn a_failed_move_keeps_the_other_results_d230() {
+        let root = owned("partial");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir(&src).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt", "note.txt"] {
+            fs::write(src.join(name), format!("new {name}")).unwrap();
+        }
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("note.txt"), "OLD note").unwrap();
+        let archive = dest.join("pack.zip");
+        pack("zip", &src, &["a.txt", "b.txt", "c.txt", "note.txt"], &archive);
+        let publish = |from: &Path, to: &Path| -> std::io::Result<()> {
+            if to.file_name().is_some_and(|name| name == "b.txt") {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            rename_no_replace_io(from, to)
+        };
+
+        let done = extract_here_with(text(&archive), text(&dest), &run_cmd_capture, &publish).unwrap();
+
+        let why = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+        assert_eq!(
+            done,
+            ExtractHereOutcome {
+                published: names(&["a.txt", "c.txt"]),
+                skipped: vec![skip("note.txt", false)],
+                failed: vec![("b.txt".to_string(), why.clone())],
+                leftover: None,
+            }
+        );
+        assert_eq!(
+            done.summary(),
+            format!("Extracted 2 items. Skipped 1 that already exists: note.txt. Failed on 1: b.txt ({why})")
+        );
+        assert_eq!(
+            tree(&dest),
+            sorted(vec![
+                "a.txt = new a.txt".to_string(),
+                "c.txt = new c.txt".to_string(),
+                "note.txt = OLD note".to_string(),
+                sized(&archive),
+            ]),
+            "the two that moved, the taken name as it was, and no temporary folder"
+        );
+    }
+
+    /// When the temporary folder cannot be removed the result says where it is,
+    /// after a good extraction and after a failed one. What was moved stays moved.
+    #[test]
+    fn a_temporary_folder_left_behind_is_reported_d230() {
+        let root = owned("leftover");
+        let src = root.0.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("b.txt"), "b").unwrap();
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+        let lock = |dir: &Path, mode: u32| fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        {
+            let dest = root.0.join("dest-good");
+            fs::create_dir(&dest).unwrap();
+            let archive = dest.join("pack.tar");
+            pack("tar", &src, &["a.txt", "b.txt"], &archive);
+            // Once the last entry has moved the folder stops accepting changes, so
+            // the temporary folder cannot be taken out of it.
+            let publish = |from: &Path, to: &Path| -> std::io::Result<()> {
+                let moved = rename_no_replace_io(from, to);
+                if to.file_name().is_some_and(|name| name == "b.txt") {
+                    lock(&dest, 0o555);
+                }
+                moved
+            };
+
+            let done = extract_here_with(text(&archive), text(&dest), &run_cmd_capture, &publish).unwrap();
+            lock(&dest, 0o755);
+
+            let found = stages(&dest);
+            assert_eq!(found.len(), 1, "the temporary folder is still there: {found:?}");
+            let left = dest.join(&found[0]).display().to_string();
+            assert_eq!(
+                done,
+                ExtractHereOutcome {
+                    published: names(&["a.txt", "b.txt"]),
+                    leftover: Some((left.clone(), denied.clone())),
+                    ..Default::default()
+                }
+            );
+            assert_eq!(done.summary(), format!("Extracted 2 items. Temporary folder not removed: {left} ({denied})"));
+            assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "a");
+            assert_eq!(fs::read_to_string(dest.join("b.txt")).unwrap(), "b");
+        }
+        {
+            let dest = root.0.join("dest-failed");
+            fs::create_dir(&dest).unwrap();
+            let archive = dest.join("pack.tar");
+            pack("tar", &src, &["a.txt", "b.txt"], &archive);
+            let run = |cmd: &str, args: &[&str]| -> Result<(), String> {
+                fs::write(out_dir(cmd, args).join("a.txt"), "HALF").unwrap();
+                lock(&dest, 0o555);
+                Err(format!("{cmd} failed on purpose"))
+            };
+
+            let result = extract_here_with(text(&archive), text(&dest), &run, &rename_no_replace_io);
+            lock(&dest, 0o755);
+
+            let found = stages(&dest);
+            assert_eq!(found.len(), 1, "the temporary folder is still there: {found:?}");
+            let left = dest.join(&found[0]).display().to_string();
+            assert_eq!(
+                result,
+                Err(format!("tar failed on purpose. Temporary folder not removed: {left} ({denied})"))
+            );
+            let top: Vec<String> = fs::read_dir(&dest)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(sorted(top), [found[0].as_str(), "pack.tar"], "nothing was moved into the folder");
+        }
+    }
+
+    /// Cleanup removes the folder this extraction made and no other. When that
+    /// folder was moved away, with or without another put under its name, nothing
+    /// is removed and the result says so.
+    #[test]
+    fn cleanup_never_removes_a_folder_it_did_not_make_d230() {
+        let root = owned("swap");
+        let src = root.0.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        for (replaced, why) in [(true, "something else now has its name"), (false, "it was moved or removed by something else")] {
+            let dest = root.0.join(format!("dest-{replaced}"));
+            fs::create_dir(&dest).unwrap();
+            let archive = dest.join("pack.tar");
+            pack("tar", &src, &["a.txt"], &archive);
+            let moved_away = root.0.join(format!("moved-away-{replaced}"));
+            let publish = |from: &Path, to: &Path| -> std::io::Result<()> {
+                let moved = rename_no_replace_io(from, to);
+                let stage = from.parent().unwrap().parent().unwrap();
+                fs::rename(stage, &moved_away).unwrap();
+                if replaced {
+                    fs::create_dir(stage).unwrap();
+                    fs::write(stage.join("theirs.txt"), "NOT OURS").unwrap();
+                }
+                moved
+            };
+
+            let done = extract_here_with(text(&archive), text(&dest), &run_cmd_capture, &publish).unwrap();
+
+            let (left, reason) = done.leftover.clone().expect("the result says the folder was not removed");
+            assert_eq!(reason, why);
+            assert_eq!(done.published, ["a.txt"]);
+            assert_eq!(Path::new(&left).parent(), Some(dest.as_path()));
+            if replaced {
+                assert_eq!(tree(Path::new(&left)), ["theirs.txt = NOT OURS"], "the other folder is untouched");
+            } else {
+                assert!(fs::symlink_metadata(&left).is_err());
+            }
+            assert!(moved_away.is_dir(), "the folder that was moved away was not followed");
+            assert_eq!(done.summary(), format!("Extracted 1 item. Temporary folder not removed: {left} ({why})"));
+        }
+    }
+
+    /// The temporary folder is always made new. Names it would have used that are
+    /// taken, by a dangling link, a file or a folder with something in it, are
+    /// passed over, and are all still there, untouched, afterwards.
+    #[test]
+    fn a_taken_temporary_name_is_never_used_d230() {
+        let root = owned("reserve");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::create_dir(&dest).unwrap();
+        let archive = dest.join("pack.tar");
+        pack("tar", &src, &["a.txt"], &archive);
+        let pid = std::process::id();
+        // Other tests may use a few numbers meanwhile; this run still starts inside the taken range.
+        let first = EXTRACT_STAGE_COUNTER.load(Ordering::SeqCst);
+        for n in first..first + 300 {
+            let name = dest.join(format!(".wf-extract-{pid}-{n}"));
+            match n % 3 {
+                0 => symlink("nowhere", &name).unwrap(),
+                1 => fs::write(&name, "a file with that name").unwrap(),
+                _ => {
+                    fs::create_dir(&name).unwrap();
+                    fs::write(name.join("theirs.txt"), "NOT OURS").unwrap();
+                }
+            }
+        }
+        let before = tree(&dest);
+
+        let done = extract_archive_here(text(&archive), text(&dest)).unwrap();
+
+        assert_eq!(done, ExtractHereOutcome { published: names(&["a.txt"]), ..Default::default() });
+        assert!(
+            EXTRACT_STAGE_COUNTER.load(Ordering::SeqCst) > first + 300,
+            "the run had to pass over taken names"
+        );
+        let mut expected = before;
+        expected.push("a.txt = a".to_string());
+        assert_eq!(tree(&dest), sorted(expected), "every taken name is as it was, and nothing was left behind");
+    }
+
+    /// A folder the archive marks read-only arrives with that mode. When its name
+    /// is taken it is skipped whole and still cleaned out of the temporary folder.
+    #[test]
+    fn a_read_only_folder_is_extracted_or_skipped_whole_d230() {
+        let root = owned("read-only");
+        let src = root.0.join("src");
+        fs::create_dir_all(src.join("locked")).unwrap();
+        fs::write(src.join("locked/inner.txt"), "inner").unwrap();
+        fs::set_permissions(src.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+        {
+            let dest = root.0.join("dest-free");
+            fs::create_dir(&dest).unwrap();
+            let archive = dest.join("pack.tar");
+            pack("tar", &src, &["locked"], &archive);
+            // What tar itself gives the folder, for comparison.
+            let plain = root.0.join("plain");
+            fs::create_dir(&plain).unwrap();
+            extract_archive(text(&archive), text(&plain)).unwrap();
+            assert_eq!(mode(&plain.join("locked")) & 0o200, 0, "the folder really is read-only");
+
+            let done = extract_archive_here(text(&archive), text(&dest)).unwrap();
+
+            assert_eq!(done, ExtractHereOutcome { published: names(&["locked"]), ..Default::default() });
+            assert_eq!(mode(&dest.join("locked")), mode(&plain.join("locked")), "the folder keeps the archive's mode");
+            assert_eq!(tree(&dest.join("locked")), ["inner.txt = inner"]);
+            assert!(stages(&dest).is_empty());
+        }
+        {
+            let dest = root.0.join("dest-taken");
+            fs::create_dir_all(dest.join("locked")).unwrap();
+            fs::write(dest.join("locked/own.txt"), "OLD own").unwrap();
+            let archive = dest.join("pack.tar");
+            pack("tar", &src, &["locked"], &archive);
+
+            let done = extract_archive_here(text(&archive), text(&dest)).unwrap();
+
+            assert_eq!(done, ExtractHereOutcome { skipped: vec![skip("locked", true)], ..Default::default() });
+            assert_eq!(done.summary(), "Nothing extracted. Skipped 1 that already exists: locked (whole folder)");
+            assert_eq!(tree(&dest.join("locked")), ["own.txt = OLD own"]);
+            assert!(stages(&dest).is_empty(), "the read-only folder was removed with the temporary folder");
+        }
+    }
+
+    /// A tar made of "." carries that folder's own mode, and tar gives it to the
+    /// folder it writes into. That is the temporary folder now, so a read-only
+    /// one neither blocks the result nor changes the mode of the folder on show.
+    #[test]
+    fn a_tar_of_a_read_only_folder_itself_is_extracted_d230() {
+        let root = owned("dot");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("sub/b.txt"), "b").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("a.txt"), "OLD a").unwrap();
+        let archive = dest.join("pack.tar");
+        pack("tar", &src, &["."], &archive);
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+        let before = mode(&dest);
+        // tar really does this: decoding straight into a folder leaves it read-only.
+        let plain = root.0.join("plain");
+        fs::create_dir(&plain).unwrap();
+        extract_archive(text(&archive), text(&plain)).unwrap();
+        assert_eq!(mode(&plain) & 0o222, 0, "tar gave its output folder the archived mode");
+
+        let done = extract_archive_here(text(&archive), text(&dest)).unwrap();
+
+        assert_eq!(
+            done,
+            ExtractHereOutcome {
+                published: names(&["sub"]),
+                skipped: vec![skip("a.txt", false)],
+                ..Default::default()
+            }
+        );
+        assert_eq!(mode(&dest), before, "the folder on show keeps its own mode");
+        assert_eq!(
+            tree(&dest),
+            sorted(vec![
+                "a.txt = OLD a".to_string(),
+                sized(&archive),
+                "sub/".to_string(),
+                "sub/b.txt = b".to_string(),
+            ])
+        );
+    }
+
+    /// Links inside the archive arrive as the same links, and a link whose name is
+    /// taken is skipped as a name, not as a folder, whatever it points at.
+    #[test]
+    fn links_in_the_archive_stay_links_d230() {
+        let root = owned("links");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir_all(src.join("real-dir")).unwrap();
+        fs::write(src.join("real-dir/in.txt"), "in").unwrap();
+        fs::write(src.join("real.txt"), "real").unwrap();
+        symlink("real.txt", src.join("to-file")).unwrap();
+        symlink("real-dir", src.join("to-dir")).unwrap();
+        symlink("nowhere", src.join("to-nothing")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("to-dir"), "OLD file named to-dir").unwrap();
+        let archive = dest.join("pack.tar");
+        pack("tar", &src, &["real-dir", "real.txt", "to-dir", "to-file", "to-nothing"], &archive);
+
+        let done = extract_archive_here(text(&archive), text(&dest)).unwrap();
+
+        assert_eq!(
+            done,
+            ExtractHereOutcome {
+                published: names(&["real-dir", "real.txt", "to-file", "to-nothing"]),
+                skipped: vec![skip("to-dir", false)],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            tree(&dest),
+            sorted(vec![
+                sized(&archive),
+                "real-dir/".to_string(),
+                "real-dir/in.txt = in".to_string(),
+                "real.txt = real".to_string(),
+                "to-dir = OLD file named to-dir".to_string(),
+                "to-file -> real.txt".to_string(),
+                "to-nothing -> nowhere".to_string(),
+            ])
+        );
+    }
+
+    /// A type no tool is listed for is refused before anything is created.
+    #[test]
+    fn an_unsupported_type_creates_nothing_d230() {
+        let root = owned("unsupported");
+        let dest = root.0.join("dest");
+        fs::create_dir(&dest).unwrap();
+        let file = dest.join("plain.txt");
+        fs::write(&file, "not an archive").unwrap();
+        let run = |cmd: &str, _: &[&str]| -> Result<(), String> { panic!("{cmd} must not be started") };
+
+        let result = extract_here_with(text(&file), text(&dest), &run, &rename_no_replace_io);
+
+        assert_eq!(result, Err("unsupported archive type".to_string()));
+        assert_eq!(tree(&dest), ["plain.txt = not an archive"]);
+    }
+
+    /// The message: plain only for a clean result; otherwise the counts, every
+    /// skipped name with whole folders marked, each failure and anything left behind.
+    #[test]
+    fn the_message_counts_and_names_everything_d230() {
+        let clean = ExtractHereOutcome { published: names(&["a", "b"]), ..Default::default() };
+        assert_eq!(clean.summary(), "Extracted archive");
+        assert_eq!(ExtractHereOutcome::default().summary(), "Nothing to extract: the archive is empty");
+
+        let one = ExtractHereOutcome {
+            published: names(&["a"]),
+            skipped: vec![skip("note.txt", false)],
+            ..Default::default()
+        };
+        assert_eq!(one.summary(), "Extracted 1 item. Skipped 1 that already exists: note.txt");
+        let all = ExtractHereOutcome { skipped: vec![skip("note.txt", false), skip("photos", true)], ..Default::default() };
+        assert_eq!(all.summary(), "Nothing extracted. Skipped 2 that already exist: note.txt, photos (whole folder)");
+        let folder = ExtractHereOutcome {
+            published: names(&["a", "b", "c"]),
+            skipped: vec![skip("photos", true)],
+            ..Default::default()
+        };
+        assert_eq!(folder.summary(), "Extracted 3 items. Skipped 1 that already exists: photos (whole folder)");
+        let failed = ExtractHereOutcome { failed: vec![("f".to_string(), "why".to_string())], ..Default::default() };
+        assert_eq!(failed.summary(), "Nothing extracted. Failed on 1: f (why)");
+        let left = ExtractHereOutcome {
+            published: names(&["a"]),
+            leftover: Some(("/p/.wf-extract-1-2".to_string(), "why".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(left.summary(), "Extracted 1 item. Temporary folder not removed: /p/.wf-extract-1-2 (why)");
+        let mixed = ExtractHereOutcome {
+            published: names(&["a"]),
+            skipped: vec![skip("s", false)],
+            failed: vec![("f1".to_string(), "why 1".to_string()), ("f2".to_string(), "why 2".to_string())],
+            leftover: Some(("/p/.wf-extract-1-2".to_string(), "why 3".to_string())),
+        };
+        assert_eq!(
+            mixed.summary(),
+            "Extracted 1 item. Skipped 1 that already exists: s. Failed on 2: f1 (why 1), f2 (why 2). \
+             Temporary folder not removed: /p/.wf-extract-1-2 (why 3)"
+        );
+        for result in [&one, &all, &folder, &failed, &left, &mixed] {
+            assert_ne!(result.summary(), "Extracted archive", "{result:?}");
+        }
+    }
+}
+
+/// D-231: the exact Trash batch on a fixture Trash of each test's own. The moves
+/// are real renames into that Trash with real `.trashinfo` files. The last test
+/// uses the real GIO call instead, in a home folder of its own. The user's Trash
+/// is never read or changed.
+#[cfg(test)]
+mod partial_trash_tests_d231 {
+    use super::extract_here_tests_d230::{tree, Owned};
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// What one batch reported: every moved item with its receipt and guard,
+    /// the item it stopped at (its state, its path, the reason), and the items
+    /// it never tried.
+    #[derive(Debug)]
+    struct Seen {
+        done: Vec<(TrashReceipt, Fingerprint)>,
+        stop: Option<(&'static str, String, String)>,
+        left: Vec<String>,
+    }
+
+    /// One exact Trash batch as a caller sees it. Its own function so the same
+    /// test text also builds on a tree from before the repair, where the batch
+    /// was all or an error.
+    fn batch_d231(paths: &[String]) -> Seen {
+        let batch = trash_paths_exact(paths);
+        Seen {
+            done: batch.done.into_iter().map(|item| (item.receipt, item.fingerprint)).collect(),
+            stop: batch.stopped.map(|stop| match stop {
+                TrashStop::NotMoved { path, reason } => ("not moved", path, reason),
+                TrashStop::MovedUnidentified { path, reason } => ("moved, not identified", path, reason),
+            }),
+            left: batch.not_attempted,
+        }
+    }
+
+    /// A folder of this test's own with a fixture Trash (`bin`) and a work
+    /// folder holding `names`, each file with its own bytes.
+    struct Case {
+        /// First, so it is dropped first: `bin/files` is listable again before
+        /// the folder is removed.
+        trash: fixture_trash::Installed,
+        _root: Owned,
+        bin: PathBuf,
+        work: PathBuf,
+    }
+
+    impl Case {
+        fn path(&self, name: &str) -> String {
+            self.work.join(name).to_string_lossy().to_string()
+        }
+
+        /// The receipt of the item `name` that sits in the Trash under `stem`.
+        fn receipt(&self, name: &str, stem: &str) -> TrashReceipt {
+            TrashReceipt { original: self.path(name), selector: self.bin.join("files").join(stem).to_string_lossy().to_string() }
+        }
+
+        fn in_trash(&self) -> Vec<String> {
+            tree(&self.bin.join("files"))
+        }
+    }
+
+    /// A new folder of this test's own under the scratch root.
+    fn own_root(tag: &str) -> Owned {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!("wf-d231-{tag}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst));
+        // Another test's cleanup may remove the shared root while it is empty.
+        (0..50)
+            .find_map(|_| {
+                let dir = scratch_root().join(&name);
+                match fs::create_dir(&dir) {
+                    Ok(()) => Some(Owned(dir)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("a new folder of this test's own, {}: {e}", dir.display()),
+                }
+            })
+            .expect("the scratch root kept disappearing")
+    }
+
+    fn case(tag: &str, names: &[&str]) -> Case {
+        let root = own_root(tag);
+        let (bin, work) = (root.0.join("bin"), root.0.join("work"));
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&work).unwrap();
+        for name in names {
+            fs::write(work.join(name), format!("{name} bytes")).unwrap();
+        }
+        let trash = fixture_trash::install(&bin);
+        Case { trash, _root: root, bin, work }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    fn denied() -> String {
+        std::io::Error::from_raw_os_error(libc::EACCES).to_string()
+    }
+
+    const NOTHING: [&str; 0] = [];
+
+    #[test]
+    fn a_later_refusal_keeps_the_moved_item_d231() {
+        let case = case("refuse", &["a.txt", "b.txt", "c.txt"]);
+        case.trash.refuse("b.txt");
+        let guard_a = fingerprint(&case.path("a.txt")).unwrap();
+        let seen = batch_d231(&[case.path("a.txt"), case.path("b.txt"), case.path("c.txt")]);
+
+        // Disk: the first really moved, the refused one and the third are as they were.
+        assert_eq!(tree(&case.work), ["b.txt = b.txt bytes", "c.txt = c.txt bytes"]);
+        assert_eq!(case.in_trash(), ["a.txt = a.txt bytes"]);
+        assert_eq!(case.trash.asked(), [case.path("a.txt"), case.path("b.txt")], "the batch stops at the first failure");
+        // The record: the moved item keeps its exact receipt and its own guard.
+        let a = case.receipt("a.txt", "a.txt");
+        assert_eq!(seen.done, [(a.clone(), guard_a)], "the item already in Trash lost its record: {seen:?}");
+        assert_eq!(seen.stop, Some(("not moved", case.path("b.txt"), "the fixture Trash refused this item".to_string())));
+        assert_eq!(seen.left, [case.path("c.txt")]);
+        // And that record restores the exact payload.
+        restore_from_trash_exact(&[a]).unwrap();
+        assert_eq!(tree(&case.work), ["a.txt = a.txt bytes", "b.txt = b.txt bytes", "c.txt = c.txt bytes"]);
+        assert_eq!(case.in_trash(), NOTHING);
+        assert_eq!(tree(&case.bin.join("info")), NOTHING);
+    }
+
+    #[test]
+    fn a_whole_batch_pairs_every_item_with_its_own_guard_d231() {
+        let case = case("whole", &[]);
+        fs::write(case.work.join("a.txt"), "first a").unwrap();
+        fs::create_dir(case.work.join("sub")).unwrap();
+        fs::write(case.work.join("sub/a.txt"), "second a").unwrap();
+        fs::create_dir(case.work.join("folder")).unwrap();
+        fs::write(case.work.join("folder/inner.txt"), "inner").unwrap();
+        let paths = [case.path("a.txt"), case.path("sub/a.txt"), case.path("folder")];
+        let guards: Vec<Fingerprint> = paths.iter().map(|path| fingerprint(path).unwrap()).collect();
+        let before = tree(&case.work);
+        assert!(!case.bin.join("files").exists(), "this Trash has never been used");
+
+        let seen = batch_d231(&paths);
+
+        assert_eq!(seen.stop, None);
+        assert_eq!(seen.left, NOTHING);
+        assert_eq!(tree(&case.work), ["sub/"]);
+        assert_eq!(case.in_trash(), ["a.txt = first a", "a.txt.2 = second a", "folder/", "folder/inner.txt = inner"]);
+        assert_eq!(case.trash.asked(), paths);
+        // Each item with the entry it really went to, and the guard taken from that item.
+        let receipts = [case.receipt("a.txt", "a.txt"), case.receipt("sub/a.txt", "a.txt.2"), case.receipt("folder", "folder")];
+        let expected: Vec<(TrashReceipt, Fingerprint)> = receipts.iter().cloned().zip(guards).collect();
+        assert_eq!(seen.done, expected);
+        for (receipt, guard) in &seen.done {
+            assert_eq!(&fingerprint(&receipt.selector).unwrap(), guard, "the guard is not this payload's: {receipt:?}");
+        }
+        restore_from_trash_exact(&receipts).unwrap();
+        assert_eq!(tree(&case.work), before);
+        assert_eq!(case.in_trash(), NOTHING);
+    }
+
+    #[test]
+    fn an_unreadable_later_item_is_left_where_it_is_d231() {
+        let case = case("unreadable", &["a.txt", "b.txt", "c.txt"]);
+        let b = case.work.join("b.txt");
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+        let guard_a = fingerprint(&case.path("a.txt")).unwrap();
+        let seen = batch_d231(&[case.path("a.txt"), case.path("b.txt"), case.path("c.txt")]);
+
+        // No guard can be taken from it, so it is not moved and nothing after it is tried.
+        assert_eq!(case.trash.asked(), [case.path("a.txt")], "an item with no guard was moved");
+        assert_eq!(names(&case.work), ["b.txt", "c.txt"]);
+        assert_eq!(fs::symlink_metadata(&b).unwrap().permissions().mode() & 0o777, 0o000);
+        assert_eq!(case.in_trash(), ["a.txt = a.txt bytes"]);
+        let a = case.receipt("a.txt", "a.txt");
+        assert_eq!(seen.done, [(a.clone(), guard_a)], "the item already in Trash lost its record: {seen:?}");
+        assert_eq!(seen.stop, Some(("not moved", case.path("b.txt"), denied())));
+        assert_eq!(seen.left, [case.path("c.txt")]);
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o600)).unwrap();
+        restore_from_trash_exact(&[a]).unwrap();
+        assert_eq!(tree(&case.work), ["a.txt = a.txt bytes", "b.txt = b.txt bytes", "c.txt = c.txt bytes"]);
+    }
+
+    #[test]
+    fn a_second_new_entry_keeps_the_earlier_receipt_d231() {
+        let case = case("twin", &["a.txt", "b.txt", "c.txt"]);
+        case.trash.twin("b.txt");
+        let guard_a = fingerprint(&case.path("a.txt")).unwrap();
+        let seen = batch_d231(&[case.path("a.txt"), case.path("b.txt"), case.path("c.txt")]);
+
+        assert_eq!(tree(&case.work), ["c.txt = c.txt bytes"]);
+        assert_eq!(case.in_trash(), ["a.txt = a.txt bytes", "b.txt = b.txt bytes", "b.txt.twin = someone else's item"]);
+        assert_eq!(case.trash.asked(), [case.path("a.txt"), case.path("b.txt")]);
+        let a = case.receipt("a.txt", "a.txt");
+        assert_eq!(seen.done, [(a.clone(), guard_a)], "the item already in Trash lost its record: {seen:?}");
+        // The second item is in Trash, and no entry is guessed to be its own.
+        assert_eq!(seen.stop, Some(("moved, not identified", case.path("b.txt"), "2 new Trash entries, expected 1".to_string())));
+        assert_eq!(seen.left, [case.path("c.txt")]);
+        restore_from_trash_exact(&[a]).unwrap();
+        assert_eq!(tree(&case.work), ["a.txt = a.txt bytes", "c.txt = c.txt bytes"]);
+        assert_eq!(case.in_trash(), ["b.txt = b.txt bytes", "b.txt.twin = someone else's item"]);
+    }
+
+    #[test]
+    fn a_trash_that_cannot_be_listed_after_a_move_keeps_the_earlier_receipt_d231() {
+        let case = case("blind-after", &["a.txt", "b.txt", "c.txt"]);
+        case.trash.blind_after("b.txt");
+        let guard_a = fingerprint(&case.path("a.txt")).unwrap();
+        let seen = batch_d231(&[case.path("a.txt"), case.path("b.txt"), case.path("c.txt")]);
+        case.trash.blind(false);
+
+        assert_eq!(tree(&case.work), ["c.txt = c.txt bytes"]);
+        assert_eq!(case.in_trash(), ["a.txt = a.txt bytes", "b.txt = b.txt bytes"]);
+        assert_eq!(case.trash.asked(), [case.path("a.txt"), case.path("b.txt")]);
+        let a = case.receipt("a.txt", "a.txt");
+        assert_eq!(seen.done, [(a.clone(), guard_a)], "the item already in Trash lost its record: {seen:?}");
+        assert_eq!(
+            seen.stop,
+            Some(("moved, not identified", case.path("b.txt"), format!("cannot read the Trash folder: {}", denied())))
+        );
+        assert_eq!(seen.left, [case.path("c.txt")]);
+        restore_from_trash_exact(&[a]).unwrap();
+        assert_eq!(tree(&case.work), ["a.txt = a.txt bytes", "c.txt = c.txt bytes"]);
+    }
+
+    #[test]
+    fn a_trash_that_cannot_be_listed_gets_nothing_moved_into_it_d231() {
+        let case = case("blind", &["a.txt", "b.txt"]);
+        fs::create_dir(case.bin.join("files")).unwrap();
+        case.trash.blind(true);
+        let seen = batch_d231(&[case.path("a.txt"), case.path("b.txt")]);
+        case.trash.blind(false);
+
+        // An unreadable Trash folder is an error, not an empty one.
+        assert_eq!(case.trash.asked(), NOTHING, "an item was moved into a Trash that could not be read");
+        assert_eq!(tree(&case.work), ["a.txt = a.txt bytes", "b.txt = b.txt bytes"]);
+        assert_eq!(case.in_trash(), NOTHING);
+        assert!(seen.done.is_empty(), "{seen:?}");
+        assert_eq!(
+            seen.stop,
+            Some(("not moved", case.path("a.txt"), format!("cannot read the Trash folder: {}", denied())))
+        );
+        assert_eq!(seen.left, [case.path("b.txt")]);
+    }
+
+    /// The same batch on the real GIO Trash call, with no fixture. GIO takes
+    /// its Trash from the home folder its process started with, so this starts
+    /// a second copy of the test program with HOME set to a folder of this
+    /// test's own: the only Trash that copy works in is inside this test's
+    /// root. The later refusal is real as well: GIO cannot move a file out of
+    /// a folder that does not allow changes.
+    #[test]
+    fn a_real_gio_refusal_keeps_the_moved_item_d231() {
+        const ROOT: &str = "WF_D231_GIO_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            return real_gio_refusal(Path::new(&root));
+        }
+        let root = own_root("gio");
+        let home = root.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["a_real_gio_refusal_keeps_the_moved_item_d231", "--nocapture"])
+            .env("HOME", &home)
+            .env(ROOT, &root.0)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .expect("start the second copy of the test program");
+        let (said, noted) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && said.contains("1 passed"), "the copy with its own home failed:\n{said}\n{noted}");
+        eprint!("{noted}");
+    }
+
+    /// Runs in the second copy, where HOME is `root/home`.
+    fn real_gio_refusal(root: &Path) {
+        let home = root.join("home");
+        // Never on the real home: only on a root this test made.
+        assert!(root.starts_with(scratch_root()) && root != scratch_root(), "{} is not this test's own", root.display());
+        assert_eq!(std::env::var_os("HOME"), Some(home.clone().into_os_string()));
+        assert_eq!(std::env::var_os("XDG_DATA_HOME"), None);
+        assert_eq!(fixture_trash::dir(), None, "this copy has no fixture Trash");
+        let (work, locked) = (root.join("work"), root.join("work/locked"));
+        fs::create_dir_all(&locked).unwrap();
+        let path = |name: &str| work.join(name).to_string_lossy().to_string();
+        for name in ["a.txt", "locked/b.txt", "c.txt"] {
+            fs::write(work.join(name), format!("{name} bytes")).unwrap();
+        }
+        let guard_a = fingerprint(&path("a.txt")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let seen = batch_d231(&[path("a.txt"), path("locked/b.txt"), path("c.txt")]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("real GIO batch: {seen:?}");
+
+        // GIO put a.txt, and nothing else, in the Trash of this home with its record.
+        let trash = home.join(".local/share/Trash");
+        assert_eq!(tree(&trash.join("files")), ["a.txt = a.txt bytes"]);
+        assert_eq!(names(&trash.join("info")), ["a.txt.trashinfo"]);
+        let info = fs::read_to_string(trash.join("info/a.txt.trashinfo")).unwrap();
+        assert!(info.contains(&format!("Path={}\n", path("a.txt"))), "{info}");
+        assert_eq!(tree(&work), ["c.txt = c.txt bytes", "locked/", "locked/b.txt = locked/b.txt bytes"]);
+        // The moved item keeps its exact receipt and guard although b.txt was refused.
+        let a = TrashReceipt { original: path("a.txt"), selector: trash.join("files/a.txt").to_string_lossy().to_string() };
+        assert_eq!(seen.done, [(a.clone(), guard_a)], "the moved item's receipt was lost");
+        let (state, at, reason) = seen.stop.clone().expect("the batch stopped");
+        assert_eq!((state, at), ("not moved", path("locked/b.txt")));
+        assert!(reason.contains("Permission denied"), "{reason}");
+        assert_eq!(seen.left, [path("c.txt")]);
+        // The exact restore takes it back out of this home's Trash.
+        restore_from_trash_exact(&[a]).unwrap();
+        assert_eq!(
+            tree(&work),
+            ["a.txt = a.txt bytes", "c.txt = c.txt bytes", "locked/", "locked/b.txt = locked/b.txt bytes"]
+        );
+        assert_eq!(names(&trash.join("files")), NOTHING);
+        assert_eq!(names(&trash.join("info")), NOTHING);
+    }
+}
+
+/// D-232: the clipboard formats on their own. No clipboard and no display is
+/// used here; the bytes are the ones the three forms carry.
+#[cfg(test)]
+mod clip_format_tests_d232 {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn files(intent: ClipIntent, paths: &[&str]) -> Result<ClipFiles, String> {
+        Ok(ClipFiles { intent, paths: paths.iter().map(PathBuf::from).collect() })
+    }
+    fn gnome(data: &str) -> Result<ClipFiles, String> {
+        clip_decode(&ClipRead::Gnome { gnome: data.as_bytes().to_vec(), kde_cut: None })
+    }
+    fn gnome_kde(data: &str, marker: &[u8]) -> Result<ClipFiles, String> {
+        clip_decode(&ClipRead::Gnome { gnome: data.as_bytes().to_vec(), kde_cut: Some(marker.to_vec()) })
+    }
+    fn kde(before: &[u8], uris: &str, after: &[u8]) -> Result<ClipFiles, String> {
+        clip_decode(&ClipRead::Kde {
+            cut_before: before.to_vec(),
+            uris: uris.as_bytes().to_vec(),
+            cut_after: after.to_vec(),
+        })
+    }
+    fn uri_only(uris: &str) -> Result<ClipFiles, String> {
+        clip_decode(&ClipRead::UriOnly { uris: uris.as_bytes().to_vec() })
+    }
+    fn refused(result: Result<ClipFiles, String>) -> String {
+        result.expect_err("this clipboard content is refused")
+    }
+
+    const PLAIN: &str = "/tmp/wf d232/a b.txt";
+    const ODD: &str = "/tmp/wf d232/100%#é\nx";
+    const PLAIN_URI: &str = "file:///tmp/wf%20d232/a%20b.txt";
+    const ODD_URI: &str = "file:///tmp/wf%20d232/100%25%23%C3%A9%0Ax";
+
+    #[test]
+    fn encode_writes_the_three_forms_exactly_d232() {
+        let paths = [PathBuf::from(PLAIN), PathBuf::from(ODD)];
+        let cut = clip_encode(&paths, ClipIntent::Cut).unwrap();
+        assert_eq!(String::from_utf8(cut.gnome).unwrap(), format!("cut\n{PLAIN_URI}\n{ODD_URI}"));
+        assert_eq!(String::from_utf8(cut.uri_list).unwrap(), format!("{PLAIN_URI}\r\n{ODD_URI}\r\n"));
+        assert_eq!(cut.kde_cut, b"1");
+        let copy = clip_encode(&paths[..1], ClipIntent::Copy).unwrap();
+        assert_eq!(String::from_utf8(copy.gnome).unwrap(), format!("copy\n{PLAIN_URI}"));
+        assert_eq!(String::from_utf8(copy.uri_list).unwrap(), format!("{PLAIN_URI}\r\n"));
+        assert_eq!(copy.kde_cut, b"0");
+        // Nothing, or a path that is not full, is refused instead of guessed.
+        assert_eq!(clip_encode(&[], ClipIntent::Copy).unwrap_err(), "there is nothing to put on the clipboard");
+        assert_eq!(clip_encode(&[PathBuf::from("a.txt")], ClipIntent::Copy).unwrap_err(), "a.txt is not a full path");
+    }
+
+    #[test]
+    fn every_form_reads_back_the_same_files_d232() {
+        // A name that is not UTF-8 goes through as its exact bytes.
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/wf d232/\xff\xfe.bin".to_vec()));
+        let paths = vec![PathBuf::from(PLAIN), PathBuf::from(ODD), raw];
+        for intent in [ClipIntent::Copy, ClipIntent::Cut] {
+            let want = Ok(ClipFiles { intent, paths: paths.clone() });
+            let payload = clip_encode(&paths, intent).unwrap();
+            let both = ClipRead::Gnome { gnome: payload.gnome.clone(), kde_cut: Some(payload.kde_cut.clone()) };
+            assert_eq!(clip_decode(&both), want, "the GNOME form with the KDE marker");
+            let alone = ClipRead::Gnome { gnome: payload.gnome.clone(), kde_cut: None };
+            assert_eq!(clip_decode(&alone), want, "the GNOME form alone");
+            let marked = ClipRead::Kde {
+                cut_before: payload.kde_cut.clone(),
+                uris: payload.uri_list.clone(),
+                cut_after: payload.kde_cut.clone(),
+            };
+            assert_eq!(clip_decode(&marked), want, "the URI list with the KDE marker");
+            // A URI list alone never moves anything.
+            let list = ClipRead::UriOnly { uris: payload.uri_list.clone() };
+            assert_eq!(clip_decode(&list), Ok(ClipFiles { intent: ClipIntent::Copy, paths: paths.clone() }));
+        }
+    }
+
+    #[test]
+    fn the_gnome_form_needs_copy_or_cut_d232() {
+        assert_eq!(gnome("copy\nfile:///tmp/a"), files(ClipIntent::Copy, &["/tmp/a"]));
+        assert_eq!(gnome("cut\nfile:///tmp/a\nfile:///tmp/b\n"), files(ClipIntent::Cut, &["/tmp/a", "/tmp/b"]));
+        assert_eq!(gnome("cut\r\nfile:///tmp/a\r\n\0"), files(ClipIntent::Cut, &["/tmp/a"]), "line ends and a final zero byte");
+        assert_eq!(gnome("copy\nfile:///tmp/a\nfile:///tmp/a"), files(ClipIntent::Copy, &["/tmp/a"]), "the same file twice");
+        for first in ["", "move", "Cut", "copy ", " cut", "file:///tmp/a", "cutfile:///tmp/a"] {
+            assert_eq!(
+                refused(gnome(&format!("{first}\nfile:///tmp/a"))),
+                "the clipboard does not say copy or cut",
+                "first line {first:?}"
+            );
+        }
+        assert_eq!(refused(gnome("cut")), "the clipboard holds no files");
+        assert_eq!(refused(gnome("copy\n\n\n")), "the clipboard holds no files");
+        // A `#` line is a note only in a URI list; here it is a bad entry.
+        assert_eq!(refused(gnome("copy\n#file:///tmp/a")), "#file:///tmp/a is not a valid file address");
+        assert_eq!(
+            refused(clip_decode(&ClipRead::Gnome { gnome: b"cut\nfile:///tmp/\xff".to_vec(), kde_cut: None })),
+            "the clipboard data is not text"
+        );
+    }
+
+    #[test]
+    fn a_marker_is_never_guessed_d232() {
+        // Both markers present: they must agree.
+        assert_eq!(gnome_kde("cut\nfile:///tmp/a", b"1"), files(ClipIntent::Cut, &["/tmp/a"]));
+        assert_eq!(gnome_kde("copy\nfile:///tmp/a", b"0\0"), files(ClipIntent::Copy, &["/tmp/a"]));
+        assert_eq!(refused(gnome_kde("copy\nfile:///tmp/a", b"1")), "the clipboard's copy and cut markers disagree");
+        assert_eq!(refused(gnome_kde("cut\nfile:///tmp/a", b"0")), "the clipboard's copy and cut markers disagree");
+        for marker in [&b""[..], b"2", b"11", b"cut", b"true", b"\xff", b"1 0"] {
+            assert_eq!(
+                refused(gnome_kde("cut\nfile:///tmp/a", marker)),
+                "the clipboard's cut marker is not 0 or 1",
+                "marker {marker:?} beside the GNOME form"
+            );
+            assert_eq!(
+                refused(kde(marker, "file:///tmp/a\r\n", marker)),
+                "the clipboard's cut marker is not 0 or 1",
+                "marker {marker:?} beside a URI list"
+            );
+        }
+        // The KDE form: the marker read before the list and after it must match.
+        assert_eq!(kde(b"1", "file:///tmp/a\r\n", b"1"), files(ClipIntent::Cut, &["/tmp/a"]));
+        assert_eq!(kde(b"0", "file:///tmp/a\r\n", b"0"), files(ClipIntent::Copy, &["/tmp/a"]));
+        assert_eq!(refused(kde(b"1", "file:///tmp/a\r\n", b"0")), "the clipboard changed while it was read");
+        assert_eq!(refused(kde(b"0", "file:///tmp/a\r\n", b"1")), "the clipboard changed while it was read");
+    }
+
+    #[test]
+    fn a_uri_list_alone_is_a_copy_d232() {
+        assert_eq!(
+            uri_only("# a note\r\nfile:///tmp/a\r\n\r\n  file:///tmp/b%20c  \r\n"),
+            files(ClipIntent::Copy, &["/tmp/a", "/tmp/b c"])
+        );
+        assert_eq!(uri_only("file:///tmp/a"), files(ClipIntent::Copy, &["/tmp/a"]), "no final line end");
+        assert_eq!(uri_only("file://localhost/tmp/a\n"), files(ClipIntent::Copy, &["/tmp/a"]));
+        assert_eq!(uri_only(&format!("file://{}/tmp/a\n", glib::host_name())), files(ClipIntent::Copy, &["/tmp/a"]));
+        assert_eq!(uri_only("FILE:///tmp/a\n"), files(ClipIntent::Copy, &["/tmp/a"]));
+        assert_eq!(uri_only(&format!("{PLAIN_URI}\r\n{ODD_URI}\r\n")), files(ClipIntent::Copy, &[PLAIN, ODD]));
+        for empty in ["", "\r\n", "# only a note\r\n", "\0\0"] {
+            assert_eq!(refused(uri_only(empty)), "the clipboard holds no files", "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn one_bad_entry_refuses_the_whole_paste_d232() {
+        let cases = [
+            ("sftp://host/tmp/a", "sftp://host/tmp/a is not a local file (sftp is not supported)"),
+            ("smb://server/share/a", "smb://server/share/a is not a local file (smb is not supported)"),
+            ("trash:///a.txt", "trash:///a.txt is not a local file (trash is not supported)"),
+            ("https://example.org/a", "https://example.org/a is not a local file (https is not supported)"),
+            ("file://elsewhere.invalid/tmp/a", "file://elsewhere.invalid/tmp/a is on another computer"),
+            ("/tmp/a", "/tmp/a is not a file address"),
+            ("a.txt", "a.txt is not a file address"),
+            ("file:tmp/a", "file:tmp/a is not a valid file address"),
+            ("file:///tmp/a%00b", "file:///tmp/a%00b is not a valid file address"),
+            ("file:///tmp/a%2Fb", "file:///tmp/a%2Fb is not a valid file address"),
+            ("file:///tmp/a%zz", "file:///tmp/a%zz is not a valid file address"),
+            ("file:///tmp/a#b", "file:///tmp/a#b is not a valid file address"),
+            ("file:///tmp/a?b", "file:///tmp/a?b is not a valid file address"),
+            ("file:///", "file:/// does not name a file or folder"),
+            ("file:///tmp/..", "file:///tmp/.. does not name a file or folder"),
+        ];
+        for (bad, why) in cases {
+            assert_eq!(refused(uri_only(&format!("{bad}\r\n"))), why, "alone");
+            // A good entry before it and after it does not get through either.
+            let mixed = format!("file:///tmp/good-1\n{bad}\nfile:///tmp/good-2");
+            assert_eq!(refused(uri_only(&mixed)), why, "between two good entries, URI list");
+            assert_eq!(refused(gnome(&format!("cut\n{mixed}"))), why, "between two good entries, GNOME form");
+            assert_eq!(refused(kde(b"1", &mixed, b"1")), why, "between two good entries, KDE form");
+        }
+        // A long entry is shown cut to its first 80 characters.
+        let long = format!("ftp://host/{}", "x".repeat(200));
+        assert_eq!(
+            refused(uri_only(&long)),
+            format!("{} is not a local file (ftp is not supported)", &long[..80])
+        );
+        // A control character in an entry never reaches the status line.
+        assert_eq!(refused(uri_only("file:///tmp/a\0b\r\n")), "file:///tmp/a\u{FFFD}b is not a valid file address");
+        assert_eq!(refused(gnome("copy\nbell\u{7}here")), "bell\u{FFFD}here is not a file address");
     }
 }

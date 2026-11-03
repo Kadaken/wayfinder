@@ -702,16 +702,14 @@ popover contents {
 }
 "#;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ClipboardMode {
-    Copy,
-    Cut,
-}
-
-#[derive(Clone)]
-struct FileClipboard {
-    mode: ClipboardMode,
-    paths: Vec<native_core::ClipboardSource>,
+/// D-232: this window's own last Copy or Cut, kept for its status line only.
+/// The display clipboard is the one authority for Paste; this note goes the
+/// moment the clipboard changes hands.
+#[derive(Clone, Copy)]
+struct PendingOffer {
+    serial: u64,
+    intent: native_core::ClipIntent,
+    count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -765,6 +763,11 @@ struct JobOutcome {
     /// never fires for it; `undo_action`/`redo_action` push it onto the
     /// correct stack themselves.
     reciprocal: Option<UndoAction>,
+    /// D-231: set only by a history step that moved some of its items to
+    /// Trash and then stopped. It is the part of the source entry that was not
+    /// performed; `undo_action`/`redo_action` put it back on the stack the
+    /// step came from, so a retry never touches an item already moved.
+    remainder: Option<UndoAction>,
 }
 
 impl JobOutcome {
@@ -774,6 +777,7 @@ impl JobOutcome {
             undo: None,
             refresh_to: None,
             reciprocal: None,
+            remainder: None,
         }
     }
 
@@ -783,6 +787,7 @@ impl JobOutcome {
             undo: Some(undo),
             refresh_to: None,
             reciprocal: None,
+            remainder: None,
         }
     }
 
@@ -792,6 +797,7 @@ impl JobOutcome {
             undo: None,
             refresh_to: Some(path),
             reciprocal: None,
+            remainder: None,
         }
     }
 
@@ -801,6 +807,7 @@ impl JobOutcome {
             undo: None,
             refresh_to: None,
             reciprocal: Some(reciprocal),
+            remainder: None,
         }
     }
 }
@@ -818,7 +825,7 @@ enum ZoomTarget {
     Preview,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 struct Bookmark {
     name: String,
     path: String,
@@ -938,17 +945,18 @@ struct WireChoiceNative {
 }
 
 /// Mirrors `portal_service::WireRequest`: the decoded per-request data
-/// read from `--request <path>`. Absent or malformed means every field
-/// defaults empty/false, matching an ordinary pre-D-222 pick.
+/// read from `--request <path>`. `Default` backs only the legacy
+/// no-`--request` invocation; a supplied request file must carry every
+/// field explicitly (`current_filter`'s value may be `null`, but the key
+/// itself must be present) -- `parse_wire_request` enforces this by
+/// checking key presence before deserializing, since serde's own
+/// per-field handling of an `Option<T>` treats a missing key as `None`
+/// regardless of `#[serde(default)]`.
 #[derive(Clone, Debug, Default, Deserialize)]
 struct WireRequestNative {
-    #[serde(default)]
     multiple: bool,
-    #[serde(default)]
     filters: Vec<WireFilterNative>,
-    #[serde(default)]
     current_filter: Option<WireFilterNative>,
-    #[serde(default)]
     choices: Vec<WireChoiceNative>,
 }
 
@@ -996,6 +1004,12 @@ struct PickerConfig {
     filter: Option<String>,
     window: Option<PickerWindow>,
     request: WireRequestNative,
+    /// The calling app's exported toplevel handle as the portal passed
+    /// it (`wayland:<handle>` / `x11:<xid>`), or `None` when the app
+    /// supplied no parent. `Some` makes the picker a child of that
+    /// toplevel, so the compositor stacks it above the app that asked
+    /// instead of leaving it behind that app's window.
+    parent_window: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1057,11 +1071,81 @@ fn parse_picker_window(value: &str) -> Option<PickerWindow> {
     }
 }
 
-fn parse_wire_request(path: &str) -> WireRequestNative {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// Same bound as `portal_service::MAX_WIRE_JSON_BYTES`; defined
+/// separately rather than imported -- this file must never import
+/// `portal_service`.
+const MAX_WIRE_REQUEST_BYTES: u64 = 64 * 1024;
+
+/// Reads and decodes `--request <path>`. Every failure mode -- the path
+/// doesn't exist, isn't readable, exceeds `MAX_WIRE_REQUEST_BYTES`, isn't
+/// valid JSON, isn't a JSON object, is missing one of the four required
+/// top-level keys (`current_filter` included -- its value may be `null`,
+/// but the key must be present), or doesn't deserialize into the expected
+/// shape once those keys are confirmed -- is `Err(())`; never a silently
+/// defaulted, unconstrained request. The bound is enforced by the read
+/// itself: at most `MAX_WIRE_REQUEST_BYTES + 1` bytes are ever pulled off
+/// the file, so a file whose metadata lies about its length (a FIFO
+/// reports zero) or that grows after being opened still cannot produce an
+/// accepted oversized request. The caller (`main`) must exit before any
+/// window is built when this fails for a `--pick` invocation;
+/// `parse_picker_state` below treats its own call to this function the
+/// same way -- a failure there is a refusal, never a default.
+fn parse_wire_request(path: &str) -> Result<WireRequestNative, ()> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|_| ())?;
+    let mut buf = Vec::new();
+    file.take(MAX_WIRE_REQUEST_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| ())?;
+    if buf.len() as u64 > MAX_WIRE_REQUEST_BYTES {
+        return Err(());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&buf).map_err(|_| ())?;
+    let obj = value.as_object().ok_or(())?;
+    for key in ["multiple", "filters", "current_filter", "choices"] {
+        if !obj.contains_key(key) {
+            return Err(());
+        }
+    }
+    serde_json::from_value(value).map_err(|_| ())
+}
+
+/// A `--pick --request <path>` invocation whose request file is absent,
+/// unreadable, oversized, malformed JSON or the wrong shape must never
+/// open any window -- picker or ordinary unconstrained browser -- so this
+/// exits the process before GTK, GStreamer or a display connection are
+/// touched. A `--pick` invocation with no `--request` at all is the
+/// ordinary legacy picker path and is untouched by this check. A
+/// trailing `--request` with no following value is tracked as "the flag
+/// was supplied" independently of having a path, so it is refused here
+/// rather than silently treated as if `--request` had never appeared.
+fn fail_closed_on_invalid_request() {
+    let mut args = std::env::args().skip(1);
+    let mut pick = false;
+    let mut saw_request_flag = false;
+    let mut request_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--pick" => pick = true,
+            "--request" => {
+                saw_request_flag = true;
+                request_path = args.next();
+            }
+            _ => {}
+        }
+    }
+    if !pick {
+        return;
+    }
+    if saw_request_flag {
+        let ok = request_path
+            .as_deref()
+            .map(|path| parse_wire_request(path).is_ok())
+            .unwrap_or(false);
+        if !ok {
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolves the index of `request.current_filter` within
@@ -1097,6 +1181,7 @@ fn parse_picker_state() -> Option<PickerState> {
     let mut filter = None;
     let mut out_file = None;
     let mut window = None;
+    let mut parent_window = None;
     let mut request = WireRequestNative::default();
     let mut meta_path = None;
 
@@ -1108,12 +1193,23 @@ fn parse_picker_state() -> Option<PickerState> {
             "--out" => out_file = args.next(),
             "--starting-dir" => starting_dir = args.next(),
             "--filter" => filter = args.next(),
-            "--request" => {
-                if let Some(path) = args.next() {
-                    request = parse_wire_request(&path);
-                    meta_path = Some(result_meta_path_for(&path));
-                }
-            }
+            "--request" => match args.next() {
+                Some(path) => match parse_wire_request(&path) {
+                    Ok(parsed) => {
+                        request = parsed;
+                        meta_path = Some(result_meta_path_for(&path));
+                    }
+                    // A valid `--pick` invocation already passed
+                    // `fail_closed_on_invalid_request`'s check of this same
+                    // path; a failure here means the file changed out from
+                    // under that check, or this call came from a test
+                    // bypassing it. Either way it is a refusal, never the
+                    // unconstrained `WireRequestNative::default()` this once
+                    // fell back to.
+                    Err(()) => std::process::exit(1),
+                },
+                None => std::process::exit(1),
+            },
             "--picker-size" => {
                 if let Some(value) = args.next() {
                     window = parse_picker_size(&value);
@@ -1123,6 +1219,9 @@ fn parse_picker_state() -> Option<PickerState> {
                 if let Some(value) = args.next() {
                     window = parse_picker_window(&value);
                 }
+            }
+            "--parent-window" => {
+                parent_window = args.next().filter(|value| !value.is_empty());
             }
             _ => {}
         }
@@ -1143,6 +1242,7 @@ fn parse_picker_state() -> Option<PickerState> {
             filter,
             window,
             request,
+            parent_window,
         },
         out_file: out_file?,
         meta_path,
@@ -1181,15 +1281,65 @@ fn wire_filter_allows(filter: &WireFilterNative, entry: &Entry) -> bool {
     })
 }
 
-/// Minimal glob matcher supporting `*` (any run of characters) and `?`
-/// (exactly one character); no character classes, no escaping -- the
-/// portal's own filter contract defines nothing beyond this.
+/// Glob matcher supporting `*` (any run of characters), `?` (exactly one
+/// character), and a `[...]` character class matching exactly one
+/// character against the set/ranges inside the brackets (e.g.
+/// `[tT]`, `[a-z]`); `[!...]`/`[^...]` negates the class. Case-sensitive
+/// throughout, no escaping beyond the class -- this is the installed
+/// `org.freedesktop.portal.FileChooser` contract's own glob grammar, not
+/// an extension of it.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    /// Parses a `[...]` class starting just after the opening `[` in `p`.
+    /// Returns the matched members, whether the class is negated, and the
+    /// remaining pattern slice after the closing `]`. `None` when there is
+    /// no closing `]` -- an unterminated class is matched as a literal
+    /// `[` instead of a class.
+    fn parse_class(p: &[char]) -> Option<(Vec<(char, char)>, bool, &[char])> {
+        let mut i = 0;
+        let negated = matches!(p.first(), Some('!') | Some('^'));
+        if negated {
+            i += 1;
+        }
+        let start = i;
+        while i < p.len() && (p[i] != ']' || i == start) {
+            i += 1;
+        }
+        if i >= p.len() {
+            return None;
+        }
+        let members = &p[start..i];
+        let mut ranges = Vec::new();
+        let mut j = 0;
+        while j < members.len() {
+            if j + 2 < members.len() && members[j + 1] == '-' {
+                ranges.push((members[j], members[j + 2]));
+                j += 3;
+            } else {
+                ranges.push((members[j], members[j]));
+                j += 1;
+            }
+        }
+        Some((ranges, negated, &p[i + 1..]))
+    }
+
+    fn class_matches(ranges: &[(char, char)], negated: bool, c: char) -> bool {
+        let hit = ranges.iter().any(|(lo, hi)| *lo <= c && c <= *hi);
+        hit != negated
+    }
+
     fn inner(p: &[char], t: &[char]) -> bool {
         match p.first() {
             None => t.is_empty(),
             Some('*') => inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..])),
             Some('?') => !t.is_empty() && inner(&p[1..], &t[1..]),
+            Some('[') => match parse_class(&p[1..]) {
+                Some((ranges, negated, rest)) => {
+                    !t.is_empty()
+                        && class_matches(&ranges, negated, t[0])
+                        && inner(rest, &t[1..])
+                }
+                None => t.first() == Some(&'[') && inner(&p[1..], &t[1..]),
+            },
             Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
         }
     }
@@ -1198,31 +1348,17 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     inner(&p, &t)
 }
 
-/// `Entry` carries no MIME type, only an extension; this guesses a MIME
-/// type from the extension for the common cases a filter is likely to
-/// name, and falls back to `application/octet-stream` otherwise -- a
-/// best-effort match, never a crash or a panic on an unknown extension.
-fn guess_mime_from_name(name: &str) -> &'static str {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "txt" => "text/plain",
-        "md" => "text/markdown",
-        "csv" => "text/csv",
-        "html" | "htm" => "text/html",
-        "json" => "application/json",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "mp3" => "audio/mpeg",
-        "mp4" => "video/mp4",
-        _ => "application/octet-stream",
-    }
+/// `Entry` carries no MIME type, only a name; this resolves one via the
+/// platform's own GIO content-type database (`g_content_type_guess`,
+/// name-only, no file data read) and converts the result to its
+/// registered MIME type string, matching whatever `xdg-mime`/the desktop
+/// environment itself would report -- never a separate, narrower
+/// extension table that drifts from the platform.
+fn guess_mime_from_name(name: &str) -> String {
+    let (content_type, _uncertain) = gio::content_type_guess(Some(name), None);
+    gio::content_type_get_mime_type(&content_type)
+        .map(|mime| mime.to_string())
+        .unwrap_or_else(|| content_type.to_string())
 }
 
 fn mime_match(pattern: &str, entry: &Entry) -> bool {
@@ -1242,6 +1378,10 @@ fn picker_filter_allows(picker: Option<&PickerState>, entry: &Entry) -> bool {
     if let Some(index) = *picker.active_filter.borrow() {
         if let Some(active) = picker.config.request.filters.get(index) {
             return entry.is_dir || wire_filter_allows(active, entry);
+        }
+    } else if picker.config.request.filters.is_empty() {
+        if let Some(lone) = &picker.config.request.current_filter {
+            return entry.is_dir || wire_filter_allows(lone, entry);
         }
     }
     let Some(filter) = picker.config.filter.as_deref() else {
@@ -1265,7 +1405,14 @@ fn picker_write_result_meta(picker: &PickerState) {
     let current_filter = picker
         .active_filter
         .borrow()
-        .and_then(|i| picker.config.request.filters.get(i).cloned());
+        .and_then(|i| picker.config.request.filters.get(i).cloned())
+        .or_else(|| {
+            if picker.config.request.filters.is_empty() {
+                picker.config.request.current_filter.clone()
+            } else {
+                None
+            }
+        });
     let selections = picker.choice_selections.borrow();
     let choices = picker
         .config
@@ -1642,7 +1789,9 @@ struct AppState {
     tree_children: HashMap<String, Vec<(String, String, bool)>>,
     typeahead: String,
     typeahead_at: Instant,
-    clipboard: Option<FileClipboard>,
+    pending_offer: Option<PendingOffer>,
+    /// D-232: counts this window's Paste presses, so an older read gives way.
+    paste_request: u64,
     /// D-155: the one transfer whose progress and Cancel the strip shows.
     active_transfer: Option<ActiveTransfer>,
     undo_stack: Vec<UndoAction>,
@@ -1681,6 +1830,15 @@ struct AppState {
     /// A refresh was asked for while one ran; run once more when it lands.
     drive_refresh_again: bool,
     drive_scan: DriveScan,
+    /// The drive rows the last sidebar rebuild made, in the order of `drives`.
+    drive_rows: Vec<DriveRowHandle>,
+    /// Drive menus opened in this window. Closed ones drop out on the next look.
+    drive_menus: Vec<glib::WeakRef<gtk::Popover>>,
+    /// The newest drive list that calls for a rebuild, held while a drive menu is open.
+    drives_pending: Option<Vec<Drive>>,
+    /// The recents the last sidebar rebuild listed. A visit changes `recents` and
+    /// leaves the sidebar alone; the next drive scan brings the list up to date.
+    recents_shown: Vec<Bookmark>,
     /// The one newest guide request for this window (never queued).
     #[cfg(feature = "guide")]
     guide_pending: GuideRequest,
@@ -3001,6 +3159,7 @@ fn main() {
     if std::env::args().any(|arg| arg == "--pick-capable") {
         std::process::exit(0);
     }
+    fail_closed_on_invalid_request();
     // D-85: required once before any playbin/appsink use (video Grid posters,
     // preview). No-op cost if a folder is never opened.
     gst::init().expect("gstreamer init");
@@ -3076,6 +3235,33 @@ fn main() {
     app.run_with_args(&gtk_launch_args(&launch_args));
 }
 
+/// Makes `window` a child of the calling app's exported toplevel, named
+/// by the portal's `parent_window` handle. Without this the picker is a
+/// parentless toplevel: a Wayland compositor has no relationship to
+/// stack it by, so it opens behind the window that asked for it.
+///
+/// The surface only exists once the window is realized, and the handle
+/// only takes effect before the surface is mapped, so this realizes the
+/// window and sets the relationship in that gap, before `present()`.
+/// Only the `wayland:` shape is handled; an `x11:` handle on a Wayland
+/// session, or any other shape, is left alone rather than guessed at.
+fn attach_to_exported_parent(window: &adw::ApplicationWindow, handle: &str) {
+    let Some(exported) = handle.strip_prefix("wayland:") else {
+        return;
+    };
+    if exported.is_empty() {
+        return;
+    }
+    gtk::prelude::WidgetExt::realize(window);
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    let Ok(toplevel) = surface.downcast::<gdk4_wayland::WaylandToplevel>() else {
+        return;
+    };
+    toplevel.set_transient_for_exported(exported);
+}
+
 fn gtk_launch_args(raw_args: &[String]) -> Vec<String> {
     let program = raw_args
         .first()
@@ -3092,6 +3278,7 @@ fn gtk_launch_args(raw_args: &[String]) -> Vec<String> {
                 | "--filter"
                 | "--picker-size"
                 | "--picker-window"
+                | "--parent-window"
         )
     });
 
@@ -3141,6 +3328,61 @@ fn install_app_css() {
     }
 }
 
+/// Builds the real filter-dropdown and choice controls onto `actions` from
+/// `picker_state`'s decoded request. `build_ui` and any test proving the
+/// enumerated choice's caller-visible label actually lands in the GTK
+/// widget tree call this same function -- never a copy of it.
+fn build_picker_filter_and_choice_controls(
+    actions: &gtk::Box,
+    picker_state: &PickerState,
+) -> (Option<gtk::DropDown>, Vec<(String, ChoiceWidget)>) {
+    let mut picker_filter_dropdown: Option<gtk::DropDown> = None;
+    let mut picker_choice_widgets: Vec<(String, ChoiceWidget)> = Vec::new();
+
+    let filters = &picker_state.config.request.filters;
+    if filters.len() >= 2 {
+        let names: Vec<&str> = filters.iter().map(|f| f.name.as_str()).collect();
+        let dropdown = gtk::DropDown::from_strings(&names);
+        dropdown.add_css_class("wf-picker-filter");
+        if let Some(index) = *picker_state.active_filter.borrow() {
+            dropdown.set_selected(index as u32);
+        }
+        actions.append(&dropdown);
+        picker_filter_dropdown = Some(dropdown);
+    }
+
+    for choice in &picker_state.config.request.choices {
+        let selections = &picker_state.choice_selections;
+        let initial_selected = selections
+            .borrow()
+            .get(&choice.id)
+            .cloned()
+            .unwrap_or_else(|| choice.initial.clone());
+        let widget = if choice.options.is_empty() {
+            let check = gtk::CheckButton::builder().label(&choice.label).build();
+            check.set_active(initial_selected == "true");
+            actions.append(&check);
+            ChoiceWidget::Boolean(check)
+        } else {
+            let option_ids: Vec<String> =
+                choice.options.iter().map(|(id, _)| id.clone()).collect();
+            let labels: Vec<&str> =
+                choice.options.iter().map(|(_, label)| label.as_str()).collect();
+            let choice_label = gtk::Label::new(Some(&choice.label));
+            actions.append(&choice_label);
+            let dropdown = gtk::DropDown::from_strings(&labels);
+            if let Some(index) = option_ids.iter().position(|id| id == &initial_selected) {
+                dropdown.set_selected(index as u32);
+            }
+            actions.append(&dropdown);
+            ChoiceWidget::Enumerated(dropdown, option_ids)
+        };
+        picker_choice_widgets.push((choice.id.clone(), widget));
+    }
+
+    (picker_filter_dropdown, picker_choice_widgets)
+}
+
 fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: Option<String>) {
     let config = load_config();
     let picker = parse_picker_state();
@@ -3187,7 +3429,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         tree_children: HashMap::new(),
         typeahead: String::new(),
         typeahead_at: Instant::now(),
-        clipboard: None,
+        pending_offer: None,
+        paste_request: 0,
         active_transfer: None,
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
@@ -3205,6 +3448,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         drive_refresh_in_flight: false,
         drive_refresh_again: false,
         drive_scan: drive_scan(),
+        drive_rows: Vec::new(),
+        drive_menus: Vec::new(),
+        drives_pending: None,
+        recents_shown: Vec::new(),
         #[cfg(feature = "guide")]
         guide_pending: GuideRequest::Clear,
         #[cfg(feature = "guide")]
@@ -3637,44 +3884,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         actions.set_halign(gtk::Align::Fill);
 
         if let Some(picker_state) = picker.as_ref() {
-            let filters = &picker_state.config.request.filters;
-            if filters.len() >= 2 {
-                let names: Vec<&str> = filters.iter().map(|f| f.name.as_str()).collect();
-                let dropdown = gtk::DropDown::from_strings(&names);
-                dropdown.add_css_class("wf-picker-filter");
-                if let Some(index) = *picker_state.active_filter.borrow() {
-                    dropdown.set_selected(index as u32);
-                }
-                actions.append(&dropdown);
-                picker_filter_dropdown = Some(dropdown);
-            }
-
-            for choice in &picker_state.config.request.choices {
-                let selections = &picker_state.choice_selections;
-                let initial_selected = selections
-                    .borrow()
-                    .get(&choice.id)
-                    .cloned()
-                    .unwrap_or_else(|| choice.initial.clone());
-                let widget = if choice.options.is_empty() {
-                    let check = gtk::CheckButton::builder().label(&choice.label).build();
-                    check.set_active(initial_selected == "true");
-                    actions.append(&check);
-                    ChoiceWidget::Boolean(check)
-                } else {
-                    let option_ids: Vec<String> =
-                        choice.options.iter().map(|(id, _)| id.clone()).collect();
-                    let labels: Vec<&str> =
-                        choice.options.iter().map(|(_, label)| label.as_str()).collect();
-                    let dropdown = gtk::DropDown::from_strings(&labels);
-                    if let Some(index) = option_ids.iter().position(|id| id == &initial_selected) {
-                        dropdown.set_selected(index as u32);
-                    }
-                    actions.append(&dropdown);
-                    ChoiceWidget::Enumerated(dropdown, option_ids)
-                };
-                picker_choice_widgets.push((choice.id.clone(), widget));
-            }
+            let (dropdown, widgets) = build_picker_filter_and_choice_controls(&actions, picker_state);
+            picker_filter_dropdown = dropdown;
+            picker_choice_widgets = widgets;
         }
 
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -4013,6 +4225,18 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         });
     }
 
+    // Parent the picker to the app that asked for it before the first
+    // map, so the compositor stacks it above that app's window instead
+    // of behind it.
+    if let Some(handle) = state
+        .borrow()
+        .picker
+        .as_ref()
+        .and_then(|picker| picker.config.parent_window.clone())
+    {
+        attach_to_exported_parent(&ui.window, &handle);
+    }
+
     ui.window.present();
 
     #[cfg(feature = "picker-test-driver")]
@@ -4036,6 +4260,15 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.clone();
     let ui = ui.clone();
+    // Set exactly once, on the tick that performs the filter/choice cycle
+    // below, so a tick that finds no eligible row under the now-active
+    // filter retries only the row scan on later ticks -- it must never
+    // cycle the controls again. Without this, every `Continue` retry
+    // (including the ones used to wait for `visible_entries` to load) ran
+    // the cycle step again, so an empty-match tick flipped the dropdown
+    // right back to the filter it just left instead of waiting out the
+    // real deadline under the filter actually under test; see round 223.
+    let cycled = std::cell::Cell::new(false);
     glib::timeout_add_local(Duration::from_millis(20), move || {
         if !ui.window.is_mapped() {
             return glib::ControlFlow::Continue;
@@ -4052,10 +4285,37 @@ fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         let Some(picker) = state.borrow().picker.clone() else {
             return glib::ControlFlow::Continue;
         };
-        // Selects every currently filter-eligible fixture row (up to two
-        // when `multiple` is set), the real `picker_entry_can_submit` /
+        // Exercises the real filter/choice controls through their own
+        // widget APIs -- never a synthetic pointer event -- BEFORE any
+        // row is selected, so selection below obeys the filter actually
+        // under test rather than whichever one was active at load time.
+        // Cycling after selecting (the round-222 shape) let the
+        // regression pass whether or not the filter predicate behind the
+        // cycle ran at all; see round 223.
+        if !cycled.replace(true) {
+            if let Some(dropdown) = ui.picker_filter_dropdown.clone() {
+                let filters_len = picker.config.request.filters.len() as u32;
+                if filters_len > 0 {
+                    dropdown.set_selected((dropdown.selected() + 1) % filters_len);
+                }
+            }
+            for (_, widget) in &ui.picker_choice_widgets {
+                match widget {
+                    ChoiceWidget::Boolean(check) => check.set_active(!check.is_active()),
+                    ChoiceWidget::Enumerated(dropdown, option_ids) => {
+                        let len = option_ids.len() as u32;
+                        if len > 0 {
+                            dropdown.set_selected((dropdown.selected() + 1) % len);
+                        }
+                    }
+                }
+            }
+        }
+        // Selects every now-filter-eligible fixture row (up to two when
+        // `multiple` is set), the real `picker_entry_can_submit` /
         // `picker_filter_allows` guard a real click would also obey, so a
-        // nonmatching fixture never gets selected here either.
+        // nonmatching fixture never gets selected here either. Read
+        // after the cycle above, against the filter now actually active.
         let matching_indices: Vec<usize> = state
             .borrow()
             .visible_entries
@@ -4070,27 +4330,6 @@ fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         let take = if picker.config.multiple { 2 } else { 1 };
         for (position, &index) in matching_indices.iter().take(take).enumerate() {
             ui.list_selection.select_item(index as u32, position == 0);
-        }
-        // Exercises the real filter/choice controls through their own
-        // widget APIs -- never a synthetic pointer event -- so the result
-        // meta this round writes reflects live widget state, not just
-        // each control's already-resolved initial value.
-        if let Some(dropdown) = ui.picker_filter_dropdown.clone() {
-            let filters_len = picker.config.request.filters.len() as u32;
-            if filters_len > 0 {
-                dropdown.set_selected((dropdown.selected() + 1) % filters_len);
-            }
-        }
-        for (_, widget) in &ui.picker_choice_widgets {
-            match widget {
-                ChoiceWidget::Boolean(check) => check.set_active(!check.is_active()),
-                ChoiceWidget::Enumerated(dropdown, option_ids) => {
-                    let len = option_ids.len() as u32;
-                    if len > 0 {
-                        dropdown.set_selected((dropdown.selected() + 1) % len);
-                    }
-                }
-            }
         }
         if let Some(open) = ui.picker_open.clone() {
             open.emit_clicked();
@@ -4747,6 +4986,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 
     let drives = state.borrow().drives.clone();
+    let mut drive_rows = Vec::with_capacity(drives.len());
     if !drives.is_empty() {
         #[cfg(feature = "guide")]
         guide_name(&append_sidebar_heading(&ui.sidebar, "Devices"), GUIDE_DRIVE_SPACE);
@@ -4754,7 +4994,8 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         append_sidebar_heading(&ui.sidebar, "Devices");
         for drive in drives {
             let view = drive.space_view();
-            let row = sidebar_row_with_bar(&drive.name, &view.words, drive_icon(&drive), view.fraction);
+            let (row, handle) = sidebar_row_with_bar(&drive.name, &view.words, drive_icon(&drive), view.fraction);
+            drive_rows.push(handle);
             if !drive.mountpoint.is_empty() {
                 mark_sidebar_active(
                     &row,
@@ -4774,6 +5015,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             ui.sidebar.append(&row);
         }
     }
+    state.borrow_mut().drive_rows = drive_rows;
 
     append_sidebar_heading(&ui.sidebar, "Network");
     let connect_row = sidebar_row("Connect to Server\u{2026}", "", "asset:network");
@@ -4831,6 +5073,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 
     let recents = state.borrow().recents.clone();
+    state.borrow_mut().recents_shown = recents.clone();
     if !recents.is_empty() {
         append_sidebar_heading(&ui.sidebar, "Recent");
         for recent in recents {
@@ -5539,16 +5782,18 @@ fn append_sidebar_heading(sidebar: &gtk::ListBox, text: &str) -> gtk::ListBoxRow
 }
 
 fn sidebar_row(name: &str, detail: &str, icon_name: &str) -> gtk::ListBoxRow {
-    sidebar_row_with_bar(name, detail, icon_name, None)
+    sidebar_row_with_bar(name, detail, icon_name, None).0
 }
 
 /// The one sidebar row layout; a drive row adds a fill bar below its words.
+/// The handle is what a drive refresh needs to rewrite those words and that bar
+/// without replacing the row.
 fn sidebar_row_with_bar(
     name: &str,
     detail: &str,
     icon_name: &str,
     fraction: Option<f64>,
-) -> gtk::ListBoxRow {
+) -> (gtk::ListBoxRow, DriveRowHandle) {
     let row = gtk::ListBoxRow::builder().activatable(true).build();
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     line.set_margin_top(4);
@@ -5576,18 +5821,31 @@ fn sidebar_row_with_bar(
     if !detail.label().is_empty() {
         text.append(&detail);
     }
+    let handle = DriveRowHandle {
+        row: row.downgrade(),
+        text: text.downgrade(),
+        detail: detail.downgrade(),
+        bar: glib::WeakRef::new(),
+    };
     if let Some(fraction) = fraction {
-        let bar = gtk::ProgressBar::new();
-        bar.add_css_class("wf-space-bar");
-        bar.set_fraction(fraction.clamp(0.0, 1.0));
-        bar.set_can_target(false);
-        bar.set_can_focus(false);
+        let bar = space_bar(fraction);
         text.append(&bar);
+        handle.bar.set(Some(&bar));
     }
     line.append(&icon);
     line.append(&text);
     row.set_child(Some(&line));
-    row
+    (row, handle)
+}
+
+/// The small fill bar under a drive's words.
+fn space_bar(fraction: f64) -> gtk::ProgressBar {
+    let bar = gtk::ProgressBar::new();
+    bar.add_css_class("wf-space-bar");
+    bar.set_fraction(fraction.clamp(0.0, 1.0));
+    bar.set_can_target(false);
+    bar.set_can_focus(false);
+    bar
 }
 
 fn place_icon(name: &str) -> &'static str {
@@ -8462,12 +8720,8 @@ fn update_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             status.push_str(&format!("  -  {} selected", entries.len()));
         }
     }
-    if let Some(clipboard) = &state_ref.clipboard {
-        let mode = match clipboard.mode {
-            ClipboardMode::Copy => "copy",
-            ClipboardMode::Cut => "cut",
-        };
-        status.push_str(&format!("  -  {} {} pending", clipboard.paths.len(), mode));
+    if let Some(offer) = state_ref.pending_offer.filter(|offer| offer.serial == clipboard_serial()) {
+        status.push_str(&pending_segment(offer));
     }
     if !state_ref.undo_stack.is_empty() {
         status.push_str("  -  undo available");
@@ -8940,67 +9194,437 @@ fn clipboard_sources_from_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) -> R
 }
 
 fn copy_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let paths = match clipboard_sources_from_selection(state, ui) {
-        Ok(paths) => paths,
-        Err(msg) => {
-            ui.status.set_label(msg);
-            return;
-        }
-    };
-    state.borrow_mut().clipboard = Some(FileClipboard {
-        mode: ClipboardMode::Copy,
-        paths,
-    });
-    update_selection(state, ui);
+    publish_selection(state, ui, native_core::ClipIntent::Copy);
 }
 
 fn cut_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let paths = match clipboard_sources_from_selection(state, ui) {
-        Ok(paths) => paths,
+    publish_selection(state, ui, native_core::ClipIntent::Cut);
+}
+
+/// D-232: Copy and Cut put the selected real files on the display clipboard,
+/// where every window and every other program can read them. A refusal or a
+/// failure says so and leaves the clipboard as it was.
+fn publish_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, intent: native_core::ClipIntent) {
+    let sources = match clipboard_sources_from_selection(state, ui) {
+        Ok(sources) => sources,
         Err(msg) => {
             ui.status.set_label(msg);
             return;
         }
     };
-    state.borrow_mut().clipboard = Some(FileClipboard {
-        mode: ClipboardMode::Cut,
-        paths,
-    });
-    update_selection(state, ui);
+    let paths: Vec<PathBuf> = sources.iter().map(|source| source.real_path().to_path_buf()).collect();
+    match publish_file_offer(intent, &paths) {
+        Ok(serial) => {
+            state.borrow_mut().pending_offer = Some(PendingOffer { serial, intent, count: paths.len() });
+            update_selection(state, ui);
+        }
+        Err(err) => {
+            let verb = match intent {
+                native_core::ClipIntent::Copy => "Copy",
+                native_core::ClipIntent::Cut => "Cut",
+            };
+            ui.status.set_label(&format!("{verb} failed: {err}"));
+        }
+    }
 }
 
+/// The display's clipboard and what this program knows about its changes.
+struct ClipboardWatch {
+    clipboard: gdk::Clipboard,
+    /// Counts every change of the clipboard's content or owner, ours or another
+    /// program's. An offer is named by the count that made it.
+    serial: u64,
+    /// The cut offer a transfer is pasting now, and that transfer's claim.
+    cut_claim: Option<(u64, std::rc::Weak<()>)>,
+}
+
+type ClipboardJob = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+#[derive(Default)]
+struct ClipboardReads {
+    busy: bool,
+    waiting: std::collections::VecDeque<ClipboardJob>,
+}
+
+thread_local! {
+    static CLIPBOARD_WATCH: RefCell<Option<ClipboardWatch>> = const { RefCell::new(None) };
+    static CLIPBOARD_READS: RefCell<ClipboardReads> = RefCell::new(ClipboardReads::default());
+}
+
+/// The display clipboard, watched for changes from its first use on.
+fn watched_clipboard() -> Option<gdk::Clipboard> {
+    if let Some(clipboard) = CLIPBOARD_WATCH.with(|w| w.borrow().as_ref().map(|w| w.clipboard.clone())) {
+        return Some(clipboard);
+    }
+    let clipboard = gdk::Display::default()?.clipboard();
+    clipboard.connect_changed(|_| clipboard_changed());
+    CLIPBOARD_WATCH.with(|w| {
+        *w.borrow_mut() = Some(ClipboardWatch { clipboard: clipboard.clone(), serial: 0, cut_claim: None });
+    });
+    Some(clipboard)
+}
+
+fn clipboard_serial() -> u64 {
+    CLIPBOARD_WATCH.with(|w| w.borrow().as_ref().map_or(0, |w| w.serial))
+}
+
+fn pending_segment(offer: PendingOffer) -> String {
+    format!("  -  {} {} pending", offer.count, offer.intent.word())
+}
+
+/// Every change of content or owner. A window's pending note belongs to one
+/// offer and leaves its status line with it, whatever replaced the offer.
+fn clipboard_changed() {
+    let changed = CLIPBOARD_WATCH.with(|w| {
+        w.borrow_mut().as_mut().map(|watch| {
+            watch.serial += 1;
+            watch.serial
+        })
+    });
+    if changed.is_none() {
+        return;
+    }
+    let windows = WINDOWS.with(|w| w.try_borrow().map(|w| w.windows()).unwrap_or_default());
+    for (state, ui) in windows {
+        // A window that is busy keeps a stale note; it is never shown, because
+        // the status line checks the note against the clipboard's count.
+        let Ok(mut st) = state.try_borrow_mut() else { continue };
+        let Some(offer) = st.pending_offer.take() else { continue };
+        drop(st);
+        let text = ui.status.label();
+        let note = pending_segment(offer);
+        if text.contains(&note) {
+            ui.status.set_label(&text.replacen(&note, "", 1));
+        }
+    }
+}
+
+/// D-232: real files on the display clipboard, in the three forms other file
+/// managers read. Returns the clipboard change that made this offer.
+fn publish_file_offer(intent: native_core::ClipIntent, paths: &[PathBuf]) -> Result<u64, String> {
+    let payload = native_core::clip_encode(paths, intent)?;
+    let clipboard = watched_clipboard().ok_or("there is no display clipboard")?;
+    if clipboard_publish_refused() {
+        return Err("the clipboard could not be taken".to_string());
+    }
+    let form = |mime: &str, bytes: Vec<u8>| gdk::ContentProvider::for_bytes(mime, &glib::Bytes::from_owned(bytes));
+    let provider = gdk::ContentProvider::new_union(&[
+        form(native_core::CLIP_GNOME_FILES, payload.gnome),
+        form(native_core::CLIP_URI_LIST, payload.uri_list),
+        form(native_core::CLIP_KDE_CUT, payload.kde_cut),
+    ]);
+    clipboard
+        .set_content(Some(&provider))
+        .map_err(|_| "the clipboard could not be taken".to_string())?;
+    Ok(clipboard_serial())
+}
+
+/// D-232: clipboard reads run one at a time for the whole program, and a read
+/// that has started always runs to its end. GTK pairs an X11 answer with a
+/// waiting read by format alone, so two reads of one format in flight could
+/// take each other's answer.
+fn queue_clipboard_read(job: impl std::future::Future<Output = ()> + 'static) {
+    let job: ClipboardJob = Box::pin(job);
+    let first = CLIPBOARD_READS.with(|reads| {
+        let mut reads = reads.borrow_mut();
+        if reads.busy {
+            reads.waiting.push_back(job);
+            None
+        } else {
+            reads.busy = true;
+            Some(job)
+        }
+    });
+    let Some(mut job) = first else { return };
+    glib::spawn_future_local(async move {
+        loop {
+            job.await;
+            let next = CLIPBOARD_READS.with(|reads| {
+                let mut reads = reads.borrow_mut();
+                let next = reads.waiting.pop_front();
+                reads.busy = next.is_some();
+                next
+            });
+            match next {
+                Some(next) => job = next,
+                None => break,
+            }
+        }
+    });
+}
+
+/// The file forms a clipboard offers, as seen at one moment.
+#[derive(Clone, Copy)]
+struct ClipForms {
+    gnome: bool,
+    uris: bool,
+    kde: bool,
+}
+
+impl ClipForms {
+    fn of(clipboard: &gdk::Clipboard) -> Self {
+        let formats = clipboard.formats();
+        Self {
+            gnome: formats.contain_mime_type(native_core::CLIP_GNOME_FILES),
+            uris: formats.contain_mime_type(native_core::CLIP_URI_LIST),
+            kde: formats.contain_mime_type(native_core::CLIP_KDE_CUT),
+        }
+    }
+
+    /// Plain text, pictures and an empty clipboard are never files.
+    fn files(self) -> bool {
+        self.gnome || self.uris
+    }
+}
+
+const CLIP_CHANGED_MID_READ: &str = "the clipboard changed while it was read";
+
+/// One format, read to its end, with the stream closed either way. What
+/// another program offers is bounded: past the limit nothing more is kept and
+/// the read is refused. It is still read to its end, because an answer left
+/// half way stays open on the owner's side and could land in the next read.
+/// This program's own offer is not outside input and has no limit.
+async fn read_clipboard_bytes(clipboard: &gdk::Clipboard, mime: &str) -> Result<Vec<u8>, String> {
+    let unreadable = |err: glib::Error| format!("the clipboard could not be read ({})", err.message());
+    let bounded = !clipboard.is_local();
+    let (stream, _) = clipboard.read_future(&[mime], glib::Priority::DEFAULT).await.map_err(unreadable)?;
+    let mut data = Vec::new();
+    let mut too_large = false;
+    let result = loop {
+        match stream.read_bytes_future(64 * 1024, glib::Priority::DEFAULT).await {
+            Ok(chunk) if chunk.is_empty() => break Ok(()),
+            Ok(_) if too_large => {}
+            Ok(chunk) => {
+                data.extend_from_slice(&chunk);
+                if bounded && data.len() > native_core::CLIP_READ_LIMIT {
+                    too_large = true;
+                    data = Vec::new();
+                }
+            }
+            Err(err) => break Err(unreadable(err)),
+        }
+    };
+    let _ = stream.close_future(glib::Priority::DEFAULT).await;
+    if too_large {
+        return Err("the clipboard data is too large".to_string());
+    }
+    result.map(|()| data)
+}
+
+/// Reads one offer's file forms. The GNOME form wins when it is offered; then
+/// the address list with KDE's cut marker; an address list alone is a Copy.
+/// A read stops as soon as the clipboard has changed hands, so the pieces of
+/// one answer never come from two owners.
+async fn read_file_offer(
+    clipboard: &gdk::Clipboard,
+    forms: ClipForms,
+    serial: u64,
+) -> Result<native_core::ClipRead, String> {
+    let same_offer = || {
+        if clipboard_serial() == serial {
+            Ok(())
+        } else {
+            Err(CLIP_CHANGED_MID_READ.to_string())
+        }
+    };
+    if forms.gnome {
+        let gnome = read_clipboard_bytes(clipboard, native_core::CLIP_GNOME_FILES).await?;
+        let kde_cut = if forms.kde {
+            same_offer()?;
+            Some(read_clipboard_bytes(clipboard, native_core::CLIP_KDE_CUT).await?)
+        } else {
+            None
+        };
+        return Ok(native_core::ClipRead::Gnome { gnome, kde_cut });
+    }
+    if forms.kde {
+        // The marker is read on both sides of the list: it and the list are two
+        // answers, and a marker that moved between them is refused.
+        let cut_before = read_clipboard_bytes(clipboard, native_core::CLIP_KDE_CUT).await?;
+        same_offer()?;
+        let uris = read_clipboard_bytes(clipboard, native_core::CLIP_URI_LIST).await?;
+        same_offer()?;
+        let cut_after = read_clipboard_bytes(clipboard, native_core::CLIP_KDE_CUT).await?;
+        return Ok(native_core::ClipRead::Kde { cut_before, uris, cut_after });
+    }
+    Ok(native_core::ClipRead::UriOnly { uris: read_clipboard_bytes(clipboard, native_core::CLIP_URI_LIST).await? })
+}
+
+const PASTE_READING: &str = "Reading the clipboard";
+
+/// What one press of Paste was about, taken before the clipboard is read.
+struct PasteRequest {
+    clipboard: gdk::Clipboard,
+    forms: ClipForms,
+    /// The clipboard change that made the offer this press saw.
+    serial: u64,
+    /// This window's count of Paste presses at this press.
+    request: u64,
+    tab: u64,
+    cwd: native_core::Location,
+    dest: PathBuf,
+}
+
+/// The window a Paste was pressed in, if that press still stands: the window
+/// is open, no newer Paste was pressed in it, the clipboard still holds the
+/// same offer, and the same tab still shows the same folder. A press that no
+/// longer stands starts nothing; it says why only while its own reading note
+/// is still the status text, so it never writes over anything newer.
+fn paste_still_wanted(
+    window: &std::rc::Weak<RefCell<AppState>>,
+    request: &PasteRequest,
+) -> Option<(Rc<RefCell<AppState>>, Ui)> {
+    let state = window.upgrade()?;
+    // A closed window is no longer registered, though its state lives on.
+    let ui = ui_for_state(&state)?;
+    let why = {
+        let st = state.borrow();
+        if st.paste_request != request.request {
+            return None;
+        }
+        if clipboard_serial() != request.serial {
+            Some("Clipboard changed, nothing pasted")
+        } else if st.tabs.active().id != request.tab || st.cwd != request.cwd {
+            Some("Folder changed, nothing pasted")
+        } else {
+            None
+        }
+    };
+    match why {
+        None => Some((state, ui)),
+        Some(why) => {
+            if ui.status.label() == PASTE_READING {
+                ui.status.set_label(why);
+            }
+            None
+        }
+    }
+}
+
+/// D-232: Paste reads the display clipboard, whoever owns it, without holding
+/// up the window, and hands real local files to the one transfer gate.
 fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
-    let Some(clipboard) = state.borrow().clipboard.clone() else {
+    let Some(clipboard) = watched_clipboard() else {
         ui.status.set_label("Nothing to paste");
         return;
     };
-    let dest = match state.borrow().cwd.clone() {
-        native_core::Location::RealDir(path) => path,
+    let forms = ClipForms::of(&clipboard);
+    if !forms.files() {
+        ui.status.set_label("Nothing to paste");
+        return;
+    }
+    let cwd = state.borrow().cwd.clone();
+    let dest = match &cwd {
+        native_core::Location::RealDir(path) => path.clone(),
         native_core::Location::ZipDir { .. } => {
             ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
             return;
         }
     };
-    let is_copy = clipboard.mode == ClipboardMode::Copy;
-    let clear_after = clipboard.mode == ClipboardMode::Cut;
-    let srcs = clipboard
-        .paths
-        .iter()
-        .map(|p| match p {
-            native_core::ClipboardSource::Real(path) => path.clone(),
-        })
-        .collect();
-    transfer_with_preflight(
-        state,
-        ui,
-        Transfer {
-            srcs,
+    if state.borrow().active_transfer.is_some() {
+        ui.status.set_label("A transfer is already running");
+        return;
+    }
+    let request = {
+        let mut st = state.borrow_mut();
+        st.paste_request += 1;
+        PasteRequest {
+            clipboard,
+            forms,
+            serial: clipboard_serial(),
+            request: st.paste_request,
+            tab: st.tabs.active().id,
+            cwd,
             dest,
-            is_copy,
-            clear_cut_after: clear_after,
-            style: TransferStyle::Paste,
-        },
-    );
+        }
+    };
+    ui.status.set_label(PASTE_READING);
+    // Only a weak hold: a read that is waiting keeps no window alive.
+    let window = Rc::downgrade(&state);
+    queue_clipboard_read(async move {
+        if paste_still_wanted(&window, &request).is_none() {
+            return;
+        }
+        let read = read_file_offer(&request.clipboard, request.forms, request.serial).await;
+        let Some((state, ui)) = paste_still_wanted(&window, &request) else { return };
+        let files = match read.and_then(|read| native_core::clip_decode(&read)) {
+            Ok(files) => files,
+            Err(err) => {
+                ui.status.set_label(&format!("Paste refused: {err}"));
+                return;
+            }
+        };
+        let is_copy = files.intent == native_core::ClipIntent::Copy;
+        let cut_offer = if is_copy {
+            None
+        } else {
+            match claim_cut_offer(request.serial) {
+                Some(offer) => Some(offer),
+                None => {
+                    ui.status.set_label("This cut is already being pasted");
+                    return;
+                }
+            }
+        };
+        if ui.status.label() == PASTE_READING {
+            update_selection(&state, &ui);
+        }
+        transfer_with_preflight(
+            state,
+            ui,
+            Transfer { srcs: files.paths, dest: request.dest, is_copy, cut_offer, style: TransferStyle::Paste },
+        );
+    });
+}
+
+/// D-232: the cut offer one transfer is pasting. `serial` is the clipboard
+/// change that made the offer. The claim lives exactly as long as that transfer
+/// may still finish, so the same pending cut is never started twice.
+#[derive(Clone)]
+struct CutOffer {
+    serial: u64,
+    _claim: Rc<()>,
+}
+
+/// None while another transfer still holds a claim on this same offer.
+fn claim_cut_offer(serial: u64) -> Option<CutOffer> {
+    CLIPBOARD_WATCH.with(|w| {
+        let mut watch = w.borrow_mut();
+        let watch = watch.as_mut()?;
+        if let Some((claimed, claim)) = &watch.cut_claim {
+            if *claimed == serial && claim.strong_count() > 0 {
+                return None;
+            }
+        }
+        let claim = Rc::new(());
+        watch.cut_claim = Some((serial, Rc::downgrade(&claim)));
+        Some(CutOffer { serial, _claim: claim })
+    })
+}
+
+/// A finished cut takes its own offer off the clipboard, and only that one.
+/// X11 has no check-and-clear in one step, so this first lets everything
+/// another program did meanwhile arrive, then reads the clipboard again and
+/// clears it only if it still holds this cut of these files.
+fn consume_cut_offer(offer: CutOffer, srcs: Vec<PathBuf>) {
+    let Some(clipboard) = watched_clipboard() else { return };
+    queue_clipboard_read(async move {
+        clipboard.display().sync();
+        glib::timeout_future_with_priority(glib::Priority::LOW, std::time::Duration::ZERO).await;
+        let forms = ClipForms::of(&clipboard);
+        if clipboard_serial() != offer.serial || !forms.files() {
+            return;
+        }
+        let read = read_file_offer(&clipboard, forms, offer.serial).await;
+        let same_cut = read
+            .and_then(|read| native_core::clip_decode(&read))
+            .is_ok_and(|files| files.intent == native_core::ClipIntent::Cut && files.paths == srcs);
+        if same_cut && clipboard_serial() == offer.serial {
+            let _ = clipboard.set_content(gdk::ContentProvider::NONE);
+        }
+        // The claim ends here, after the clear.
+        drop(offer);
+    });
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -9017,7 +9641,8 @@ struct Transfer {
     srcs: Vec<PathBuf>,
     dest: PathBuf,
     is_copy: bool,
-    clear_cut_after: bool,
+    /// The clipboard offer a cut paste came from; None for a copy and a drop.
+    cut_offer: Option<CutOffer>,
     style: TransferStyle,
 }
 
@@ -9040,9 +9665,21 @@ fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Trans
         }
         TransferPlan::Ask(conflicts) => {
             let ui_for_choice = ui.clone();
-            show_conflict_dialog(&ui, &conflicts, move |mode| {
-                run_transfer(state.clone(), ui_for_choice.clone(), transfer.clone(), mode);
-            });
+            // Held once: a choice takes it and runs it, Cancel takes it and drops
+            // it, so a cut's claim on its offer ends with the dialog (D-232).
+            let held = Rc::new(RefCell::new(Some(transfer)));
+            let dismissed = held.clone();
+            show_conflict_dialog(
+                &ui,
+                &conflicts,
+                move |mode| {
+                    let transfer = held.borrow_mut().take();
+                    if let Some(transfer) = transfer {
+                        run_transfer(state.clone(), ui_for_choice.clone(), transfer, mode);
+                    }
+                },
+                move || drop(dismissed.borrow_mut().take()),
+            );
         }
     }
 }
@@ -9077,13 +9714,11 @@ fn apply_conflict_response(response: &str, start: impl FnOnce(native_core::Paste
     }
 }
 
-/// A cut clipboard is emptied only when the job succeeded.
-fn clipboard_after_job<T>(clear_cut_after: bool, succeeded: bool, clipboard: Option<T>) -> Option<T> {
-    if clear_cut_after && succeeded {
-        None
-    } else {
-        clipboard
-    }
+/// A job takes an offer off the clipboard only when it pasted a cut, it
+/// succeeded, and the clipboard still holds that same offer (D-232). `cut_offer`
+/// is the clipboard change that made the offer; `now` is the latest change.
+fn cut_consumes_offer(cut_offer: Option<u64>, succeeded: bool, now: u64) -> bool {
+    succeeded && cut_offer == Some(now)
 }
 
 /// Replace / Duplicate / Cancel. Escape or closing the window is Cancel.
@@ -9104,7 +9739,7 @@ fn conflict_dialog_text(conflicts: &[String]) -> (String, Option<String>) {
     )
 }
 
-fn show_conflict_dialog<F>(ui: &Ui, conflicts: &[String], on_choice: F)
+fn show_conflict_dialog<F>(ui: &Ui, conflicts: &[String], on_choice: F, on_dismiss: impl Fn() + 'static)
 where
     F: Fn(native_core::PasteConflict) + 'static,
 {
@@ -9120,6 +9755,9 @@ where
     dialog.set_default_response(Some("duplicate"));
     dialog.set_close_response("cancel");
     dialog.connect_response(None, move |_, response| {
+        if native_core::conflict_response(response).is_none() {
+            on_dismiss();
+        }
         apply_conflict_response(response, &on_choice);
     });
     dialog.present(Some(&ui.window));
@@ -9319,6 +9957,18 @@ thread_local! {
     /// thread, before the worker is spawned; production always passes false
     /// and gains no setting, environment switch or user-visible branch.
     static TRANSFER_FORCE_CROSS_DEVICE: RefCell<bool> = const { RefCell::new(false) };
+    /// Test seam (D-232): Copy and Cut find the clipboard refusing their offer,
+    /// so a fixture can check the failure is reported and nothing else changes.
+    /// Read on the GTK thread; production always reads false.
+    static CLIPBOARD_REFUSES_PUBLISH: RefCell<bool> = const { RefCell::new(false) };
+}
+
+fn clipboard_publish_refused() -> bool {
+    #[cfg(any(test))]
+    if CLIPBOARD_REFUSES_PUBLISH.with(|f| *f.borrow()) {
+        return true;
+    }
+    false
 }
 
 fn transfer_copy_program() -> String {
@@ -9347,7 +9997,10 @@ fn run_transfer(
         ui.status.set_label("A transfer is already running");
         return;
     }
-    let Transfer { srcs, dest, is_copy, clear_cut_after, style } = transfer;
+    let Transfer { srcs, dest, is_copy, cut_offer, style } = transfer;
+    // D-232: the offer a cut paste came from, and the files it named. The claim
+    // inside lives until this job's last message is handled.
+    let mut cut = cut_offer.map(|offer| (offer, srcs.clone()));
     let count = srcs.len();
     let (ing, ed) = match (style, is_copy) {
         (TransferStyle::Paste, _) => ("Pasting", "Pasted"),
@@ -9415,12 +10068,15 @@ fn run_transfer(
                     match result {
                         Ok(result) => {
                             if let Ok(outcome) = transfer_outcome(ed, is_copy, Ok(result)) {
-                                // A cut clipboard is emptied only on success.
-                                complete_job(&state, &ui, outcome, &refresh_path, &|state, _, _| {
-                                    let mut st = state.borrow_mut();
-                                    st.clipboard =
-                                        clipboard_after_job(clear_cut_after, true, st.clipboard.take());
-                                });
+                                // A cut offer is taken off the clipboard only on
+                                // success, and only if it is still the one there.
+                                let offered = cut.as_ref().map(|(offer, _)| offer.serial);
+                                if cut_consumes_offer(offered, true, clipboard_serial()) {
+                                    if let Some((offer, srcs)) = cut.take() {
+                                        consume_cut_offer(offer, srcs);
+                                    }
+                                }
+                                complete_job(&state, &ui, outcome, &refresh_path, &|_, _, _| {});
                             }
                         }
                         Err(native_core::TransferFail::Cancelled) => {
@@ -9466,12 +10122,15 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         state,
         ui,
         format!("Moving {count} item{} to Trash", plural(count)),
-        move || {
-            let trashed = reciprocal_trash(paths)?;
-            Ok(JobOutcome::undo(
+        move || match trash_step(&paths, "Moved", "Undo") {
+            TrashStep::Whole(trashed) => Ok(JobOutcome::undo(
                 format!("Moved {count} item{} to Trash", plural(count)),
                 trashed,
-            ))
+            )),
+            TrashStep::Refused(why) => Err(why),
+            // D-231: one Undo entry for the items that did move.
+            TrashStep::Partial { entry: Some(trashed), message, .. } => Ok(JobOutcome::undo(message, trashed)),
+            TrashStep::Partial { entry: None, message, .. } => Ok(JobOutcome::message(message)),
         },
         |_, _, _| {},
     );
@@ -9586,8 +10245,7 @@ fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
             return glib::ControlFlow::Break;
         };
         if let Some(drives) = result {
-            state.borrow_mut().drives = drives;
-            rebuild_sidebar(&state, &ui);
+            apply_drive_scan(&state, &ui, drives);
             #[cfg(feature = "guide")]
             guide_sync_crucial(&state, &ui);
         }
@@ -9596,6 +10254,152 @@ fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
         }
         glib::ControlFlow::Break
     });
+}
+
+/// The pieces of one drive row that a scan can change without replacing the row.
+/// Weak, so a rebuild that drops the row leaves nothing behind.
+#[derive(Clone)]
+struct DriveRowHandle {
+    row: glib::WeakRef<gtk::ListBoxRow>,
+    text: glib::WeakRef<gtk::Box>,
+    detail: glib::WeakRef<gtk::Label>,
+    /// Empty while the row has no bar.
+    bar: glib::WeakRef<gtk::ProgressBar>,
+}
+
+/// Takes one finished drive scan into the sidebar without pulling a row out from
+/// under an open drive menu. The same drives leave every row alone. A change in
+/// space alone is written into the rows that are there. Anything else rebuilds
+/// the sidebar; while a drive menu is open in this window that list waits, and
+/// only the newest one is kept.
+///
+/// The rebuild is also what shows folders visited since the last one under
+/// Recent, so recents the sidebar does not list yet count as a reason to rebuild.
+fn apply_drive_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, scanned: Vec<Drive>) {
+    let (change, recents_wait) = {
+        let state = state.borrow();
+        (native_core::drive_change(&state.drives, &scanned), state.recents != state.recents_shown)
+    };
+    let rows_are_right = match change {
+        native_core::DriveChange::Same => true,
+        native_core::DriveChange::SpaceOnly => match update_drive_space(state, ui, &scanned) {
+            Ok(()) => {
+                state.borrow_mut().drives = scanned.clone();
+                true
+            }
+            Err(why) => {
+                eprintln!("wayfinder: drive space not updated in place: {why}");
+                false
+            }
+        },
+        native_core::DriveChange::Structural => false,
+    };
+    if rows_are_right && !recents_wait {
+        state.borrow_mut().drives_pending = None;
+        return;
+    }
+    if drive_menu_is_open(state, ui) {
+        state.borrow_mut().drives_pending = Some(scanned);
+        return;
+    }
+    {
+        let mut state = state.borrow_mut();
+        state.drives = scanned;
+        state.drives_pending = None;
+    }
+    rebuild_sidebar(state, ui);
+}
+
+/// Writes new space words and bars into the drive rows that are showing. Changes
+/// nothing and says why when a row is not where the last rebuild left it.
+fn update_drive_space(state: &Rc<RefCell<AppState>>, ui: &Ui, scanned: &[Drive]) -> Result<(), &'static str> {
+    let handles = state.borrow().drive_rows.clone();
+    if handles.len() != scanned.len() {
+        return Err("the sidebar has a different number of drive rows");
+    }
+    let mut rows = Vec::with_capacity(handles.len());
+    for handle in &handles {
+        let (Some(row), Some(text), Some(detail)) = (handle.row.upgrade(), handle.text.upgrade(), handle.detail.upgrade())
+        else {
+            return Err("a drive row no longer exists");
+        };
+        if !row.is_ancestor(&ui.sidebar) {
+            return Err("a drive row is no longer in the sidebar");
+        }
+        if detail.parent().as_ref() != Some(text.upcast_ref::<gtk::Widget>()) {
+            return Err("a drive row has no space words");
+        }
+        rows.push((text, detail));
+    }
+    for (((text, detail), handle), drive) in rows.iter().zip(&handles).zip(scanned) {
+        let view = drive.space_view();
+        detail.set_label(&view.words);
+        match (view.fraction, handle.bar.upgrade()) {
+            (Some(fraction), Some(bar)) => bar.set_fraction(fraction.clamp(0.0, 1.0)),
+            (Some(fraction), None) => {
+                let bar = space_bar(fraction);
+                text.append(&bar);
+                handle.bar.set(Some(&bar));
+            }
+            (None, Some(bar)) => {
+                if bar.parent().as_ref() == Some(text.upcast_ref::<gtk::Widget>()) {
+                    text.remove(&bar);
+                }
+                handle.bar.set(None::<&gtk::ProgressBar>);
+            }
+            (None, None) => {}
+        }
+    }
+    state.borrow_mut().drive_rows = handles;
+    Ok(())
+}
+
+/// True while a drive menu opened in this window is on screen. One that has
+/// closed, or gone with its row or its window, is forgotten here.
+fn drive_menu_is_open(state: &Rc<RefCell<AppState>>, ui: &Ui) -> bool {
+    let mut state = state.borrow_mut();
+    state
+        .drive_menus
+        .retain(|menu| menu.upgrade().is_some_and(|menu| menu.is_mapped() && menu.is_ancestor(&ui.window)));
+    !state.drive_menus.is_empty()
+}
+
+/// Remembers an open drive menu, so a refresh holds a changed drive list until it
+/// closes. The held list is taken on the next turn of the loop after the close:
+/// after the click that closed the menu has finished, never inside it, and
+/// without waiting for another scan.
+fn track_drive_menu(popover: &gtk::Popover, state: &Rc<RefCell<AppState>>) {
+    state.borrow_mut().drive_menus.push(popover.downgrade());
+    let weak = Rc::downgrade(state);
+    popover.connect_unmap(move |_| {
+        let weak = weak.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(state) = weak.upgrade() {
+                apply_pending_drive_scan(&state);
+            }
+        });
+    });
+}
+
+/// Takes the held drive list once no drive menu is open in this window. Safe to
+/// run any number of times: with nothing held, or with a menu open again, it
+/// changes nothing on screen, and a window that has gone only lets the held list
+/// go. The open-menu check comes first so every close forgets its menu, held
+/// list or not.
+fn apply_pending_drive_scan(state: &Rc<RefCell<AppState>>) {
+    let Some(ui) = ui_for_state(state) else {
+        state.borrow_mut().drives_pending = None;
+        return;
+    };
+    if drive_menu_is_open(state, &ui) || state.borrow().drives_pending.is_none() {
+        return;
+    }
+    let Some(scanned) = state.borrow_mut().drives_pending.take() else {
+        return;
+    };
+    apply_drive_scan(state, &ui, scanned);
+    #[cfg(feature = "guide")]
+    guide_sync_crucial(state, &ui);
 }
 
 fn open_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
@@ -9770,8 +10574,9 @@ fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
         ui,
         "Extracting archive".to_string(),
         move || {
-            native_core::extract_archive(&path, &cwd)?;
-            Ok(JobOutcome::message("Extracted archive"))
+            // D-230: never the plain "Extracted archive" when a name was skipped or failed.
+            let outcome = native_core::extract_archive_here(&path, &cwd)?;
+            Ok(JobOutcome::message(outcome.summary()))
         },
         |_, _, _| {},
     );
@@ -9808,8 +10613,8 @@ fn copy_paths_to_system_clipboard(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             paths.push(cwd);
         }
     }
-    if let Some(display) = gdk::Display::default() {
-        display.clipboard().set_text(&paths.join("\n"));
+    if let Some(clipboard) = watched_clipboard() {
+        clipboard.set_text(&paths.join("\n"));
         ui.status.set_label(&format!(
             "Copied {} path{} to clipboard",
             paths.len(),
@@ -9859,6 +10664,9 @@ fn undo_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         move || perform_undo(action),
         |state, outcome| {
             state.borrow_mut().undo_stack.pop();
+            if let Some(remainder) = outcome.remainder.clone() {
+                state.borrow_mut().undo_stack.push(remainder);
+            }
             if let Some(reciprocal) = outcome.reciprocal.clone() {
                 push_redo(state, reciprocal);
             }
@@ -9884,6 +10692,9 @@ fn redo_action(state: Rc<RefCell<AppState>>, ui: Ui) {
         move || perform_redo(action),
         |state, outcome| {
             state.borrow_mut().redo_stack.pop();
+            if let Some(remainder) = outcome.remainder.clone() {
+                state.borrow_mut().redo_stack.push(remainder);
+            }
             if let Some(reciprocal) = outcome.reciprocal.clone() {
                 let mut st = state.borrow_mut();
                 st.undo_stack.push(reciprocal);
@@ -9962,10 +10773,7 @@ fn undo_label(action: &UndoAction) -> String {
 
 fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
     match action {
-        UndoAction::Created { paths } => {
-            let reciprocal = reciprocal_trash(paths).map_err(|err| format!("Undo refused: {err}"))?;
-            Ok(JobOutcome::reciprocal("Undid create/copy: moved to Trash", reciprocal))
-        }
+        UndoAction::Created { paths } => history_trash_created(paths, "Undo", "Undid create/copy: moved to Trash"),
         UndoAction::Renamed { from, to, fp } => {
             let reciprocal = reciprocal_rename(from, to, fp, "Undo")?;
             Ok(JobOutcome::reciprocal("Undid rename", reciprocal))
@@ -9976,8 +10784,7 @@ fn perform_undo(action: UndoAction) -> Result<JobOutcome, String> {
         }
         UndoAction::Pasted { items, was_copy, fps } => {
             if was_copy {
-                let reciprocal = reciprocal_trash_checked(items, fps, "Undo")?;
-                Ok(JobOutcome::reciprocal("Undid paste: moved to Trash", reciprocal))
+                history_trash_copies(items, fps, "Undo", "Undid paste: moved to Trash")
             } else {
                 let reciprocal = reciprocal_move(items, fps, "Undo")?;
                 Ok(JobOutcome::reciprocal("Undid move", reciprocal))
@@ -10057,22 +10864,117 @@ fn reciprocal_batch_rename(
     Ok(UndoAction::BatchRenamed { items: result, fps })
 }
 
-/// D-187: trashes exactly `paths`, by exact receipt (never "newest for this
-/// original path"), and records a fingerprint of each payload so the opposite
-/// restore can detect a direct edit to the Trash payload. Shared by Undo of a
-/// real creation and Redo of a real Trash-restore: both need "trash these
-/// paths again" and the reciprocal either direction leaves for the other
-/// stack is the same `Trashed` shape.
-fn reciprocal_trash(paths: Vec<String>) -> Result<UndoAction, String> {
-    let receipts = native_core::trash_paths_exact(&paths)?;
-    let fps = receipts
-        .iter()
-        .map(|receipt| native_core::fingerprint(&receipt.selector))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(UndoAction::Trashed { receipts, fps })
+/// D-231: what one Trash step did. Shared by the ordinary Trash action and by
+/// every history step that moves items to Trash, so none of them can lose the
+/// items that did move when a later one fails.
+enum TrashStep {
+    /// Every item moved; the entry holds each exact receipt with its guard.
+    Whole(UndoAction),
+    /// Nothing changed on disk. Holds the item and the reason.
+    Refused(String),
+    /// Some items moved, then the step stopped. `entry` holds the moved items
+    /// that have an exact receipt (None when none has), `performed` is how
+    /// many items, counted from the first, are no longer where they were.
+    Partial { entry: Option<UndoAction>, performed: usize, message: String },
 }
 
-/// D-187: the reciprocal of `reciprocal_trash` — restores exactly `receipts`
+/// D-187/D-231: the `Trashed` entry for the items an exact batch moved. Each
+/// receipt is paired with the guard taken from that same item just before its
+/// move, so a restore can detect a direct edit to the Trash payload.
+fn trashed_action(done: Vec<native_core::TrashedItem>) -> UndoAction {
+    let (receipts, fps) = done.into_iter().map(|item| (item.receipt, item.fingerprint)).unzip();
+    UndoAction::Trashed { receipts, fps }
+}
+
+/// D-231: trashes `paths` by exact receipt and sorts the result into whole,
+/// refused or partial. `lead` opens a partial result's line ("Moved",
+/// "Undo moved", "Redo moved"); `restorer` is the control that puts the moved
+/// items back ("Undo" or "Redo").
+fn trash_step(paths: &[String], lead: &str, restorer: &str) -> TrashStep {
+    use native_core::TrashStop;
+    let batch = native_core::trash_paths_exact(paths);
+    let done = batch.done.len();
+    match batch.stopped {
+        None => TrashStep::Whole(trashed_action(batch.done)),
+        Some(TrashStop::NotMoved { path, reason }) if done == 0 => TrashStep::Refused(format!("{path}: {reason}")),
+        Some(stop) => {
+            let message = partial_trash_message(lead, restorer, paths.len(), done, &stop, batch.not_attempted.len());
+            let performed = done + usize::from(matches!(stop, TrashStop::MovedUnidentified { .. }));
+            TrashStep::Partial { entry: (done > 0).then(|| trashed_action(batch.done)), performed, message }
+        }
+    }
+}
+
+/// D-231: the line for a Trash step that stopped part-way: how many of the
+/// items are in Trash, what `restorer` can put back, the item the step
+/// stopped at with the reason, and how many items were never tried.
+fn partial_trash_message(
+    lead: &str,
+    restorer: &str,
+    total: usize,
+    done: usize,
+    stop: &native_core::TrashStop,
+    not_attempted: usize,
+) -> String {
+    use native_core::TrashStop;
+    let name = |path: &str| {
+        Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string())
+    };
+    let (moved, stopped) = match stop {
+        TrashStop::NotMoved { path, reason } => (done, format!("{} was not moved: {reason}", name(path))),
+        TrashStop::MovedUnidentified { path, reason } => {
+            (done + 1, format!("{} is in Trash without an exact record: {reason}", name(path)))
+        }
+    };
+    let restores = match (done, moved) {
+        (0, _) => format!("{restorer} cannot restore it"),
+        (1, 1) => format!("{restorer} restores it"),
+        (done, moved) if done == moved => format!("{restorer} restores those {done}"),
+        (done, _) => format!("{restorer} restores {done} of them"),
+    };
+    format!(
+        "{lead} {moved} of {total} item{} to Trash; {restores}. {stopped}. {not_attempted} not attempted.",
+        plural(total)
+    )
+}
+
+/// D-231: a history step that moves `paths` to Trash. A whole step is the
+/// reciprocal it always was. A step that changed nothing is a refusal and
+/// leaves both stacks alone. A step that stopped part-way hands the moved
+/// items to the other stack and keeps `rest(performed)`, the part of its own
+/// entry that was not performed, on the stack it came from.
+fn history_trash(
+    paths: &[String],
+    verb: &str,
+    whole: &str,
+    rest: impl FnOnce(usize) -> Option<UndoAction>,
+) -> Result<JobOutcome, String> {
+    let restorer = if verb == "Undo" { "Redo" } else { "Undo" };
+    match trash_step(paths, &format!("{verb} moved"), restorer) {
+        TrashStep::Whole(trashed) => Ok(JobOutcome::reciprocal(whole, trashed)),
+        TrashStep::Refused(why) => Err(format!("{verb} refused: {why}")),
+        TrashStep::Partial { entry, performed, message } => Ok(JobOutcome {
+            reciprocal: entry,
+            remainder: rest(performed),
+            ..JobOutcome::message(message)
+        }),
+    }
+}
+
+/// D-187: Undo of a real creation and Redo of a real Trash-restore both need
+/// "trash these paths again", and the reciprocal either direction leaves for
+/// the other stack is the same `Trashed` shape.
+fn history_trash_created(paths: Vec<String>, verb: &str, whole: &str) -> Result<JobOutcome, String> {
+    history_trash(&paths, verb, whole, |performed| {
+        let rest = paths[performed..].to_vec();
+        (!rest.is_empty()).then_some(UndoAction::Created { paths: rest })
+    })
+}
+
+/// D-187: the reciprocal of `history_trash` — restores exactly `receipts`
 /// by exact payload identity, refusing fail-closed if any payload is missing
 /// or has changed since this entry was recorded (checked for every receipt
 /// before any is restored, so one bad entry refuses the whole batch). Shared
@@ -10103,14 +11005,15 @@ fn reciprocal_restore(
 /// D-187: Undo/Redo of a copy-paste. Checks every pasted item's current
 /// fingerprint against what was recorded before trashing any of them (one
 /// changed item refuses the whole batch), then trashes the copies by exact
-/// receipt — the identical shape `reciprocal_trash` already gives Created,
+/// receipt — the identical shape `history_trash` already gives Created,
 /// since "trash these paths" is the same operation whichever direction it is
 /// reached from.
-fn reciprocal_trash_checked(
+fn history_trash_copies(
     items: Vec<ResolvedItem>,
     fps: Vec<native_core::Fingerprint>,
     verb: &str,
-) -> Result<UndoAction, String> {
+    whole: &str,
+) -> Result<JobOutcome, String> {
     if items.len() != fps.len() {
         return Err(format!("{verb} refused: history entry is malformed"));
     }
@@ -10124,8 +11027,11 @@ fn reciprocal_trash_checked(
             ));
         }
     }
-    let to_paths: Vec<String> = items.into_iter().map(|item| item.to).collect();
-    reciprocal_trash(to_paths).map_err(|err| format!("{verb} refused: {err}"))
+    let to_paths: Vec<String> = items.iter().map(|item| item.to.clone()).collect();
+    history_trash(&to_paths, verb, whole, |performed| {
+        let (items, fps) = (items[performed..].to_vec(), fps[performed..].to_vec());
+        (!items.is_empty()).then_some(UndoAction::Pasted { items, was_copy: true, fps })
+    })
 }
 
 /// D-187: self-symmetric move transition shared by Undo and Redo, exactly
@@ -10196,18 +11102,14 @@ fn perform_redo(action: UndoAction) -> Result<JobOutcome, String> {
             let reciprocal = reciprocal_batch_rename(items, fps, "Redo")?;
             Ok(JobOutcome::reciprocal("Redid batch rename", reciprocal))
         }
-        UndoAction::Created { paths } => {
-            let reciprocal = reciprocal_trash(paths).map_err(|err| format!("Redo refused: {err}"))?;
-            Ok(JobOutcome::reciprocal("Redid create/copy: moved to Trash", reciprocal))
-        }
+        UndoAction::Created { paths } => history_trash_created(paths, "Redo", "Redid create/copy: moved to Trash"),
         UndoAction::Trashed { receipts, fps } => {
             let reciprocal = reciprocal_restore(receipts, fps, "Redo")?;
             Ok(JobOutcome::reciprocal("Redid restore from Trash", reciprocal))
         }
         UndoAction::Pasted { items, was_copy, fps } => {
             if was_copy {
-                let reciprocal = reciprocal_trash_checked(items, fps, "Redo")?;
-                Ok(JobOutcome::reciprocal("Redid paste: moved to Trash", reciprocal))
+                history_trash_copies(items, fps, "Redo", "Redid paste: moved to Trash")
             } else {
                 let reciprocal = reciprocal_move(items, fps, "Redo")?;
                 Ok(JobOutcome::reciprocal("Redid move", reciprocal))
@@ -10939,6 +11841,7 @@ fn show_drive_context_menu(
 
     popover.set_child(Some(&menu));
     unparent_when_closed(&popover);
+    track_drive_menu(&popover, &state);
     #[cfg(feature = "guide")]
     guide_repaint_on_close(&popover, &state);
     popover.popup();
@@ -12042,7 +12945,7 @@ impl DropTxn {
 
     fn into_transfer(self) -> Transfer {
         let style = self.style();
-        Transfer { srcs: self.srcs, dest: self.dest, is_copy: self.is_copy, clear_cut_after: false, style }
+        Transfer { srcs: self.srcs, dest: self.dest, is_copy: self.is_copy, cut_offer: None, style }
     }
 }
 
@@ -12654,6 +13557,318 @@ fn copy_zip_members_out_action(state: Rc<RefCell<AppState>>, ui: Ui, zip_srcs: V
 
 #[cfg(test)]
 mod tests {
+    fn test_entry(name: &str) -> super::Entry {
+        super::Entry {
+            name: name.to_string(),
+            source: super::native_core::EntrySource::real(name),
+            is_dir: false,
+            size: 0,
+            modified: 0,
+            is_image: false,
+            icon: String::new(),
+            metadata_error: None,
+        }
+    }
+
+    /// D-224: committed `75ca650`'s `glob_match` treated `[`/`]` literally,
+    /// so the installed contract's bracket-class form never worked. Calls
+    /// the real `glob_match` directly, not a copy.
+    #[test]
+    fn glob_match_bracket_class_admits_case_variants_and_excludes_wrong_suffix() {
+        assert!(super::glob_match("*.[iI][cC][oO]", "favicon.ico"));
+        assert!(super::glob_match("*.[iI][cC][oO]", "FAVICON.ICO"));
+        assert!(super::glob_match("*.[iI][cC][oO]", "Favicon.Ico"));
+        assert!(!super::glob_match("*.[iI][cC][oO]", "favicon.png"));
+        assert!(!super::glob_match("*.[iI][cC][oO]", "favicon.icon"));
+        // A range form and negation also work, matching the contract's own
+        // glob grammar rather than only the enumerated-set form.
+        assert!(super::glob_match("*.[a-z]", "x.m"));
+        assert!(!super::glob_match("*.[a-z]", "x.M"));
+        assert!(super::glob_match("*.[!a-z]", "x.M"));
+        assert!(!super::glob_match("*.[!a-z]", "x.m"));
+    }
+
+    /// D-224: committed `75ca650`'s `guess_mime_from_name` knew only twelve
+    /// hardcoded extensions; everything else fell to
+    /// `application/octet-stream`, so a filter naming a type outside that
+    /// table could never match. `.rs` resolves via the platform's own GIO
+    /// content-type database to `text/rust`, confidently (not uncertain),
+    /// confirmed outside this test by direct `gio::content_type_guess`
+    /// probing -- never in the old table, so this proves the platform
+    /// resolver is actually used.
+    #[test]
+    fn mime_match_platform_resolved_type_matches_exact_and_wildcard() {
+        let entry = test_entry("lib.rs");
+        assert!(super::mime_match("text/rust", &entry));
+        assert!(super::mime_match("text/*", &entry));
+        assert!(!super::mime_match("text/plain", &entry));
+        assert!(!super::mime_match("image/*", &entry));
+    }
+
+    /// D-225: a fresh, round-owned root under `~/Projects/Scratch`, never
+    /// the ambient `std::env::temp_dir()` and never an existing root.
+    fn owned_scratch_dir_225(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = crate::native_core::scratch_root()
+            .join(format!("d225-{label}-{}-{nanos}", std::process::id()));
+        assert!(!dir.exists(), "must be a fresh root, never an existing one");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// D-224/D-225: `parse_wire_request` must fail closed -- never
+    /// `WireRequestNative::default()` -- for every malformed input mode,
+    /// including `{}`, an unrelated-only object, each required key missing
+    /// individually, and a present-but-null `current_filter` succeeding
+    /// only once every other key is also present. Calls the real function
+    /// directly against real files on disk in an owned Scratch root;
+    /// every file is created and read before the root is torn down, and
+    /// only then are the captured results asserted.
+    #[test]
+    fn parse_wire_request_rejects_incomplete_malformed_and_wrong_shaped_but_accepts_valid() {
+        let dir = owned_scratch_dir_225("parse-wire-request");
+
+        let write_and_parse = |name: &str, contents: &str| -> Result<super::WireRequestNative, ()> {
+            let path = dir.join(name);
+            fs::write(&path, contents).unwrap();
+            super::parse_wire_request(path.to_str().unwrap())
+        };
+
+        let absent = super::parse_wire_request(dir.join("absent.json").to_str().unwrap());
+
+        let oversized_padding = "x".repeat(super::MAX_WIRE_REQUEST_BYTES as usize + 1);
+        let oversized = write_and_parse(
+            "oversized.json",
+            &format!(
+                "{{\"multiple\":false,\"filters\":[],\"current_filter\":null,\"choices\":[],\"pad\":\"{oversized_padding}\"}}"
+            ),
+        );
+
+        let malformed = write_and_parse("malformed.json", "{ not json");
+        let wrong_shape = write_and_parse("wrong-shape.json", "[1, 2, 3]");
+        let empty_object = write_and_parse("empty.json", "{}");
+        let unrelated_only = write_and_parse("unrelated.json", "{\"unrelated\":true}");
+        let missing_multiple = write_and_parse(
+            "missing-multiple.json",
+            "{\"filters\":[],\"current_filter\":null,\"choices\":[]}",
+        );
+        let missing_filters = write_and_parse(
+            "missing-filters.json",
+            "{\"multiple\":false,\"current_filter\":null,\"choices\":[]}",
+        );
+        let missing_current_filter = write_and_parse(
+            "missing-current-filter.json",
+            "{\"multiple\":false,\"filters\":[],\"choices\":[]}",
+        );
+        let missing_choices = write_and_parse(
+            "missing-choices.json",
+            "{\"multiple\":false,\"filters\":[],\"current_filter\":null}",
+        );
+        let wrong_type = write_and_parse(
+            "wrong-type.json",
+            "{\"multiple\":\"yes\",\"filters\":[],\"current_filter\":null,\"choices\":[]}",
+        );
+        let valid_with_null_current_filter = write_and_parse(
+            "valid.json",
+            "{\"multiple\":true,\"filters\":[],\"current_filter\":null,\"choices\":[]}",
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(absent.is_err());
+        assert!(oversized.is_err());
+        assert!(malformed.is_err());
+        assert!(wrong_shape.is_err());
+        assert!(empty_object.is_err(), "{{}} must be refused, not an unconstrained default");
+        assert!(unrelated_only.is_err());
+        assert!(missing_multiple.is_err());
+        assert!(missing_filters.is_err());
+        assert!(
+            missing_current_filter.is_err(),
+            "the current_filter key must be required even though its value may be null"
+        );
+        assert!(missing_choices.is_err());
+        assert!(wrong_type.is_err());
+        let parsed = valid_with_null_current_filter
+            .expect("a complete, well-formed request within the size bound must parse");
+        assert!(parsed.multiple);
+        assert!(parsed.current_filter.is_none());
+    }
+
+    /// D-225: proves the bound is enforced by the read itself, not by a
+    /// prior `fs::metadata` length check -- a FIFO always reports a
+    /// metadata length of zero, so a metadata-based bound would have
+    /// accepted it regardless of how many bytes are actually written to
+    /// it. A writer thread pushes `MAX_WIRE_REQUEST_BYTES + 1` bytes
+    /// through the pipe while `parse_wire_request` reads it; the result is
+    /// captured, the writer is joined and the owned root torn down, and
+    /// only then is the rejection asserted.
+    #[test]
+    fn parse_wire_request_bounds_the_read_itself_not_file_metadata() {
+        let dir = owned_scratch_dir_225("fifo-bound");
+        let fifo_path = dir.join("req.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo must run on this box");
+        assert!(status.success(), "mkfifo must succeed to run this proof");
+
+        let writer_path = fifo_path.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo for writing");
+            let payload = "x".repeat(super::MAX_WIRE_REQUEST_BYTES as usize + 1);
+            let _ = f.write_all(payload.as_bytes());
+        });
+
+        let result = super::parse_wire_request(fifo_path.to_str().unwrap());
+        writer.join().expect("writer thread must not panic");
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a FIFO whose metadata length is always 0 must still be rejected once its actual bytes exceed the bound"
+        );
+    }
+
+    /// D-225: spawns the real `wayfinder-native` executable with `DISPLAY`
+    /// and `WAYLAND_DISPLAY` removed, so any attempt to reach GTK or a
+    /// display would surface as its own distinct failure. A malformed
+    /// `--request` file and a trailing `--request` with no value must
+    /// both exit 1 -- `fail_closed_on_invalid_request`'s own exit code --
+    /// with no GTK/GStreamer/display text on stderr, proving the refusal
+    /// happens in the precheck before `gst::init()`, not as a side effect
+    /// of having no display.
+    #[test]
+    fn fail_closed_on_invalid_request_refuses_a_real_pick_invocation_before_gtk_init() {
+        let dir = owned_scratch_dir_225("startup-refusal");
+        let bad = dir.join("bad.json");
+        fs::write(&bad, "{ not json").unwrap();
+        // `env!("CARGO_BIN_EXE_wayfinder-native")` isn't available here --
+        // this test lives inside that same binary's own source, and Cargo
+        // only defines that variable for a *different* crate's tests. The
+        // plain (non-test-harness) binary sits beside the test harness's
+        // own `deps/` directory as `target/<profile>/wayfinder-native`;
+        // building it is a prerequisite for this test (`cargo build --bin
+        // wayfinder-native`), named as such in the round's gate report.
+        let bin = {
+            let exe = std::env::current_exe().expect("current test executable path");
+            let profile_dir = exe
+                .parent()
+                .and_then(|deps| deps.parent())
+                .expect("target/<profile>/deps -> target/<profile>");
+            profile_dir.join("wayfinder-native")
+        };
+        assert!(
+            bin.exists(),
+            "{} must already be built via `cargo build --bin wayfinder-native` before this test runs",
+            bin.display()
+        );
+
+        let malformed_output = std::process::Command::new(&bin)
+            .args(["--pick", "--request", bad.to_str().unwrap()])
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .output()
+            .expect("spawn the real wayfinder-native binary");
+
+        let trailing_output = std::process::Command::new(&bin)
+            .args(["--pick", "--request"])
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .output()
+            .expect("spawn the real wayfinder-native binary");
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let stderr = String::from_utf8_lossy(&malformed_output.stderr).to_lowercase();
+        assert_eq!(
+            malformed_output.status.code(),
+            Some(1),
+            "a malformed --request file must be refused with exit 1 before any display/GTK attempt; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("gtk") && !stderr.contains("gstreamer") && !stderr.contains("display") && !stderr.contains("x11"),
+            "the refusal must come from the precheck, not a later display/GTK/gst failure: {stderr}"
+        );
+        assert_eq!(
+            trailing_output.status.code(),
+            Some(1),
+            "a trailing --request with no value must be refused, not treated as if --request were absent"
+        );
+    }
+
+    /// D-224: the caller's user-visible enumerated-choice label must land
+    /// in the real GTK widget tree beside the option dropdown -- `75ca650`
+    /// built only the `DropDown` for an enumerated choice and put
+    /// `choice.label` on screen only for the boolean branch. Calls the
+    /// real `build_picker_filter_and_choice_controls` (the same function
+    /// `build_ui` calls), never a copy of its logic, and walks the real
+    /// `gtk::Box` children it populates.
+    #[test]
+    fn enumerated_choice_label_lands_in_the_real_widget_tree() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let picker_state = super::PickerState {
+            config: super::PickerConfig {
+                multiple: false,
+                directory: false,
+                starting_dir: None,
+                filter: None,
+                window: None,
+                request: super::WireRequestNative {
+                    multiple: false,
+                    filters: Vec::new(),
+                    current_filter: None,
+                    choices: vec![super::WireChoiceNative {
+                        id: "encoding".to_string(),
+                        label: "Encoding".to_string(),
+                        options: vec![
+                            ("utf8".to_string(), "UTF-8".to_string()),
+                            ("latin1".to_string(), "Latin-1".to_string()),
+                        ],
+                        initial: "utf8".to_string(),
+                    }],
+                },
+                parent_window: None,
+            },
+            out_file: String::new(),
+            meta_path: None,
+            active_filter: Rc::new(RefCell::new(None)),
+            choice_selections: Rc::new(RefCell::new(HashMap::new())),
+        };
+
+        let (dropdown, widgets) =
+            super::build_picker_filter_and_choice_controls(&actions, &picker_state);
+        assert!(dropdown.is_none(), "no filters were supplied, so no filter dropdown is built");
+        assert_eq!(widgets.len(), 1, "exactly one choice widget must be built");
+
+        let mut found_label = false;
+        let mut child = actions.first_child();
+        while let Some(widget) = child {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.text() == "Encoding" {
+                    found_label = true;
+                }
+            }
+            child = widget.next_sibling();
+        }
+        assert!(
+            found_label,
+            "the real widget tree must contain a Label with the choice's own \
+             user-visible label text, not only its option DropDown"
+        );
+    }
+
     #[test]
     fn job_poll_interval_is_a_frame_not_a_stall() {
         // D-91 regression guard: run_job's completion poll must stay at a
@@ -12664,8 +13879,19 @@ mod tests {
         assert!(super::JOB_POLL_INTERVAL < std::time::Duration::from_millis(50));
     }
 
+    /// D-231: the entry a Trash history step leaves for the other stack. The
+    /// D-187 tests move one item per step, so a step that did not move it
+    /// whole is their error, as it was when the step returned one.
+    fn whole_reciprocal(step: Result<JobOutcome, String>) -> Result<UndoAction, String> {
+        let outcome = step?;
+        match (outcome.reciprocal, outcome.remainder) {
+            (Some(reciprocal), None) => Ok(reciprocal),
+            _ => Err(format!("the step did not move every item: {}", outcome.message)),
+        }
+    }
+
     /// D-187: Created and Trashed are an exact reciprocal pair. Undo of a real
-    /// creation trashes it by exact receipt (reciprocal_trash); Redo restores it
+    /// creation trashes it by exact receipt (history_trash_created); Redo restores it
     /// by that same exact receipt (reciprocal_restore), and a second Undo trashes
     /// it again. Also proves the fail-closed refusal: editing the Trash payload
     /// between recording and replay refuses restore without touching anything or
@@ -12693,7 +13919,7 @@ mod tests {
             let original_str = original.to_string_lossy().to_string();
 
             // ---- Undo of Created: trash it by exact receipt.
-            let trashed = reciprocal_trash(vec![original_str.clone()])?;
+            let trashed = whole_reciprocal(perform_undo(UndoAction::Created { paths: vec![original_str.clone()] }))?;
             let (receipts, fps) = match trashed {
                 UndoAction::Trashed { receipts, fps } => (receipts, fps),
                 other => panic!("expected Trashed, got {other:?}"),
@@ -12717,7 +13943,7 @@ mod tests {
             assert_eq!(fs::read(&original).unwrap(), b"newly created payload", "restored exact bytes");
 
             // ---- Undo again: trash it a second time.
-            let trashed_again = reciprocal_trash(vec![original_str.clone()])?;
+            let trashed_again = whole_reciprocal(perform_undo(UndoAction::Created { paths: vec![original_str.clone()] }))?;
             let (receipts2, fps2) = match trashed_again {
                 UndoAction::Trashed { receipts, fps } => (receipts, fps),
                 other => panic!("expected Trashed, got {other:?}"),
@@ -12757,7 +13983,7 @@ mod tests {
     }
 
     /// D-187: Undo of a copy-paste trashes the pasted copy by exact receipt
-    /// (reciprocal_trash_checked), checking its fingerprint first so a direct
+    /// (history_trash_copies), checking its fingerprint first so a direct
     /// edit of the copy between pasting and Undo refuses instead of trashing
     /// changed content; Redo (reciprocal_restore, reused from Created/Trashed)
     /// restores it exactly.
@@ -12787,14 +14013,14 @@ mod tests {
 
             // ---- Fail-closed: edit the copy before Undo even runs.
             fs::write(&pasted, b"edited after paste, before undo").unwrap();
-            let refused = reciprocal_trash_checked(items.clone(), fps.clone(), "Undo");
+            let refused = whole_reciprocal(perform_undo(UndoAction::Pasted { items: items.clone(), was_copy: true, fps: fps.clone() }));
             let err = refused.expect_err("a changed pasted copy must refuse Undo");
             assert!(err.starts_with("Undo refused:"), "message was {err:?}");
             assert!(pasted.is_file(), "a refused Undo must not trash the copy");
 
             // ---- Restore the original content, then Undo trashes it for real.
             fs::write(&pasted, b"pasted copy payload").unwrap();
-            let trashed = reciprocal_trash_checked(items, fps, "Undo")?;
+            let trashed = whole_reciprocal(perform_undo(UndoAction::Pasted { items, was_copy: true, fps }))?;
             let (receipts, fps2) = match trashed {
                 UndoAction::Trashed { receipts, fps } => (receipts, fps),
                 other => panic!("expected Trashed, got {other:?}"),
@@ -12847,10 +14073,12 @@ mod tests {
             started.set(started.get() + 1);
         });
         assert_eq!(started.get(), 2);
-        // cut clipboard: kept on failure or when not a cut, cleared only on success
-        assert_eq!(clipboard_after_job(true, false, Some("cut")), Some("cut"));
-        assert_eq!(clipboard_after_job(false, true, Some("copy")), Some("copy"));
-        assert_eq!(clipboard_after_job(true, true, Some("cut")), None);
+        // cut clipboard: kept on failure or when not a cut, cleared only on success,
+        // and (D-232) only while the clipboard still holds the very offer that was cut
+        assert!(!cut_consumes_offer(Some(7), false, 7));
+        assert!(!cut_consumes_offer(None, true, 7));
+        assert!(cut_consumes_offer(Some(7), true, 7));
+        assert!(!cut_consumes_offer(Some(7), true, 8));
     }
 
     #[test]
@@ -12982,7 +14210,7 @@ mod tests {
             srcs: srcs.into_iter().map(PathBuf::from).collect(),
             dest: PathBuf::from(p("Inbox/Target")),
             is_copy: false,
-            clear_cut_after: false,
+            cut_offer: None,
             style: TransferStyle::DropOnRow,
         };
         assert_eq!(
@@ -13122,7 +14350,7 @@ mod tests {
             srcs,
             dest: dest.to_path_buf(),
             is_copy,
-            clear_cut_after: !is_copy,
+            cut_offer: (!is_copy).then(|| CutOffer { serial: 0, _claim: Rc::new(()) }),
             style: TransferStyle::Paste,
         };
         assert_eq!(plan_transfer(&mk(vec![s("src/free.txt")], &s("dest"), false)), TransferPlan::Run);
@@ -13605,7 +14833,7 @@ Broken: the copy keeps running.\n";
                 srcs: vec![transfer_src.join("big-1.bin")],
                 dest: dir.clone(),
                 is_copy: true,
-                clear_cut_after: false,
+                cut_offer: None,
                 style: TransferStyle::Paste,
             },
             native_core::PasteConflict::KeepBoth,
@@ -14821,10 +16049,8 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.status.label(), refusal, "Compress refused inside a ZIP");
         {
             std::fs::write(out_dir.join("blocker.txt"), "x").unwrap();
-            state.borrow_mut().clipboard = Some(FileClipboard {
-                mode: ClipboardMode::Copy,
-                paths: vec![native_core::ClipboardSource::Real(out_dir.join("blocker.txt"))],
-            });
+            // D-232: a real Copy offer on the display clipboard, as Copy publishes it.
+            publish_test_offer(native_core::ClipIntent::Copy, &[out_dir.join("blocker.txt")]).expect("the copy is on the clipboard");
             paste_clipboard(state.clone(), ui.clone());
             assert_eq!(ui.status.label(), refusal, "Paste into a ZIP is always refused");
         }
@@ -14832,14 +16058,20 @@ Broken: Either state is wrong.\n";
         // Delete Permanently, Terminal, and picker submission of a ZIP
         // member — also refuse at the typed handler boundary, fail-closed,
         // with no clipboard state, process launch or picker exit.
-        let clipboard_before_zip_copy = state.borrow().clipboard.clone();
+        let clipboard_before_zip_copy = (clipboard_serial(), clipboard_files_now());
+        assert_eq!(
+            clipboard_before_zip_copy.1,
+            Some(Ok(native_core::ClipFiles { intent: native_core::ClipIntent::Copy, paths: vec![out_dir.join("blocker.txt")] })),
+            "D-232: the earlier Copy offer is what the clipboard holds"
+        );
         copy_selection(&state, &ui);
         assert_eq!(ui.status.label(), refusal, "Copy refused inside a ZIP");
         assert_eq!(
-            state.borrow().clipboard.is_some(),
-            clipboard_before_zip_copy.is_some(),
+            (clipboard_serial(), clipboard_files_now()),
+            clipboard_before_zip_copy,
             "D-188 #29: a refused Copy inside a ZIP must not change clipboard presence"
         );
+        clear_test_clipboard();
         ui.status.set_label("");
         permanent_delete_selection(state.clone(), ui.clone());
         assert_eq!(ui.status.label(), refusal, "Delete Permanently refused inside a ZIP");
@@ -14848,7 +16080,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.status.label(), refusal, "Terminal refused inside a ZIP");
         {
             state.borrow_mut().picker = Some(PickerState {
-                config: PickerConfig { multiple: false, directory: false, starting_dir: None, filter: None, window: None, request: WireRequestNative::default() },
+                config: PickerConfig { multiple: false, directory: false, starting_dir: None, filter: None, window: None, request: WireRequestNative::default(), parent_window: None },
                 out_file: dir.join("picker-zip.out").to_string_lossy().to_string(),
                 meta_path: None,
                 active_filter: Rc::new(RefCell::new(None)),
@@ -16687,6 +17919,10 @@ Broken: Either state is wrong.\n";
         if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
             return;
         }
+        // D-232: this test puts files on the display's clipboard, so it runs
+        // only in a private session. Checked before GTK and GIO read HOME or
+        // the display.
+        let _session = private_session_guard_d232();
         zip_read_only_browse_open_copy_out_d188();
         zip_bad_oracles_d188();
     }
@@ -16722,6 +17958,9 @@ Broken: Either state is wrong.\n";
         if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
             return;
         }
+        // D-232: the suite uses the display's clipboard, so it runs only in a
+        // private session. Checked before GTK and GIO read HOME or the display.
+        let d232_session = private_session_guard_d232();
         gtk::init().expect("gtk init on the virtual display");
         gst::init().expect("gstreamer init");
         let display = gdk::Display::default().expect("display");
@@ -16732,6 +17971,7 @@ Broken: Either state is wrong.\n";
         );
         // First: earlier tests leave modal dialogs that would swallow real pointer input.
         real_pointer_drag_carries_the_press_time_selection();
+        enumerated_choice_label_lands_in_the_real_widget_tree();
         // Also real pointer input, so it runs before anything can leave a modal behind.
         #[cfg(feature = "guide")]
         guide_ring_and_label_are_drawn_d52();
@@ -16783,6 +18023,11 @@ Broken: Either state is wrong.\n";
         item_right_click_menu_opens_bounded_and_stays_d41();
         open_with_opens_a_side_menu_not_a_dialog_d42();
         drive_space_bars_refresh_off_thread_and_stay_cached_d46();
+        drive_menus_survive_refresh_d229(None);
+        extract_here_keeps_existing_entries_d230();
+        partial_trash_keeps_undo_d231();
+        shared_clipboard_d232(&d232_session);
+        shared_clipboard_seams_d232(&d232_session);
         context_menu_actions_fire_once_and_leave_no_popover_d54();
         child_apps_launch_with_the_window_context_d57();
         thumbnail_queue_caps_concurrency_and_drains_on_cancel_d84();
@@ -18367,7 +19612,7 @@ Broken: Either state is wrong.\n";
         run_transfer(
             state.clone(),
             ui.clone(),
-            Transfer { srcs: vec![src.join("big.bin")], dest: dest.clone(), is_copy: true, clear_cut_after: false, style: TransferStyle::Paste },
+            Transfer { srcs: vec![src.join("big.bin")], dest: dest.clone(), is_copy: true, cut_offer: None, style: TransferStyle::Paste },
             native_core::PasteConflict::KeepBoth,
         );
         wait_for("bar and Cancel become visible", || ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible());
@@ -18766,7 +20011,7 @@ Broken: Either state is wrong.\n";
         still_pending("failed open_path");
         // Picker mode (directory picker, so a file is refused and nothing exits).
         state.borrow_mut().picker = Some(PickerState {
-            config: PickerConfig { multiple: false, directory: true, starting_dir: None, filter: None, window: None, request: WireRequestNative::default() },
+            config: PickerConfig { multiple: false, directory: true, starting_dir: None, filter: None, window: None, request: WireRequestNative::default(), parent_window: None },
             meta_path: None,
             active_filter: Rc::new(RefCell::new(None)),
             choice_selections: Rc::new(RefCell::new(HashMap::new())),
@@ -20908,7 +22153,7 @@ Broken: Either state is wrong.\n";
             names.sort();
             (
                 names,
-                s.clipboard.is_none(),
+                (clipboard_serial(), s.pending_offer.is_none()),
                 s.undo_stack.len(),
                 (s.tabs.tabs[0].history.clone(), s.tabs.tabs[0].index),
                 (ui.back.is_sensitive(), ui.forward.is_sensitive()),
@@ -21532,7 +22777,17 @@ Broken: Either state is wrong.\n";
         let menu = popovers_of(&row).pop().unwrap();
         button_labelled(menu.upcast_ref(), "Copy").unwrap().emit_clicked();
         pump();
-        assert!(state.borrow().clipboard.is_some(), "Copy still copies");
+        assert!(state.borrow().pending_offer.is_some(), "Copy still copies");
+        let copied = match &entry.source {
+            native_core::EntrySource::Real(path) => path.clone(),
+            native_core::EntrySource::ZipMember(_) => unreachable!("the row is a real file"),
+        };
+        assert_eq!(
+            clipboard_files_now(),
+            Some(Ok(native_core::ClipFiles { intent: native_core::ClipIntent::Copy, paths: vec![copied] })),
+            "D-232: the menu's Copy put that file on the display clipboard"
+        );
+        clear_test_clipboard();
         assert!(!menu.is_mapped(), "Copy still closes the menu");
         drop(menu);
         pump();
@@ -22221,6 +23476,597 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// How many drive menus the window still remembers. Its own function so the
+    /// D-229 test text also builds on a tree from before the repair, where no
+    /// menu is remembered.
+    fn tracked_drive_menus(state: &Rc<RefCell<AppState>>) -> usize {
+        state.borrow().drive_menus.len()
+    }
+
+    #[test]
+    fn drive_menus_survive_refresh_d229_alone() {
+        if std::env::var("WAYFINDER_D229_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        let only = std::env::var("WAYFINDER_D229_CASE").ok();
+        drive_menus_survive_refresh_d229(only.as_deref());
+    }
+
+    /// D-229: a drive refresh must not take a row out from under an open drive menu.
+    /// Real sidebar rows, real menus and buttons, and the real worker and result
+    /// path, on this test's own scratch folders. `only` runs one case, for a
+    /// before/after pair; the suite runs every case.
+    ///
+    /// Each window also keeps its own 30-second refresh running. It reads the same
+    /// list the test last set, so it can add a scan but never a different answer;
+    /// nothing here depends on the exact number of scans. A visit leaves Recent
+    /// waiting for the next scan, so a case that visits a folder either shuts the
+    /// gate first or refreshes before it compares rows.
+    fn drive_menus_survive_refresh_d229(only: Option<&str>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+
+        /// One window with its own drive scan: what the scan returns, how often it
+        /// ran, and a gate its worker waits at.
+        struct Win {
+            _app: adw::Application,
+            state: Rc<RefCell<AppState>>,
+            ui: Ui,
+            listing: Arc<Mutex<Vec<Drive>>>,
+            calls: Arc<AtomicUsize>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        fn show(list: &[Drive]) -> String {
+            format!("{list:?}")
+        }
+
+        impl Win {
+            fn open(id: &str, home: &std::path::Path, first: &[Drive]) -> Win {
+                let listing = Arc::new(Mutex::new(first.to_vec()));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let gate = Arc::new((Mutex::new(true), Condvar::new()));
+                let scan: DriveScan = {
+                    let (listing, calls, gate) = (listing.clone(), calls.clone(), gate.clone());
+                    Arc::new(move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let (open, cv) = &*gate;
+                        let mut open = open.lock().unwrap();
+                        while !*open {
+                            open = cv.wait(open).unwrap();
+                        }
+                        drop(open);
+                        listing.lock().unwrap().clone()
+                    })
+                };
+                TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = Some(scan));
+                let app = adw::Application::builder()
+                    .application_id(id)
+                    .flags(gio::ApplicationFlags::NON_UNIQUE)
+                    .build();
+                app.register(gio::Cancellable::NONE).expect("register test application");
+                build_ui(&app, Some(home.to_string_lossy().to_string()), None);
+                let (state, ui) = WINDOWS
+                    .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                    .expect("the test window is registered");
+                ui.window.present();
+                let win = Win { _app: app, state, ui, listing, calls, gate };
+                wait_for("the first scan to be shown", || win.shown() == show(first) && !win.busy());
+                pump();
+                win
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+
+            fn busy(&self) -> bool {
+                self.state.borrow().drive_refresh_in_flight
+            }
+
+            /// The drives the sidebar stands for.
+            fn shown(&self) -> String {
+                show(&self.state.borrow().drives)
+            }
+
+            fn cwd(&self) -> String {
+                self.state.borrow().cwd.real_path_string().unwrap_or_default()
+            }
+
+            fn go(&self, dir: &std::path::Path) {
+                navigate(&self.state, native_core::Location::real(dir));
+                wait_for("navigated", || self.cwd() == dir.to_string_lossy());
+                pump();
+            }
+
+            fn set_gate(&self, open: bool) {
+                let (flag, cv) = &*self.gate;
+                *flag.lock().unwrap() = open;
+                cv.notify_all();
+            }
+
+            /// Shuts the gate with no scan in the air: until it opens, no scan
+            /// result can arrive, whoever asks for one.
+            fn hold(&self) {
+                loop {
+                    self.set_gate(false);
+                    if !self.busy() {
+                        return;
+                    }
+                    self.set_gate(true);
+                    wait_for("a running scan to land", || !self.busy());
+                }
+            }
+
+            fn release(&self) {
+                self.set_gate(true);
+                wait_for("held scans to land", || !self.busy());
+                pump();
+            }
+
+            /// A real refresh: the worker reads `list`, and its result has been taken in.
+            fn refresh(&self, list: &[Drive]) {
+                *self.listing.lock().unwrap() = list.to_vec();
+                let n = self.calls();
+                request_drive_refresh(&self.state);
+                wait_for("the scan to land", || self.calls() > n && !self.busy());
+                pump();
+            }
+
+            /// Two requests while the gate is shut: one scan runs and one is queued.
+            /// The queued one must start in the same loop turn that takes the first
+            /// result in, whatever that result was.
+            fn queued_scan_still_runs(&self, why: &str, list: &[Drive]) {
+                self.hold();
+                *self.listing.lock().unwrap() = list.to_vec();
+                let n = self.calls();
+                request_drive_refresh(&self.state);
+                request_drive_refresh(&self.state);
+                wait_for("the first scan to start", || self.calls() == n + 1);
+                assert!(
+                    self.busy() && self.state.borrow().drive_refresh_again,
+                    "{why}: the second request was not queued behind the first"
+                );
+                self.set_gate(true);
+                let ctx = glib::MainContext::default();
+                let mut landed = false;
+                for _ in 0..8000 {
+                    ctx.iteration(false);
+                    if !self.state.borrow().drive_refresh_again || self.calls() > n + 1 {
+                        landed = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(landed, "{why}: the first result never arrived");
+                assert!(self.busy(), "{why}: the queued scan was dropped");
+                wait_for("the queued scan to land", || self.calls() >= n + 2 && !self.busy());
+                pump();
+            }
+
+            fn rows(&self) -> Vec<(String, String, usize, gtk::ListBoxRow)> {
+                all_widgets(self.ui.sidebar.upcast_ref())
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+                    .map(|row| {
+                        let inner = all_widgets(row.upcast_ref());
+                        let text = |class: &str| {
+                            inner
+                                .iter()
+                                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                                .find(|l| l.has_css_class(class))
+                                .map(|l| l.label().to_string())
+                                .unwrap_or_default()
+                        };
+                        let bars = inner.iter().filter(|w| w.is::<gtk::ProgressBar>()).count();
+                        (text("wf-sidebar-title"), text("wf-sidebar-detail"), bars, row.clone())
+                    })
+                    .collect()
+            }
+
+            fn find(&self, name: &str) -> Option<gtk::ListBoxRow> {
+                self.rows().into_iter().find(|r| r.0 == name).map(|r| r.3)
+            }
+
+            fn row(&self, name: &str) -> gtk::ListBoxRow {
+                self.find(name).unwrap_or_else(|| panic!("no sidebar row named {name}"))
+            }
+
+            /// The drive rows, top to bottom.
+            fn drive_names(&self) -> Vec<String> {
+                self.rows().into_iter().map(|r| r.0).filter(|n| n.starts_with("Syn") || n == "Launch Box SSD 2TB").collect()
+            }
+
+            /// Opens the real drive menu on `row`, as a right click does.
+            fn menu_on(&self, row: &gtk::ListBoxRow, drive: &Drive) -> (gtk::Popover, gtk::Button) {
+                let before = popovers_of(row.upcast_ref());
+                show_drive_context_menu(row, self.state.clone(), self.ui.clone(), drive.clone(), 5.0, 5.0);
+                pump();
+                let menu = popovers_of(row.upcast_ref()).into_iter().find(|p| !before.contains(p)).expect("the drive menu");
+                assert!(
+                    menu.is_mapped() && menu.parent().as_ref() == Some(row.upcast_ref::<gtk::Widget>()),
+                    "the drive menu did not open on its row"
+                );
+                let open = button_labelled(menu.upcast_ref(), "Open").expect("the menu's Open button");
+                (menu, open)
+            }
+
+            /// The row called `name` is still `row`, with `menu` open on it and its button usable.
+            fn same_menu(&self, why: &str, name: &str, row: &gtk::ListBoxRow, menu: &gtk::Popover, button: &gtk::Button) {
+                assert_eq!(self.find(name).as_ref(), Some(row), "{why}: the row under the open menu was replaced");
+                assert!(
+                    row.is_ancestor(&self.ui.window) && row.is_mapped(),
+                    "{why}: the row under the open menu left the window"
+                );
+                assert_eq!(menu.parent().as_ref(), Some(row.upcast_ref::<gtk::Widget>()), "{why}: the menu lost its row");
+                assert!(menu.is_visible() && menu.is_mapped(), "{why}: the menu closed");
+                assert!(
+                    button.is_ancestor(menu) && button.is_mapped() && button.is_sensitive(),
+                    "{why}: the menu's button can no longer be used"
+                );
+            }
+        }
+
+        const CASES: [&str; 7] = ["identical", "space", "structural", "queue", "close", "recents", "windows"];
+        assert!(only.is_none_or(|case| CASES.contains(&case)), "unknown case {only:?}");
+        let run = |case: &str| only.is_none_or(|o| o == case);
+
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d229-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let mount_a = root.join("mount-a");
+        let mount_b = root.join("mount-b");
+        for d in [&home, &mount_a, &mount_b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        #[cfg(feature = "guide")]
+        let old_guide = std::env::var("WF_GUIDE_FILE").ok();
+        #[cfg(feature = "guide")]
+        {
+            let gdir = root.join("guide");
+            std::fs::create_dir_all(&gdir).unwrap();
+            std::env::set_var("WF_GUIDE_FILE", gdir.join("wayfinder.json"));
+        }
+        let gb: u64 = 1024 * 1024 * 1024;
+        let drive = |name: &str, mount: Option<&std::path::Path>, space: Option<native_core::Space>| Drive {
+            name: name.to_string(),
+            path: format!("/dev/synthetic-{name}"),
+            mountpoint: mount.map(|m| m.to_string_lossy().to_string()).unwrap_or_default(),
+            size: 100 * gb,
+            fstype: "ext4".into(),
+            kind: "drive".into(),
+            removable: false,
+            space,
+        };
+        let space = |total_gb: u64, free_gb: u64| Some(native_core::Space { total: total_gb * gb, available: free_gb * gb });
+        let a = drive("SynA", Some(&mount_a), space(100, 25));
+        let b = drive("SynB", Some(&mount_b), None);
+        let c = drive("SynC", None, None);
+        let base = vec![a.clone(), b.clone()];
+        let swapped = vec![b.clone(), a.clone()];
+        let bar_of = |row: &gtk::ListBoxRow| all_widgets(row.upcast_ref()).into_iter().find_map(|w| w.downcast::<gtk::ProgressBar>().ok());
+
+        // Optional pictures of the whole virtual screen, for a before/after record.
+        let frames = std::env::var("WF_D229_FRAMES").ok().map(std::path::PathBuf::from);
+        let frame = |name: &str| {
+            if let Some(dir) = &frames {
+                pump();
+                std::thread::sleep(Duration::from_millis(400));
+                pump();
+                let out = std::process::Command::new("/usr/bin/import")
+                    .args(["-window", "root"])
+                    .arg(dir.join(name))
+                    .output()
+                    .expect("import");
+                assert!(out.status.success(), "frame capture: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        };
+
+        // The bar's size comes from the app stylesheet, which build_ui does not install.
+        install_app_css();
+        let w = Win::open("com.kadaken.wayfinder.d229test", &home, &base);
+
+        // The same drives again, and no drives again.
+        if run("identical") {
+            w.refresh(&base);
+            let (row, other) = (w.row("SynA"), w.row("SynB"));
+            let (menu, open) = w.menu_on(&row, &a);
+            frame("identical-1-menu-open.png");
+            w.refresh(&base);
+            frame("identical-2-after-the-same-scan.png");
+            w.same_menu("the same drives again", "SynA", &row, &menu, &open);
+            assert_eq!(w.row("SynB"), other, "the same drives again: a row away from the menu was replaced");
+            // The button that was there before the scan still does its job. The gate is
+            // shut, so nothing but the close itself could rebuild the sidebar here.
+            w.hold();
+            open.emit_clicked();
+            wait_for("Open went to the drive", || w.cwd() == mount_a.to_string_lossy());
+            pump();
+            assert!(!menu.is_mapped(), "the menu closes on its action");
+            assert_eq!(w.row("SynA"), row, "closing the menu rebuilt the sidebar with nothing waiting");
+            assert_eq!(tracked_drive_menus(&w.state), 0, "a menu that closed with nothing waiting is still remembered");
+            w.release();
+
+            // No drives before and none after: the menu sits on a row that is not a drive row.
+            w.refresh(&[]);
+            let anchor = w.row("Home");
+            let (menu, open) = w.menu_on(&anchor, &a);
+            w.refresh(&[]);
+            w.same_menu("no drives again", "Home", &anchor, &menu, &open);
+            menu.popdown();
+            pump();
+            assert_eq!(w.row("Home"), anchor, "closing the menu rebuilt the sidebar with nothing waiting");
+            assert_eq!(tracked_drive_menus(&w.state), 0, "a menu that closed with nothing waiting is still remembered");
+        }
+
+        // Only the space changed: written into the rows that are there.
+        if run("space") {
+            w.refresh(&base);
+            let (row, other) = (w.row("SynA"), w.row("SynB"));
+            let (menu, open) = w.menu_on(&row, &a);
+            type Words = (&'static str, Option<f64>);
+            let gone: Words = ("Space unavailable", None);
+            let half: Words = ("25 GB available", Some(0.5));
+            let steps: [(&str, Option<native_core::Space>, Words, Option<native_core::Space>, Words); 7] = [
+                ("more free space", space(100, 40), ("40 GB available", Some(0.6)), None, gone),
+                ("a bigger total", space(200, 40), ("40 GB available", Some(0.8)), None, gone),
+                ("space appears on the other drive", space(200, 40), ("40 GB available", Some(0.8)), space(50, 25), half),
+                ("space goes", None, gone, space(50, 25), half),
+                ("space comes back", space(100, 25), ("25 GB available", Some(0.75)), space(50, 25), half),
+                ("a zero total", Some(native_core::Space { total: 0, available: 0 }), gone, space(50, 25), half),
+                ("space after a zero total", space(100, 10), ("10 GB available", Some(0.9)), None, gone),
+            ];
+            for (what, space_a, want_a, space_b, want_b) in steps {
+                let had = bar_of(&row);
+                let list = vec![Drive { space: space_a, ..a.clone() }, Drive { space: space_b, ..b.clone() }];
+                w.refresh(&list);
+                w.same_menu(what, "SynA", &row, &menu, &open);
+                assert_eq!(w.row("SynB"), other, "{what}: the other drive's row was replaced");
+                assert_eq!(w.shown(), show(&list), "{what}: the new space was not taken in");
+                if had.is_some() && want_a.1.is_some() {
+                    assert_eq!(bar_of(&row), had, "{what}: the bar was replaced, not refilled");
+                }
+                for (name, want) in [("SynA", want_a), ("SynB", want_b)] {
+                    let (_, words, bars, row) = w.rows().into_iter().find(|r| r.0 == name).expect(name);
+                    assert_eq!((words.as_str(), bars), (want.0, usize::from(want.1.is_some())), "{what}: {name}");
+                    if let Some(fraction) = want.1 {
+                        let bar = bar_of(&row).expect("bar");
+                        assert!((bar.fraction() - fraction).abs() < 1e-9, "{what}: {name} bar shows {}", bar.fraction());
+                        assert!(
+                            bar.has_css_class("wf-space-bar") && !bar.can_target() && !bar.can_focus(),
+                            "{what}: {name} bar is not the usual bar"
+                        );
+                        let text = bar.parent().expect("the bar's box");
+                        assert_eq!(text.last_child().as_ref(), Some(bar.upcast_ref::<gtk::Widget>()), "{what}: {name} bar is not under the words");
+                    }
+                }
+            }
+            // A row changed in place is the size of a freshly built one.
+            pump();
+            let size = || {
+                let row = w.row("SynA");
+                let bar = bar_of(&row).expect("bar");
+                (row.height(), row.width(), bar.height(), bar.width())
+            };
+            let in_place = size();
+            assert!(in_place.2 > 0 && in_place.2 <= 8, "bar is small: {}", in_place.2);
+            menu.popdown();
+            pump();
+            assert_eq!(w.row("SynA"), row, "closing the menu rebuilt the sidebar with nothing waiting");
+            assert_eq!(tracked_drive_menus(&w.state), 0, "a menu that closed with nothing waiting is still remembered");
+            w.refresh(&[]);
+            w.refresh(&[Drive { space: space(100, 10), ..a.clone() }, b.clone()]);
+            assert_ne!(w.row("SynA"), row, "expected a rebuilt row to compare with");
+            assert_eq!(size(), in_place, "a row changed in place is not the size of a rebuilt one");
+        }
+
+        // The rows themselves would change: the newest scan waits for the menu to close.
+        if run("structural") {
+            w.refresh(&base);
+            w.go(&mount_a);
+            w.refresh(&base);
+            let (row, other) = (w.row("SynA"), w.row("SynB"));
+            let (menu, open) = w.menu_on(&row, &a);
+            frame("changed-1-menu-open.png");
+            // The same drives in another order would move the rows.
+            w.refresh(&swapped);
+            frame("changed-2-after-a-changed-scan.png");
+            w.same_menu("a reordered scan", "SynA", &row, &menu, &open);
+            assert_eq!(w.row("SynB"), other, "a reordered scan: a row away from the menu was replaced");
+            assert_eq!(w.shown(), show(&base), "a reordered scan was taken in under an open menu");
+            // What the menu acts on changes and a drive arrives: the newer scan is the one that waits.
+            let crucial = Drive { name: "Launch Box SSD 2TB".into(), path: "/dev/synthetic-moved".into(), ..a.clone() };
+            let newest = vec![crucial.clone(), b.clone(), c.clone()];
+            w.refresh(&newest);
+            w.same_menu("a newer changed scan", "SynA", &row, &menu, &open);
+            assert_eq!(w.shown(), show(&base), "a newer changed scan was taken in under an open menu");
+            assert_eq!(w.drive_names(), ["SynA", "SynB"]);
+            #[cfg(feature = "guide")]
+            assert_ne!(w.ui.files_stack.widget_name(), GUIDE_CRUCIAL_BACK, "the guide was matched to drives that are not shown yet");
+            // The menu is dismissed without an action, and its close is signalled more
+            // than once. The gate is shut, so what shows next can only be the waiting scan.
+            w.hold();
+            menu.popdown();
+            menu.popdown();
+            menu.emit_by_name::<()>("closed", &[]);
+            pump();
+            assert_eq!(w.shown(), show(&newest), "the newest waiting scan was not shown when the menu closed");
+            assert_eq!(w.drive_names(), ["Launch Box SSD 2TB", "SynB", "SynC"]);
+            #[cfg(feature = "guide")]
+            assert_eq!(w.ui.files_stack.widget_name(), GUIDE_CRUCIAL_BACK, "the guide did not follow the drives once they were shown");
+            w.release();
+
+            // A waiting scan is dropped when the drives go back to what is showing.
+            let row = w.row("Launch Box SSD 2TB");
+            let (menu, open) = w.menu_on(&row, &crucial);
+            w.refresh(&base);
+            w.same_menu("a changed scan", "Launch Box SSD 2TB", &row, &menu, &open);
+            w.refresh(&newest);
+            w.same_menu("back to the drives that show", "Launch Box SSD 2TB", &row, &menu, &open);
+            w.hold();
+            menu.popdown();
+            pump();
+            assert_eq!(w.find("Launch Box SSD 2TB").as_ref(), Some(&row), "a waiting scan that was overtaken still rebuilt the sidebar");
+            assert_eq!(w.shown(), show(&newest));
+            w.release();
+
+            // So is one overtaken by a change in space alone, which goes into the rows.
+            let (menu, open) = w.menu_on(&row, &crucial);
+            w.refresh(&base);
+            let roomier = vec![Drive { space: space(100, 60), ..crucial.clone() }, b.clone(), c.clone()];
+            w.refresh(&roomier);
+            w.same_menu("a change in space after a waiting scan", "Launch Box SSD 2TB", &row, &menu, &open);
+            assert_eq!(w.shown(), show(&roomier));
+            assert_eq!(w.rows().into_iter().find(|r| r.3 == row).map(|r| r.1).as_deref(), Some("60 GB available"));
+            w.hold();
+            menu.popdown();
+            pump();
+            assert_eq!(w.find("Launch Box SSD 2TB").as_ref(), Some(&row), "a waiting scan that was overtaken still rebuilt the sidebar");
+            assert_eq!(w.shown(), show(&roomier));
+            w.release();
+        }
+
+        // A second request made while a scan runs still gets its own scan.
+        if run("queue") {
+            w.refresh(&base);
+            w.queued_scan_still_runs("the same drives", &base);
+            assert_eq!(w.shown(), show(&base));
+            let row = w.row("SynA");
+            let (menu, open) = w.menu_on(&row, &a);
+            w.queued_scan_still_runs("a change that waits for the menu", &swapped);
+            w.same_menu("a queued scan behind a waiting one", "SynA", &row, &menu, &open);
+            assert_eq!(w.shown(), show(&base), "a changed scan was taken in under an open menu");
+            w.hold();
+            menu.popdown();
+            pump();
+            assert_eq!(w.shown(), show(&swapped), "the waiting scan was not shown when the menu closed");
+            assert_eq!(w.drive_names(), ["SynB", "SynA"]);
+            w.release();
+        }
+
+        // Closing by an action, and a second menu opened before the first close is dealt with.
+        if run("close") {
+            w.refresh(&base);
+            let (row_a, row_b) = (w.row("SynA"), w.row("SynB"));
+            let (menu, open) = w.menu_on(&row_a, &a);
+            w.refresh(&swapped);
+            w.same_menu("a changed scan", "SynA", &row_a, &menu, &open);
+            w.hold();
+            menu.popdown();
+            let (second, open) = w.menu_on(&row_b, &b);
+            w.same_menu("a second drive menu", "SynB", &row_b, &second, &open);
+            assert_eq!(w.row("SynA"), row_a, "the first menu's row was replaced while a second drive menu was open");
+            assert_eq!(w.shown(), show(&base), "the waiting scan was shown while another drive menu was open");
+            // The real Open button closes its menu, then acts. When its click ends the
+            // rows are still the old ones; the waiting scan is shown after that.
+            let at_click_end = Rc::new(std::cell::Cell::new(None));
+            {
+                let (seen, row_b, sidebar) = (at_click_end.clone(), row_b.clone(), w.ui.sidebar.clone());
+                open.connect_clicked(move |_| seen.set(Some(row_b.is_ancestor(&sidebar))));
+            }
+            open.emit_clicked();
+            assert_eq!(at_click_end.get(), Some(true), "the sidebar was rebuilt inside the click that closed the menu");
+            assert!(!second.is_mapped(), "the menu closes on its action");
+            wait_for("Open went to the drive", || w.cwd() == mount_b.to_string_lossy());
+            pump();
+            assert_eq!(w.shown(), show(&swapped), "the waiting scan was not shown after the action");
+            assert_eq!(w.drive_names(), ["SynB", "SynA"]);
+            w.release();
+        }
+
+        // A visit is listed under Recent by the next scan, as it always was. Under an
+        // open drive menu that rebuild waits for the close like any other.
+        if run("recents") {
+            let (one, two) = (root.join("visited-one"), root.join("visited-two"));
+            for d in [&one, &two] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            w.refresh(&base);
+            w.hold();
+            w.go(&one);
+            assert!(w.find("visited-one").is_none(), "a visit is expected to leave the sidebar alone until the next scan");
+            w.release();
+            w.refresh(&base);
+            assert!(w.find("visited-one").is_some(), "the same drives again: a visit was not listed under Recent");
+
+            w.hold();
+            w.go(&two);
+            let row = w.row("SynA");
+            let (menu, open) = w.menu_on(&row, &a);
+            w.release();
+            w.refresh(&base);
+            w.same_menu("the same drives with a visit waiting", "SynA", &row, &menu, &open);
+            assert!(w.find("visited-two").is_none(), "the sidebar was rebuilt under an open drive menu");
+            let roomier = vec![Drive { space: space(100, 60), ..a.clone() }, b.clone()];
+            w.refresh(&roomier);
+            w.same_menu("a change in space with a visit waiting", "SynA", &row, &menu, &open);
+            assert_eq!(w.rows().into_iter().find(|r| r.3 == row).map(|r| r.1).as_deref(), Some("60 GB available"));
+            assert!(w.find("visited-two").is_none(), "the sidebar was rebuilt under an open drive menu");
+            w.hold();
+            menu.popdown();
+            pump();
+            assert!(w.find("visited-two").is_some(), "the visit was not listed when the menu closed");
+            assert_eq!(w.shown(), show(&roomier));
+            w.release();
+        }
+
+        // Two windows: each holds its own scan for its own menu, and one can go away.
+        if run("windows") {
+            w.refresh(&base);
+            let w2 = Win::open("com.kadaken.wayfinder.d229test2", &home, &base);
+            let row = w.row("SynA");
+            let (menu, open) = w.menu_on(&row, &a);
+            // The other window has no drive menu open: its change shows at once.
+            w2.refresh(&swapped);
+            assert_eq!(w2.shown(), show(&swapped));
+            assert_eq!(w2.drive_names(), ["SynB", "SynA"]);
+            w.same_menu("another window's scan", "SynA", &row, &menu, &open);
+            assert_eq!(w.shown(), show(&base));
+            let row2 = w2.row("SynA");
+            let (menu2, open2) = w2.menu_on(&row2, &a);
+            w.same_menu("another window's menu", "SynA", &row, &menu, &open);
+            w.refresh(&swapped);
+            w.same_menu("this window's changed scan", "SynA", &row, &menu, &open);
+            w2.refresh(&base);
+            w2.same_menu("the other window's changed scan", "SynA", &row2, &menu2, &open2);
+            w.hold();
+            w2.hold();
+            menu.popdown();
+            pump();
+            assert_eq!(w.shown(), show(&swapped), "this window did not show its waiting scan when its menu closed");
+            assert_eq!(w2.shown(), show(&swapped), "a menu closing in one window let go the scan waiting in another");
+            w2.same_menu("a menu closing in another window", "SynA", &row2, &menu2, &open2);
+            // The other window goes away with its menu open and its scan still waiting.
+            let kept = w.row("SynA");
+            w2.ui.window.destroy();
+            pump();
+            assert!(!menu2.is_mapped(), "a closed window's menu is still up");
+            assert_eq!(w.row("SynA"), kept, "a window closing disturbed another window's sidebar");
+            assert_eq!(w.shown(), show(&swapped));
+            w2.set_gate(true);
+            w.release();
+        }
+
+        w.release();
+        w.ui.window.destroy();
+        TEST_DRIVE_SCAN.with(|s| *s.borrow_mut() = None);
+        #[cfg(feature = "guide")]
+        match old_guide {
+            Some(v) => std::env::set_var("WF_GUIDE_FILE", v),
+            None => std::env::remove_var("WF_GUIDE_FILE"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn invert_selection_is_the_exact_complement_d29() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d29-{}", std::process::id()));
@@ -22257,7 +24103,7 @@ Broken: Either state is wrong.\n";
             let s = state.borrow();
             (
                 names(),
-                s.clipboard.is_none(),
+                (clipboard_serial(), s.pending_offer.is_none()),
                 s.undo_stack.len(),
                 (s.tabs.tabs[0].history.clone(), s.tabs.tabs[0].index),
                 (ui.back.is_sensitive(), ui.forward.is_sensitive()),
@@ -22939,6 +24785,2634 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    #[test]
+    fn extract_here_keeps_existing_entries_d230_alone() {
+        if std::env::var("WAYFINDER_D230_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        extract_here_keeps_existing_entries_d230();
+    }
+
+    /// D-230: Extract Here from the real item menu, through the real worker and
+    /// result path, on this test's own scratch folder. A file and a folder that
+    /// already exist stay as they were, the entry that does not clash is extracted
+    /// and listed, and the status line that stays names what was skipped.
+    fn extract_here_keeps_existing_entries_d230() {
+        /// Puts HOME back on every way out, a failed assertion included.
+        struct HomeBack(Option<String>);
+        impl Drop for HomeBack {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
+        let root = crate::native_core::scratch_root().join(format!("wf-d230-gtk-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("a new folder of this test's own");
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir, src) = (root.join("home"), root.join("dir"), root.join("src"));
+        for d in [&home, &dir, &src.join("photos")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // The archive, packed by the real zip: a file and a folder whose names are
+        // taken in the folder on show, and one file whose name is free.
+        std::fs::write(src.join("note.txt"), "NEW note").unwrap();
+        std::fs::write(src.join("neighbor.txt"), "new neighbor").unwrap();
+        std::fs::write(src.join("photos/new.jpg"), "NEW photo").unwrap();
+        let packed = std::process::Command::new("zip")
+            .args(["-r", "-q"])
+            .arg(dir.join("pack.zip"))
+            .args(["note.txt", "neighbor.txt", "photos"])
+            .current_dir(&src)
+            .output()
+            .expect("run zip");
+        assert!(packed.status.success(), "zip: {}", String::from_utf8_lossy(&packed.stderr));
+        let archive_bytes = std::fs::read(dir.join("pack.zip")).unwrap();
+        std::fs::write(dir.join("note.txt"), "OLD note").unwrap();
+        std::fs::create_dir(dir.join("photos")).unwrap();
+        std::fs::write(dir.join("photos/own.txt"), "OLD own").unwrap();
+        let _home = HomeBack(std::env::var("HOME").ok());
+        std::env::set_var("HOME", &home);
+
+        // Optional pictures of the whole virtual screen, for a before/after record.
+        let frames = std::env::var("WF_D230_FRAMES").ok().map(std::path::PathBuf::from);
+        let frame = |name: &str| {
+            if let Some(dir) = &frames {
+                pump();
+                std::thread::sleep(Duration::from_millis(400));
+                pump();
+                let out = std::process::Command::new("/usr/bin/import")
+                    .args(["-window", "root"])
+                    .arg(dir.join(name))
+                    .output()
+                    .expect("import");
+                assert!(out.status.success(), "frame capture: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        };
+
+        install_app_css();
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d230test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        pump();
+
+        // The archive's own row, its real menu, and the real Extract Here button.
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3))
+        };
+        let shows = |w: &gtk::Widget, name: &str| {
+            all_widgets(w).into_iter().any(|c| c.downcast::<gtk::Label>().is_ok_and(|l| l.text() == name))
+        };
+        let row = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::Box>() && has_right_click(w) && shows(w, "pack.zip"))
+            .expect("the archive's row carries the right-click gesture");
+        let entry = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .find(|e| e.name == "pack.zip")
+            .cloned()
+            .expect("the archive is listed");
+        frame("1-before-extract-here.png");
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
+        pump();
+        let menu = popovers_of(&row).pop().expect("the item menu");
+        let extract_here = button_labelled(menu.upcast_ref(), "Extract Here").expect("Extract Here is in the menu");
+        frame("2-menu-open.png");
+        extract_here.emit_clicked();
+
+        // The real worker, then the refresh that follows it: the new neighbor is listed.
+        wait_for("the extracted neighbor to be listed", || {
+            let state = state.borrow();
+            state.listing_cancel.is_none() && state.visible_entries.iter().any(|e| e.name == "neighbor.txt")
+        });
+        pump();
+        frame("3-after-extract-here.png");
+
+        // The user's own bytes first: this is what the old route replaced.
+        assert_eq!(std::fs::read_to_string(dir.join("note.txt")).unwrap(), "OLD note", "the existing note.txt was replaced");
+        assert_eq!(dir_names(&dir.join("photos")), ["own.txt"], "the existing folder was added to");
+        assert_eq!(std::fs::read_to_string(dir.join("photos/own.txt")).unwrap(), "OLD own");
+        // The neighbor is extracted, and listed after the refresh with nothing extra.
+        assert_eq!(std::fs::read_to_string(dir.join("neighbor.txt")).unwrap(), "new neighbor");
+        assert_eq!(dir_names(&dir), ["neighbor.txt", "note.txt", "pack.zip", "photos"], "the folder on disk");
+        let mut listed: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+        listed.sort();
+        assert_eq!(listed, ["neighbor.txt", "note.txt", "pack.zip", "photos"], "the refreshed listing");
+        assert_eq!(std::fs::read(dir.join("pack.zip")).unwrap(), archive_bytes, "the archive changed");
+        // The line that stays in the status bar names both skipped entries.
+        let expected = "Extracted 1 item. Skipped 2 that already exist: note.txt, photos (whole folder)";
+        assert_eq!(ui.status.label(), expected);
+        pump();
+        pump();
+        assert_eq!(ui.status.label(), expected, "the result stays after the refresh");
+        assert!(ui.status.is_mapped(), "the status line is on screen");
+
+        ui.window.destroy();
+        pump();
+    }
+
+    #[test]
+    fn partial_trash_keeps_undo_d231_alone() {
+        if std::env::var("WAYFINDER_D231_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
+        partial_trash_keeps_undo_d231();
+    }
+
+    /// D-231: Trash, Undo and Redo through the real toolbar buttons, the real
+    /// workers and the real refresh, on a fixture Trash of this test's own (real
+    /// renames and `.trashinfo` files in its own scratch folder; the real Trash
+    /// is never read or changed). A later item the Trash refuses must not cost
+    /// the items already moved their Undo entry.
+    fn partial_trash_keeps_undo_d231() {
+        /// Puts HOME back on every way out, a failed assertion included.
+        struct HomeBack(Option<String>);
+        impl Drop for HomeBack {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        const NOTHING: [&str; 0] = [];
+        const NAMES: [&str; 3] = ["a.txt", "b.txt", "c.txt"];
+
+        let root = crate::native_core::scratch_root().join(format!("wf-d231-gtk-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("a new folder of this test's own");
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir, bin) = (root.join("home"), root.join("dir"), root.join("bin"));
+        for d in [&home, &dir, &bin] {
+            std::fs::create_dir(d).unwrap();
+        }
+        for name in NAMES {
+            std::fs::write(dir.join(name), format!("{name} bytes")).unwrap();
+        }
+        // Declared after the cleanup, so the fixture goes before its folder does.
+        let trash = native_core::fixture_trash::install(&bin);
+        let _home = HomeBack(std::env::var("HOME").ok());
+        std::env::set_var("HOME", &home);
+
+        let at = |name: &str| dir.join(name).to_string_lossy().to_string();
+        let binned = |stem: &str| bin.join("files").join(stem).to_string_lossy().to_string();
+        let read = |path: std::path::PathBuf| std::fs::read_to_string(path).unwrap();
+        let guard = |name: &str| native_core::fingerprint(&at(name)).unwrap();
+        let receipt = |name: &str| native_core::TrashReceipt { original: at(name), selector: binned(name) };
+        let shown = |entries: &[UndoAction]| format!("{entries:?}");
+
+        // Optional pictures of the whole virtual screen, for a before/after record.
+        let frames = std::env::var("WF_D231_FRAMES").ok().map(std::path::PathBuf::from);
+        let frame = |name: &str| {
+            if let Some(dir) = &frames {
+                pump();
+                std::thread::sleep(Duration::from_millis(400));
+                pump();
+                let out = std::process::Command::new("/usr/bin/import")
+                    .args(["-window", "root"])
+                    .arg(dir.join(name))
+                    .output()
+                    .expect("import");
+                assert!(out.status.success(), "frame capture: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        };
+
+        install_app_css();
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d231test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        pump();
+
+        // Every text the status line shows, in order; cleared before each action.
+        let said: Rc<RefCell<Vec<String>>> = Rc::default();
+        ui.status.connect_label_notify({
+            let said = said.clone();
+            move |status| said.borrow_mut().push(status.label().to_string())
+        });
+        // Clicks a real button, waits for a status text that starts with one of
+        // `ends` and for no listing to be on its way, and returns that text.
+        let click = |button: &gtk::Button, what: &str, ends: &[&str]| -> String {
+            said.borrow_mut().clear();
+            button.emit_clicked();
+            let ended = || said.borrow().iter().rev().find(|text| ends.iter().any(|end| text.starts_with(end))).cloned();
+            wait_for(what, || state.borrow().listing_cancel.is_none() && ended().is_some());
+            pump();
+            ended().unwrap()
+        };
+        const TRASH_ENDS: [&str; 2] = ["Moved ", "Operation failed"];
+        const UNDO_ENDS: [&str; 3] = ["Undo ", "Undid ", "Restored "];
+        const REDO_ENDS: [&str; 2] = ["Redo ", "Redid "];
+        let tool = |tip: &str| {
+            all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|button| button.tooltip_text().as_deref() == Some(tip))
+                .unwrap_or_else(|| panic!("the {tip} button"))
+        };
+        let (undo, redo) = (tool("Undo"), tool("Redo"));
+        // The rows, picked through the view's own selection.
+        let select = |names: &[&str]| {
+            ui.list_selection.unselect_all();
+            for name in names {
+                let index = state.borrow().visible_entries.iter().position(|e| e.name == *name).expect("the row is listed");
+                ui.list_selection.select_item(index as u32, false);
+            }
+            pump();
+            assert_eq!(selected_paths(&state, &ui), names.iter().map(|name| at(name)).collect::<Vec<_>>());
+        };
+        let listed = || {
+            let mut names: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+            names.sort();
+            names
+        };
+        let stacks = || {
+            let state = state.borrow();
+            (format!("{:?}", state.undo_stack), format!("{:?}", state.redo_stack))
+        };
+        let none = || "[]".to_string();
+
+        // ---- 1. Three rows to Trash; the Trash refuses the second.
+        trash.refuse("b.txt");
+        let guards = NAMES.map(guard);
+        select(&NAMES);
+        frame("1-three-selected.png");
+        let result = click(&ui.trash, "the Trash job to end", &TRASH_ENDS);
+        frame("2-partial-result.png");
+        // Disk: the first really moved; the refused one and the third are as they were.
+        assert_eq!(dir_names(&dir), ["b.txt", "c.txt"]);
+        assert_eq!((read(dir.join("b.txt")), read(dir.join("c.txt"))), ("b.txt bytes".to_string(), "c.txt bytes".to_string()));
+        assert_eq!(dir_names(&bin.join("files")), ["a.txt"]);
+        assert_eq!(read(bin.join("files/a.txt")), "a.txt bytes");
+        assert_eq!(trash.asked(), [at("a.txt"), at("b.txt")], "the batch stops at the first failure");
+        // History: one entry, for the moved item, with its exact receipt and its own guard.
+        let a_trashed = UndoAction::Trashed { receipts: vec![receipt("a.txt")], fps: vec![guards[0].clone()] };
+        assert_eq!(stacks(), (shown(&[a_trashed.clone()]), none()), "the item already in Trash has no Undo entry; the status said {result:?}");
+        // The line that stays says what moved, what did not, and what Undo covers.
+        let partial = "Moved 1 of 3 items to Trash; Undo restores it. b.txt was not moved: the fixture Trash refused this item. 1 not attempted.";
+        assert_eq!(result, partial);
+        assert_eq!(ui.status.label(), partial);
+        assert_eq!(listed(), ["b.txt", "c.txt"], "the refreshed listing");
+        pump();
+        pump();
+        assert_eq!(ui.status.label(), partial, "the result stays after the refresh");
+        assert!(ui.status.is_mapped(), "the status line is on screen");
+
+        // ---- 2. The real Undo button. A changed payload and a taken name are still refused.
+        std::fs::write(bin.join("files/a.txt"), "changed in Trash").unwrap();
+        assert_eq!(
+            click(&undo, "the refusal", &UNDO_ENDS),
+            "Undo refused: a trashed item changed since this history entry was recorded"
+        );
+        assert_eq!(dir_names(&dir), ["b.txt", "c.txt"]);
+        assert_eq!(read(bin.join("files/a.txt")), "changed in Trash");
+        assert_eq!(stacks(), (shown(&[a_trashed.clone()]), none()));
+        std::fs::write(bin.join("files/a.txt"), "a.txt bytes").unwrap();
+        std::fs::write(dir.join("a.txt"), "a newcomer").unwrap();
+        assert_eq!(click(&undo, "the refusal", &UNDO_ENDS), format!("Undo refused: cannot restore from trash: already exists: {}", at("a.txt")));
+        assert_eq!(read(dir.join("a.txt")), "a newcomer");
+        assert_eq!(read(bin.join("files/a.txt")), "a.txt bytes");
+        assert_eq!(stacks(), (shown(&[a_trashed.clone()]), none()));
+        assert!(!state.borrow().history_busy);
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        // Undo restores the exact payload; Redo moves it again; Undo restores it again.
+        assert_eq!(click(&undo, "the restore", &UNDO_ENDS), "Restored from Trash");
+        frame("3-after-undo.png");
+        assert_eq!(dir_names(&dir), NAMES);
+        assert_eq!(read(dir.join("a.txt")), "a.txt bytes");
+        assert_eq!(dir_names(&bin.join("files")), NOTHING);
+        assert_eq!(dir_names(&bin.join("info")), NOTHING);
+        assert_eq!(listed(), NAMES);
+        let a_created = UndoAction::Created { paths: vec![at("a.txt")] };
+        assert_eq!(stacks(), (none(), shown(&[a_created.clone()])));
+        assert_eq!(trash.asked(), NOTHING);
+        assert_eq!(click(&redo, "the redo", &REDO_ENDS), "Redid create/copy: moved to Trash");
+        assert_eq!(dir_names(&dir), ["b.txt", "c.txt"]);
+        assert_eq!(read(bin.join("files/a.txt")), "a.txt bytes");
+        assert_eq!(stacks(), (shown(&[a_trashed.clone()]), none()), "the reciprocal names the same exact entry");
+        assert_eq!(trash.asked(), [at("a.txt")]);
+        assert_eq!(click(&undo, "the restore", &UNDO_ENDS), "Restored from Trash");
+        assert_eq!(dir_names(&dir), NAMES);
+        assert_eq!(read(dir.join("a.txt")), "a.txt bytes");
+        assert_eq!(stacks(), (none(), shown(&[a_created.clone()])));
+
+        // ---- 3. The first item refused: nothing moves, no entry is added, the Redo branch stays.
+        trash.clear_faults();
+        trash.refuse("a.txt");
+        select(&NAMES);
+        assert_eq!(
+            click(&ui.trash, "the Trash job to end", &TRASH_ENDS),
+            format!("Operation failed: {}: the fixture Trash refused this item", at("a.txt"))
+        );
+        assert_eq!(dir_names(&dir), NAMES);
+        assert_eq!(dir_names(&bin.join("files")), NOTHING);
+        assert_eq!(trash.asked(), [at("a.txt")]);
+        assert_eq!(stacks(), (none(), shown(&[a_created.clone()])), "a refusal adds no entry and keeps the Redo branch");
+
+        // ---- 4. All three moved: one entry, as before. Undo it, then Redo with the second refused.
+        trash.clear_faults();
+        select(&NAMES);
+        assert_eq!(click(&ui.trash, "the Trash job to end", &TRASH_ENDS), "Moved 3 items to Trash");
+        assert_eq!(dir_names(&dir), NOTHING);
+        assert_eq!(trash.asked(), NAMES.map(at));
+        let all_trashed = UndoAction::Trashed { receipts: NAMES.map(receipt).to_vec(), fps: guards.to_vec() };
+        assert_eq!(stacks(), (shown(&[all_trashed]), none()));
+        assert_eq!(click(&undo, "the restore", &UNDO_ENDS), "Restored from Trash");
+        assert_eq!(stacks(), (none(), shown(&[UndoAction::Created { paths: NAMES.map(at).to_vec() }])));
+        trash.refuse("b.txt");
+        assert_eq!(
+            click(&redo, "the redo", &REDO_ENDS),
+            "Redo moved 1 of 3 items to Trash; Undo restores it. b.txt was not moved: the fixture Trash refused this item. 1 not attempted."
+        );
+        assert_eq!(dir_names(&dir), ["b.txt", "c.txt"]);
+        assert_eq!(listed(), ["b.txt", "c.txt"]);
+        assert_eq!(trash.asked(), [at("a.txt"), at("b.txt")]);
+        let rest_created = UndoAction::Created { paths: vec![at("b.txt"), at("c.txt")] };
+        assert_eq!(
+            stacks(),
+            (shown(&[a_trashed.clone()]), shown(&[rest_created.clone()])),
+            "the moved item goes to Undo and only the rest stays on Redo"
+        );
+        assert!(!state.borrow().history_busy);
+        // The retry moves the rest and never asks for the first again.
+        trash.clear_faults();
+        assert_eq!(click(&redo, "the redo", &REDO_ENDS), "Redid create/copy: moved to Trash");
+        assert_eq!(trash.asked(), [at("b.txt"), at("c.txt")], "an item already moved was asked for again");
+        assert_eq!(dir_names(&dir), NOTHING);
+        let rest_trashed = UndoAction::Trashed { receipts: vec![receipt("b.txt"), receipt("c.txt")], fps: guards[1..].to_vec() };
+        assert_eq!(stacks(), (shown(&[a_trashed.clone(), rest_trashed]), none()));
+        assert_eq!(click(&undo, "the restore", &UNDO_ENDS), "Restored from Trash");
+        assert_eq!(dir_names(&dir), ["b.txt", "c.txt"]);
+        assert_eq!(click(&undo, "the restore", &UNDO_ENDS), "Restored from Trash");
+        assert_eq!(dir_names(&dir), NAMES);
+        assert_eq!(NAMES.map(|name| read(dir.join(name))), NAMES.map(|name| format!("{name} bytes")));
+        assert_eq!(stacks(), (none(), shown(&[rest_created, a_created])));
+
+        // ---- 5. Undo of a copy whose second item the Trash refuses; other entries on both stacks stay,
+        // and a Redo stack that is full stays at its 100 entries.
+        const COPIES: [&str; 3] = ["x1.txt", "x2.txt", "x3.txt"];
+        for name in COPIES {
+            std::fs::write(dir.join(name), format!("{name} bytes")).unwrap();
+        }
+        let copy_guards = COPIES.map(guard);
+        let copied = COPIES.map(|name| ResolvedItem { from: root.join("elsewhere").join(name).to_string_lossy().to_string(), to: at(name) });
+        let keep_undo = UndoAction::Created { paths: vec![at("never-made-1")] };
+        let keep_redo = UndoAction::Created { paths: vec![at("never-made-2")] };
+        let mut redo_full = vec![UndoAction::Created { paths: vec![at("never-made-0")] }];
+        redo_full.resize(100, keep_redo);
+        {
+            let mut state = state.borrow_mut();
+            state.undo_stack = vec![
+                keep_undo.clone(),
+                UndoAction::Pasted { items: copied.to_vec(), was_copy: true, fps: copy_guards.to_vec() },
+            ];
+            state.redo_stack = redo_full.clone();
+        }
+        trash.refuse("x2.txt");
+        assert_eq!(
+            click(&undo, "the undo", &UNDO_ENDS),
+            "Undo moved 1 of 3 items to Trash; Redo restores it. x2.txt was not moved: the fixture Trash refused this item. 1 not attempted."
+        );
+        assert_eq!(trash.asked(), [at("x1.txt"), at("x2.txt")]);
+        assert_eq!(dir_names(&dir), ["a.txt", "b.txt", "c.txt", "x2.txt", "x3.txt"]);
+        let rest_copied = UndoAction::Pasted { items: copied[1..].to_vec(), was_copy: true, fps: copy_guards[1..].to_vec() };
+        let x1_trashed = UndoAction::Trashed { receipts: vec![receipt("x1.txt")], fps: vec![copy_guards[0].clone()] };
+        // Redo drops its oldest entry for the moved copy; nothing else leaves either stack.
+        let mut redo_now = redo_full[1..].to_vec();
+        redo_now.push(x1_trashed);
+        assert_eq!(
+            stacks(),
+            (shown(&[keep_undo.clone(), rest_copied]), shown(&redo_now)),
+            "the moved copy goes to Redo and only the rest stays on Undo"
+        );
+        assert_eq!(state.borrow().redo_stack.len(), 100);
+        assert!(!state.borrow().history_busy);
+        trash.clear_faults();
+        assert_eq!(click(&undo, "the undo", &UNDO_ENDS), "Undid paste: moved to Trash");
+        assert_eq!(trash.asked(), [at("x2.txt"), at("x3.txt")], "a copy already moved was asked for again");
+        assert_eq!(dir_names(&dir), NAMES);
+        let rest_trashed = UndoAction::Trashed { receipts: vec![receipt("x2.txt"), receipt("x3.txt")], fps: copy_guards[1..].to_vec() };
+        redo_now.remove(0);
+        redo_now.push(rest_trashed);
+        assert_eq!(stacks(), (shown(&[keep_undo.clone()]), shown(&redo_now)));
+        assert_eq!(state.borrow().redo_stack.len(), 100);
+
+        // ---- 6. A second new entry lands with the second item: it is in Trash with no record of its own.
+        trash.twin("b.txt");
+        select(&NAMES);
+        let result = click(&ui.trash, "the Trash job to end", &TRASH_ENDS);
+        frame("4-moved-without-a-record.png");
+        assert_eq!(
+            result,
+            "Moved 2 of 3 items to Trash; Undo restores 1 of them. b.txt is in Trash without an exact record: 2 new Trash entries, expected 1. 1 not attempted."
+        );
+        assert_eq!(ui.status.label(), result);
+        assert_eq!(dir_names(&dir), ["c.txt"]);
+        assert_eq!(listed(), ["c.txt"]);
+        assert_eq!(dir_names(&bin.join("files")), ["a.txt", "b.txt", "b.txt.twin", "x1.txt", "x2.txt", "x3.txt"]);
+        assert_eq!(trash.asked(), [at("a.txt"), at("b.txt")]);
+        assert_eq!(stacks(), (shown(&[keep_undo, a_trashed]), none()));
+        assert_eq!(click(&undo, "the restore", &UNDO_ENDS), "Restored from Trash");
+        assert_eq!(dir_names(&dir), ["a.txt", "c.txt"]);
+        assert_eq!(read(dir.join("a.txt")), "a.txt bytes");
+        assert_eq!(read(bin.join("files/b.txt")), "b.txt bytes");
+
+        ui.window.destroy();
+        pump();
+    }
+
+    /// One Undo or Redo step as its worker runs it: the message, the entry for
+    /// the opposite stack, and what stays of the source entry. Its own function
+    /// so the same test text also builds on a tree from before the repair,
+    /// where a step leaves nothing of its entry behind.
+    fn history_step_d231(action: UndoAction, undo: bool) -> Result<(String, String, String), String> {
+        let outcome = if undo { perform_undo(action) } else { perform_redo(action) }?;
+        Ok((outcome.message, format!("{:?}", outcome.reciprocal), format!("{:?}", outcome.remainder)))
+    }
+
+    /// D-231: every history step that moves items to Trash (Undo and Redo of a
+    /// create, Undo and Redo of a copy), run as its worker runs it, on a fixture
+    /// Trash of this test's own. A step that moved some items reports them for
+    /// the opposite stack and keeps only the rest of its entry; a step that
+    /// moved nothing is a refusal.
+    #[test]
+    fn history_trash_steps_keep_the_moved_part_d231() {
+        const NOTHING: [&str; 0] = [];
+        let root = crate::native_core::scratch_root().join(format!("wf-d231-history-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("a new folder of this test's own");
+        let _cleanup = ScratchCleanup(root.clone());
+        let (dir, bin) = (root.join("dir"), root.join("bin"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let trash = native_core::fixture_trash::install(&bin);
+        // Makes the named files, each with its own bytes; returns paths and guards.
+        let make = |names: &[&str]| -> (Vec<String>, Vec<native_core::Fingerprint>) {
+            let paths: Vec<String> = names.iter().map(|name| dir.join(name).to_string_lossy().to_string()).collect();
+            for (path, name) in paths.iter().zip(names) {
+                std::fs::write(path, format!("{name} bytes")).unwrap();
+            }
+            let guards = paths.iter().map(|path| native_core::fingerprint(path).unwrap()).collect();
+            (paths, guards)
+        };
+        let copies = |paths: &[String]| -> Vec<ResolvedItem> {
+            paths.iter().map(|to| ResolvedItem { from: format!("{to}.source"), to: to.clone() }).collect()
+        };
+        let trashed = |paths: &[String], guards: &[native_core::Fingerprint]| UndoAction::Trashed {
+            receipts: paths
+                .iter()
+                .map(|path| native_core::TrashReceipt {
+                    original: path.clone(),
+                    selector: bin.join("files").join(Path::new(path).file_name().unwrap()).to_string_lossy().to_string(),
+                })
+                .collect(),
+            fps: guards.to_vec(),
+        };
+        let some = |action: UndoAction| format!("{:?}", Some(action));
+        let none = || "None".to_string();
+        let refused = "the fixture Trash refused this item";
+        let twinned = "2 new Trash entries, expected 1";
+
+        // Undo of a create, the second of three refused: the first is in Trash.
+        let (p, g) = make(&["a1.txt", "a2.txt", "a3.txt"]);
+        trash.refuse("a2.txt");
+        let step = history_step_d231(UndoAction::Created { paths: p.clone() }, true);
+        assert_eq!(trash.asked(), p[..2]);
+        assert_eq!(dir_names(&dir), ["a2.txt", "a3.txt"]);
+        assert_eq!(
+            step.expect("a step that moved an item is not a refusal"),
+            (
+                format!("Undo moved 1 of 3 items to Trash; Redo restores it. a2.txt was not moved: {refused}. 1 not attempted."),
+                some(trashed(&p[..1], &g[..1])),
+                some(UndoAction::Created { paths: p[1..].to_vec() }),
+            )
+        );
+        // The rest of that entry, retried from the other side once the Trash takes it.
+        trash.clear_faults();
+        assert_eq!(
+            history_step_d231(UndoAction::Created { paths: p[1..].to_vec() }, false),
+            Ok(("Redid create/copy: moved to Trash".to_string(), some(trashed(&p[1..], &g[1..])), none()))
+        );
+        assert_eq!(trash.asked(), p[1..]);
+        assert_eq!(dir_names(&dir), NOTHING);
+
+        // Redo of a copy, a second new entry landing with its second item: that
+        // item is in Trash with no record, so it is in neither entry.
+        let (p, g) = make(&["b1.txt", "b2.txt", "b3.txt"]);
+        trash.twin("b2.txt");
+        let step = history_step_d231(UndoAction::Pasted { items: copies(&p), was_copy: true, fps: g.clone() }, false);
+        assert_eq!(trash.asked(), p[..2]);
+        assert_eq!(dir_names(&dir), ["b3.txt"]);
+        assert_eq!(
+            step.expect("a step that moved items is not a refusal"),
+            (
+                format!("Redo moved 2 of 3 items to Trash; Undo restores 1 of them. b2.txt is in Trash without an exact record: {twinned}. 1 not attempted."),
+                some(trashed(&p[..1], &g[..1])),
+                some(UndoAction::Pasted { items: copies(&p[2..]), was_copy: true, fps: g[2..].to_vec() }),
+            )
+        );
+
+        // Undo of a copy, the last of two refused: the refused one is what stays.
+        trash.clear_faults();
+        let (p, g) = make(&["c1.txt", "c2.txt"]);
+        trash.refuse("c2.txt");
+        let step = history_step_d231(UndoAction::Pasted { items: copies(&p), was_copy: true, fps: g.clone() }, true);
+        assert_eq!(
+            step.expect("a step that moved an item is not a refusal"),
+            (
+                format!("Undo moved 1 of 2 items to Trash; Redo restores it. c2.txt was not moved: {refused}. 0 not attempted."),
+                some(trashed(&p[..1], &g[..1])),
+                some(UndoAction::Pasted { items: copies(&p[1..]), was_copy: true, fps: g[1..].to_vec() }),
+            )
+        );
+        assert_eq!(trash.asked(), p);
+
+        // The only item moved, with no record: nothing for either stack.
+        trash.clear_faults();
+        let (p, _) = make(&["f1.txt"]);
+        trash.twin("f1.txt");
+        assert_eq!(
+            history_step_d231(UndoAction::Created { paths: p.clone() }, true),
+            Ok((
+                format!("Undo moved 1 of 1 item to Trash; Redo cannot restore it. f1.txt is in Trash without an exact record: {twinned}. 0 not attempted."),
+                none(),
+                none(),
+            ))
+        );
+        assert_eq!(trash.asked(), p);
+
+        // Nothing moved is a refusal, worded as before, from all four steps.
+        trash.clear_faults();
+        let (p, g) = make(&["d1.txt", "d2.txt"]);
+        trash.refuse("d1.txt");
+        for (undo, verb) in [(true, "Undo"), (false, "Redo")] {
+            let refusal = Err(format!("{verb} refused: {}: {refused}", p[0]));
+            assert_eq!(history_step_d231(UndoAction::Created { paths: p.clone() }, undo), refusal);
+            assert_eq!(history_step_d231(UndoAction::Pasted { items: copies(&p), was_copy: true, fps: g.clone() }, undo), refusal);
+        }
+        assert_eq!(trash.asked(), vec![p[0].clone(); 4]);
+        // A changed copy still refuses the whole step before anything moves.
+        trash.clear_faults();
+        std::fs::write(&p[1], "edited since").unwrap();
+        assert_eq!(
+            history_step_d231(UndoAction::Pasted { items: copies(&p), was_copy: true, fps: g.clone() }, true),
+            Err(format!("Undo refused: {} changed since this history entry was recorded", p[1]))
+        );
+        assert_eq!(trash.asked(), NOTHING);
+        assert_eq!(dir_names(&dir), ["b3.txt", "c2.txt", "d1.txt", "d2.txt"]);
+
+        // A whole step keeps its wording, and its entry restores the exact payloads.
+        let (p, g) = make(&["g1.txt", "g2.txt"]);
+        assert_eq!(
+            history_step_d231(UndoAction::Created { paths: p.clone() }, true),
+            Ok(("Undid create/copy: moved to Trash".to_string(), some(trashed(&p, &g)), none()))
+        );
+        assert_eq!(dir_names(&dir), ["b3.txt", "c2.txt", "d1.txt", "d2.txt"]);
+        assert_eq!(
+            history_step_d231(trashed(&p, &g), false),
+            Ok(("Redid restore from Trash".to_string(), some(UndoAction::Created { paths: p.clone() }), none()))
+        );
+        assert_eq!(dir_names(&dir), ["b3.txt", "c2.txt", "d1.txt", "d2.txt", "g1.txt", "g2.txt"]);
+        assert_eq!(std::fs::read_to_string(&p[1]).unwrap(), "g2.txt bytes");
+    }
+
+    // D232-PART-A-BEGIN
+    // D-232: file Copy, Cut and Paste shared between windows and with other
+    // programs. Real buttons, the display's real clipboard on the script's own
+    // virtual display, a separate peer process, the real transfer workers and
+    // the real refresh. Nothing here reads or changes the clipboard, Trash or
+    // HOME of a live session: every test refuses to start outside a private one.
+    const GNOME_D232: &str = "x-special/gnome-copied-files";
+    const URIS_D232: &str = "text/uri-list";
+    const KDE_D232: &str = "application/x-kde-cutselection";
+    const TEXT_D232: &str = "text/plain;charset=utf-8";
+    const PASTE_ENDS_D232: [&str; 11] = [
+        "Pasted ",
+        "Nothing to paste",
+        "Paste refused",
+        "Operation failed",
+        "Already in this folder",
+        "Clipboard changed",
+        "Folder changed",
+        "This cut is already",
+        "A transfer is already running",
+        "Copy cancelled",
+        "Move cancelled",
+    ];
+
+    /// The environment this process started with, before anything changed it.
+    fn start_env_d232() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::fs::read("/proc/self/environ").expect("this process's start environment");
+        raw.split(|byte| *byte == 0)
+            .filter_map(|entry| {
+                let at = entry.iter().position(|byte| *byte == b'=')?;
+                Some((
+                    std::ffi::OsString::from_vec(entry[..at].to_vec()),
+                    std::ffi::OsString::from_vec(entry[at + 1..].to_vec()),
+                ))
+            })
+            .collect()
+    }
+
+    /// A process's state letter and its parent, from the kernel's own record.
+    fn proc_stat_d232(pid: u32) -> Option<(char, u32)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut rest = stat[stat.rfind(')')? + 1..].split_whitespace();
+        Some((rest.next()?.chars().next()?, rest.next()?.parse().ok()?))
+    }
+
+    /// Refuses to go on unless this process started in a session of its own: a
+    /// HOME under Scratch that is not the account's home, data, config, cache,
+    /// state and runtime folders inside it, a session bus address inside it, and
+    /// the X display of an Xvfb that one of this process's own ancestors started.
+    /// Runs before GTK or GLib is first used. Returns what it found.
+    fn private_session_guard_d232() -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let start = start_env_d232();
+        let at_start = |name: &str| {
+            start.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_string_lossy().to_string())
+        };
+        // The account's home from the password file, never from HOME.
+        let real_home = unsafe {
+            let entry = libc::getpwuid(libc::getuid());
+            assert!(!entry.is_null(), "the account has a password-file entry");
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr((*entry).pw_dir).to_bytes()))
+        };
+        let scratch = real_home.join("Projects/Scratch");
+        let home = at_start("HOME").expect("HOME is set at start");
+        let home_path = std::path::PathBuf::from(&home);
+        assert!(
+            home_path.starts_with(&scratch) && home_path != scratch && home_path != real_home,
+            "D-232: the clipboard tests need a HOME of their own under Scratch (start them through run232.sh), got {home}"
+        );
+        assert_eq!(std::env::var("HOME").ok().as_deref(), Some(home.as_str()), "HOME is as it was at start");
+        for name in ["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"] {
+            let value = at_start(name).unwrap_or_else(|| panic!("{name} is set at start"));
+            assert!(std::path::Path::new(&value).starts_with(&home_path), "{name} is inside the private HOME, got {value}");
+        }
+        let bus = at_start("DBUS_SESSION_BUS_ADDRESS").expect("a session bus address is set at start");
+        assert!(bus.starts_with(&format!("unix:path={home}/")), "the session bus address is inside the private HOME, got {bus}");
+        assert_eq!(at_start("GDK_BACKEND").as_deref(), Some("x11"), "GTK is told to use X11 from the start");
+        assert!(at_start("WAYLAND_DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none(), "no Wayland display is named");
+        let display = at_start("DISPLAY").expect("DISPLAY is set at start");
+        assert!(
+            display.len() > 1 && display.starts_with(':') && display[1..].bytes().all(|byte| byte.is_ascii_digit()),
+            "DISPLAY names a local display by number only, got {display}"
+        );
+        assert_eq!(std::env::var("DISPLAY").ok().as_deref(), Some(display.as_str()), "DISPLAY is as it was at start");
+        // The one Xvfb that serves this display, and who started it.
+        let mut servers = Vec::new();
+        for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+            let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else { continue };
+            if exe.file_name().and_then(|name| name.to_str()) != Some("Xvfb") {
+                continue;
+            }
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else { continue };
+            if cmdline.split(|byte| *byte == 0).any(|arg| arg == display.as_bytes()) {
+                servers.push(pid);
+            }
+        }
+        assert_eq!(servers.len(), 1, "exactly one Xvfb serves {display}, found {servers:?}");
+        let (_, server_parent) = proc_stat_d232(servers[0]).expect("the Xvfb's parent");
+        let mut ancestors = Vec::new();
+        let mut pid = std::process::id();
+        while pid > 1 {
+            let Some((_, parent)) = proc_stat_d232(pid) else { break };
+            ancestors.push(parent);
+            pid = parent;
+        }
+        assert!(
+            server_parent > 1 && ancestors.contains(&server_parent),
+            "the Xvfb was started by an ancestor of this process (its parent {server_parent}, ancestors {ancestors:?})"
+        );
+        let found = format!(
+            "pid={} home={home} display={display} xvfb_pid={} xvfb_parent={server_parent}",
+            std::process::id(),
+            servers[0]
+        );
+        println!("D232 SESSION {found}");
+        found
+    }
+
+    /// The display GTK opened is the one named at start.
+    fn private_display_check_d232(display: &gdk::Display) {
+        let named = start_env_d232()
+            .into_iter()
+            .find(|(key, _)| key == "DISPLAY")
+            .map(|(_, value)| value.to_string_lossy().to_string())
+            .expect("DISPLAY is set at start");
+        let opened = display.name().to_string();
+        assert!(
+            display.type_().name().contains("X11") && (opened == named || opened.starts_with(&format!("{named}."))),
+            "GTK opened the private X display {named}, got {opened}"
+        );
+    }
+
+    /// Runs what the GTK loop has ready, and no more.
+    fn drain_d232() {
+        let ctx = glib::MainContext::default();
+        let mut turns = 0;
+        while turns < 400 && ctx.iteration(false) {
+            turns += 1;
+        }
+    }
+
+    /// Runs the GTK loop until `cond` holds. No fixed wait: it returns the
+    /// moment the condition holds and fails after 20 seconds.
+    fn until_d232(what: &str, mut cond: impl FnMut() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            drain_d232();
+            if cond() {
+                return;
+            }
+            assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// GDK on X11 compares clipboard times to the millisecond. When a program
+    /// empties the clipboard, the display's notice of that comes back to it a
+    /// moment later. An offer the same program makes in that same millisecond,
+    /// before it has read the notice, is dropped when the notice is read. A
+    /// person's key press cannot follow that fast; a test's press can. So a
+    /// test waits here, before it makes an offer, until the notice of this
+    /// program's own clear has been read. Until then GDK holds the cleared
+    /// clipboard as its own and empty; nothing else leaves it in that state.
+    fn own_clear_seen_d232() {
+        let clipboard = gdk::Display::default().expect("the test's display").clipboard();
+        until_d232("the notice of this program's own clear", || !(clipboard.is_local() && clipboard.content().is_none()));
+    }
+
+    /// Every file and folder under `dir`, with each file's exact bytes.
+    fn tree_d232(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Option<Vec<u8>>)>) {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+            entries.sort();
+            for path in entries {
+                let name = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if path.is_dir() {
+                    out.push((name, None));
+                    walk(base, &path, out);
+                } else {
+                    out.push((name, Some(std::fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    fn put_d232(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A file address written out by hand, not by the code under test. Letters,
+    /// digits and -._~/!$&'()*+,=:@ stay as they are; every other byte is
+    /// written as a percent sign and two capital hex digits, as GLib writes it.
+    fn uri_d232(path: &Path) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let mut uri = String::from("file://");
+        for byte in path.as_os_str().as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => uri.push(*byte as char),
+                b'-' | b'.' | b'_' | b'~' | b'/' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b'=' | b':' | b'@' => {
+                    uri.push(*byte as char)
+                }
+                other => uri.push_str(&format!("%{other:02X}")),
+            }
+        }
+        uri
+    }
+
+    /// The separate program on the other side of the clipboard: this same test
+    /// program, started again by a test with the test's own start environment.
+    /// It owns and reads the private display's clipboard as a process of its
+    /// own, on commands from the test. It does nothing unless a test started it.
+    #[test]
+    fn shared_clipboard_peer_d232() {
+        if std::env::var("WF_D232_PEER").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::{BufRead, Write};
+        let session = private_session_guard_d232();
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        let clipboard = display.clipboard();
+        let ctx = glib::MainContext::default();
+        let say = |text: &str| {
+            let mut out = std::io::stdout().lock();
+            write!(out, "\nD232PEER {text}\n").expect("the peer's reply is written");
+            out.flush().expect("the peer's reply is sent");
+        };
+        let formats = || clipboard.formats().mime_types().iter().map(|mime| mime.to_string()).collect::<Vec<String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(Some(line)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(None);
+        });
+        say(&format!("ready {session}"));
+        loop {
+            let command = match rx.try_recv() {
+                Ok(Some(line)) => line,
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if !ctx.iteration(false) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    continue;
+                }
+            };
+            let (verb, rest) = command.split_once(' ').unwrap_or((command.as_str(), ""));
+            match verb {
+                // Take the clipboard with the forms a folder of files describes.
+                "own" => {
+                    let dir = std::path::PathBuf::from(rest);
+                    let manifest = std::fs::read_to_string(dir.join("manifest")).expect("the offer's manifest");
+                    let forms: Vec<gdk::ContentProvider> = manifest
+                        .lines()
+                        .map(|line| {
+                            let (file, mime) = line.split_once('\t').expect("a file and its type");
+                            let bytes = std::fs::read(dir.join(file)).expect("the offer's bytes");
+                            gdk::ContentProvider::for_bytes(mime, &glib::Bytes::from_owned(bytes))
+                        })
+                        .collect();
+                    let provider = gdk::ContentProvider::new_union(&forms);
+                    // Every notice about an earlier offer is read before this
+                    // process takes the clipboard. One from the same
+                    // millisecond, read after the claim, would make GDK drop
+                    // this process's own offer and answer nobody.
+                    display.sync();
+                    drain_d232();
+                    match clipboard.set_content(Some(&provider)) {
+                        Ok(()) => {
+                            display.sync();
+                            drain_d232();
+                            say("own ok");
+                        }
+                        Err(_) => say("own failed"),
+                    }
+                }
+                // Leave the clipboard empty, whoever held it.
+                "clear" => {
+                    display.sync();
+                    drain_d232();
+                    let cleared = clipboard.set_content(gdk::ContentProvider::NONE).is_ok();
+                    display.sync();
+                    drain_d232();
+                    say(if cleared { "clear ok" } else { "clear failed" });
+                }
+                // Deal with everything the display has for this process, and
+                // have the display take everything this process answered.
+                "sync" => {
+                    display.sync();
+                    drain_d232();
+                    display.sync();
+                    say("sync ok");
+                }
+                // Whether this process still owns the clipboard, and what it sees offered.
+                "state" => {
+                    display.sync();
+                    drain_d232();
+                    say(&format!("state local={} formats={}", clipboard.is_local(), formats().join(",")));
+                }
+                // Wait until another process offers this form.
+                "await" => {
+                    display.sync();
+                    drain_d232();
+                    let end = std::time::Instant::now() + Duration::from_secs(20);
+                    let seen = loop {
+                        drain_d232();
+                        if !clipboard.is_local() && clipboard.formats().contain_mime_type(rest) {
+                            break true;
+                        }
+                        if std::time::Instant::now() >= end {
+                            break false;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    };
+                    say(if seen { "await ok" } else { "await timeout" });
+                }
+                // Read what is offered, as any other program would, into files.
+                "read" => {
+                    let out = std::path::PathBuf::from(rest);
+                    std::fs::create_dir(&out).expect("a new folder for what was read");
+                    let mut offered = formats();
+                    offered.sort();
+                    std::fs::write(out.join("formats"), offered.join("\n")).unwrap();
+                    // Each form is asked for, whatever this process's own list
+                    // says: GDK adds a new list of forms to the one before it
+                    // when two offers follow each other closely, so the list can
+                    // name a form the owner no longer has. A form the owner
+                    // refuses leaves no file.
+                    for (mime, file) in [(GNOME_D232, "gnome.bin"), (URIS_D232, "uris.bin"), (KDE_D232, "kde.bin"), (TEXT_D232, "text.bin")] {
+                        let bytes = ctx.block_on(async {
+                            let stream = match clipboard.read_future(&[mime], glib::Priority::DEFAULT).await {
+                                Ok((stream, _)) => stream,
+                                Err(err) if err.matches(gio::IOErrorEnum::NotFound) => return None,
+                                Err(err) => panic!("the peer's read of {mime} starts: {err:?}"),
+                            };
+                            let mut data = Vec::new();
+                            loop {
+                                let chunk = stream
+                                    .read_bytes_future(64 * 1024, glib::Priority::DEFAULT)
+                                    .await
+                                    .expect("the peer's read goes on");
+                                if chunk.is_empty() {
+                                    break;
+                                }
+                                data.extend_from_slice(&chunk);
+                            }
+                            let _ = stream.close_future(glib::Priority::DEFAULT).await;
+                            Some(data)
+                        });
+                        if let Some(bytes) = bytes {
+                            std::fs::write(out.join(file), bytes).unwrap();
+                        }
+                    }
+                    say("read ok");
+                }
+                other => say(&format!("unknown {other}")),
+            }
+        }
+    }
+
+    /// The test's side of one peer process.
+    struct PeerD232 {
+        child: std::process::Child,
+        input: Option<std::process::ChildStdin>,
+        lines: std::sync::mpsc::Receiver<String>,
+        count: std::cell::Cell<u32>,
+        stopped: std::cell::Cell<bool>,
+        ended: bool,
+    }
+
+    impl PeerD232 {
+        fn start(cx: &CxD232) -> Self {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new(std::env::current_exe().expect("this test program"))
+                .args(["shared_clipboard_peer_d232", "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .envs(start_env_d232())
+                .env("WF_D232_PEER", "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("the peer process starts");
+            let stdout = child.stdout.take().expect("the peer's replies");
+            let (tx, lines) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Some(reply) = line.strip_prefix("D232PEER ") {
+                        if tx.send(reply.to_string()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            let peer = Self { input: child.stdin.take(), child, lines, count: std::cell::Cell::new(0), stopped: std::cell::Cell::new(false), ended: false };
+            // A process of its own, in the same private session as the test.
+            let own = format!("pid={}", std::process::id());
+            let theirs = format!("pid={}", peer.child.id());
+            assert_ne!(own, theirs, "the peer is another process");
+            assert!(cx.session.starts_with(&format!("{own} ")), "the test's session line starts with its own pid");
+            let ready = peer.reply("the peer to start");
+            assert_eq!(ready, format!("ready {}", cx.session.replacen(&own, &theirs, 1)), "the peer runs in the test's private session");
+            println!("D232 PEER {}", &ready["ready ".len()..]);
+            // What the new process asks about the clipboard as it starts is
+            // answered before the test goes on.
+            peer.quiet(cx);
+            peer
+        }
+
+        /// The peer's next reply. The GTK loop runs while the test waits, so
+        /// this program can answer the peer's own clipboard requests.
+        fn reply(&self, what: &str) -> String {
+            let ctx = glib::MainContext::default();
+            let end = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match self.lines.try_recv() {
+                    Ok(line) => return line,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("the peer ended while the test waited for {what}"),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
+                if !ctx.iteration(false) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        fn ask(&self, command: &str) -> String {
+            use std::io::Write;
+            let mut input = self.input.as_ref().expect("the peer is running");
+            writeln!(input, "{command}").expect("the command reaches the peer");
+            input.flush().expect("the command is sent");
+            self.reply(command)
+        }
+
+        fn next(&self) -> u32 {
+            self.count.set(self.count.get() + 1);
+            self.count.get()
+        }
+
+        /// Both programs finish what they owe each other over the display: every
+        /// question one has asked about the clipboard's forms is answered by the
+        /// other and taken in. Round trips to the display, no waiting on a
+        /// clock. Without it an answer about an earlier offer can arrive after
+        /// a newer offer, and GDK then lists the old forms with the new ones.
+        fn quiet(&self, cx: &CxD232) {
+            assert!(!self.stopped.get(), "a stopped peer answers nothing");
+            for _ in 0..2 {
+                cx.settle();
+                assert_eq!(self.ask("sync"), "sync ok");
+            }
+            cx.settle();
+        }
+
+        /// The peer takes the clipboard with exactly these forms, plus one form
+        /// whose name is new each time, so the test knows which offer it sees.
+        /// Returns when this program sees that offer.
+        fn offer(&self, cx: &CxD232, forms: &[(&str, &[u8])]) {
+            let n = self.next();
+            let tag = format!("application/x-wf-d232-offer-{}-{n}", self.child.id());
+            let dir = cx.root.join(format!("offer-{}-{n}", self.child.id()));
+            std::fs::create_dir(&dir).unwrap();
+            let mut manifest = String::new();
+            for (index, (mime, bytes)) in forms.iter().enumerate() {
+                std::fs::write(dir.join(format!("form-{index}")), bytes).unwrap();
+                manifest.push_str(&format!("form-{index}\t{mime}\n"));
+            }
+            std::fs::write(dir.join("tag"), b"").unwrap();
+            manifest.push_str(&format!("tag\t{tag}\n"));
+            std::fs::write(dir.join("manifest"), manifest).unwrap();
+            self.quiet(cx);
+            assert_eq!(self.ask(&format!("own {}", dir.display())), "own ok");
+            until_d232("the peer's offer to arrive", || !cx.clipboard.is_local() && cx.clipboard.formats().contain_mime_type(&tag));
+            self.quiet(cx);
+        }
+
+        /// The peer empties the clipboard, as a program that stops offering does.
+        fn clear(&self, cx: &CxD232) {
+            self.quiet(cx);
+            assert_eq!(self.ask("clear"), "clear ok");
+            until_d232("the emptied clipboard to arrive", || cx.clipboard.formats().mime_types().is_empty());
+            self.quiet(cx);
+        }
+
+        /// "local=<whether the peer still owns the clipboard> formats=<what it sees>".
+        fn state(&self, cx: &CxD232) -> String {
+            self.quiet(cx);
+            let reply = self.ask("state");
+            reply.strip_prefix("state ").unwrap_or_else(|| panic!("a state reply, got {reply}")).to_string()
+        }
+
+        /// The peer reads what this program offers, once it sees `form` offered.
+        /// Returns the folder with what it read.
+        fn read(&self, cx: &CxD232, form: &str) -> std::path::PathBuf {
+            let out = cx.root.join(format!("read-{}-{}", self.child.id(), self.next()));
+            self.quiet(cx);
+            assert_eq!(self.ask(&format!("await {form}")), "await ok");
+            assert_eq!(self.ask(&format!("read {}", out.display())), "read ok");
+            out
+        }
+
+        /// The peer stops running, with whatever it holds: it still owns the
+        /// clipboard and answers nothing until it is continued.
+        fn stop(&self) {
+            assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGSTOP) }, 0, "the peer is stopped");
+            until_d232("the peer to be stopped", || proc_stat_d232(self.child.id()).is_some_and(|(state, _)| state == 'T'));
+            self.stopped.set(true);
+        }
+
+        fn cont(&self) {
+            assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) }, 0, "the peer is continued");
+            self.stopped.set(false);
+        }
+
+        /// Ends the peer and checks it ended cleanly. Its offer leaves with it.
+        fn finish(mut self, cx: &CxD232) {
+            assert!(!self.stopped.get(), "a stopped peer cannot end");
+            // The peer answers everything it was asked before it goes.
+            self.quiet(cx);
+            drop(self.input.take());
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = self.child.try_wait().expect("the peer's exit status") {
+                    break status;
+                }
+                assert!(std::time::Instant::now() < end, "timed out waiting for the peer to end");
+                drain_d232();
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            self.ended = true;
+            assert!(status.success(), "the peer ended cleanly, got {status:?}");
+            // The display takes the ended process's offer away a moment after
+            // the process is gone. The test goes on once this program has seen
+            // that, so the notice cannot land on top of a later Copy.
+            let mine = format!("application/x-wf-d232-offer-{}-", self.child.id());
+            until_d232("the ended peer's offer to leave", || {
+                !cx.clipboard.formats().mime_types().iter().any(|mime| mime.starts_with(&mine))
+            });
+            cx.settle();
+        }
+    }
+
+    impl Drop for PeerD232 {
+        fn drop(&mut self) {
+            if self.ended {
+                return;
+            }
+            // Only this test's own child, by its exact process id.
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) };
+            drop(self.input.take());
+            let end = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < end {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Holds a transfer at its copy step until the test opens the gate, so the
+    /// test can act at a known point inside a running transfer.
+    struct GateD232 {
+        started: std::path::PathBuf,
+        open: std::path::PathBuf,
+    }
+
+    impl GateD232 {
+        fn install(cx: &CxD232, name: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = cx.root.join(format!("gate-{name}"));
+            std::fs::create_dir(&dir).unwrap();
+            let (started, open, script) = (dir.join("started"), dir.join("open"), dir.join("gated-copy.sh"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nexec cp -a -T -- \"$4\" \"$5\"\n",
+                    started.display(),
+                    open.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(script.to_string_lossy().to_string()));
+            TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = true);
+            Self { started, open }
+        }
+
+        fn wait_started(&self) {
+            until_d232("the held transfer to reach its copy step", || self.started.exists());
+        }
+
+        fn open(&self) {
+            std::fs::write(&self.open, b"").unwrap();
+        }
+    }
+
+    impl Drop for GateD232 {
+        fn drop(&mut self) {
+            TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
+            TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = false);
+            let _ = std::fs::write(&self.open, b"");
+        }
+    }
+
+    /// One real window, worked through its own buttons.
+    #[derive(Clone)]
+    struct WinD232 {
+        state: Rc<RefCell<AppState>>,
+        ui: Ui,
+        /// Every text the status line showed since the last press.
+        said: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl WinD232 {
+        fn dir(&self) -> std::path::PathBuf {
+            std::path::PathBuf::from(self.state.borrow().cwd.real_path_string().expect("the window shows a real folder"))
+        }
+
+        fn listed(&self) -> Vec<String> {
+            let mut names: Vec<String> = self.state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+            names.sort();
+            names
+        }
+
+        fn idle(&self) -> bool {
+            let st = self.state.borrow();
+            st.listing_cancel.is_none() && st.active_transfer.is_none()
+        }
+
+        /// Waits until the rows are exactly what the folder holds on disk.
+        fn shows(&self) {
+            until_d232("the rows to match the folder on disk", || self.idle() && self.listed() == dir_names(&self.dir()));
+        }
+
+        fn status(&self) -> String {
+            self.ui.status.label().to_string()
+        }
+
+        /// The status line as the window builds it now, from its own state.
+        fn rebuilt_status(&self) -> String {
+            update_selection(&self.state, &self.ui);
+            self.status()
+        }
+
+        /// Picks rows through the view's own selection. Returns their paths in
+        /// the order the window itself gives them.
+        fn select(&self, names: &[&str]) -> Vec<String> {
+            self.ui.list_selection.unselect_all();
+            for name in names {
+                let index = self
+                    .state
+                    .borrow()
+                    .visible_entries
+                    .iter()
+                    .position(|e| e.name == *name)
+                    .unwrap_or_else(|| panic!("the row {name:?} is listed"));
+                self.ui.list_selection.select_item(index as u32, false);
+            }
+            let mut want: Vec<String> = names.iter().map(|name| self.dir().join(name).to_string_lossy().to_string()).collect();
+            want.sort();
+            let picked = || {
+                let mut got = selected_paths(&self.state, &self.ui);
+                got.sort();
+                got
+            };
+            until_d232("the picked rows to be selected", || picked() == want);
+            selected_paths(&self.state, &self.ui)
+        }
+
+        /// Presses a real button. The status line is rebuilt first, so the text
+        /// the press ends with is always a change the recorder sees.
+        fn begin(&self, button: &gtk::Button, what: &str) {
+            assert!(button.is_sensitive(), "the {what} button can be pressed");
+            update_selection(&self.state, &self.ui);
+            self.said.borrow_mut().clear();
+            button.emit_clicked();
+        }
+
+        fn ended(&self, ends: &[&str]) -> Option<String> {
+            self.said.borrow().iter().rev().find(|text| ends.iter().any(|end| text.starts_with(end))).cloned()
+        }
+
+        /// Waits for a status text that starts with one of `ends`, with no
+        /// listing and no transfer still on its way, and returns that text.
+        fn end(&self, what: &str, ends: &[&str]) -> String {
+            let stop = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                drain_d232();
+                if self.idle() {
+                    if let Some(text) = self.ended(ends) {
+                        return text;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < stop,
+                    "timed out waiting for {what} to end; the status line said {:?}",
+                    self.said.borrow()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Copy and Cut answer at once. Returns what the status line then says.
+        fn copy(&self) -> String {
+            own_clear_seen_d232();
+            self.begin(&self.ui.copy, "Copy");
+            drain_d232();
+            self.status()
+        }
+
+        fn cut(&self) -> String {
+            own_clear_seen_d232();
+            self.begin(&self.ui.cut, "Cut");
+            drain_d232();
+            self.status()
+        }
+
+        fn paste_begin(&self) {
+            self.begin(&self.ui.paste, "Paste");
+        }
+
+        fn paste_end(&self) -> String {
+            self.end("Paste", &PASTE_ENDS_D232)
+        }
+
+        fn paste(&self) -> String {
+            self.paste_begin();
+            self.paste_end()
+        }
+
+        fn tool(&self, tip: &str) -> gtk::Button {
+            all_widgets(self.ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|button| button.tooltip_text().as_deref() == Some(tip))
+                .unwrap_or_else(|| panic!("the {tip} button"))
+        }
+
+        fn undo(&self) -> String {
+            self.begin(&self.tool("Undo"), "Undo");
+            self.end("Undo", &["Undo ", "Undid ", "Restored "])
+        }
+
+        fn redo(&self) -> String {
+            self.begin(&self.tool("Redo"), "Redo");
+            self.end("Redo", &["Redo ", "Redid "])
+        }
+
+        /// The window's Undo list and Redo list, as text.
+        fn history(&self) -> (String, String) {
+            let st = self.state.borrow();
+            (format!("{:?}", st.undo_stack), format!("{:?}", st.redo_stack))
+        }
+
+        fn go(&self, dir: &Path) {
+            navigate(&self.state, native_core::Location::real(dir.to_path_buf()));
+            until_d232("the folder to open", || self.dir() == dir);
+            self.shows();
+        }
+
+        fn question(&self) -> Option<adw::AlertDialog> {
+            self.ui.window.visible_dialog().and_then(|dialog| dialog.downcast::<adw::AlertDialog>().ok())
+        }
+
+        /// Waits for the name-clash question to be up in this window.
+        fn asked(&self) {
+            until_d232("the name-clash question", || self.question().is_some());
+        }
+
+        /// Presses one of the question's own buttons and waits for it to close.
+        fn answer(&self, label: &str) {
+            self.asked();
+            let dialog = self.question().unwrap();
+            let button = button_labelled(dialog.upcast_ref(), label).unwrap_or_else(|| panic!("the question's {label} button"));
+            button.emit_clicked();
+            until_d232("the question to close", || self.question().is_none());
+        }
+
+        fn close(&self) {
+            self.ui.window.close();
+            until_d232("the window to be gone", || ui_for_state(&self.state).is_none());
+        }
+    }
+
+    /// What every case shares: the test application, its scratch folder, the
+    /// private display and that display's clipboard.
+    struct CxD232 {
+        app: adw::Application,
+        root: std::path::PathBuf,
+        bin: std::path::PathBuf,
+        display: gdk::Display,
+        clipboard: gdk::Clipboard,
+        session: String,
+        frames: Option<std::path::PathBuf>,
+    }
+
+    impl CxD232 {
+        /// Everything this program sent has reached the display, and everything
+        /// the display had for this program has been handled.
+        fn settle(&self) {
+            drain_d232();
+            self.display.sync();
+            drain_d232();
+            self.display.sync();
+        }
+
+        fn has_files(&self) -> bool {
+            let formats = self.clipboard.formats();
+            formats.contain_mime_type(GNOME_D232) || formats.contain_mime_type(URIS_D232)
+        }
+
+        /// Empties the private display's clipboard between cases.
+        fn clear(&self) {
+            self.clipboard.set_content(gdk::ContentProvider::NONE).expect("the test display's clipboard is emptied");
+            own_clear_seen_d232();
+            self.settle();
+            until_d232("the emptied clipboard", || self.clipboard.formats().mime_types().is_empty());
+        }
+
+        /// A new folder of this test's own.
+        fn dir(&self, name: &str) -> std::path::PathBuf {
+            let dir = self.root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn windows() -> Vec<(Rc<RefCell<AppState>>, Ui)> {
+            WINDOWS.with(|w| w.borrow().windows())
+        }
+
+        fn adopt(&self, before: Vec<(Rc<RefCell<AppState>>, Ui)>, dir: &Path) -> WinD232 {
+            let mut fresh: Vec<(Rc<RefCell<AppState>>, Ui)> = Self::windows()
+                .into_iter()
+                .filter(|(state, _)| !before.iter().any(|(old, _)| Rc::ptr_eq(old, state)))
+                .collect();
+            assert_eq!(fresh.len(), 1, "exactly one new window opened");
+            let (state, ui) = fresh.remove(0);
+            ui.window.present();
+            let said: Rc<RefCell<Vec<String>>> = Rc::default();
+            ui.status.connect_label_notify({
+                let said = said.clone();
+                move |status| said.borrow_mut().push(status.label().to_string())
+            });
+            let win = WinD232 { state, ui, said };
+            until_d232("the new window's folder", || win.dir() == dir);
+            win.shows();
+            win
+        }
+
+        /// A new window on `dir`, made the way the program makes its first one.
+        fn open(&self, dir: &Path) -> WinD232 {
+            let before = Self::windows();
+            build_ui(&self.app, Some(dir.to_string_lossy().to_string()), None);
+            self.adopt(before, dir)
+        }
+
+        /// A new window on `dir`, opened from another window's own command.
+        fn open_from(&self, from: &WinD232, dir: &Path) -> WinD232 {
+            let before = Self::windows();
+            open_new_window(&from.ui, dir.to_string_lossy().to_string());
+            self.adopt(before, dir)
+        }
+
+        /// Optional picture of the whole virtual screen with these windows side
+        /// by side. Only the private display is asked; the pointer is not used.
+        fn frame(&self, name: &str, wins: &[&WinD232]) {
+            let Some(dir) = &self.frames else { return };
+            let display = self.display.name().to_string();
+            let tool = |args: &[&str]| {
+                let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display).args(args).output().expect("xdotool");
+                assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            for (index, win) in wins.iter().enumerate() {
+                let title = format!("wf-d232-{}-{index}", std::process::id());
+                let old = win.ui.window.title();
+                win.ui.window.set_title(Some(&title));
+                self.settle();
+                let id = tool(&["search", "--name", &format!("^{title}$")]);
+                let id = id.lines().next().expect("the window is on the private display").to_string();
+                tool(&["windowsize", &id, "940", "1000"]);
+                tool(&["windowmove", &id, &(index * 960 + 10).to_string(), "20"]);
+                win.ui.window.set_title(old.as_deref());
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(400));
+            pump();
+            let out = std::process::Command::new("/usr/bin/import")
+                .env("DISPLAY", &display)
+                .args(["-window", "root"])
+                .arg(dir.join(name))
+                .output()
+                .expect("import");
+            assert!(out.status.success(), "frame capture: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// The GNOME form: the intent, then one file address per line.
+    fn gnome_d232(intent: &str, paths: &[&Path]) -> Vec<u8> {
+        let mut text = intent.to_string();
+        for path in paths {
+            text.push('\n');
+            text.push_str(&uri_d232(path));
+        }
+        text.into_bytes()
+    }
+
+    /// The plain list form: one file address per line, each ended the way the
+    /// format says.
+    fn uris_d232(paths: &[&Path]) -> Vec<u8> {
+        paths.iter().map(|path| format!("{}\r\n", uri_d232(path))).collect::<String>().into_bytes()
+    }
+
+    /// The one history entry a Paste of `from` into `to_dir` must leave.
+    fn pasted_d232(from: &[String], to_dir: &Path, was_copy: bool) -> String {
+        let items: Vec<native_core::ResolvedItem> = from
+            .iter()
+            .map(|from| native_core::ResolvedItem {
+                from: from.clone(),
+                to: to_dir.join(Path::new(from).file_name().unwrap()).to_string_lossy().to_string(),
+            })
+            .collect();
+        let fps = items.iter().map(|item| native_core::fingerprint(&item.to).expect("the pasted item is on disk")).collect();
+        format!("{:?}", vec![UndoAction::Pasted { items, was_copy, fps }])
+    }
+
+    fn no_history_d232() -> (String, String) {
+        ("[]".to_string(), "[]".to_string())
+    }
+
+    /// Group 1: Copy in one window, Paste in a window opened afterwards. Exact
+    /// files, folders and bytes, refreshed rows, normal Undo and Redo, and the
+    /// same Copy pasted again.
+    fn case_copy_across_d232(cx: &CxD232) {
+        let (a_dir, b_dir, c_dir) = (cx.dir("copy-across/a"), cx.dir("copy-across/b"), cx.dir("copy-across/c"));
+        put_d232(&a_dir.join("report.txt"), b"report bytes\n");
+        put_d232(&a_dir.join("tree/inner/deep.bin"), &[0, 1, 2, 255, 254]);
+        put_d232(&a_dir.join("tree/note.txt"), b"note");
+        std::fs::create_dir(a_dir.join("tree/empty")).unwrap();
+        let source = tree_d232(&a_dir);
+
+        let a = cx.open(&a_dir);
+        let picked = a.select(&["report.txt", "tree"]);
+        assert!(a.copy().contains("  -  2 copy pending"), "Copy shows as pending in its own window, got {:?}", a.status());
+        let b = cx.open_from(&a, &b_dir);
+        assert_eq!(b.paste(), "Pasted 2 items", "a window opened after the Copy pastes it");
+        b.shows();
+        assert_eq!(b.listed(), ["report.txt", "tree"], "the pasted rows are listed");
+        assert_eq!(tree_d232(&b_dir), source, "the copies hold the same files, folders and bytes");
+        assert_eq!(tree_d232(&a_dir), source, "the source is as it was");
+        assert_eq!(a.history(), no_history_d232(), "the copying window gains no history");
+        assert_eq!(b.history(), (pasted_d232(&picked, &b_dir, true), "[]".to_string()), "the pasting window gains one Paste entry");
+        cx.frame("copy-across-1-pasted.png", &[&a, &b]);
+
+        assert_eq!(b.undo(), "Undid paste: moved to Trash");
+        b.shows();
+        assert!(dir_names(&b_dir).is_empty(), "Undo takes the copies away");
+        assert_eq!(tree_d232(&cx.bin.join("files")), source, "the copies are in the test's own Trash, whole");
+        assert_eq!(tree_d232(&a_dir), source, "Undo leaves the source alone");
+        assert_eq!(b.redo(), "Redid restore from Trash");
+        b.shows();
+        assert_eq!(tree_d232(&b_dir), source, "Redo brings the copies back, whole");
+        assert!(dir_names(&cx.bin.join("files")).is_empty(), "nothing is left in the test's own Trash");
+
+        // Copy can be pasted again, by another window.
+        let c = cx.open(&c_dir);
+        assert_eq!(c.paste(), "Pasted 2 items", "the same Copy pastes a second time");
+        c.shows();
+        assert_eq!(tree_d232(&c_dir), source);
+        assert!(a.rebuilt_status().contains("  -  2 copy pending"), "the Copy is still pending in its own window");
+        assert!(cx.has_files(), "the Copy is still on the clipboard");
+        cx.frame("copy-across-2-pasted-again.png", &[&a, &c]);
+        for win in [&a, &b, &c] {
+            win.close();
+        }
+    }
+
+    /// Group 1: Cut in one window, Paste in another. Moved once, the old offer
+    /// used up, normal Undo and Redo.
+    fn case_cut_across_d232(cx: &CxD232) {
+        let (a_dir, b_dir) = (cx.dir("cut-across/a"), cx.dir("cut-across/b"));
+        put_d232(&a_dir.join("x.txt"), b"cut me");
+        put_d232(&a_dir.join("keep.txt"), b"stay");
+        let a = cx.open(&a_dir);
+        let b = cx.open(&b_dir);
+        let picked = a.select(&["x.txt"]);
+        assert!(a.cut().contains("  -  1 cut pending"), "Cut shows as pending in its own window, got {:?}", a.status());
+        cx.frame("cut-across-1-cut.png", &[&a, &b]);
+        assert_eq!(b.paste(), "Pasted 1 item", "another window pastes the Cut");
+        b.shows();
+        a.shows();
+        assert_eq!((a.listed(), b.listed()), (vec!["keep.txt".to_string()], vec!["x.txt".to_string()]), "both windows show the move");
+        assert_eq!(std::fs::read(b_dir.join("x.txt")).unwrap(), b"cut me");
+        assert_eq!(dir_names(&a_dir), ["keep.txt"], "the file left its old folder");
+        assert_eq!(b.history(), (pasted_d232(&picked, &b_dir, false), "[]".to_string()), "the pasting window gains one Move entry");
+        assert_eq!(a.history(), no_history_d232());
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert!(!a.rebuilt_status().contains("pending"), "the used Cut is no longer pending, got {:?}", a.status());
+        cx.frame("cut-across-2-moved.png", &[&a, &b]);
+
+        // The old offer is gone: a second Paste, anywhere, moves nothing.
+        assert_eq!(b.paste(), "Nothing to paste");
+        assert_eq!(a.paste(), "Nothing to paste");
+        assert_eq!((dir_names(&a_dir), dir_names(&b_dir)), (vec!["keep.txt".to_string()], vec!["x.txt".to_string()]), "moved once");
+
+        assert_eq!(b.undo(), "Undid move");
+        a.shows();
+        b.shows();
+        assert_eq!(std::fs::read(a_dir.join("x.txt")).unwrap(), b"cut me", "Undo puts the file back");
+        assert!(dir_names(&b_dir).is_empty());
+        assert_eq!(b.redo(), "Redid move");
+        a.shows();
+        b.shows();
+        assert_eq!(std::fs::read(b_dir.join("x.txt")).unwrap(), b"cut me", "Redo moves it again");
+        assert_eq!(dir_names(&a_dir), ["keep.txt"]);
+        a.close();
+        b.close();
+    }
+
+    /// Group 2: another program offers files the GNOME way, as Copy and as Cut.
+    fn case_peer_gnome_d232(cx: &CxD232) {
+        let (src, d1, d2, d3) = (cx.dir("peer-gnome/src"), cx.dir("peer-gnome/d1"), cx.dir("peer-gnome/d2"), cx.dir("peer-gnome/d3"));
+        put_d232(&src.join("one.txt"), b"one");
+        put_d232(&src.join("dir/two.txt"), b"two");
+        let source = tree_d232(&src);
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&d1);
+
+        // Copy, with no newline after the last address and a text form beside it.
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &[&src.join("one.txt"), &src.join("dir")])), (TEXT_D232, b"one.txt dir")]);
+        assert_eq!(w.paste(), "Pasted 2 items", "the other program's Copy pastes");
+        w.shows();
+        assert_eq!(tree_d232(&d1), source, "exact files, folders and bytes");
+        assert_eq!(tree_d232(&src), source, "a Copy leaves the source");
+        assert_eq!(
+            w.history(),
+            (
+                pasted_d232(&[src.join("one.txt").to_string_lossy().to_string(), src.join("dir").to_string_lossy().to_string()], &d1, true),
+                "[]".to_string()
+            )
+        );
+        assert!(peer.state(cx).starts_with("local=true "), "a pasted Copy stays with its owner");
+        w.go(&d2);
+        assert_eq!(w.paste(), "Pasted 2 items", "the other program's Copy pastes again");
+        assert_eq!(tree_d232(&d2), source);
+
+        // Cut, with a newline after the last address.
+        let mut cut = gnome_d232("cut", &[&src.join("one.txt")]);
+        cut.push(b'\n');
+        peer.offer(cx, &[(GNOME_D232, &cut)]);
+        w.go(&d3);
+        assert_eq!(w.paste(), "Pasted 1 item", "the other program's Cut pastes");
+        w.shows();
+        assert_eq!(std::fs::read(d3.join("one.txt")).unwrap(), b"one");
+        assert_eq!(dir_names(&src), ["dir"], "a Cut moves the file away");
+        assert_eq!(w.state.borrow().undo_stack.len(), 3, "three Pastes, three entries");
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert_eq!(peer.state(cx), "local=false formats=", "the other program sees its Cut was taken");
+        assert_eq!(w.paste(), "Nothing to paste");
+        assert_eq!(dir_names(&d3), ["one.txt"], "moved once");
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 2: another program offers files the KDE way: the address list
+    /// plus the cut marker.
+    fn case_peer_kde_d232(cx: &CxD232) {
+        let (src, d1, d2) = (cx.dir("peer-kde/src"), cx.dir("peer-kde/d1"), cx.dir("peer-kde/d2"));
+        put_d232(&src.join("k.txt"), b"kde bytes");
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&d1);
+
+        peer.offer(cx, &[(URIS_D232, &uris_d232(&[&src.join("k.txt")])), (KDE_D232, b"0"), (TEXT_D232, b"k.txt")]);
+        assert_eq!(w.paste(), "Pasted 1 item", "marker 0 pastes as a Copy");
+        w.shows();
+        assert_eq!(std::fs::read(d1.join("k.txt")).unwrap(), b"kde bytes");
+        assert_eq!(std::fs::read(src.join("k.txt")).unwrap(), b"kde bytes", "marker 0 leaves the source");
+        assert_eq!(w.history(), (pasted_d232(&[src.join("k.txt").to_string_lossy().to_string()], &d1, true), "[]".to_string()));
+        assert!(peer.state(cx).starts_with("local=true "));
+
+        peer.offer(cx, &[(URIS_D232, &uris_d232(&[&src.join("k.txt")])), (KDE_D232, b"1")]);
+        w.go(&d2);
+        assert_eq!(w.paste(), "Pasted 1 item", "marker 1 pastes as a Cut");
+        w.shows();
+        assert_eq!(std::fs::read(d2.join("k.txt")).unwrap(), b"kde bytes");
+        assert!(dir_names(&src).is_empty(), "marker 1 moves the file away");
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert_eq!(peer.state(cx), "local=false formats=", "the other program sees its Cut was taken");
+        assert_eq!(w.paste(), "Nothing to paste");
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 2: another program reads what Copy and Cut put on the clipboard.
+    fn case_export_d232(cx: &CxD232) {
+        let a_dir = cx.dir("export/a");
+        put_d232(&a_dir.join("plain.txt"), b"plain");
+        put_d232(&a_dir.join("sub/in.txt"), b"in");
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&a_dir);
+        let picked = w.select(&["plain.txt", "sub"]);
+        let uris: Vec<String> = picked.iter().map(|path| uri_d232(Path::new(path))).collect();
+        let listed: String = uris.iter().map(|uri| format!("{uri}\r\n")).collect();
+        const FORMS: &str = "application/x-kde-cutselection\ntext/uri-list\nx-special/gnome-copied-files";
+
+        assert!(w.copy().contains("  -  2 copy pending"));
+        let got = peer.read(cx, GNOME_D232);
+        assert_eq!(std::fs::read_to_string(got.join("formats")).unwrap(), FORMS, "Copy offers exactly the three file forms");
+        assert_eq!(String::from_utf8(std::fs::read(got.join("gnome.bin")).unwrap()).unwrap(), format!("copy\n{}", uris.join("\n")));
+        assert_eq!(String::from_utf8(std::fs::read(got.join("uris.bin")).unwrap()).unwrap(), listed);
+        assert_eq!(std::fs::read(got.join("kde.bin")).unwrap(), b"0");
+
+        assert!(w.cut().contains("  -  2 cut pending"));
+        let got = peer.read(cx, GNOME_D232);
+        assert_eq!(std::fs::read_to_string(got.join("formats")).unwrap(), FORMS, "Cut offers exactly the three file forms");
+        assert_eq!(String::from_utf8(std::fs::read(got.join("gnome.bin")).unwrap()).unwrap(), format!("cut\n{}", uris.join("\n")));
+        assert_eq!(String::from_utf8(std::fs::read(got.join("uris.bin")).unwrap()).unwrap(), listed);
+        assert_eq!(std::fs::read(got.join("kde.bin")).unwrap(), b"1");
+        // Being read by another program uses nothing up.
+        assert!(w.rebuilt_status().contains("  -  2 cut pending"));
+        assert_eq!(dir_names(&a_dir), ["plain.txt", "sub"]);
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 3: an address list with no marker at all is a Copy.
+    fn case_uri_only_d232(cx: &CxD232) {
+        let (src, d1, d2) = (cx.dir("uri-only/src"), cx.dir("uri-only/d1"), cx.dir("uri-only/d2"));
+        put_d232(&src.join("one.txt"), b"one");
+        put_d232(&src.join("two.txt"), b"two");
+        let source = tree_d232(&src);
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&d1);
+        let body = format!(
+            "# a note line\r\n{}\r\n{}\r\n",
+            uri_d232(&src.join("one.txt")),
+            uri_d232(&src.join("two.txt")).replacen("file://", "file://localhost", 1)
+        );
+        peer.offer(cx, &[(URIS_D232, body.as_bytes())]);
+        assert_eq!(w.paste(), "Pasted 2 items", "an address list alone pastes");
+        w.shows();
+        assert_eq!(tree_d232(&d1), source);
+        assert_eq!(tree_d232(&src), source, "an address list alone is a Copy: the source stays");
+        assert!(peer.state(cx).starts_with("local=true "), "and its owner keeps it");
+        w.go(&d2);
+        assert_eq!(w.paste(), "Pasted 2 items", "and it pastes again");
+        assert_eq!(tree_d232(&d2), source);
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 3: names with spaces, percent signs, #, ?, other alphabets and a
+    /// line break, in from another program and out to it.
+    fn case_encodings_d232(cx: &CxD232) {
+        const NAMES: [&str; 7] = ["a b.txt", "100%.txt", "#tag.txt", "é-日本.txt", "line\nbreak.txt", "what?.txt", "k!$&'()*+,;=:@~.txt"];
+        let (src, d1, d2, src2) = (cx.dir("encodings/src"), cx.dir("encodings/d1"), cx.dir("encodings/d2"), cx.dir("encodings/src2"));
+        for name in NAMES {
+            put_d232(&src.join(name), format!("bytes of {name}").as_bytes());
+        }
+        put_d232(&src.join("dir #1/in%side.txt"), b"inside");
+        put_d232(&src2.join("A~b.txt"), b"over-escaped");
+        let source = tree_d232(&src);
+        let mut all: Vec<&str> = NAMES.to_vec();
+        all.push("dir #1");
+        let peer = PeerD232::start(cx);
+
+        // In: addresses written by hand, the way another program writes them.
+        let w = cx.open(&d1);
+        let paths: Vec<std::path::PathBuf> = all.iter().map(|name| src.join(name)).collect();
+        let refs: Vec<&Path> = paths.iter().map(|path| path.as_path()).collect();
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &refs))]);
+        assert_eq!(w.paste(), "Pasted 8 items", "every name comes in");
+        w.shows();
+        assert_eq!(tree_d232(&d1), source, "every name and every byte arrives as it is on disk");
+        // In: letters another program escaped although it need not have, and a
+        // semicolon another program left as it is.
+        put_d232(&src2.join("semi;colon.txt"), b"left raw");
+        let odd = format!("{0}/%41%7eb.txt\r\n{0}/semi;colon.txt\r\n", uri_d232(&src2));
+        peer.offer(cx, &[(URIS_D232, odd.as_bytes())]);
+        assert_eq!(w.paste(), "Pasted 2 items", "both other spellings are read");
+        assert_eq!(std::fs::read(d1.join("A~b.txt")).unwrap(), b"over-escaped");
+        assert_eq!(std::fs::read(d1.join("semi;colon.txt")).unwrap(), b"left raw");
+
+        // Out: what another program reads from Copy.
+        let s = cx.open(&src);
+        let picked = s.select(&all);
+        assert!(s.copy().contains("  -  8 copy pending"));
+        let got = peer.read(cx, GNOME_D232);
+        let uris: Vec<String> = picked.iter().map(|path| uri_d232(Path::new(path))).collect();
+        assert_eq!(String::from_utf8(std::fs::read(got.join("gnome.bin")).unwrap()).unwrap(), format!("copy\n{}", uris.join("\n")));
+        assert_eq!(
+            String::from_utf8(std::fs::read(got.join("uris.bin")).unwrap()).unwrap(),
+            uris.iter().map(|uri| format!("{uri}\r\n")).collect::<String>()
+        );
+        // And round again into another window.
+        w.go(&d2);
+        assert_eq!(w.paste(), "Pasted 8 items");
+        assert_eq!(tree_d232(&d2), source, "out and back in, every name and byte the same");
+        assert_eq!(tree_d232(&src), source);
+        peer.finish(cx);
+        w.close();
+        s.close();
+    }
+
+    /// Group 3: offers that must be refused whole, with the reason shown, the
+    /// disk and history untouched, and the refused offer left with its owner.
+    fn case_refusals_d232(cx: &CxD232) {
+        let (src, dest) = (cx.dir("refusals/src"), cx.dir("refusals/dest"));
+        put_d232(&src.join("good.txt"), b"good");
+        let good = uri_d232(&src.join("good.txt"));
+        let cut_short = |text: &str| text.chars().take(80).collect::<String>();
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&dest);
+        let text = |mime: &'static str, body: String| (mime, body.into_bytes());
+        let rows: Vec<(&str, Vec<(&str, Vec<u8>)>, String)> = vec![
+            ("a first line that is neither copy nor cut", vec![text(GNOME_D232, format!("move\n{good}"))], "the clipboard does not say copy or cut".into()),
+            ("an empty GNOME form", vec![(GNOME_D232, Vec::new())], "the clipboard does not say copy or cut".into()),
+            ("copy with no addresses", vec![text(GNOME_D232, "copy\n".into())], "the clipboard holds no files".into()),
+            ("an address list of notes only", vec![text(URIS_D232, "# only a note\r\n".into())], "the clipboard holds no files".into()),
+            (
+                "a remote protocol",
+                vec![text(GNOME_D232, "copy\nsftp://host/x".into())],
+                "sftp://host/x is not a local file (sftp is not supported)".into(),
+            ),
+            (
+                "a web address",
+                vec![text(URIS_D232, "http://example.invalid/a.txt\r\n".into())],
+                "http://example.invalid/a.txt is not a local file (http is not supported)".into(),
+            ),
+            (
+                "a file on another computer",
+                vec![text(URIS_D232, "file://elsewhere.invalid/tmp/a.txt\r\n".into())],
+                "file://elsewhere.invalid/tmp/a.txt is on another computer".into(),
+            ),
+            (
+                "one good address, then a remote one",
+                vec![text(GNOME_D232, format!("copy\n{good}\nsftp://host/x"))],
+                "sftp://host/x is not a local file (sftp is not supported)".into(),
+            ),
+            (
+                "a remote address, then a good one",
+                vec![text(GNOME_D232, format!("copy\nsftp://host/x\n{good}"))],
+                "sftp://host/x is not a local file (sftp is not supported)".into(),
+            ),
+            ("a file address with no folder path", vec![text(URIS_D232, "file:tmp/a\r\n".into())], "file:tmp/a is not a valid file address".into()),
+            (
+                "a cut marker that is not 0 or 1",
+                vec![text(URIS_D232, format!("{good}\r\n")), (KDE_D232, b"2".to_vec())],
+                "the clipboard's cut marker is not 0 or 1".into(),
+            ),
+            (
+                "a cut marker in words",
+                vec![text(URIS_D232, format!("{good}\r\n")), (KDE_D232, b"yes".to_vec())],
+                "the clipboard's cut marker is not 0 or 1".into(),
+            ),
+            (
+                "GNOME says cut, KDE says copy",
+                vec![text(GNOME_D232, format!("cut\n{good}")), text(URIS_D232, format!("{good}\r\n")), (KDE_D232, b"0".to_vec())],
+                "the clipboard's copy and cut markers disagree".into(),
+            ),
+            (
+                "GNOME says copy, KDE says cut",
+                vec![text(GNOME_D232, format!("copy\n{good}")), text(URIS_D232, format!("{good}\r\n")), (KDE_D232, b"1".to_vec())],
+                "the clipboard's copy and cut markers disagree".into(),
+            ),
+            ("a broken escape", vec![text(URIS_D232, "file:///tmp/%zz\r\n".into())], "file:///tmp/%zz is not a valid file address".into()),
+            (
+                "an address with a fragment",
+                vec![text(URIS_D232, format!("{good}#frag\r\n"))],
+                format!("{} is not a valid file address", cut_short(&format!("{good}#frag"))),
+            ),
+            (
+                "an address with a query",
+                vec![text(URIS_D232, format!("{good}?x=1\r\n"))],
+                format!("{} is not a valid file address", cut_short(&format!("{good}?x=1"))),
+            ),
+            ("bytes that are not text", vec![(GNOME_D232, b"copy\nfile:///tmp/\xff\xfe".to_vec())], "the clipboard data is not text".into()),
+            ("plain words in an address list", vec![text(URIS_D232, "hello world\r\n".into())], "hello world is not a file address".into()),
+            ("a bare path in an address list", vec![text(URIS_D232, "/tmp/a.txt\r\n".into())], "/tmp/a.txt is not a file address".into()),
+            ("an address that names nothing", vec![text(URIS_D232, "file:///\r\n".into())], "file:/// does not name a file or folder".into()),
+            (
+                "a zero byte inside an address",
+                vec![(URIS_D232, b"file:///tmp/a\0b\r\n".to_vec())],
+                "file:///tmp/a\u{FFFD}b is not a valid file address".into(),
+            ),
+        ];
+        let untouched = || (tree_d232(&dest), tree_d232(&src), w.history());
+        let start = untouched();
+        assert_eq!(start.2, no_history_d232());
+        for (what, forms, reason) in &rows {
+            let forms: Vec<(&str, &[u8])> = forms.iter().map(|(mime, bytes)| (*mime, bytes.as_slice())).collect();
+            peer.offer(cx, &forms);
+            assert_eq!(w.paste(), format!("Paste refused: {reason}"), "{what}");
+            assert_eq!(untouched(), start, "{what}: no file and no history changed");
+            assert!(peer.state(cx).starts_with("local=true "), "{what}: the refused offer stays with its owner");
+            assert!(!w.rebuilt_status().contains("pending"), "{what}: nothing shows as pending");
+        }
+        println!("D232 REFUSALS {}", rows.len());
+
+        // A valid address of a file that is not there: the transfer itself fails.
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("cut", &[&src.join("not-there.txt")]))]);
+        let said = w.paste();
+        assert!(said.starts_with("Operation failed"), "a missing source fails in the open, got {said:?}");
+        assert_eq!(untouched(), start, "a missing source changes nothing");
+        assert!(peer.state(cx).starts_with("local=true "), "a failed Cut stays with its owner");
+
+        // More than the reader takes in: about five million bytes of made-up addresses.
+        let mut big = String::from("copy");
+        for n in 0..40_000 {
+            big.push_str(&format!("\nfile:///wf-d232-not-there/{}-{n:06}.bin", "long-made-up-name-".repeat(5)));
+        }
+        assert!(big.len() > 4 * 1024 * 1024 + 4096, "the made-up list is over the limit");
+        peer.offer(cx, &[(GNOME_D232, big.as_bytes())]);
+        assert_eq!(w.paste(), "Paste refused: the clipboard data is too large");
+        assert_eq!(untouched(), start, "an over-long list changes nothing");
+        assert!(peer.state(cx).starts_with("local=true "));
+        // Reading goes on working after it.
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &[&src.join("good.txt")]))]);
+        assert_eq!(w.paste(), "Pasted 1 item", "a small offer after the over-long one pastes");
+        assert_eq!(std::fs::read(dest.join("good.txt")).unwrap(), b"good");
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 3: offers that are not files at all. Plain text is never read as a
+    /// file list, whatever it looks like.
+    fn case_not_files_d232(cx: &CxD232) {
+        let (src, dest) = (cx.dir("not-files/src"), cx.dir("not-files/dest"));
+        put_d232(&src.join("good.txt"), b"good");
+        let good = uri_d232(&src.join("good.txt"));
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&dest);
+        let offers: Vec<(&str, Vec<(&str, Vec<u8>)>)> = vec![
+            ("plain words", vec![(TEXT_D232, b"just some words".to_vec())]),
+            ("a picture", vec![("image/png", vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 0])]),
+            ("text that looks like a file address", vec![(TEXT_D232, good.clone().into_bytes())]),
+            ("text that looks like the GNOME form", vec![(TEXT_D232, format!("cut\n{good}").into_bytes())]),
+            ("a cut marker with no files", vec![(KDE_D232, b"1".to_vec())]),
+        ];
+        for (what, forms) in &offers {
+            let forms: Vec<(&str, &[u8])> = forms.iter().map(|(mime, bytes)| (*mime, bytes.as_slice())).collect();
+            peer.offer(cx, &forms);
+            assert_eq!(w.paste(), "Nothing to paste", "{what}");
+            assert!(dir_names(&dest).is_empty(), "{what}: nothing pasted");
+            assert_eq!(dir_names(&src), ["good.txt"], "{what}: nothing moved");
+            assert_eq!(w.history(), no_history_d232(), "{what}");
+            assert!(peer.state(cx).starts_with("local=true "), "{what}: the offer stays with its owner");
+        }
+        peer.clear(cx);
+        assert_eq!(w.paste(), "Nothing to paste", "an empty clipboard");
+        assert!(dir_names(&dest).is_empty());
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 3: text put on the clipboard after a file Copy replaces it. The
+    /// old files never come back.
+    fn case_text_replaces_d232(cx: &CxD232) {
+        let (a_dir, d_dir) = (cx.dir("text-replaces/a"), cx.dir("text-replaces/d"));
+        put_d232(&a_dir.join("f.txt"), b"f");
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&a_dir);
+
+        // Copy Path(s), this program's own text command.
+        let picked = w.select(&["f.txt"]);
+        assert!(w.copy().contains("  -  1 copy pending"));
+        copy_paths_to_system_clipboard(&w.state, &w.ui);
+        assert_eq!(w.status(), "Copied 1 path to clipboard");
+        assert!(!w.rebuilt_status().contains("pending"), "Copy Path(s) ends the pending file Copy, got {:?}", w.status());
+        w.go(&d_dir);
+        assert_eq!(w.paste(), "Nothing to paste", "the copied path is text, not a file to paste");
+        assert!(dir_names(&d_dir).is_empty());
+        let got = peer.read(cx, TEXT_D232);
+        assert_eq!(String::from_utf8(std::fs::read(got.join("text.bin")).unwrap()).unwrap(), picked[0], "another program reads the path as text");
+        for form in ["gnome.bin", "uris.bin", "kde.bin"] {
+            assert!(!got.join(form).exists(), "Copy Path(s) offers no file form ({form})");
+        }
+
+        // Text from another program.
+        w.go(&a_dir);
+        w.select(&["f.txt"]);
+        assert!(w.copy().contains("  -  1 copy pending"));
+        peer.offer(cx, &[(TEXT_D232, b"words from another program")]);
+        assert!(!w.status().contains("pending"), "the pending note leaves when the text arrives, got {:?}", w.status());
+        assert!(!w.rebuilt_status().contains("pending"), "and does not come back, got {:?}", w.status());
+        w.go(&d_dir);
+        assert_eq!(w.paste(), "Nothing to paste", "the replaced file Copy does not come back");
+        assert!(dir_names(&d_dir).is_empty());
+        assert_eq!(w.history(), no_history_d232());
+        assert!(peer.state(cx).starts_with("local=true "));
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// What the three late-answer cases share. The owner of the offer is
+    /// stopped, so the read that Paste starts stays open for as long as the test
+    /// wants. `change` then acts on the window that pressed Paste. A second
+    /// window's Paste waits in line behind that read and is the end signal: when
+    /// it has pasted, the first read was answered and dealt with before it.
+    fn late_answer_d232(cx: &CxD232, name: &str, change: impl Fn(&WinD232, &Path)) {
+        let (src, d1, d2, d3) =
+            (cx.dir(&format!("{name}/src")), cx.dir(&format!("{name}/d1")), cx.dir(&format!("{name}/d2")), cx.dir(&format!("{name}/d3")));
+        put_d232(&src.join("s.txt"), b"s");
+        let peer = PeerD232::start(cx);
+        let stale = cx.open(&d1);
+        let marker = cx.open(&d2);
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &[&src.join("s.txt")]))]);
+        peer.stop();
+        stale.paste_begin();
+        cx.settle();
+        assert_eq!(stale.status(), "Reading the clipboard", "Paste is waiting for the stopped owner; the window is not held up");
+        marker.paste_begin();
+        change(&stale, &d3);
+        peer.cont();
+        assert_eq!(marker.paste_end(), "Pasted 1 item", "the Paste that still stands goes through");
+        marker.shows();
+        cx.settle();
+        assert_eq!(dir_names(&d2), ["s.txt"]);
+        assert!(dir_names(&d1).is_empty(), "the overtaken Paste put nothing in its old folder");
+        assert!(dir_names(&d3).is_empty(), "and nothing in the folder shown now");
+        assert_eq!(stale.history(), no_history_d232(), "and left no history");
+        assert!(stale.state.borrow().active_transfer.is_none(), "and started no transfer");
+        assert!(!stale.said.borrow().iter().any(|text| text.starts_with("Pasted")), "and never said it pasted");
+        peer.finish(cx);
+        if ui_for_state(&stale.state).is_some() {
+            stale.close();
+        }
+        marker.close();
+    }
+
+    /// Group 4: the window is closed while its Paste waits for the answer.
+    fn case_stale_closed_d232(cx: &CxD232) {
+        late_answer_d232(cx, "stale-closed", |stale, _| stale.close());
+    }
+
+    /// Group 4: the window goes to another folder while its Paste waits.
+    fn case_stale_navigated_d232(cx: &CxD232) {
+        late_answer_d232(cx, "stale-navigated", |stale, other| stale.go(other));
+    }
+
+    /// Group 4: a new tab is opened while the Paste waits.
+    fn case_stale_tab_d232(cx: &CxD232) {
+        late_answer_d232(cx, "stale-tab", |stale, _| {
+            new_tab_action(stale.state.clone(), stale.ui.clone());
+            drain_d232();
+            stale.shows();
+        });
+    }
+
+    /// Group 4: Paste pressed twice while the first read is still open. One
+    /// transfer, not two; a Cut moves once.
+    fn case_two_pastes_d232(cx: &CxD232) {
+        let (src, d1, d2) = (cx.dir("two-pastes/src"), cx.dir("two-pastes/d1"), cx.dir("two-pastes/d2"));
+        put_d232(&src.join("s.txt"), b"s");
+        put_d232(&src.join("m.txt"), b"m");
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&d1);
+        let twice = |w: &WinD232| {
+            peer.stop();
+            w.paste_begin();
+            cx.settle();
+            assert_eq!(w.status(), "Reading the clipboard");
+            w.paste_begin();
+            peer.cont();
+            let said = w.paste_end();
+            w.shows();
+            cx.settle();
+            assert!(w.question().is_none(), "no second transfer came asking about a name clash");
+            // The overtaken press went no further than its read: it never
+            // reached the transfer gate or the Cut's claim to be turned away.
+            let all = w.said.borrow();
+            assert!(
+                !all.iter().any(|text| text == "A transfer is already running" || text == "This cut is already being pasted"),
+                "the overtaken press started nothing, got {all:?}"
+            );
+            said
+        };
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &[&src.join("s.txt")]))]);
+        assert_eq!(twice(&w), "Pasted 1 item");
+        assert_eq!(dir_names(&d1), ["s.txt"], "one copy, not two");
+        assert_eq!(w.history(), (pasted_d232(&[src.join("s.txt").to_string_lossy().to_string()], &d1, true), "[]".to_string()), "one entry");
+
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("cut", &[&src.join("m.txt")]))]);
+        w.go(&d2);
+        assert_eq!(twice(&w), "Pasted 1 item");
+        assert_eq!(dir_names(&d2), ["m.txt"], "moved once");
+        assert_eq!(dir_names(&src), ["s.txt"]);
+        assert_eq!(w.state.borrow().undo_stack.len(), 2, "one entry for each of the two transfers");
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert_eq!(peer.state(cx), "local=false formats=");
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 4: the clipboard gets a new owner while the old owner's answer is
+    /// still on its way. The late answer starts nothing and harms nothing newer.
+    fn case_replaced_mid_read_d232(cx: &CxD232) {
+        let (src, a_dir, d1) = (cx.dir("replaced-mid-read/src"), cx.dir("replaced-mid-read/a"), cx.dir("replaced-mid-read/d1"));
+        put_d232(&src.join("x.txt"), b"x");
+        put_d232(&src.join("y.txt"), b"y");
+        put_d232(&a_dir.join("own.txt"), b"own");
+        let old = PeerD232::start(cx);
+        let new = PeerD232::start(cx);
+        let w = cx.open(&d1);
+        let a = cx.open(&a_dir);
+        let held = |forms: &[(&str, &[u8])]| {
+            old.offer(cx, forms);
+            old.stop();
+            w.paste_begin();
+            cx.settle();
+            assert_eq!(w.status(), "Reading the clipboard");
+        };
+        let nothing_moved = |what: &str| {
+            assert_eq!(dir_names(&src), ["x.txt", "y.txt"], "{what}: the sources are where they were");
+            assert_eq!(w.history(), no_history_d232(), "{what}");
+        };
+
+        // Another program's Cut, replaced by this program's own Copy.
+        held(&[(GNOME_D232, &gnome_d232("cut", &[&src.join("x.txt")]))]);
+        a.select(&["own.txt"]);
+        assert!(a.copy().contains("  -  1 copy pending"));
+        old.cont();
+        assert_eq!(w.paste_end(), "Clipboard changed, nothing pasted");
+        cx.settle();
+        nothing_moved("own Copy over a Cut");
+        assert!(dir_names(&d1).is_empty());
+        assert!(a.rebuilt_status().contains("  -  1 copy pending"), "the newer Copy is still pending");
+        assert_eq!(w.paste(), "Pasted 1 item", "and it is the newer Copy that pastes");
+        assert_eq!(dir_names(&d1), ["own.txt"]);
+        assert_eq!(w.state.borrow().undo_stack.len(), 1);
+        std::fs::remove_file(d1.join("own.txt")).unwrap();
+        w.shows();
+        w.state.borrow_mut().undo_stack.clear();
+
+        // The KDE way: one owner's list with cut marker 1, replaced by another
+        // owner's list with marker 0. The two are never mixed.
+        held(&[(URIS_D232, &uris_d232(&[&src.join("x.txt")])), (KDE_D232, b"1")]);
+        new.offer(cx, &[(URIS_D232, &uris_d232(&[&src.join("y.txt")])), (KDE_D232, b"0")]);
+        old.cont();
+        assert_eq!(w.paste_end(), "Clipboard changed, nothing pasted");
+        cx.settle();
+        nothing_moved("a list with marker 0 over a list with marker 1");
+        assert!(dir_names(&d1).is_empty());
+        assert_eq!(w.paste(), "Pasted 1 item", "the newer list pastes");
+        assert_eq!(dir_names(&d1), ["y.txt"], "it is the newer owner's file");
+        assert_eq!(dir_names(&src), ["x.txt", "y.txt"], "as a Copy, by the newer owner's marker");
+        assert!(new.state(cx).starts_with("local=true "));
+        std::fs::remove_file(d1.join("y.txt")).unwrap();
+        w.shows();
+        w.state.borrow_mut().undo_stack.clear();
+
+        // Files replaced by text.
+        held(&[(GNOME_D232, &gnome_d232("copy", &[&src.join("x.txt")]))]);
+        new.offer(cx, &[(TEXT_D232, b"words")]);
+        old.cont();
+        assert_eq!(w.paste_end(), "Clipboard changed, nothing pasted");
+        cx.settle();
+        nothing_moved("text over files");
+        assert_eq!(w.paste(), "Nothing to paste");
+        assert!(dir_names(&d1).is_empty());
+        assert!(new.state(cx).starts_with("local=true "));
+        old.finish(cx);
+        new.finish(cx);
+        w.close();
+        a.close();
+    }
+
+    /// Group 4: a new Copy is made while an older Cut is still being moved. The
+    /// finished Cut does not take the newer Copy off the clipboard.
+    fn case_replaced_during_job_d232(cx: &CxD232) {
+        let (a_dir, b_dir, c_dir) =
+            (cx.dir("replaced-during-job/a"), cx.dir("replaced-during-job/b"), cx.dir("replaced-during-job/c"));
+        put_d232(&a_dir.join("x.txt"), b"x");
+        put_d232(&b_dir.join("z.txt"), b"z");
+        let w = cx.open(&a_dir);
+        w.select(&["x.txt"]);
+        assert!(w.cut().contains("  -  1 cut pending"));
+        w.go(&b_dir);
+        let gate = GateD232::install(cx, "job-copy");
+        w.paste_begin();
+        gate.wait_started();
+        w.select(&["z.txt"]);
+        assert!(w.copy().contains("  -  1 copy pending"), "a new Copy during the move, got {:?}", w.status());
+        gate.open();
+        assert_eq!(w.paste_end(), "Pasted 1 item");
+        drop(gate);
+        w.shows();
+        cx.settle();
+        assert!(dir_names(&a_dir).is_empty(), "the Cut moved");
+        assert_eq!(dir_names(&b_dir), ["x.txt", "z.txt"], "once");
+        assert!(w.rebuilt_status().contains("  -  1 copy pending"), "the newer Copy is still pending, got {:?}", w.status());
+        w.go(&c_dir);
+        assert_eq!(w.paste(), "Pasted 1 item", "the newer Copy pastes");
+        assert_eq!(dir_names(&c_dir), ["z.txt"]);
+        assert_eq!(dir_names(&b_dir), ["x.txt", "z.txt"], "as a Copy");
+        assert!(w.rebuilt_status().contains("  -  1 copy pending"));
+
+        // The same, with another program's text arriving during the move.
+        let (e_dir, f_dir) = (cx.dir("replaced-during-job/e"), cx.dir("replaced-during-job/f"));
+        put_d232(&e_dir.join("x2.txt"), b"x2");
+        let peer = PeerD232::start(cx);
+        w.go(&e_dir);
+        w.select(&["x2.txt"]);
+        assert!(w.cut().contains("  -  1 cut pending"));
+        w.go(&f_dir);
+        let gate = GateD232::install(cx, "job-text");
+        w.paste_begin();
+        gate.wait_started();
+        peer.offer(cx, &[(TEXT_D232, b"words during the move")]);
+        gate.open();
+        assert_eq!(w.paste_end(), "Pasted 1 item");
+        drop(gate);
+        w.shows();
+        assert_eq!(dir_names(&f_dir), ["x2.txt"]);
+        assert!(peer.state(cx).starts_with("local=true "), "the other program's text is still on the clipboard");
+        assert!(peer.state(cx).starts_with("local=true "), "and stays there");
+        assert_eq!(w.paste(), "Nothing to paste");
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 4: another program makes a new offer while the name-clash question
+    /// of an older Cut is still open.
+    fn case_replaced_during_dialog_d232(cx: &CxD232) {
+        let (a_dir, b_dir, c_dir, src) = (
+            cx.dir("replaced-during-dialog/a"),
+            cx.dir("replaced-during-dialog/b"),
+            cx.dir("replaced-during-dialog/c"),
+            cx.dir("replaced-during-dialog/src"),
+        );
+        put_d232(&a_dir.join("x.txt"), b"new");
+        put_d232(&b_dir.join("x.txt"), b"old");
+        put_d232(&src.join("y.txt"), b"y");
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&a_dir);
+        w.select(&["x.txt"]);
+        assert!(w.cut().contains("  -  1 cut pending"));
+        w.go(&b_dir);
+        w.paste_begin();
+        w.asked();
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &[&src.join("y.txt")]))]);
+        w.answer("Overwrite");
+        assert_eq!(w.paste_end(), "Pasted 1 item");
+        w.shows();
+        assert_eq!(std::fs::read(b_dir.join("x.txt")).unwrap(), b"new", "the Cut went through as asked");
+        assert!(dir_names(&a_dir).is_empty());
+        assert!(peer.state(cx).starts_with("local=true "), "the newer offer is still on the clipboard");
+        w.go(&c_dir);
+        assert_eq!(w.paste(), "Pasted 1 item", "and it pastes");
+        assert_eq!(dir_names(&c_dir), ["y.txt"]);
+        assert_eq!(dir_names(&src), ["y.txt"]);
+        peer.finish(cx);
+        w.close();
+    }
+
+    /// Group 4: Cancel on the name-clash question of a Cut. Nothing moves and
+    /// the Cut stays on offer, for this window and for any other.
+    fn case_cut_cancel_d232(cx: &CxD232) {
+        let (a_dir, b_dir, c_dir) = (cx.dir("cut-cancel/a"), cx.dir("cut-cancel/b"), cx.dir("cut-cancel/c"));
+        put_d232(&a_dir.join("x.txt"), b"new");
+        put_d232(&b_dir.join("x.txt"), b"old");
+        let w = cx.open(&a_dir);
+        let picked = w.select(&["x.txt"]);
+        assert!(w.cut().contains("  -  1 cut pending"));
+        w.go(&b_dir);
+        for round in ["first", "second"] {
+            w.paste_begin();
+            w.answer("Cancel");
+            cx.settle();
+            assert_eq!(std::fs::read(a_dir.join("x.txt")).unwrap(), b"new", "{round} Cancel: the source stays");
+            assert_eq!(std::fs::read(b_dir.join("x.txt")).unwrap(), b"old", "{round} Cancel: the old file stays");
+            assert_eq!(w.history(), no_history_d232(), "{round} Cancel: no history");
+            assert!(w.state.borrow().active_transfer.is_none(), "{round} Cancel: no transfer");
+            assert!(w.rebuilt_status().contains("  -  1 cut pending"), "{round} Cancel: the Cut is still pending, got {:?}", w.status());
+        }
+        // The Cut is still there for another window.
+        let other = cx.open(&c_dir);
+        assert_eq!(other.paste(), "Pasted 1 item", "the cancelled Cut is still on offer");
+        other.shows();
+        assert_eq!(std::fs::read(c_dir.join("x.txt")).unwrap(), b"new");
+        assert!(dir_names(&a_dir).is_empty());
+        assert_eq!(std::fs::read(b_dir.join("x.txt")).unwrap(), b"old");
+        assert_eq!(other.history(), (pasted_d232(&picked, &c_dir, false), "[]".to_string()));
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert!(!w.rebuilt_status().contains("pending"));
+        w.close();
+        other.close();
+    }
+
+    /// Group 4: a Cut whose move fails stays on offer.
+    fn case_cut_failure_d232(cx: &CxD232) {
+        use std::os::unix::fs::PermissionsExt;
+        /// Makes the folder writable again on every way out.
+        struct Writable(std::path::PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let (a_dir, shut, c_dir) = (cx.dir("cut-failure/a"), cx.dir("cut-failure/shut"), cx.dir("cut-failure/c"));
+        put_d232(&a_dir.join("x.txt"), b"x");
+        let w = cx.open(&a_dir);
+        let picked = w.select(&["x.txt"]);
+        assert!(w.cut().contains("  -  1 cut pending"));
+        w.go(&shut);
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = Writable(shut.clone());
+        let said = w.paste();
+        assert!(said.starts_with("Operation failed"), "a move into a folder that takes no files fails in the open, got {said:?}");
+        cx.settle();
+        assert_eq!(std::fs::read(a_dir.join("x.txt")).unwrap(), b"x", "the source stays");
+        assert!(dir_names(&shut).is_empty());
+        assert_eq!(w.history(), no_history_d232());
+        assert!(w.rebuilt_status().contains("  -  1 cut pending"), "the failed Cut is still pending, got {:?}", w.status());
+        drop(writable);
+        // The Cut is still there for another window.
+        let other = cx.open(&c_dir);
+        assert_eq!(other.paste(), "Pasted 1 item", "the failed Cut is still on offer");
+        other.shows();
+        assert_eq!(std::fs::read(c_dir.join("x.txt")).unwrap(), b"x");
+        assert!(dir_names(&a_dir).is_empty());
+        assert_eq!(other.history(), (pasted_d232(&picked, &c_dir, false), "[]".to_string()));
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert!(!w.rebuilt_status().contains("pending"));
+        w.close();
+        other.close();
+    }
+
+    /// Group 4: a Cut pasted into the folder it came from does nothing and
+    /// stays on offer.
+    fn case_cut_noop_d232(cx: &CxD232) {
+        let (a_dir, c_dir) = (cx.dir("cut-noop/a"), cx.dir("cut-noop/c"));
+        put_d232(&a_dir.join("x.txt"), b"x");
+        let w = cx.open(&a_dir);
+        let picked = w.select(&["x.txt"]);
+        assert!(w.cut().contains("  -  1 cut pending"));
+        assert_eq!(w.paste(), "Already in this folder");
+        cx.settle();
+        assert_eq!(std::fs::read(a_dir.join("x.txt")).unwrap(), b"x");
+        assert_eq!(w.history(), no_history_d232());
+        assert!(w.rebuilt_status().contains("  -  1 cut pending"), "the Cut is still pending, got {:?}", w.status());
+        let other = cx.open(&c_dir);
+        assert_eq!(other.paste(), "Pasted 1 item", "the Cut is still on offer");
+        other.shows();
+        assert_eq!(std::fs::read(c_dir.join("x.txt")).unwrap(), b"x");
+        assert!(dir_names(&a_dir).is_empty());
+        assert_eq!(other.history(), (pasted_d232(&picked, &c_dir, false), "[]".to_string()));
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert!(!w.rebuilt_status().contains("pending"));
+        w.close();
+        other.close();
+    }
+
+    /// Group 4: one pending Cut cannot be started twice.
+    fn case_cut_twice_d232(cx: &CxD232) {
+        // While one window's name-clash question holds the Cut.
+        let (a_dir, b_dir, c_dir) = (cx.dir("cut-twice/a"), cx.dir("cut-twice/b"), cx.dir("cut-twice/c"));
+        put_d232(&a_dir.join("x.txt"), b"new");
+        put_d232(&b_dir.join("x.txt"), b"old");
+        let w1 = cx.open(&a_dir);
+        let w2 = cx.open(&c_dir);
+        w1.select(&["x.txt"]);
+        assert!(w1.cut().contains("  -  1 cut pending"));
+        w1.go(&b_dir);
+        w1.paste_begin();
+        w1.asked();
+        assert_eq!(w2.paste(), "This cut is already being pasted");
+        assert!(dir_names(&c_dir).is_empty());
+        assert_eq!(std::fs::read(a_dir.join("x.txt")).unwrap(), b"new");
+        w1.answer("Cancel");
+        assert_eq!(w2.paste(), "Pasted 1 item", "Cancel gives the Cut back");
+        w2.shows();
+        assert_eq!(std::fs::read(c_dir.join("x.txt")).unwrap(), b"new");
+        assert!(dir_names(&a_dir).is_empty());
+        assert_eq!(std::fs::read(b_dir.join("x.txt")).unwrap(), b"old");
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+
+        // Two windows' Pastes of another program's Cut, both waiting on one answer.
+        let (src, d1, d2) = (cx.dir("cut-twice/src"), cx.dir("cut-twice/d1"), cx.dir("cut-twice/d2"));
+        put_d232(&src.join("p.txt"), b"p");
+        let peer = PeerD232::start(cx);
+        w1.go(&d1);
+        w2.go(&d2);
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("cut", &[&src.join("p.txt")]))]);
+        peer.stop();
+        let gate = GateD232::install(cx, "twice");
+        w1.paste_begin();
+        cx.settle();
+        assert_eq!(w1.status(), "Reading the clipboard");
+        w2.paste_begin();
+        peer.cont();
+        gate.wait_started();
+        assert_eq!(w2.paste_end(), "This cut is already being pasted", "the second window is turned away while the first one moves");
+        assert!(dir_names(&d2).is_empty());
+        gate.open();
+        assert_eq!(w1.paste_end(), "Pasted 1 item");
+        drop(gate);
+        w1.shows();
+        assert_eq!((dir_names(&d1), dir_names(&d2), dir_names(&src)), (vec!["p.txt".to_string()], vec![], vec![]), "moved once");
+        assert_eq!(std::fs::read(d1.join("p.txt")).unwrap(), b"p");
+        assert_eq!(w2.state.borrow().undo_stack.len(), 1, "the second window has only its earlier move");
+        until_d232("the used Cut to leave the clipboard", || !cx.has_files());
+        assert_eq!(peer.state(cx), "local=false formats=");
+        peer.finish(cx);
+        w1.close();
+        w2.close();
+    }
+
+    /// Group 3: Copy and Cut that are refused leave the clipboard as it was.
+    fn case_copy_refused_keeps_d232(cx: &CxD232) {
+        let (src, d_dir) = (cx.dir("copy-refused-keeps/src"), cx.dir("copy-refused-keeps/d"));
+        put_d232(&src.join("k.txt"), b"k");
+        let peer = PeerD232::start(cx);
+        let w = cx.open(&d_dir);
+        peer.offer(cx, &[(GNOME_D232, &gnome_d232("copy", &[&src.join("k.txt")]))]);
+        w.ui.list_selection.unselect_all();
+        drain_d232();
+        assert_eq!(w.copy(), "Nothing selected");
+        assert_eq!(w.cut(), "Nothing selected");
+        assert!(peer.state(cx).starts_with("local=true "), "a refused Copy and Cut leave the earlier offer with its owner");
+        assert_eq!(w.paste(), "Pasted 1 item", "and it still pastes");
+        assert_eq!(dir_names(&d_dir), ["k.txt"]);
+        peer.finish(cx);
+        w.close();
+    }
+
+    const CASES_D232: [(&str, fn(&CxD232)); 22] = [
+        ("copy-across", case_copy_across_d232),
+        ("cut-across", case_cut_across_d232),
+        ("peer-gnome", case_peer_gnome_d232),
+        ("peer-kde", case_peer_kde_d232),
+        ("export", case_export_d232),
+        ("uri-only", case_uri_only_d232),
+        ("encodings", case_encodings_d232),
+        ("refusals", case_refusals_d232),
+        ("not-files", case_not_files_d232),
+        ("text-replaces", case_text_replaces_d232),
+        ("copy-refused-keeps", case_copy_refused_keeps_d232),
+        ("stale-closed", case_stale_closed_d232),
+        ("stale-navigated", case_stale_navigated_d232),
+        ("stale-tab", case_stale_tab_d232),
+        ("two-pastes", case_two_pastes_d232),
+        ("replaced-mid-read", case_replaced_mid_read_d232),
+        ("replaced-during-job", case_replaced_during_job_d232),
+        ("replaced-during-dialog", case_replaced_during_dialog_d232),
+        ("cut-cancel", case_cut_cancel_d232),
+        ("cut-failure", case_cut_failure_d232),
+        ("cut-noop", case_cut_noop_d232),
+        ("cut-twice", case_cut_twice_d232),
+    ];
+
+    /// Builds what every D-232 test shares and runs `body` with it. The private
+    /// display's clipboard is emptied before and after. `session` is what the
+    /// private-session guard found before GTK started.
+    fn with_cx_d232(session: &str, tag: &str, body: impl FnOnce(&CxD232)) {
+        let root = crate::native_core::scratch_root().join(format!("wf-d232-{tag}-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("a new folder of this test's own");
+        let _cleanup = ScratchCleanup(root.clone());
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // Declared after the cleanup, so the fixture goes before its folder does.
+        let _trash = native_core::fixture_trash::install(&bin);
+        install_app_css();
+        let app = adw::Application::builder()
+            .application_id(format!("com.kadaken.wayfinder.d232{tag}"))
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        let cx = CxD232 {
+            app,
+            root,
+            bin,
+            clipboard: display.clipboard(),
+            display,
+            session: session.to_string(),
+            frames: std::env::var("WF_D232_FRAMES").ok().map(std::path::PathBuf::from),
+        };
+        cx.clear();
+        body(&cx);
+        cx.clear();
+    }
+
+    /// D-232: every case above, or the ones WF_D232_CASE names.
+    fn shared_clipboard_d232(session: &str) {
+        with_cx_d232(session, "gtk", |cx| {
+            let only = std::env::var("WF_D232_CASE").ok();
+            let wanted: Option<Vec<&str>> = only.as_deref().map(|list| list.split(',').collect());
+            for name in wanted.iter().flatten() {
+                assert!(CASES_D232.iter().any(|(case, _)| case == name), "WF_D232_CASE names a case that exists, got {name}");
+            }
+            let mut run = 0;
+            for (name, case) in CASES_D232 {
+                if wanted.as_ref().is_some_and(|wanted| !wanted.contains(&name)) {
+                    continue;
+                }
+                cx.clear();
+                println!("D232 CASE {name}");
+                case(cx);
+                println!("D232 CASE {name} ok");
+                run += 1;
+            }
+            println!("D232 CASES RUN {run}");
+        });
+    }
+
+    #[test]
+    fn shared_clipboard_d232_alone() {
+        if std::env::var("WAYFINDER_D232_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let session = private_session_guard_d232();
+        gtk::init().expect("gtk init on the virtual display");
+        shared_clipboard_d232(&session);
+    }
+    // D232-PART-A-END
+
+    // D232-PART-B-BEGIN
+    /// D-232, this program's own side: a Copy or Cut the clipboard will not take
+    /// is reported and changes nothing, and a very long offer of this program's
+    /// own reads back whole.
+    fn shared_clipboard_seams_d232(session: &str) {
+        /// Lets the clipboard take offers again on every way out.
+        struct Taking;
+        impl Drop for Taking {
+            fn drop(&mut self) {
+                CLIPBOARD_REFUSES_PUBLISH.with(|f| *f.borrow_mut() = false);
+            }
+        }
+        with_cx_d232(session, "seams", |cx| {
+            let (src, dest) = (cx.dir("refused/src"), cx.dir("refused/dest"));
+            put_d232(&src.join("a.txt"), b"a");
+            put_d232(&src.join("b.txt"), b"b");
+            let w = cx.open(&src);
+
+            // Nothing on the clipboard before: nothing after.
+            w.select(&["b.txt"]);
+            {
+                let _taking = Taking;
+                CLIPBOARD_REFUSES_PUBLISH.with(|f| *f.borrow_mut() = true);
+                assert_eq!(w.copy(), "Copy failed: the clipboard could not be taken");
+                assert_eq!(w.cut(), "Cut failed: the clipboard could not be taken");
+            }
+            cx.settle();
+            assert!(clipboard_files_now().is_none(), "a refused Copy and Cut put no files on the clipboard");
+            assert!(!w.rebuilt_status().contains("pending"), "and show nothing as pending, got {:?}", w.status());
+            assert_eq!(w.paste(), "Nothing to paste");
+
+            // An earlier Copy on the clipboard: it is still there, unchanged.
+            let first = w.select(&["a.txt"]);
+            assert!(w.copy().contains("  -  1 copy pending"));
+            let held = native_core::ClipFiles { intent: native_core::ClipIntent::Copy, paths: vec![PathBuf::from(&first[0])] };
+            assert_eq!(clipboard_files_now(), Some(Ok(held.clone())));
+            w.select(&["b.txt"]);
+            {
+                let _taking = Taking;
+                CLIPBOARD_REFUSES_PUBLISH.with(|f| *f.borrow_mut() = true);
+                assert_eq!(w.cut(), "Cut failed: the clipboard could not be taken");
+                assert_eq!(w.copy(), "Copy failed: the clipboard could not be taken");
+            }
+            cx.settle();
+            assert_eq!(clipboard_files_now(), Some(Ok(held)), "the earlier Copy is still the clipboard's content");
+            let said = w.rebuilt_status();
+            assert!(said.contains("  -  1 copy pending") && !said.contains("cut pending"), "the earlier Copy is still what is pending, got {said:?}");
+            assert_eq!(dir_names(&src), ["a.txt", "b.txt"]);
+            w.go(&dest);
+            assert_eq!(w.paste(), "Pasted 1 item", "and it is the earlier Copy that pastes");
+            assert_eq!(dir_names(&dest), ["a.txt"]);
+            w.close();
+
+            // This program's own offer is not cut off by the limit set for
+            // other programs' data: about five million bytes read back whole.
+            let many: Vec<PathBuf> =
+                (0..40_000).map(|n| PathBuf::from(format!("/wf-d232-not-there/{}-{n:06}.bin", "long-made-up-name-".repeat(5)))).collect();
+            let bytes: usize = many.iter().map(|path| path.as_os_str().len() + 8).sum();
+            assert!(bytes > native_core::CLIP_READ_LIMIT + 4096, "the made-up offer is over the limit");
+            publish_test_offer(native_core::ClipIntent::Copy, &many).expect("the long offer is published");
+            cx.settle();
+            let read = clipboard_files_now().expect("the long offer is on the clipboard").expect("and reads back");
+            assert_eq!(read.intent, native_core::ClipIntent::Copy);
+            assert!(read.paths == many, "all {} paths read back, in order (got {})", many.len(), read.paths.len());
+        });
+    }
+
+    #[test]
+    fn shared_clipboard_seams_d232_alone() {
+        if std::env::var("WAYFINDER_D232_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let session = private_session_guard_d232();
+        gtk::init().expect("gtk init on the virtual display");
+        shared_clipboard_seams_d232(&session);
+    }
+    // D232-PART-B-END
+
     /// Removes a scratch fixture on success and on a failed assertion.
     struct ScratchCleanup(std::path::PathBuf);
     impl Drop for ScratchCleanup {
@@ -23071,6 +27545,50 @@ Broken: Either state is wrong.\n";
             descendants(&c, out);
             child = c.next_sibling();
         }
+    }
+
+    /// D-232: what the display clipboard holds now, read and decoded the way
+    /// Paste reads it. None when it offers no files.
+    fn clipboard_files_now() -> Option<Result<native_core::ClipFiles, String>> {
+        let clipboard = watched_clipboard().expect("the test display has a clipboard");
+        let forms = ClipForms::of(&clipboard);
+        if !forms.files() {
+            return None;
+        }
+        let serial = clipboard_serial();
+        let read = Rc::new(RefCell::new(None));
+        let slot = read.clone();
+        queue_clipboard_read(async move {
+            let files = read_file_offer(&clipboard, forms, serial).await.and_then(|read| native_core::clip_decode(&read));
+            *slot.borrow_mut() = Some(files);
+        });
+        let ctx = glib::MainContext::default();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while read.borrow().is_none() {
+            assert!(std::time::Instant::now() < end, "the clipboard read never finished");
+            if !ctx.iteration(false) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let files = read.borrow_mut().take();
+        files
+    }
+
+    /// D-232: a test takes its own offer off the display clipboard when it ends.
+    fn clear_test_clipboard() {
+        let clipboard = watched_clipboard().expect("the test display has a clipboard");
+        clipboard.set_content(gdk::ContentProvider::NONE).expect("the test's own offer is cleared");
+        assert!(!ClipForms::of(&clipboard).files(), "the clipboard offers no files after the clear");
+        // The next offer may follow at once; see `own_clear_seen_d232`.
+        own_clear_seen_d232();
+    }
+
+    /// D-232: a test puts files on the display clipboard the way Copy and Cut
+    /// do. It first waits until the notice of an earlier clear by this program
+    /// has been read; see `own_clear_seen_d232`.
+    fn publish_test_offer(intent: native_core::ClipIntent, paths: &[PathBuf]) -> Result<u64, String> {
+        own_clear_seen_d232();
+        publish_file_offer(intent, paths)
     }
 
     fn all_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
@@ -24090,7 +28608,7 @@ Broken: Either state is wrong.\n";
             std::fs::write(folder.join("inside.txt"), "original tree contents").unwrap();
             let folder_str = folder.to_string_lossy().to_string();
 
-            let trashed = reciprocal_trash(vec![folder_str.clone()])?;
+            let trashed = whole_reciprocal(perform_undo(UndoAction::Created { paths: vec![folder_str.clone()] }))?;
             let (receipts, fps) = match trashed {
                 UndoAction::Trashed { receipts, fps } => (receipts, fps),
                 other => panic!("expected Trashed, got {other:?}"),
@@ -24453,6 +28971,10 @@ Broken: Either state is wrong.\n";
         if std::env::var("WAYFINDER_D155_ONLY").as_deref() != Ok("1") {
             return;
         }
+        // D-232: this test puts files on the display's clipboard, so it runs
+        // only in a private session. Checked before GTK and GIO read HOME or
+        // the display.
+        let _session = private_session_guard_d232();
         gtk::init().expect("gtk init on the virtual display");
         let display = gdk::Display::default().expect("display");
         assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
@@ -24501,11 +29023,11 @@ Broken: Either state is wrong.\n";
             .expect("the test window is registered");
         wait_for("listing", || state.borrow().cwd.real_path_string().unwrap_or_default() == dest.to_string_lossy());
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = Some(slow.to_string_lossy().to_string()));
-        let transfer = |name: &str, is_copy: bool, clear_cut: bool| Transfer {
+        let transfer = |name: &str, is_copy: bool, cut_offer: Option<CutOffer>| Transfer {
             srcs: vec![src.join(name)],
             dest: dest.clone(),
             is_copy,
-            clear_cut_after: clear_cut,
+            cut_offer,
             style: TransferStyle::Paste,
         };
         let until = |what: &str, cond: &dyn Fn() -> bool| {
@@ -24520,7 +29042,7 @@ Broken: Either state is wrong.\n";
         assert!(!request_transfer_cancel(&state, &ui), "Cancel with nothing running does nothing");
 
         // 1. A successful copy: percent and byte text follow the worker.
-        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, false), native_core::PasteConflict::KeepBoth);
+        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, None), native_core::PasteConflict::KeepBoth);
         assert!(ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
         until("copy done", &|| state.borrow().active_transfer.is_none());
         assert!(at_rest(), "controls hide when the transfer ends");
@@ -24529,7 +29051,7 @@ Broken: Either state is wrong.\n";
         std::fs::remove_file(dest.join("big.bin")).unwrap();
 
         // 2. Live labels while a transfer runs.
-        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, false), native_core::PasteConflict::KeepBoth);
+        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, None), native_core::PasteConflict::KeepBoth);
         let mut seen: Vec<String> = Vec::new();
         let end = Instant::now() + Duration::from_secs(20);
         while state.borrow().active_transfer.is_some() {
@@ -24551,19 +29073,19 @@ Broken: Either state is wrong.\n";
         std::fs::remove_file(dest.join("big.bin")).ok();
 
         // 3. A second transfer cannot steal the controls; Cancel hits the live one.
-        state.borrow_mut().clipboard = Some(FileClipboard {
-            mode: ClipboardMode::Cut,
-            paths: vec![native_core::ClipboardSource::Real(src.join("big.bin"))],
-        });
+        // D-232: a real Cut offer on the display clipboard, put there the way Cut puts it.
+        let cut_serial = publish_test_offer(native_core::ClipIntent::Cut, &[src.join("big.bin")]).expect("the cut is on the clipboard");
         let undo_before = state.borrow().undo_stack.len();
         let before = crate::native_core::fingerprint(root.to_str().unwrap()).unwrap();
         // Same-filesystem MOVE is a rename with no bytes, so the live transfer is a copy
-        // that also carries the cut clipboard's clear-on-success flag.
-        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, true), native_core::PasteConflict::KeepBoth);
+        // that also carries the cut clipboard's offer, cleared on success only.
+        let cut_claim = claim_cut_offer(cut_serial);
+        assert!(cut_claim.is_some(), "the cut offer is claimed by its transfer");
+        run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, cut_claim), native_core::PasteConflict::KeepBoth);
         let live_id = state.borrow().active_transfer.as_ref().map(|a| a.id).expect("transfer is live");
         // wait until a real byte update is on screen
         until("first bytes", &|| ui.status.label().contains('%') && ui.status.label().starts_with("Copying "));
-        run_transfer(state.clone(), ui.clone(), transfer("other.txt", true, false), native_core::PasteConflict::KeepBoth);
+        run_transfer(state.clone(), ui.clone(), transfer("other.txt", true, None), native_core::PasteConflict::KeepBoth);
         assert_eq!(state.borrow().active_transfer.as_ref().map(|a| a.id), Some(live_id), "second transfer refused");
         assert!(ui.status.label().contains("already running"));
         // a stale event for another id changes nothing
@@ -24591,16 +29113,25 @@ Broken: Either state is wrong.\n";
         assert!(at_rest());
         assert_eq!(crate::native_core::fingerprint(root.to_str().unwrap()).unwrap(), before, "disk exactly as before");
         assert!(std::fs::read_dir(&dest).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".wf-replace-")));
-        assert!(state.borrow().clipboard.is_some(), "cut clipboard survives a cancel");
+        assert_eq!(
+            (clipboard_serial(), clipboard_files_now()),
+            (cut_serial, Some(Ok(native_core::ClipFiles { intent: native_core::ClipIntent::Cut, paths: vec![src.join("big.bin")] }))),
+            "cut clipboard survives a cancel"
+        );
+        assert!(claim_cut_offer(cut_serial).is_some(), "D-232: a cancelled cut is free to be pasted again");
         assert_eq!(state.borrow().undo_stack.len(), undo_before, "no Undo entry for a cancel");
         assert!(!request_transfer_cancel(&state, &ui), "a finished transfer cannot be cancelled again");
 
         // 4. The ordinary path still works after a cancel; a cut clipboard clears on success.
-        run_transfer(state.clone(), ui.clone(), transfer("other.txt", false, true), native_core::PasteConflict::KeepBoth);
+        let cut_serial = publish_test_offer(native_core::ClipIntent::Cut, &[src.join("other.txt")]).expect("the cut is on the clipboard");
+        let cut_claim = claim_cut_offer(cut_serial);
+        assert!(cut_claim.is_some(), "the cut offer is claimed by its transfer");
+        run_transfer(state.clone(), ui.clone(), transfer("other.txt", false, cut_claim), native_core::PasteConflict::KeepBoth);
         until("move done", &|| state.borrow().active_transfer.is_none());
         pump();
         assert!(dest.join("other.txt").exists() && !src.join("other.txt").exists());
-        assert!(state.borrow().clipboard.is_none(), "cut clipboard clears only on success");
+        until("the used cut offer leaves the clipboard", &|| !ClipForms::of(&watched_clipboard().unwrap()).files());
+        assert!(clipboard_files_now().is_none(), "cut clipboard clears only on success");
         assert_eq!(state.borrow().undo_stack.len(), undo_before + 1);
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
         ui.window.destroy();
@@ -24617,6 +29148,10 @@ Broken: Either state is wrong.\n";
         if std::env::var("WAYFINDER_D185_ONLY").as_deref() != Ok("1") {
             return;
         }
+        // D-232: this test puts files on the display's clipboard, so it runs
+        // only in a private session. Checked before GTK and GIO read HOME or
+        // the display.
+        let _session = private_session_guard_d232();
         gtk::init().expect("gtk init on the virtual display");
         let display = gdk::Display::default().expect("display");
         assert!(display.type_().name().contains("X11") && !display.name().contains("wayland"));
@@ -24735,17 +29270,16 @@ Broken: Either state is wrong.\n";
             let name = "copy-src.bin";
             std::fs::write(src.join(name), &bytes).unwrap();
             let before_sha = sha256_of(&src.join(name));
-            state.borrow_mut().clipboard = Some(FileClipboard {
-                mode: ClipboardMode::Cut,
-                paths: vec![native_core::ClipboardSource::Real(PathBuf::from("/dev/null/unrelated-clipboard-sentinel"))],
-            });
-            let clipboard_before = state.borrow().clipboard.clone();
+            // D-232: an unrelated Cut offer on the display clipboard.
+            publish_test_offer(native_core::ClipIntent::Cut, &[PathBuf::from("/dev/null/unrelated-clipboard-sentinel")])
+                .expect("the sentinel cut is on the clipboard");
+            let clipboard_before = (clipboard_serial(), clipboard_files_now());
             let undo_before = state.borrow().undo_stack.len();
             let transfer = Transfer {
                 srcs: vec![src.join(name)],
                 dest: dest.clone(),
                 is_copy: true,
-                clear_cut_after: false,
+                cut_offer: None,
                 style: TransferStyle::Paste,
             };
             run_transfer(state.clone(), ui.clone(), transfer, native_core::PasteConflict::KeepBoth);
@@ -24778,13 +29312,17 @@ Broken: Either state is wrong.\n";
             assert_eq!(sha256_of(&src.join(name)), before_sha, "source byte-identical after a cancelled copy");
             assert!(!dest.join(name).exists(), "destination absent after a cancelled copy");
             assert!(no_residue(), "no owned staging residue after a cancelled copy");
-            let clipboard_after = state.borrow().clipboard.clone();
+            let clipboard_after = (clipboard_serial(), clipboard_files_now());
             assert!(
-                matches!((&clipboard_before, &clipboard_after), (Some(a), Some(b)) if a.mode == b.mode && a.paths == b.paths),
+                matches!(
+                    (&clipboard_before, &clipboard_after),
+                    ((made, Some(Ok(a))), (now, Some(Ok(b))))
+                        if made == now && a.intent == native_core::ClipIntent::Cut && a.intent == b.intent && a.paths == b.paths
+                ),
                 "an unrelated clipboard survives a copy cancel untouched"
             );
             assert_eq!(state.borrow().undo_stack.len(), undo_before, "no Undo entry for a cancelled copy");
-            state.borrow_mut().clipboard = None;
+            clear_test_clipboard();
             std::fs::remove_file(src.join(name)).unwrap();
         }
 
@@ -24794,17 +29332,17 @@ Broken: Either state is wrong.\n";
             let name = "move-src.bin";
             std::fs::write(src.join(name), &bytes).unwrap();
             let before_sha = sha256_of(&src.join(name));
-            state.borrow_mut().clipboard = Some(FileClipboard {
-                mode: ClipboardMode::Cut,
-                paths: vec![native_core::ClipboardSource::Real(src.join(name))],
-            });
+            // D-232: a real Cut offer of the file being moved.
+            let cut_serial = publish_test_offer(native_core::ClipIntent::Cut, &[src.join(name)]).expect("the cut is on the clipboard");
+            let cut_claim = claim_cut_offer(cut_serial);
+            assert!(cut_claim.is_some(), "the cut offer is claimed by its transfer");
             let undo_before = state.borrow().undo_stack.len();
             TRANSFER_FORCE_CROSS_DEVICE.with(|f| *f.borrow_mut() = true);
             let transfer = Transfer {
                 srcs: vec![src.join(name)],
                 dest: dest.clone(),
                 is_copy: false,
-                clear_cut_after: true,
+                cut_offer: cut_claim,
                 style: TransferStyle::Paste,
             };
             run_transfer(state.clone(), ui.clone(), transfer, native_core::PasteConflict::KeepBoth);
@@ -24838,10 +29376,15 @@ Broken: Either state is wrong.\n";
             assert_eq!(sha256_of(&src.join(name)), before_sha, "move source byte-identical after a cancelled move");
             assert!(!dest.join(name).exists(), "destination absent after a cancelled move");
             assert!(no_residue(), "no owned staging residue after a cancelled move");
-            assert!(state.borrow().clipboard.is_some(), "cut clipboard survives a cancel");
+            assert_eq!(
+                (clipboard_serial(), clipboard_files_now()),
+                (cut_serial, Some(Ok(native_core::ClipFiles { intent: native_core::ClipIntent::Cut, paths: vec![src.join(name)] }))),
+                "cut clipboard survives a cancel"
+            );
+            assert!(claim_cut_offer(cut_serial).is_some(), "D-232: a cancelled cut is free to be pasted again");
             assert_eq!(state.borrow().undo_stack.len(), undo_before, "no Undo entry for a cancel");
             std::fs::remove_file(src.join(name)).unwrap();
-            state.borrow_mut().clipboard = None;
+            clear_test_clipboard();
         }
 
         // Both seams are reset by `_seams`'s Drop, on this ordinary return and
