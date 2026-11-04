@@ -4169,6 +4169,103 @@ pub fn empty_trash() -> Result<(), String> {
     run_cmd_capture("gio", &["trash", "--empty"])
 }
 
+/// The keep-for options the Trash menu offers, newest first. 0 means never.
+pub const TRASH_KEEP_CHOICES: [(u32, &str); 5] = [
+    (0, "Never delete automatically"),
+    (7, "Delete after 7 days"),
+    (14, "Delete after 14 days"),
+    (30, "Delete after 30 days"),
+    (90, "Delete after 90 days"),
+];
+
+/// Deletes every Trash item whose recorded deletion date is `keep_days` or
+/// more days in the past, and returns how many entries went. `keep_days == 0`
+/// means keep forever and touches nothing.
+///
+/// Both halves of an entry go together: the payload under `files/` and its
+/// `.trashinfo`. The rules are deliberately cautious, because nothing is
+/// watching this run:
+/// * an entry whose date cannot be read is LEFT ALONE, never deleted;
+/// * the payload name comes from the info file's own stem, never from the
+///   recorded original path, and a stem that is not a plain name is skipped,
+///   so nothing outside `files/` can be reached;
+/// * a payload that will not delete leaves its `.trashinfo` in place, so the
+///   entry still shows in the Trash instead of becoming invisible.
+pub fn expire_trash(keep_days: u32) -> Result<usize, String> {
+    if keep_days == 0 {
+        return Ok(0);
+    }
+    let now = glib::DateTime::now_local()
+        .map_err(|err| err.to_string())?
+        .to_unix();
+    expire_trash_in(&trash_dir()?, keep_days, now)
+}
+
+/// The engine behind `expire_trash`, with the trash directory and "now" both
+/// passed in so the rule can be tested against fixed dates on a real trash
+/// layout, exactly like `restore_from_trash_in`.
+fn expire_trash_in(trash: &Path, keep_days: u32, now: i64) -> Result<usize, String> {
+    if keep_days == 0 {
+        return Ok(0);
+    }
+    let info_dir = trash.join("info");
+    let files_dir = trash.join("files");
+    let entries = match fs::read_dir(&info_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(format!("cannot read {}: {err}", info_dir.display())),
+    };
+    let cutoff = i64::from(keep_days) * 86_400;
+    let mut deleted = 0usize;
+    for entry in entries.flatten() {
+        let info = entry.path();
+        if info.extension().and_then(|ext| ext.to_str()) != Some("trashinfo") {
+            continue;
+        }
+        if !fs::symlink_metadata(&info)
+            .map(|meta| meta.file_type().is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(stem) = info.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if stem.is_empty() || stem.contains('/') || stem == "." || stem == ".." {
+            continue;
+        }
+        let Some((_, date)) = fs::read_to_string(&info)
+            .ok()
+            .and_then(|content| parse_trashinfo(&content))
+        else {
+            continue;
+        };
+        let Some(when) = trashinfo_unix_time(&date) else {
+            continue;
+        };
+        if now.saturating_sub(when) < cutoff {
+            continue;
+        }
+        if remove_any(&files_dir.join(stem)).is_err() {
+            continue;
+        }
+        if fs::remove_file(&info).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// `DeletionDate` as a Unix time. The trash spec writes local time with no
+/// zone, so a bare stamp is read as local; one that carries a zone is
+/// honoured. Anything unparseable gives `None`, and that entry is kept.
+fn trashinfo_unix_time(date: &str) -> Option<i64> {
+    let local = glib::TimeZone::local();
+    glib::DateTime::from_iso8601(date, Some(&local))
+        .ok()
+        .map(|parsed| parsed.to_unix())
+}
+
 /// The archive's name without its extension, for naming the folder we extract
 /// into. Compound suffixes are handled so "backup.tar.gz" gives "backup", not
 /// "backup.tar".
@@ -6199,6 +6296,58 @@ mod tests {
     fn trash_left(root: &Path) -> usize {
         let count = |sub: &str| fs::read_dir(root.join("Trash").join(sub)).unwrap().count();
         count("files") + count("info")
+    }
+
+    /// The keep-for rule: old entries go whole, young ones stay, and anything
+    /// the rule cannot be sure about is kept rather than deleted.
+    #[test]
+    fn expire_trash_deletes_only_entries_past_the_keep_window() {
+        let root = test_dir("trash-expiry");
+        let trash = root.join("Trash");
+        let origin = root.join("F");
+        fs::create_dir_all(&origin).unwrap();
+        // 2026-03-01T00:00:00 local is "now" for this test.
+        let now = glib::DateTime::from_iso8601("2026-03-01T00:00:00", Some(&glib::TimeZone::local()))
+            .unwrap()
+            .to_unix();
+
+        // 0 days is off and must not touch a thing, however old the entry.
+        trash_entry(&root, "ancient.txt", &origin.join("ancient.txt"), "2019-01-01T00:00:00", b"x");
+        assert_eq!(expire_trash_in(&trash, 0, now).unwrap(), 0);
+        assert!(trash.join("files/ancient.txt").exists());
+        fs::remove_file(trash.join("files/ancient.txt")).unwrap();
+        fs::remove_file(trash.join("info/ancient.txt.trashinfo")).unwrap();
+
+        // 40 days old, 20 days old, exactly 30 days old, and an unreadable date.
+        trash_entry(&root, "old.txt", &origin.join("old.txt"), "2026-01-20T00:00:00", b"old");
+        trash_entry(&root, "young.txt", &origin.join("young.txt"), "2026-02-09T00:00:00", b"young");
+        trash_entry(&root, "edge.txt", &origin.join("edge.txt"), "2026-01-30T00:00:00", b"edge");
+        trash_entry(&root, "nodate.txt", &origin.join("nodate.txt"), "not a date", b"nodate");
+        // A folder goes whole, not file by file.
+        trash_entry(&root, "folder", &origin.join("folder"), "2026-01-01T00:00:00", b"");
+        let folder = trash.join("files/folder");
+        fs::remove_file(&folder).unwrap();
+        fs::create_dir_all(folder.join("sub")).unwrap();
+        fs::write(folder.join("sub/deep.txt"), b"deep").unwrap();
+
+        assert_eq!(expire_trash_in(&trash, 30, now).unwrap(), 3);
+        for gone in ["old.txt", "edge.txt", "folder"] {
+            assert!(!trash.join("files").join(gone).exists(), "{gone} should be deleted");
+            assert!(
+                !trash.join("info").join(format!("{gone}.trashinfo")).exists(),
+                "{gone}'s record should go with it"
+            );
+        }
+        for kept in ["young.txt", "nodate.txt"] {
+            assert!(trash.join("files").join(kept).exists(), "{kept} should be kept");
+            assert!(trash.join("info").join(format!("{kept}.trashinfo")).exists());
+        }
+        // Nothing outside the trash was touched.
+        assert!(origin.exists() && fs::read_dir(&origin).unwrap().count() == 0);
+        // A second run with nothing left to do reports nothing.
+        assert_eq!(expire_trash_in(&trash, 30, now).unwrap(), 0);
+        // A missing trash is not an error.
+        assert_eq!(expire_trash_in(&root.join("NoTrash"), 30, now).unwrap(), 0);
     }
 
     #[test]

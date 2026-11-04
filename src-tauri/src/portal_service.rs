@@ -1,6 +1,13 @@
-//! Stage-one `org.freedesktop.impl.portal.FileChooser` backend contract
-//! for Wayfinder. Exports only `OpenFile`; `SaveFile`/`SaveFiles` are not
-//! exported at all. This file owns all service logic; `native.rs` must
+//! `org.freedesktop.impl.portal.FileChooser` backend contract for
+//! Wayfinder. Exports `OpenFile` and `SaveFile`; `SaveFiles` (a whole
+//! directory of files in one request) is not exported yet.
+//!
+//! Exporting an interface means claiming ALL of it: a registration that
+//! names FileChooser and then answers only `OpenFile` leaves every Save
+//! request in the session unanswered, and the app that asked shows no
+//! dialog at all (Chrome's "Save image as" simply did nothing). That is
+//! why `SaveFile` is part of the same interface impl rather than a later
+//! stage. This file owns all service logic; `native.rs` must
 //! never import it or call anything here, and this file must never
 //! initialize GTK, GStreamer or a display.
 
@@ -53,6 +60,22 @@ pub struct WireRequest {
     pub filters: Vec<WireFilter>,
     pub current_filter: Option<WireFilter>,
     pub choices: Vec<WireChoice>,
+    /// True for a `SaveFile` request: the picker names a file to write
+    /// rather than choosing one that already exists.
+    #[serde(default)]
+    pub save: bool,
+    /// The file name the app suggests, already validated as a plain name
+    /// (no separator, no NUL, never "." or ".."). Empty when none was
+    /// supplied.
+    #[serde(default)]
+    pub current_name: String,
+    /// The folder the app suggests opening in, absolute. `None` when none
+    /// was supplied or it was not usable.
+    #[serde(default)]
+    pub current_folder: Option<String>,
+    /// An existing file the app suggests replacing, absolute.
+    #[serde(default)]
+    pub current_file: Option<String>,
 }
 
 impl Default for WireRequest {
@@ -62,6 +85,10 @@ impl Default for WireRequest {
             filters: Vec::new(),
             current_filter: None,
             choices: Vec::new(),
+            save: false,
+            current_name: String::new(),
+            current_folder: None,
+            current_file: None,
         }
     }
 }
@@ -732,6 +759,94 @@ fn decode_choices(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireChoic
         .collect()
 }
 
+/// Decodes a `current_folder` / `current_file` option. The wire type is
+/// `ay`: a byte string, NUL-terminated by the C portal, so trailing NULs
+/// are stripped. A plain `s` is accepted too, because some callers send
+/// one. Everything else, and anything that is not valid UTF-8, not
+/// absolute, or carries an interior NUL, is `Err(())` -- a suggestion
+/// that cannot be trusted refuses the request rather than being quietly
+/// dropped, since silently ignoring it would save the file somewhere the
+/// app did not ask for.
+fn decode_path_option(options: &HashMap<String, OwnedValue>, key: &str) -> Result<Option<String>, ()> {
+    let Some(value) = options.get(key) else {
+        return Ok(None);
+    };
+    let bytes: Vec<u8> = match Vec::<u8>::try_from(value.clone()) {
+        Ok(bytes) => bytes,
+        Err(_) => match String::try_from(value.clone()) {
+            Ok(text) => text.into_bytes(),
+            Err(_) => return Err(()),
+        },
+    };
+    let trimmed: &[u8] = match bytes.iter().position(|b| *b == 0) {
+        Some(first_nul) => {
+            // Only trailing NULs are tolerated: an interior NUL means the
+            // value is not one path.
+            if bytes[first_nul..].iter().any(|b| *b != 0) {
+                return Err(());
+            }
+            &bytes[..first_nul]
+        }
+        None => &bytes,
+    };
+    if trimmed.is_empty() {
+        return Err(());
+    }
+    let text = std::str::from_utf8(trimmed).map_err(|_| ())?;
+    if !Path::new(text).is_absolute() {
+        return Err(());
+    }
+    Ok(Some(text.to_string()))
+}
+
+/// Decodes the `current_name` option: the file name the app suggests.
+/// It must be one plain name -- no separator, no NUL, never "." or ".."
+/// -- so a suggestion can never redirect the save out of the folder the
+/// user is looking at. Absent is `Ok("")`.
+fn decode_current_name(options: &HashMap<String, OwnedValue>) -> Result<String, ()> {
+    let Some(value) = options.get("current_name") else {
+        return Ok(String::new());
+    };
+    let name = String::try_from(value.clone()).map_err(|_| ())?;
+    if name.is_empty() {
+        return Ok(String::new());
+    }
+    if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+        return Err(());
+    }
+    Ok(name)
+}
+
+/// Which FileChooser method a `decide` call is answering. Save differs
+/// from Open in exactly two places, and both are decided here rather
+/// than by sniffing the options: which options are decoded, and what a
+/// returned path has to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestShape {
+    Open,
+    Save,
+}
+
+/// The result guard for a Save: the named file does NOT have to exist --
+/// that is the whole point -- but it must be a path that can actually be
+/// written as a file. So it must be absolute, must not already be a
+/// directory, and its parent must be an existing directory. Without the
+/// parent check a save into a folder that was deleted while the picker
+/// was open would be reported to the app as success.
+fn save_target_is_writable(candidate: &Path) -> bool {
+    if !candidate.is_absolute() {
+        return false;
+    }
+    if candidate.is_dir() {
+        return false;
+    }
+    match candidate.file_name().and_then(|name| name.to_str()) {
+        Some(name) if !name.is_empty() => {}
+        _ => return false,
+    }
+    candidate.parent().is_some_and(|parent| parent.is_dir())
+}
+
 /// Every remaining stage-one option/result refusal is named here so a
 /// mutation proof can force exactly one of them off at a time and show
 /// the request then wrongly succeeds -- proving that guard, and only
@@ -749,6 +864,10 @@ pub enum GuardOverride {
     SkipCardinality,
     SkipMissingPath,
     SkipInvalidOutput,
+    /// Waives only the Save result guard (`save_target_is_writable`), so a
+    /// mutation proof can show that an unwritable Save target is refused
+    /// by that guard and nothing else.
+    SkipSaveTarget,
 }
 
 /// `pick` is called at most once, and only after every option guard has
@@ -759,11 +878,41 @@ pub fn decide(
     pick: impl FnOnce(&WireRequest) -> PickOutcome,
     override_guard: GuardOverride,
 ) -> (u32, HashMap<String, OwnedValue>) {
+    decide_with_shape(options, pick, override_guard, RequestShape::Open)
+}
+
+/// `decide` for either method. The Open path is byte-for-byte what it
+/// always was; Save decodes three more options and swaps the
+/// "the picked file must already exist" guard for "the named file must be
+/// writable", because a Save names a file that usually does not exist yet.
+pub fn decide_with_shape(
+    options: &HashMap<String, OwnedValue>,
+    pick: impl FnOnce(&WireRequest) -> PickOutcome,
+    override_guard: GuardOverride,
+    shape: RequestShape,
+) -> (u32, HashMap<String, OwnedValue>) {
+    let save = shape == RequestShape::Save;
     if override_guard != GuardOverride::SkipDirectory && option_is_true(options, "directory") {
         return refuse();
     }
 
-    let multiple = option_is_true(options, "multiple");
+    // A Save names exactly one file; `multiple` is meaningless there and is
+    // never honored, so a caller cannot ask for several save targets.
+    let multiple = !save && option_is_true(options, "multiple");
+    let (current_name, current_folder, current_file) = if save {
+        let Ok(name) = decode_current_name(options) else {
+            return refuse();
+        };
+        let Ok(folder) = decode_path_option(options, "current_folder") else {
+            return refuse();
+        };
+        let Ok(file) = decode_path_option(options, "current_file") else {
+            return refuse();
+        };
+        (name, folder, file)
+    } else {
+        (String::new(), None, None)
+    };
     let Ok(filters) = decode_filters(options) else {
         return refuse();
     };
@@ -774,7 +923,16 @@ pub fn decide(
         return refuse();
     };
 
-    let request = WireRequest { multiple, filters, current_filter, choices };
+    let request = WireRequest {
+        multiple,
+        filters,
+        current_filter,
+        choices,
+        save,
+        current_name,
+        current_folder,
+        current_file,
+    };
     let pick_outcome = pick(&request);
     // The chooser's own reported meta wins when present (a real picker may
     // let the user switch the active filter or a choice away from its
@@ -831,7 +989,16 @@ pub fn decide(
             // output, and `SkipInvalidOutput` cannot also waive a missing
             // file, so overriding one can never incidentally cover the
             // other's case.
-            if override_guard != GuardOverride::SkipMissingPath
+            if save {
+                // A Save target is judged by `save_target_is_writable`, not by
+                // already existing. The two guards never both run, so neither
+                // can stand in for the other.
+                if override_guard != GuardOverride::SkipSaveTarget
+                    && !save_target_is_writable(&candidate)
+                {
+                    return refuse();
+                }
+            } else if override_guard != GuardOverride::SkipMissingPath
                 && candidate.is_absolute()
                 && !candidate.is_file()
             {
@@ -895,6 +1062,28 @@ impl PortalService {
             &options,
             |request| chooser.pick(&app_id, &parent_window, &title, request),
             GuardOverride::None,
+        )
+    }
+
+    /// `SaveFile`: the app names a file to write. Same request plumbing and
+    /// same chooser process as `OpenFile`; the request carries `save: true`
+    /// and the suggested name/folder/file, and the result is guarded as a
+    /// writable target rather than an existing one.
+    #[zbus(name = "SaveFile")]
+    fn save_file(
+        &self,
+        _handle: ObjectPath<'_>,
+        app_id: String,
+        parent_window: String,
+        title: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> (u32, HashMap<String, OwnedValue>) {
+        let chooser = &self.chooser;
+        decide_with_shape(
+            &options,
+            |request| chooser.pick(&app_id, &parent_window, &title, request),
+            GuardOverride::None,
+            RequestShape::Save,
         )
     }
 }
@@ -2302,6 +2491,32 @@ mod tests {
             .map_err(Into::into)
     }
 
+    fn call_save_file(
+        client: &Connection,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<(u32, HashMap<String, OwnedValue>)> {
+        let handle = ObjectPath::try_from("/org/freedesktop/portal/desktop/request/t/2")
+            .expect("literal object path");
+        let body = (
+            handle,
+            "org.example.save".to_string(),
+            String::new(),
+            "Save".to_string(),
+            options,
+        );
+        let message = client.call_method(
+            Some(BUS_NAME),
+            OBJECT_PATH,
+            Some(INTERFACE_NAME),
+            "SaveFile",
+            &body,
+        )?;
+        message
+            .body()
+            .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+            .map_err(Into::into)
+    }
+
     fn uris_of(results: &HashMap<String, OwnedValue>) -> Vec<String> {
         results
             .get("uris")
@@ -2930,30 +3145,88 @@ mod tests {
         finish_private_bus(bus, server, client);
     }
 
+    /// He hit this one for real: "Save image as" in Chrome did nothing at
+    /// all, because registering the FileChooser backend claims the WHOLE
+    /// interface and only `OpenFile` was exported, so every Save request
+    /// went unanswered with no dialog and no error. This proves the method
+    /// is now there and answers over the real bus.
     #[test]
-    fn dbus_savefile_is_an_unknown_method() {
+    fn dbus_savefile_answers_over_the_real_bus() {
         let _guard = env_lock();
         let bus = PrivateBus::start();
-        let chooser = ScriptedChooser::new(vec![]);
-        let server = bus.connect_server(chooser);
+        let target = bus.root.join("saved-here.png");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![target.clone()])]);
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
 
-        let err = client
-            .call_method(
-                Some(BUS_NAME),
-                OBJECT_PATH,
-                Some(INTERFACE_NAME),
-                "SaveFile",
-                &(),
-            )
-            .expect_err("SaveFile is never exported");
-        match err {
-            zbus::Error::MethodError(name, ..) => {
-                assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.UnknownMethod");
-            }
-            other => panic!("expected UnknownMethod, got {other:?}"),
-        }
+        let mut options = HashMap::new();
+        options.insert(
+            "current_name".to_string(),
+            OwnedValue::from(zbus::zvariant::Str::from("saved-here.png")),
+        );
+        let (response, results) = call_save_file(&client, options).expect("SaveFile call");
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(chooser.call_count(), 1);
+        assert_eq!(
+            uris_of(&results),
+            vec![format!("file://{}", target.display())]
+        );
         finish_private_bus(bus, server, client);
+    }
+
+    /// A Save result whose folder does not exist is refused: the caller
+    /// would be handed a URI it cannot write, and would fail after the
+    /// dialog had already closed.
+    #[test]
+    fn dbus_savefile_refuses_a_target_in_a_folder_that_does_not_exist() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let target = bus.root.join("no-such-folder").join("file.png");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![target])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, results) = call_save_file(&client, HashMap::new()).expect("SaveFile call");
+        assert_eq!(response, RESPONSE_OTHER);
+        assert!(results.is_empty());
+        assert_eq!(chooser.call_count(), 1);
+        finish_private_bus(bus, server, client);
+    }
+
+    /// Unlike an Open, a Save target is allowed NOT to exist yet -- that is
+    /// the normal case. The missing-path guard must therefore never run for
+    /// a Save, which the success test above covers, and the writability
+    /// guard must be the only thing that can refuse one. `SkipSaveTarget`
+    /// disables exactly that guard and nothing else, which proves the
+    /// refusal above came from it.
+    #[test]
+    fn save_target_guard_is_the_only_thing_refusing_a_save_result() {
+        let candidate = PathBuf::from("/nonexistent-wayfinder-save-proof/file.png");
+        let options: HashMap<String, OwnedValue> = HashMap::new();
+        let outcome = || PickOutcome::from(ChooserOutcome::Picked(vec![candidate.clone()]));
+
+        let (guarded, _) = decide_with_shape(
+            &options,
+            |_| outcome(),
+            GuardOverride::None,
+            RequestShape::Save,
+        );
+        assert_eq!(guarded, RESPONSE_OTHER, "the guard must refuse this result");
+
+        let (waived, results) = decide_with_shape(
+            &options,
+            |_| outcome(),
+            GuardOverride::SkipSaveTarget,
+            RequestShape::Save,
+        );
+        assert_eq!(
+            waived, RESPONSE_SUCCESS,
+            "waiving only the save-target guard must let the same result through"
+        );
+        assert_eq!(
+            uris_of(&results),
+            vec![format!("file://{}", candidate.display())]
+        );
     }
 
     #[test]
@@ -3003,7 +3276,7 @@ mod tests {
 
         assert!(xml.contains(INTERFACE_NAME));
         assert!(xml.contains("OpenFile"));
-        assert!(!xml.contains("SaveFile\""), "SaveFile must not be exported");
+        assert!(xml.contains("SaveFile\""), "SaveFile must be exported");
         // OpenFile's exact signature: handle(o), app_id(s), parent_window(s),
         // title(s), options(a{sv}) in; response(u), results(a{sv}) out.
         let open_file_block = xml
@@ -3311,6 +3584,98 @@ mod tests {
         let binary = target_dir.path().join("debug").join("wayfinder-native");
         assert!(binary.exists(), "expected driver binary at {}", binary.display());
         (binary, target_dir)
+    }
+
+    /// The real `wayfinder-native` binary, launched by the real portal, as
+    /// the answer to a real `SaveFile` call over the real bus: the name box
+    /// starts from the request's own `current_name`, the real Save button
+    /// callback runs, and the URI that comes back is that name inside the
+    /// folder the request asked for. This is the proof that "Save image as"
+    /// now reaches Wayfinder instead of doing nothing.
+    #[test]
+    fn native_picker_real_save_through_exported_save_file() {
+        let _guard = env_lock();
+        let (driver, _driver_target) = build_picker_test_driver("picker-test-driver-save");
+        let xvfb = PrivateXvfb::start();
+        let old_display = std::env::var("DISPLAY").ok();
+        let old_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        std::env::set_var("DISPLAY", &xvfb.display);
+        std::env::remove_var("WAYLAND_DISPLAY");
+
+        let bus = PrivateBus::start();
+        let base = scratch_base("native-save-base");
+        let fixture_dir_root = OwnedScratchDir::create(scratch_base("native-save-fixture-home"));
+        // One ordinary file in the folder, so the listing is non-empty and
+        // the driver has something it could have selected: the name that
+        // comes back must still be the typed one, not this.
+        fs::write(
+            fixture_dir_root.path().join("already-here.txt"),
+            b"not the save target\n",
+        )
+        .expect("write fixture file");
+        let expected_file = fixture_dir_root.path().join("saved-by-the-driver.png");
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fixture_dir_root.path());
+
+        let chooser: Arc<dyn Chooser> =
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+        let server = bus.connect_server(chooser);
+        let client = bus.connect_client();
+
+        let mut options = HashMap::new();
+        options.insert(
+            "current_name".to_string(),
+            OwnedValue::from(zbus::zvariant::Str::from("saved-by-the-driver.png")),
+        );
+        options.insert(
+            "current_folder".to_string(),
+            OwnedValue::try_from(Value::from(
+                fixture_dir_root
+                    .path()
+                    .to_string_lossy()
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0u8))
+                    .collect::<Vec<u8>>(),
+            ))
+            .expect("current_folder encodes"),
+        );
+        let (response, results) = call_save_file(&client, options).expect("SaveFile call");
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let expected_uri = gio::File::for_path(&expected_file).uri().to_string();
+        assert_eq!(response, RESPONSE_SUCCESS, "a real Save must report success");
+        assert_eq!(
+            uris_of(&results),
+            vec![expected_uri],
+            "the exported URI must be the typed name inside the requested folder"
+        );
+        assert!(
+            !expected_file.exists(),
+            "the picker names the target, it must never create it"
+        );
+
+        finish_private_bus(bus, server, client);
+        match old_display {
+            Some(v) => std::env::set_var("DISPLAY", v),
+            None => std::env::remove_var("DISPLAY"),
+        }
+        match old_wayland {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+        xvfb.finish();
+        fixture_dir_root.finish();
+        assert_eq!(
+            fs::read_dir(&base).unwrap().count(),
+            0,
+            "the request root must be gone after a completed real save"
+        );
     }
 
     #[test]
@@ -3923,6 +4288,10 @@ mod tests {
         let oversized_name = "x".repeat(MAX_WIRE_JSON_BYTES as usize + 1);
         let request = WireRequest {
             multiple: false,
+            save: false,
+            current_name: String::new(),
+            current_folder: None,
+            current_file: None,
             filters: vec![WireFilter { name: oversized_name, rules: Vec::new() }],
             current_filter: None,
             choices: Vec::new(),
