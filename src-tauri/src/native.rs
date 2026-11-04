@@ -15,7 +15,7 @@ use gstreamer::prelude::{
 use gstreamer_app as gst_app;
 use native_core::{Drive, Entry, ResolvedItem};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7156,8 +7156,43 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         metadata_unavailable,
         unreadable_entries,
     ));
-    let adj = ui.list_scroll.vadjustment();
-    glib::timeout_add_local_once(Duration::from_millis(16), move || adj.set_value(saved_scroll));
+    reapply_scroll(&ui.list_scroll.vadjustment(), saved_scroll);
+}
+
+/// True once the adjustment is where it was asked to go. An offset past the
+/// end does NOT count as settled: a half-built list and a genuinely shorter one
+/// look identical at that moment, so the try cap ends the former and the latter
+/// simply reapplies a value that clamps to the same place, costing nothing.
+fn scroll_target_reached(value: f64, target: f64) -> bool {
+    (value - target).abs() < 0.5
+}
+
+/// Puts the view back where it was after a rebuild. The value is set at once,
+/// before the next frame, so there is no visible flick to the top (D-226); the
+/// rows of a GTK list materialise later, which shrinks `upper` and clamps that
+/// first attempt, so it is reapplied on each range change until it sticks.
+fn reapply_scroll(adj: &gtk::Adjustment, target: f64) {
+    adj.set_value(target);
+    if scroll_target_reached(adj.value(), target) {
+        return;
+    }
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    let tries = Rc::new(Cell::new(0u8));
+    let id = adj.connect_changed({
+        let handler = handler.clone();
+        move |adj| {
+            adj.set_value(target);
+            tries.set(tries.get().saturating_add(1));
+            if scroll_target_reached(adj.value(), target)
+                || tries.get() >= 8
+            {
+                if let Some(id) = handler.borrow_mut().take() {
+                    adj.disconnect(id);
+                }
+            }
+        }
+    });
+    *handler.borrow_mut() = Some(id);
 }
 
 /// Re-selects every surviving path after a structural rebuild.
@@ -13793,6 +13828,19 @@ mod tests {
 
     /// Nothing restored at all is the one case that is a failure, and it
     /// must carry the real reason rather than a generic message.
+    #[test]
+    fn scroll_is_restored_at_once_or_clamped_to_a_shorter_list() {
+        // Exactly where it was: nothing more to do.
+        assert!(scroll_target_reached(400.0, 400.0));
+        // Clamped to the top because the rows have not materialised yet:
+        // keep reapplying, this is the flick he could see (D-226).
+        assert!(!scroll_target_reached(0.0, 400.0));
+        // Reachable and not reached: still work to do.
+        assert!(!scroll_target_reached(1400.0, 400.0));
+        // Sub-pixel difference is arrival, not a reason to keep listening.
+        assert!(scroll_target_reached(400.2, 400.0));
+    }
+
     #[test]
     fn restore_each_fails_only_when_nothing_came_back() {
         let err = restore_each(&["bad".to_string()], &|_| Err("no such entry".to_string()))
