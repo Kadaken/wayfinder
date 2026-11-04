@@ -9,6 +9,7 @@
 #   headless-gtk-test.sh d186        the standalone real loopback SMB gate (own netns)
 #   headless-gtk-test.sh d188        the standalone read-only-zip-folder gate
 #   headless-gtk-test.sh d187        the carried round-187 undo/redo regression selector
+#   headless-gtk-test.sh d226        the standalone no-scroll-flick-on-refresh gate
 #   headless-gtk-test.sh -- CMD...   any command (used by the self-check)
 # Env: WF_HEADLESS_TIMEOUT seconds (default 900).
 set -u
@@ -79,6 +80,8 @@ case "$mode" in
         cmd=("${cargo_t[@]}" zip_read_only_browse_open_copy_out_d188_alone -- --nocapture);;
   d187) export WAYFINDER_D187_ONLY=1
         cmd=("${cargo_t[@]}" undo_redo_d187_regression_alone -- --nocapture);;
+  d226) export WAYFINDER_D226_ONLY=1
+        cmd=("${cargo_t[@]}" scroll_flick_d226_alone -- --nocapture);;
   d186) export WAYFINDER_D186_ONLY=1
         subgid="$(awk -F: -v u="$(id -un)" '$1==u{print $2":"$3; found=1} END{if(!found) exit 1}' /etc/subgid)" \
           || { echo "no /etc/subgid range for $(id -un): required for the d186 loopback namespace" >&2; exit 97; }
@@ -94,7 +97,7 @@ case "$mode" in
              bash -c 'set -e; ip link set lo up; exec dbus-run-session -- "$@"' bash "${inner_test[@]}")
         host_mounts_before="$(cat /proc/self/mountinfo)";;
   --) shift; cmd=("$@");;
-  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|-- CMD..." >&2; exit 2;;
+  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|-- CMD..." >&2; exit 2;;
 esac
 
 setsid timeout -k 5 "$t" xvfb-run -a -s "-screen 0 1920x1080x24" "${cmd[@]}" &

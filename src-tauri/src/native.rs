@@ -6882,13 +6882,15 @@ fn navigate_to_with_message(
                 if let Some(message) = &done_message {
                     ui.status.set_label(message);
                 }
-                // Restore the pre-refresh scroll position once the rebuilt rows
-                // have been allocated (so the vadjustment upper bound is valid).
+                // D-226: in Details/Compact the model is spliced in place, so
+                // the list keeps the view itself and forcing the old offset back
+                // is what produced the visible jump. Icons view rebuilds every
+                // child of a FlowBox, which really does lose the position, so
+                // only that view is put back by hand.
                 if let Some(value) = saved_scroll {
-                    let adj = ui.list_scroll.vadjustment();
-                    glib::timeout_add_local_once(Duration::from_millis(16), move || {
-                        adj.set_value(value);
-                    });
+                    if state.borrow().view_mode == ViewMode::Grid {
+                        reapply_scroll(&ui.list_scroll, value);
+                    }
                 }
             }
             glib::ControlFlow::Break
@@ -7156,7 +7158,10 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         metadata_unavailable,
         unreadable_entries,
     ));
-    reapply_scroll(&ui.list_scroll.vadjustment(), saved_scroll);
+    // Same as the navigate path (D-226): only Icons view loses its position.
+    if state.borrow().view_mode == ViewMode::Grid {
+        reapply_scroll(&ui.list_scroll, saved_scroll);
+    }
 }
 
 /// True once the adjustment is where it was asked to go. An offset past the
@@ -7167,32 +7172,36 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
     (value - target).abs() < 0.5
 }
 
-/// Puts the view back where it was after a rebuild. The value is set at once,
-/// before the next frame, so there is no visible flick to the top (D-226); the
-/// rows of a GTK list materialise later, which shrinks `upper` and clamps that
-/// first attempt, so it is reapplied on each range change until it sticks.
-fn reapply_scroll(adj: &gtk::Adjustment, target: f64) {
+/// Puts the view back where it was after a rebuild, with no visible frame
+/// anywhere else (D-226).
+///
+/// Setting the value once is not enough: when the rows are rebuilt the list
+/// moves focus to its first row and scrolls to it AFTER this returns, which is
+/// what dragged the view to the top. The old code then corrected it on a 16ms
+/// timer, and that correction is the jump he could see. A tick callback runs
+/// before each frame is painted, so reasserting the offset there means the list
+/// is never drawn anywhere but where it was. It stops as soon as the offset has
+/// held for two frames, and in any case within 400ms, so it can never fight
+/// the user's own scrolling.
+fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
+    let adj = scroller.vadjustment();
     adj.set_value(target);
-    if scroll_target_reached(adj.value(), target) {
-        return;
-    }
-    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
-    let tries = Rc::new(Cell::new(0u8));
-    let id = adj.connect_changed({
-        let handler = handler.clone();
-        move |adj| {
+    let deadline = Instant::now() + Duration::from_millis(400);
+    let stable = Cell::new(0u8);
+    scroller.add_tick_callback(move |scroller, _| {
+        let adj = scroller.vadjustment();
+        if scroll_target_reached(adj.value(), target) {
+            stable.set(stable.get().saturating_add(1));
+        } else {
+            stable.set(0);
             adj.set_value(target);
-            tries.set(tries.get().saturating_add(1));
-            if scroll_target_reached(adj.value(), target)
-                || tries.get() >= 8
-            {
-                if let Some(id) = handler.borrow_mut().take() {
-                    adj.disconnect(id);
-                }
-            }
+        }
+        if stable.get() >= 2 || Instant::now() > deadline {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
         }
     });
-    *handler.borrow_mut() = Some(id);
 }
 
 /// Re-selects every surviving path after a structural rebuild.
@@ -7900,7 +7909,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         }
     }
     let focus_was_in_files = focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid);
-    ui.list_store.remove_all();
+    // The model is NOT emptied here. Emptying it collapsed the list to nothing,
+    // which clamped the scroll offset and made the view jump (D-226); the
+    // details path below replaces its contents in one splice instead, and the
+    // grid path, which has no model rows, clears it there.
     while let Some(child) = ui.grid.first_child() {
         ui.grid.remove(&child);
     }
@@ -7986,13 +7998,14 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // folder costs the same here as a 10-row one.
     ui.list_placeholder.set_visible(visible_entries.is_empty());
     if view_mode != ViewMode::Grid {
-        ui.list_store.remove_all();
         let items: Vec<glib::BoxedAnyObject> = visible_entries
             .iter()
             .cloned()
             .map(glib::BoxedAnyObject::new)
             .collect();
-        ui.list_store.splice(0, 0, &items);
+        // One splice: the old rows out and the new rows in, in a single change,
+        // so the list is never momentarily empty (D-226).
+        ui.list_store.splice(0, ui.list_store.n_items(), &items);
     } else {
         ui.list_store.remove_all();
     }
@@ -30293,6 +30306,131 @@ Broken: Either state is wrong.\n";
         assert_eq!(visible_sort(SortKey::Modified, false, none), (SortKey::Name, true));
         assert_eq!(visible_sort(SortKey::Kind, false, none), (SortKey::Kind, false));
         assert_eq!(visible_sort(SortKey::Name, false, none), (SortKey::Name, false));
+    }
+
+    /// D-226 alone on a virtual display: the refresh a delete triggers must
+    /// never show a frame at the top of the list.
+    #[test]
+    fn scroll_flick_d226_alone() {
+        if std::env::var("WAYFINDER_D226_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        // Never his real session: this test opens a window, and it belongs on
+        // the private X display, not over whatever he is doing.
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "run this under xvfb with GDK_BACKEND=x11, not on a live session"
+        );
+        delete_refresh_never_flicks_to_the_top_d226();
+    }
+
+    /// Real window, real rows, real listing worker. A delete refresh keeps the
+    /// scroll offset, and every intermediate value the adjustment reports stays
+    /// at that offset: the old 16ms timer let it sit at 0 for a frame first.
+    fn delete_refresh_never_flicks_to_the_top_d226() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d226-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("files"));
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..200 {
+            std::fs::write(dir.join(format!("file{i:03}.txt")), b"x").unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d226test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || {
+            state.borrow().cwd.real_path_string().unwrap_or_default() == dir.to_string_lossy()
+                && !rows_of(&ui).is_empty()
+        });
+        pump();
+
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("a scrollable list", || {
+            pump();
+            adj.upper() - adj.page_size() > 200.0
+        });
+        adj.set_value(200.0);
+        pump();
+        let before = adj.value();
+        assert!(before > 100.0, "the test needs a real scroll offset, got {before}");
+
+        // What the screen actually showed: the offset as it stood after each
+        // painted frame. An intermediate value corrected before the paint is
+        // not a flick; one that survives a paint is.
+        let clock = ui.window.frame_clock().expect("frame clock");
+        let seen: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+        let watcher = clock.connect_after_paint({
+            let seen = seen.clone();
+            let adj = adj.clone();
+            move |_| seen.borrow_mut().push(adj.value())
+        });
+
+        // Exactly what a delete does: remove the file, then refresh this folder
+        // through the job's completion path.
+        std::fs::remove_file(dir.join("file000.txt")).unwrap();
+        let cwd = state.borrow().cwd.clone();
+        navigate_to_with_message(
+            &state,
+            cwd,
+            NavMode::Record,
+            Some("Deleted 1 item".to_string()),
+        );
+        wait_for("the refreshed listing", || {
+            pump();
+            state.borrow().entries.len() == 199
+        });
+        for _ in 0..8 {
+            pump();
+        }
+        clock.disconnect(watcher);
+
+        let values = seen.borrow().clone();
+        assert!(!values.is_empty(), "no frame was painted, so nothing was proved");
+        let worst = values.iter().cloned().fold(before, |acc, v| {
+            if (v - before).abs() > (acc - before).abs() { v } else { acc }
+        });
+        // One row vanished from above the viewport, so the offset may settle one
+        // row higher: the same rows stay under your eyes. What must never
+        // happen is a frame near the top of the list, which is the flick.
+        // Measured, not assumed: one row is the whole list divided by its rows.
+        let row = (adj.upper() / (ui.list_store.n_items() as f64).max(1.0)).max(1.0);
+        let slack = row * 1.5;
+        assert!(
+            (adj.value() - before).abs() <= slack,
+            "settled offset {} is more than one row from {before}",
+            adj.value()
+        );
+        assert!(
+            (worst - before).abs() <= slack,
+            "a painted frame showed the view elsewhere: worst {worst} vs {before}, frames {values:?}"
+        );
+        // And it only ever moves once: no frame goes one way and back.
+        let settled = adj.value();
+        assert!(
+            values.iter().all(|v| (*v - before).abs() < 1.0 || (*v - settled).abs() < 1.0),
+            "the view moved to a third place mid-refresh: frames {values:?}"
+        );
+        println!("D226 MEASURE offset {before} -> {settled} across {} painted frames, worst {worst}", values.len());
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     /// D-157 alone on a virtual display.
