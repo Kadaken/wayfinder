@@ -812,7 +812,7 @@ impl JobOutcome {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewMode {
     Details,
     Compact,
@@ -6882,15 +6882,16 @@ fn navigate_to_with_message(
                 if let Some(message) = &done_message {
                     ui.status.set_label(message);
                 }
-                // D-226: in Details/Compact the model is spliced in place, so
-                // the list keeps the view itself and forcing the old offset back
-                // is what produced the visible jump. Icons view rebuilds every
-                // child of a FlowBox, which really does lose the position, so
-                // only that view is put back by hand.
+                // D-226/D-233: a same-folder refresh keeps the view exactly
+                // where it was, in every view mode. The splice already stops the
+                // model from collapsing; what still moved the view was the list
+                // scrolling its focused row into view after a popover or a
+                // confirmation handed focus back. `reapply_scroll` holds the
+                // offset in the frame-clock phase BEFORE each paint, so that
+                // correction is never a frame anybody sees -- unlike the old
+                // 16ms timer, which is what he could see.
                 if let Some(value) = saved_scroll {
-                    if state.borrow().view_mode == ViewMode::Grid {
-                        reapply_scroll(&ui.list_scroll, value);
-                    }
+                    reapply_scroll(&ui.list_scroll, value);
                 }
             }
             glib::ControlFlow::Break
@@ -7158,10 +7159,8 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         metadata_unavailable,
         unreadable_entries,
     ));
-    // Same as the navigate path (D-226): only Icons view loses its position.
-    if state.borrow().view_mode == ViewMode::Grid {
-        reapply_scroll(&ui.list_scroll, saved_scroll);
-    }
+    // Same as the navigate path (D-226/D-233): every view keeps its position.
+    reapply_scroll(&ui.list_scroll, saved_scroll);
 }
 
 /// True once the adjustment is where it was asked to go. An offset past the
@@ -7186,17 +7185,43 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
 fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     let adj = scroller.vadjustment();
     adj.set_value(target);
+    // The list moves the offset itself DURING layout -- it scrolls its focused
+    // row into view once the rows change -- which is after the tick phase and
+    // before the paint. A tick callback alone therefore corrected it one frame
+    // too late, and that single painted frame is the jump he saw (D-233: one
+    // frame at 128 out of 61, measured). `value_changed` fires the instant the
+    // list moves it, inside the same layout, so the offset is put back before
+    // anything is drawn. The tick callback below stays as the backstop and is
+    // what takes the guard off again.
+    let snapping = Rc::new(Cell::new(false));
+    let handler = adj.connect_value_changed({
+        let snapping = snapping.clone();
+        move |adj| {
+            if snapping.get() || scroll_target_reached(adj.value(), target) {
+                return;
+            }
+            snapping.set(true);
+            adj.set_value(target);
+            snapping.set(false);
+        }
+    });
     let deadline = Instant::now() + Duration::from_millis(400);
     let stable = Cell::new(0u8);
+    let handler = RefCell::new(Some(handler));
     scroller.add_tick_callback(move |scroller, _| {
         let adj = scroller.vadjustment();
         if scroll_target_reached(adj.value(), target) {
             stable.set(stable.get().saturating_add(1));
         } else {
-            stable.set(0);
+            // The offset cannot be reached at all -- a shorter list clamps it --
+            // so stop trying rather than fight the user's own scrolling.
+            stable.set(stable.get().saturating_add(1));
             adj.set_value(target);
         }
         if stable.get() >= 2 || Instant::now() > deadline {
+            if let Some(handler) = handler.borrow_mut().take() {
+                adj.disconnect(handler);
+            }
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
@@ -30424,6 +30449,219 @@ Broken: Either state is wrong.\n";
             "the view moved to a third place mid-refresh: frames {values:?}"
         );
         println!("D226 MEASURE offset {before} -> {settled} across {} painted frames, worst {worst}", values.len());
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-233 alone on a virtual display: permanently deleting from the Trash
+    /// (the confirm dialog included) must not move the list either.
+    #[test]
+    fn scroll_flick_d233_alone() {
+        if std::env::var("WAYFINDER_D233_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "run this under xvfb with GDK_BACKEND=x11, not on a live session"
+        );
+        for mode in [ViewMode::Details, ViewMode::Compact, ViewMode::Grid] {
+            permanent_delete_in_trash_never_flicks_d233(mode);
+        }
+    }
+
+    /// His exact action: in the Trash, a row selected, Delete permanently, then
+    /// Delete in the confirmation. Every painted frame must stay where he was.
+    fn permanent_delete_in_trash_never_flicks_d233(mode: ViewMode) {
+        let root = crate::native_core::scratch_root()
+            .join(format!("wf-d233-{mode:?}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let files = home.join(".local/share/Trash/files");
+        let info = home.join(".local/share/Trash/info");
+        for d in [&files, &info] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..200 {
+            let name = format!("file{i:03}.txt");
+            std::fs::write(files.join(&name), b"x").unwrap();
+            std::fs::write(
+                info.join(format!("{name}.trashinfo")),
+                format!(
+                    "[Trash Info]\nPath=/home/zito/gone/{name}\nDeletionDate=2026-11-04T00:00:00\n"
+                ),
+            )
+            .unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id(&format!("com.kadaken.wayfinder.d233test{}", match mode {
+                ViewMode::Details => "a",
+                ViewMode::Compact => "b",
+                ViewMode::Grid => "c",
+            }))
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(files.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || {
+            state.borrow().cwd.real_path_string().unwrap_or_default() == files.to_string_lossy()
+                && !rows_of(&ui).is_empty()
+        });
+        pump();
+        assert!(viewing_trash(&state), "the test must actually be inside the Trash");
+        set_view_mode(&state, &ui, mode);
+        pump();
+
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("a scrollable list", || {
+            pump();
+            adj.upper() - adj.page_size() > 200.0
+        });
+        adj.set_value(200.0);
+        pump();
+
+        // A row on screen is selected, exactly as a right-click would leave it.
+        // The row must be one actually on screen at this offset: a realized row
+        // in the list views, and in Icons view a child that is laid out there.
+        let row_name = |row: &gtk::Widget| -> Option<String> {
+            all_widgets(row).iter().find_map(|w| {
+                let text = w.downcast_ref::<gtk::Label>()?.label().to_string();
+                (text.starts_with("file") && text.ends_with(".txt")).then_some(text)
+            })
+        };
+        let target_name = if mode == ViewMode::Grid {
+            let child = ui.grid.child_at_index(0).expect("a grid child");
+            row_name(child.upcast_ref()).expect("the grid child's name")
+        } else {
+            rows_of(&ui)
+                .iter()
+                .find_map(row_name)
+                .expect("a realized row at this offset")
+        };
+        let target = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .position(|e| e.name == target_name)
+            .expect("the row to delete");
+        let row_widget: gtk::Widget = if mode == ViewMode::Grid {
+            let child = ui
+                .grid
+                .child_at_index(target as i32)
+                .expect("the grid child to delete");
+            ui.grid.unselect_all();
+            ui.grid.select_child(&child);
+            child.upcast()
+        } else {
+            ui.list_selection.unselect_all();
+            ui.list_selection.select_item(target as u32, true);
+            pump();
+            rows_of(&ui)
+                .into_iter()
+                .find(|row| row_name(row).as_deref() == Some(target_name.as_str()))
+                .expect("the row to delete")
+        };
+        update_selection(&state, &ui);
+        for _ in 0..4 {
+            pump();
+        }
+
+        // Through his own route: the row's right-click menu, then its
+        // Delete Permanently item, then the confirmation. The popover and the
+        // dialog each take and give back the keyboard focus, and a focus that
+        // lands back on a rebuilt list is one of the ways a view jumps.
+        let entry = state.borrow().visible_entries[target].clone();
+        show_item_context_menu(&row_widget, state.clone(), ui.clone(), entry, 5.0, 5.0);
+        pump();
+        let menu_popover = popovers_of(&row_widget)
+            .into_iter()
+            .find(|p| !p.has_css_class("wf-guide-label"))
+            .expect("the row's context menu");
+        let item = button_labelled(menu_popover.upcast_ref(), "Delete Permanently")
+            .expect("the menu's Delete Permanently item");
+
+        // The baseline is where the view stands with the menu open: that is what
+        // he is looking at the moment he clicks Delete.
+        for _ in 0..4 {
+            pump();
+        }
+        let before = adj.value();
+        assert!(before > 100.0, "the test needs a real scroll offset, got {before}");
+        let clock = ui.window.frame_clock().expect("frame clock");
+        let seen: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+        let watcher = clock.connect_after_paint({
+            let seen = seen.clone();
+            let adj = adj.clone();
+            move |_| seen.borrow_mut().push(adj.value())
+        });
+
+        item.emit_clicked();
+        wait_for("the confirmation", || {
+            pump();
+            ui.window.visible_dialog().is_some()
+        });
+        let dialog = ui
+            .window
+            .visible_dialog()
+            .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+            .expect("the confirmation is an AdwAlertDialog");
+        let delete = button_labelled(dialog.upcast_ref(), "Delete")
+            .expect("the confirmation's Delete button");
+        delete.emit_clicked();
+        wait_for("the deleted file to be gone", || {
+            pump();
+            !files.join(&target_name).exists()
+        });
+        wait_for("the refreshed listing", || {
+            pump();
+            state.borrow().entries.len() == 199
+        });
+        for _ in 0..12 {
+            pump();
+        }
+        clock.disconnect(watcher);
+
+        let values = seen.borrow().clone();
+        assert!(!values.is_empty(), "no frame was painted, so nothing was proved");
+        let worst = values.iter().cloned().fold(before, |acc, v| {
+            if (v - before).abs() > (acc - before).abs() { v } else { acc }
+        });
+        // One row's worth of movement is allowed: the deleted item is gone from
+        // above the viewport. Measured from the live view, not assumed. In Icons
+        // view the model is empty, so the FlowBox children are counted instead.
+        let items = if mode == ViewMode::Grid {
+            state.borrow().visible_entries.len() as f64
+        } else {
+            ui.list_store.n_items() as f64
+        };
+        let row = (adj.upper() / items.max(1.0)).max(1.0);
+        let slack = row * 1.5;
+        let settled = adj.value();
+        println!("D233 MEASURE {mode:?} offset {before} -> {settled} across {} painted frames, worst {worst}", values.len());
+        assert!(
+            (settled - before).abs() <= slack,
+            "settled offset {settled} is more than one row from {before}, frames {values:?}"
+        );
+        assert!(
+            (worst - before).abs() <= slack,
+            "a painted frame showed the view elsewhere: worst {worst} vs {before}, frames {values:?}"
+        );
+        assert!(
+            values.iter().all(|v| (*v - before).abs() < 1.0 || (*v - settled).abs() < 1.0),
+            "the view moved to a third place mid-delete: frames {values:?}"
+        );
 
         ui.window.destroy();
         pump();
