@@ -6471,6 +6471,13 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             paste_clipboard(state.clone(), ui.clone())
         }));
     }
+    if viewing_trash(&state) {
+        let state = state.clone();
+        let ui = ui.clone();
+        menu.append(&context_item("edit-undo-symbolic", "Restore", "", &popover, move || {
+            restore_trash_selection(state.clone(), ui.clone())
+        }));
+    }
     {
         let state = state.clone();
         let ui = ui.clone();
@@ -10106,6 +10113,88 @@ fn run_transfer(
     });
 }
 
+/// True when the listing on screen is the Trash's own `files` folder, which
+/// is the only place a Restore makes sense.
+fn viewing_trash(state: &Rc<RefCell<AppState>>) -> bool {
+    state
+        .borrow()
+        .cwd
+        .real_path()
+        .is_some_and(|path| path.to_string_lossy().contains("/Trash/files"))
+}
+
+/// Puts the selected trashed items back where they came from. Until this
+/// existed, the restore code in `native_core` was reachable only through a
+/// window's own Undo, which dies with the window: anything trashed in an
+/// earlier session could not be got back from inside Wayfinder at all.
+///
+/// Each item is restored on its own and the failures are counted rather than
+/// stopping at the first one, so one item whose original folder is gone does
+/// not strand the rest in the Trash.
+fn restore_trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
+    let entries = selected_entries(&state, &ui);
+    if entries.is_empty() {
+        ui.status.set_label("Nothing selected");
+        return;
+    }
+    let paths: Vec<String> = entries
+        .into_iter()
+        .filter_map(|entry| entry.source.real_path_string())
+        .collect();
+    if paths.is_empty() {
+        ui.status.set_label("Nothing selected");
+        return;
+    }
+    let count = paths.len();
+    run_job(
+        state,
+        ui,
+        format!("Restoring {count} item{}", plural(count)),
+        move || {
+            restore_each(&paths, &|path| {
+                native_core::restore_from_trash(std::slice::from_ref(&path.to_string()))
+            })
+            .map(JobOutcome::message)
+        },
+        |_, _, _| {},
+    );
+}
+
+/// Restores every path, counting what failed instead of stopping at the
+/// first failure, and says exactly what happened. `Err` is only for the
+/// case where nothing at all came back, so a part-success is never
+/// reported to the user as "Operation failed".
+///
+/// `restore_one` is a parameter so the counting and the wording can be
+/// tested without a real Trash; production passes
+/// `native_core::restore_from_trash`.
+fn restore_each(
+    paths: &[String],
+    restore_one: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    let count = paths.len();
+    let mut restored = 0usize;
+    let mut first_failure = None;
+    for path in paths {
+        match restore_one(path) {
+            Ok(()) => restored += 1,
+            Err(why) => {
+                if first_failure.is_none() {
+                    first_failure = Some(why);
+                }
+            }
+        }
+    }
+    match (restored, first_failure) {
+        (0, Some(why)) => Err(why),
+        (n, None) => Ok(format!("Restored {n} item{}", plural(n))),
+        (n, Some(why)) => Ok(format!(
+            "Restored {n} of {count}; {} could not be restored: {why}",
+            count - n
+        )),
+    }
+}
+
 fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
     let entries = selected_entries(&state, &ui);
     if entries.is_empty() {
@@ -12073,6 +12162,13 @@ fn show_item_context_menu(
 
     if !entry.source.is_zip() {
         menu.append(&context_separator());
+        if viewing_trash(&state) {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("edit-undo-symbolic", "Restore", "", &popover, move || {
+                restore_trash_selection(state.clone(), ui.clone())
+            }));
+        }
         {
             let state = state.clone();
             let ui = ui.clone();
@@ -13603,6 +13699,92 @@ mod tests {
         assert!(super::mime_match("text/*", &entry));
         assert!(!super::mime_match("text/plain", &entry));
         assert!(!super::mime_match("image/*", &entry));
+    }
+
+    /// The defect this covers: `native_core`'s restore code was reachable
+    /// only through a window's own Undo stack, which dies with the window,
+    /// so anything trashed in an earlier session could not be got back
+    /// from inside Wayfinder at all. Trashes a real file through the real
+    /// Trash, then restores it the exact way the Restore menu item does,
+    /// and asserts the file is back at its original path with its bytes.
+    #[test]
+    fn restore_each_puts_a_really_trashed_file_back_where_it_came_from() {
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let dir = owned_scratch_dir_225("trash-restore-roundtrip");
+        let original = dir.join("restore-me.txt");
+        fs::write(&original, b"restore me unchanged").unwrap();
+        let original_str = original.to_string_lossy().to_string();
+
+        let home = std::env::var("HOME").expect("HOME");
+        let trash_files = std::path::PathBuf::from(&home).join(".local/share/Trash/files");
+        let before: std::collections::HashSet<String> = fs::read_dir(&trash_files)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        native_core::trash_paths(&[original_str.clone()]).expect("the file must really be trashed");
+        assert!(!original.exists(), "the file must be gone from its folder once trashed");
+
+        let landed: Vec<String> = fs::read_dir(&trash_files)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert_eq!(landed.len(), 1, "exactly one new Trash entry, got {landed:?}");
+        let selected = trash_files.join(&landed[0]).to_string_lossy().to_string();
+
+        // Exactly what the Restore menu item runs.
+        let message = restore_each(&[selected], &|path| {
+            native_core::restore_from_trash(std::slice::from_ref(&path.to_string()))
+        })
+        .expect("a restorable item must not report failure");
+
+        assert_eq!(message, "Restored 1 item");
+        assert!(original.exists(), "the file must be back at its original path");
+        assert_eq!(
+            fs::read(&original).unwrap(),
+            b"restore me unchanged",
+            "the restored bytes must be the original bytes"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One item whose original folder is gone must not strand the rest in
+    /// the Trash, and a part-success must not be reported as a failure.
+    #[test]
+    fn restore_each_counts_failures_instead_of_stopping_at_the_first() {
+        let message = restore_each(
+            &[
+                "good-1".to_string(),
+                "bad".to_string(),
+                "good-2".to_string(),
+            ],
+            &|path| {
+                if path == "bad" {
+                    Err("destination folder is missing: /gone".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("two of three restored is a success, not a failure");
+        assert_eq!(
+            message,
+            "Restored 2 of 3; 1 could not be restored: destination folder is missing: /gone"
+        );
+    }
+
+    /// Nothing restored at all is the one case that is a failure, and it
+    /// must carry the real reason rather than a generic message.
+    #[test]
+    fn restore_each_fails_only_when_nothing_came_back() {
+        let err = restore_each(&["bad".to_string()], &|_| Err("no such entry".to_string()))
+            .expect_err("nothing restored must be an error");
+        assert_eq!(err, "no such entry");
     }
 
     /// D-225: a fresh, round-owned root under `~/Projects/Scratch`, never
