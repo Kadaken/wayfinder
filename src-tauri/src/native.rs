@@ -6478,7 +6478,9 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             restore_trash_selection(state.clone(), ui.clone())
         }));
     }
-    {
+    // Nothing in the Trash can be trashed again: offering it there only ever
+    // produced an error, so the item is not built at all.
+    if !viewing_trash(&state) {
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
@@ -11998,14 +12000,25 @@ fn show_item_context_menu(
                     move || rename_action(state.clone(), ui.clone())
                 }),
             ),
-            (
-                "user-trash-symbolic",
-                "Move to Trash",
-                Box::new({
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move || trash_selection(state.clone(), ui.clone())
-                }),
-            ),
+            if viewing_trash(&state) {
+                (
+                    "edit-undo-symbolic",
+                    "Restore",
+                    Box::new({
+                        let (state, ui) = (state.clone(), ui.clone());
+                        move || restore_trash_selection(state.clone(), ui.clone())
+                    }) as Box<dyn Fn()>,
+                )
+            } else {
+                (
+                    "user-trash-symbolic",
+                    "Move to Trash",
+                    Box::new({
+                        let (state, ui) = (state.clone(), ui.clone());
+                        move || trash_selection(state.clone(), ui.clone())
+                    }) as Box<dyn Fn()>,
+                )
+            },
         ];
         for (icon, tooltip, action) in tools {
             let button = gtk::Button::from_icon_name(icon);
@@ -12169,7 +12182,7 @@ fn show_item_context_menu(
                 restore_trash_selection(state.clone(), ui.clone())
             }));
         }
-        {
+        if !viewing_trash(&state) {
             let state = state.clone();
             let ui = ui.clone();
             menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {

@@ -3177,8 +3177,20 @@ fn restore_with(
         .destination
         .parent()
         .ok_or_else(|| format!("no destination folder: {}", entry.destination.display()))?;
+    // The folder an item came from is often long gone by the time it is
+    // restored (D-225: a scratch folder deleted weeks later). Refusing left the
+    // item stranded in the Trash with no way out, so the path is rebuilt first.
+    // A path blocked by a FILE of that name is still a refusal, not a replace.
     if !parent.is_dir() {
-        return Err(format!("destination folder is missing: {}", parent.display()));
+        if parent.symlink_metadata().is_ok() {
+            return Err(format!(
+                "destination folder is blocked by a file: {}",
+                parent.display()
+            ));
+        }
+        fs::create_dir_all(parent).map_err(|err| {
+            format!("cannot recreate destination folder {}: {err}", parent.display())
+        })?;
     }
     rename_no_replace(&entry.payload, &entry.destination)
         .map_err(|err| format!("cannot restore from trash: {err}"))?;
@@ -6270,11 +6282,23 @@ mod tests {
         let err = restore_from_trash_in(&trash, original.to_str().unwrap()).unwrap_err();
         assert!(err.starts_with("trash payload missing"), "{err}");
 
+        // D-225: the folder it came from is gone. It is rebuilt and the item
+        // comes back, instead of being stranded in the Trash for ever.
         let gone = dest.join("gone-dir/y.txt");
         trash_entry(&root, "y.txt", &gone, "2026-01-01T00:00:00", b"y");
-        let err = restore_from_trash_in(&trash, gone.to_str().unwrap()).unwrap_err();
-        assert!(err.starts_with("destination folder is missing"), "{err}");
-        assert!(trash.join("files/y.txt").exists() && trash.join("info/y.txt.trashinfo").exists());
+        restore_from_trash_in(&trash, gone.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(&gone).unwrap(), b"y");
+        assert!(!trash.join("files/y.txt").exists() && !trash.join("info/y.txt.trashinfo").exists());
+
+        // A FILE sitting where the folder has to go is still a refusal: the
+        // rebuild never replaces anything.
+        let blocked = dest.join("blocker/z.txt");
+        fs::write(dest.join("blocker"), b"not a folder").unwrap();
+        trash_entry(&root, "z.txt", &blocked, "2026-01-01T00:00:00", b"z");
+        let err = restore_from_trash_in(&trash, blocked.to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("destination folder is blocked by a file"), "{err}");
+        assert_eq!(fs::read(dest.join("blocker")).unwrap(), b"not a folder");
+        assert!(trash.join("files/z.txt").exists() && trash.join("info/z.txt.trashinfo").exists());
         assert!(trash.join("files/bad").exists());
     }
 
