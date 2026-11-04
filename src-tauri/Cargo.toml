@@ -37,6 +37,7 @@ guide = []
 picker-test-driver = []
 picker-test-driver-pick = ["picker-test-driver"]
 picker-test-driver-cancel = ["picker-test-driver"]
+picker-test-driver-save = ["picker-test-driver"]
 
 [[bin]]
 name = "wayfinder-native"

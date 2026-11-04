@@ -921,6 +921,11 @@ struct AppConfig {
     search_in_files: bool,
     sort_key: SortKey,
     sort_ascending: bool,
+    /// Days an item may sit in the Trash before it is deleted for good.
+    /// 0 is "never delete automatically", and is the default, so an upgrade
+    /// never starts deleting anybody's Trash without being asked.
+    #[serde(default)]
+    trash_keep_days: u32,
 }
 
 /// Mirrors `portal_service::WireFilter`. Defined separately rather than
@@ -958,6 +963,17 @@ struct WireRequestNative {
     filters: Vec<WireFilterNative>,
     current_filter: Option<WireFilterNative>,
     choices: Vec<WireChoiceNative>,
+    /// A Save request: the picker names a file to write instead of
+    /// choosing one that exists. Defaulted, not required, so a request
+    /// file written by an older portal still parses.
+    #[serde(default)]
+    save: bool,
+    #[serde(default)]
+    current_name: String,
+    #[serde(default)]
+    current_folder: Option<String>,
+    #[serde(default)]
+    current_file: Option<String>,
 }
 
 /// Mirrors `portal_service::WireResultMeta`, written back by this process
@@ -1000,6 +1016,10 @@ impl ChoiceWidget {
 struct PickerConfig {
     multiple: bool,
     directory: bool,
+    /// True for a `SaveFile` request: the window gets a file-name box and
+    /// a Save button, and submitting writes the typed name in the folder
+    /// on screen rather than returning a selected file.
+    save: bool,
     starting_dir: Option<String>,
     filter: Option<String>,
     window: Option<PickerWindow>,
@@ -1234,10 +1254,20 @@ fn parse_picker_state() -> Option<PickerState> {
     let active_filter = initial_active_filter(&request);
     let choice_selections = initial_choice_selections(&request);
 
+    // A Save request opens where the app suggested: `current_folder`, or
+    // the folder holding the file it suggests replacing. An explicit
+    // `--starting-dir` still wins, so the flag keeps its meaning.
+    if starting_dir.is_none() {
+        starting_dir = picker_save_starting_dir(&request);
+    }
+
     Some(PickerState {
         config: PickerConfig {
-            multiple: multiple || request.multiple,
+            // A Save names exactly one file, so `multiple` is never honored
+            // for one, whatever the flag or the request says.
+            multiple: !request.save && (multiple || request.multiple),
             directory,
+            save: request.save,
             starting_dir,
             filter,
             window,
@@ -1249,6 +1279,53 @@ fn parse_picker_state() -> Option<PickerState> {
         active_filter: Rc::new(RefCell::new(active_filter)),
         choice_selections: Rc::new(RefCell::new(choice_selections)),
     })
+}
+
+/// Where a Save request should open: the suggested folder, else the folder
+/// of the file it suggests replacing. Only an absolute, existing directory
+/// is used -- a suggestion that no longer exists falls back to the ordinary
+/// start folder rather than opening nothing.
+fn picker_save_starting_dir(request: &WireRequestNative) -> Option<String> {
+    if !request.save {
+        return None;
+    }
+    let from_folder = request.current_folder.as_deref().map(PathBuf::from);
+    let from_file = request
+        .current_file
+        .as_deref()
+        .map(Path::new)
+        .and_then(|path| path.parent())
+        .map(PathBuf::from);
+    [from_folder, from_file]
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.is_absolute() && dir.is_dir())
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
+/// The name a Save box starts with: the app's suggestion, else the name of
+/// the file it suggests replacing, else empty. A suggestion that is not one
+/// plain name is ignored; the portal already refuses those, and this is the
+/// second line of that same defence.
+fn picker_save_initial_name(request: &WireRequestNative) -> String {
+    let plain = |name: &str| -> Option<String> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    };
+    if let Some(name) = plain(&request.current_name) {
+        return name;
+    }
+    request
+        .current_file
+        .as_deref()
+        .map(Path::new)
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .and_then(plain)
+        .unwrap_or_default()
 }
 
 /// `--request <path>` names `request.json` inside the owned `RequestRoot`;
@@ -1465,6 +1542,7 @@ impl Default for AppConfig {
             sort_ascending: true,
             columns: ColumnVisibility::default(),
             remembered_networks: Vec::new(),
+            trash_keep_days: 0,
         }
     }
 }
@@ -1522,6 +1600,10 @@ fn config_show_hidden(config: &mut AppConfig, value: bool) {
 
 fn config_search_in_files(config: &mut AppConfig, value: bool) {
     config.search_in_files = value;
+}
+
+fn config_trash_keep_days(config: &mut AppConfig, value: u32) {
+    config.trash_keep_days = value;
 }
 
 fn config_view_mode(config: &mut AppConfig, mode: ViewMode) {
@@ -1778,6 +1860,9 @@ struct AppState {
     sort_ascending: bool,
     columns_visible: ColumnVisibility,
     sidebar_active_key: Option<String>,
+    /// Mirror of `AppConfig::trash_keep_days`, so the Trash menu can show
+    /// which option is ticked without reading the config file.
+    trash_keep_days: u32,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
     /// D-156 connect: saved shares, the one flow of this window and its dialog.
@@ -1926,6 +2011,8 @@ struct Ui {
     transfer_bar: gtk::ProgressBar,
     transfer_cancel: gtk::Button,
     picker_open: Option<gtk::Button>,
+    /// The Save file-name box. Present only for a Save request.
+    picker_name: Option<gtk::Entry>,
     /// Present only when the request supplied 2+ filters; switches
     /// `PickerState::active_filter`.
     picker_filter_dropdown: Option<gtk::DropDown>,
@@ -3419,6 +3506,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         sort_ascending: visible_sort(config.sort_key, config.sort_ascending, config.columns).1,
         columns_visible: config.columns,
         sidebar_active_key: None,
+        trash_keep_days: config.trash_keep_days,
         favorites: config.favorites,
         recents: config.recents,
         remembered_networks: config.remembered_networks,
@@ -3878,6 +3966,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     let mut picker_cancel_for_driver: Option<gtk::Button> = None;
     let mut picker_filter_dropdown: Option<gtk::DropDown> = None;
     let mut picker_choice_widgets: Vec<(String, ChoiceWidget)> = Vec::new();
+    let mut picker_name: Option<gtk::Entry> = None;
     let picker_open = if picker.is_some() {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         actions.add_css_class("wf-picker-actions");
@@ -3895,8 +3984,38 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         let cancel = gtk::Button::builder().label("Cancel").build();
         cancel.add_css_class("wf-secondary-button");
 
-        let open = gtk::Button::builder().label("Open").build();
+        let saving = picker.as_ref().is_some_and(|picker_state| picker_state.config.save);
+        let open = gtk::Button::builder()
+            .label(if saving { "Save" } else { "Open" })
+            .build();
         open.add_css_class("wf-primary-button");
+
+        // A Save request needs somewhere to type the file name. Without this
+        // row there is nothing to answer the request with, which is why Save
+        // did nothing at all before. Its own row above the buttons, so a long
+        // name has the whole width.
+        if let Some(picker_state) = picker.as_ref().filter(|_| saving) {
+            let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            name_row.add_css_class("wf-picker-actions");
+            let label = gtk::Label::builder().label("Name").xalign(0.0).build();
+            let entry = gtk::Entry::new();
+            entry.set_hexpand(true);
+            entry.set_widget_name("wf-picker-name");
+            let initial = picker_save_initial_name(&picker_state.config.request);
+            entry.set_text(&initial);
+            // The stem is selected and the extension is not, so typing
+            // replaces the name and keeps ".png".
+            let stem_len = Path::new(&initial)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.chars().count() as i32)
+                .unwrap_or(-1);
+            entry.select_region(0, stem_len);
+            name_row.append(&label);
+            name_row.append(&entry);
+            body.append(&name_row);
+            picker_name = Some(entry);
+        }
 
         actions.append(&spacer);
         actions.append(&cancel);
@@ -3996,6 +4115,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         transfer_bar: transfer_bar.clone(),
         transfer_cancel: transfer_cancel.clone(),
         picker_open: picker_open.clone(),
+        picker_name: picker_name.clone(),
         picker_filter_dropdown: picker_filter_dropdown.clone(),
         picker_choice_widgets: picker_choice_widgets.clone(),
         #[cfg(feature = "picker-test-driver")]
@@ -4026,6 +4146,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     rebuild_tabs(&state, &ui);
     rebuild_sidebar(&state, &ui);
+    if picker.is_none() {
+        sweep_expired_trash(&state, &ui);
+    }
     start_drive_refresh(&state);
     #[cfg(feature = "guide")]
     start_guide_watch(&state);
@@ -4310,6 +4433,17 @@ fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                     }
                 }
             }
+        }
+        // A Save answers from the name box, not from the selection, and
+        // clicking a row in Save mode deliberately copies that row's name
+        // over what was typed. So the driver selects nothing here and
+        // presses Save on the name the request itself suggested, which is
+        // what makes the typed name the thing under test.
+        if picker.config.save {
+            if let Some(open) = ui.picker_open.clone() {
+                open.emit_clicked();
+            }
+            return glib::ControlFlow::Break;
         }
         // Selects every now-filter-eligible fixture row (up to two when
         // `multiple` is set), the real `picker_entry_can_submit` /
@@ -4958,6 +5092,8 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         for favorite in favorites {
             let row = sidebar_row(&favorite.name, "", "emblem-favorite-symbolic");
             row.set_tooltip_text(Some(&favorite.path));
+            row.set_widget_name("wf-place-row");
+            connect_place_context(&row, state.clone(), ui.clone(), favorite.path.clone());
             mark_sidebar_active(
                 &row,
                 &cwd,
@@ -4974,6 +5110,8 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     for (name, path) in native_core::standard_dirs() {
         let row = sidebar_row(&name, "", place_icon(&name));
         row.set_tooltip_text(Some(&path));
+        row.set_widget_name(if place_is_trash(&path) { "wf-trash-place-row" } else { "wf-place-row" });
+        connect_place_context(&row, state.clone(), ui.clone(), path.clone());
         mark_sidebar_active(
             &row,
             &cwd,
@@ -5367,6 +5505,198 @@ fn open_connect_dialog(state: &Rc<RefCell<AppState>>, ui: &Ui, prefill: Option<&
     }
     window.present();
     dialog
+}
+
+/// Right-click on a Places or Favorites row in the sidebar.
+///
+/// Until this existed the sidebar answered left-click only, so emptying the
+/// Trash meant navigating into it first and finding the item in the file
+/// menu. The Trash row now carries Empty Trash itself, and every row carries
+/// the same Open set the file list offers for a folder, so the sidebar is not
+/// a second-class place to right-click.
+fn connect_place_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let row_for_click = row.clone();
+    click.connect_pressed(move |_, _, x, y| {
+        show_place_context_menu(&row_for_click, state.clone(), ui.clone(), path.clone(), x, y);
+    });
+    row.add_controller(click);
+}
+
+/// Runs the Trash's keep-for rule once. Called when a window opens and again
+/// the moment the rule is changed, so choosing "after 30 days" clears what is
+/// already older than that instead of waiting for the next launch.
+///
+/// Off (0 days) is the default and does nothing. A failure is reported in the
+/// status line and nothing else: an automatic sweep must never put a dialog in
+/// front of somebody who did not ask for one.
+fn sweep_expired_trash(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let days = state.borrow().trash_keep_days;
+    if days == 0 {
+        return;
+    }
+    match native_core::expire_trash(days) {
+        Ok(0) => {}
+        Ok(count) => ui.status.set_label(&format!(
+            "Deleted {count} item{} from Trash older than {days} days",
+            plural(count)
+        )),
+        Err(err) => ui.status.set_label(&format!("Trash cleanup failed: {err}")),
+    }
+}
+
+/// Changes how long the Trash keeps things, writes it to the config, and
+/// applies it at once.
+fn set_trash_keep_days(state: &Rc<RefCell<AppState>>, ui: &Ui, days: u32) {
+    match update_config(|config| config_trash_keep_days(config, days)) {
+        Some(config) => state.borrow_mut().trash_keep_days = config.trash_keep_days,
+        None => state.borrow_mut().trash_keep_days = days,
+    }
+    if days == 0 {
+        ui.status.set_label("Trash keeps items until you delete them");
+    } else {
+        sweep_expired_trash(state, ui);
+        let cwd = state.borrow().cwd.clone();
+        if viewing_trash(state) {
+            navigate_without_history(state, cwd);
+        }
+    }
+}
+
+/// The "Delete Items After" submenu on the Trash row: one row per choice,
+/// the active one ticked.
+fn context_trash_keep_for(
+    parent: &gtk::Popover,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+) -> gtk::Button {
+    let row = menu_row("appointment-soon-symbolic", "Delete Items After...", "");
+    let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+    arrow.set_pixel_size(12);
+    row.append(&arrow);
+    let button = gtk::Button::builder().child(&row).halign(gtk::Align::Fill).build();
+    button.add_css_class("flat");
+    button.add_css_class("wf-menu-item");
+    button.set_widget_name("wf-trash-keep-for");
+    let parent = parent.downgrade();
+    button.connect_clicked(move |button| {
+        let current = state.borrow().trash_keep_days;
+        let side = gtk::Popover::new();
+        side.set_has_arrow(false);
+        side.set_position(gtk::PositionType::Right);
+        side.set_parent(button);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.set_margin_top(4);
+        menu.set_margin_end(4);
+        menu.set_margin_bottom(4);
+        menu.set_margin_start(4);
+        for (days, label) in native_core::TRASH_KEEP_CHOICES {
+            let checked = days == current;
+            let state = state.clone();
+            let ui = ui.clone();
+            let parent = parent.clone();
+            let item = context_item(
+                if checked { "object-select-symbolic" } else { "" },
+                label,
+                "",
+                &side,
+                move || {
+                    if let Some(parent) = parent.upgrade() {
+                        parent.popdown();
+                    }
+                    set_trash_keep_days(&state, &ui, days);
+                },
+            );
+            item.set_widget_name(&format!("wf-trash-keep-{days}"));
+            if checked {
+                item.add_css_class("wf-checked");
+            }
+            menu.append(&item);
+        }
+        side.set_child(Some(&menu));
+        unparent_when_closed(&side);
+        side.popup();
+    });
+    button
+}
+
+/// True for the one Places row that is the Trash's own `files` folder.
+fn place_is_trash(path: &str) -> bool {
+    path.ends_with("/Trash/files")
+}
+
+fn show_place_context_menu(
+    row: &gtk::ListBoxRow,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    path: String,
+    x: f64,
+    y: f64,
+) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(row);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.set_margin_top(4);
+    menu.set_margin_end(4);
+    menu.set_margin_bottom(4);
+    menu.set_margin_start(4);
+
+    {
+        let state = state.clone();
+        let path = path.clone();
+        menu.append(&context_item("folder-open-symbolic", "Open", "", &popover, move || {
+            navigate(&state, native_core::Location::real(&path));
+        }));
+    }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        let path = path.clone();
+        menu.append(&context_item("tab-new-symbolic", "Open in New Tab", "", &popover, move || {
+            open_path_in_new_tab(&state, &ui, native_core::Location::real(&path));
+        }));
+    }
+    {
+        let ui = ui.clone();
+        let path = path.clone();
+        menu.append(&context_item("window-new-symbolic", "Open in New Window", "", &popover, move || {
+            open_new_window(&ui, path.clone());
+        }));
+    }
+
+    if place_is_trash(&path) {
+        menu.append(&context_separator());
+        let state_for_empty = state.clone();
+        let ui_for_empty = ui.clone();
+        let button = context_item("user-trash-full-symbolic", "Empty Trash", "", &popover, move || {
+            empty_trash_action(state_for_empty.clone(), ui_for_empty.clone())
+        });
+        button.set_widget_name("wf-empty-trash-place");
+        menu.append(&button);
+        menu.append(&context_trash_keep_for(&popover, state.clone(), ui.clone()));
+    } else {
+        menu.append(&context_separator());
+        let favorite = is_favorite(&state.borrow(), &path);
+        let label = if favorite { "Remove from Favorites" } else { "Add to Favorites" };
+        let state_for_fav = state.clone();
+        let ui_for_fav = ui.clone();
+        let path_for_fav = path.clone();
+        menu.append(&context_button(label, &popover, move || {
+            if favorite {
+                remove_favorite_path(&state_for_fav, &ui_for_fav, path_for_fav.clone());
+            } else {
+                add_favorite_path(&state_for_fav, &ui_for_fav, path_for_fav.clone());
+            }
+        }));
+    }
+
+    popover.set_child(Some(&menu));
+    unparent_when_closed(&popover);
+    popover.popup();
 }
 
 /// Right-click on a remembered share: Forget removes only that saved entry.
@@ -6046,7 +6376,7 @@ fn connect_actions(
     {
         let state = state.clone();
         let ui = ui.clone();
-        trash.connect_clicked(move |_| trash_selection(state.clone(), ui.clone()));
+        trash.connect_clicked(move |_| trash_or_delete_selection(state.clone(), ui.clone()));
     }
     {
         let state = state.clone();
@@ -6574,7 +6904,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::D || key == gdk::Key::d) {
-            trash_selection(state_for_keys.clone(), ui_for_keys.clone());
+            trash_or_delete_selection(state_for_keys.clone(), ui_for_keys.clone());
             return glib::Propagation::Stop;
         }
         if (ctrl && (key == gdk::Key::F || key == gdk::Key::f)) || key == gdk::Key::F3 {
@@ -6674,7 +7004,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::Delete {
-            trash_selection(state_for_keys.clone(), ui_for_keys.clone());
+            trash_or_delete_selection(state_for_keys.clone(), ui_for_keys.clone());
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::Return {
@@ -8822,6 +9152,26 @@ fn update_picker_open_button(state: &Rc<RefCell<AppState>>, ui: &Ui, entries: &[
         .iter()
         .filter(|entry| picker_entry_can_submit(&picker, entry))
         .count();
+    // Saving: the typed name decides, not the selection. Clicking a file
+    // copies its name into the box so "replace that one" is one click.
+    if picker.config.save {
+        if let Some(entry) = &ui.picker_name {
+            if let Some(name) = entries
+                .iter()
+                .find(|entry| !entry.is_dir && !entry.source.is_zip())
+                .and_then(|entry| entry.source.real_path())
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+            {
+                if entry.text() != name {
+                    entry.set_text(name);
+                }
+            }
+            button.set_sensitive(!picker_save_typed_name(ui).is_empty());
+        }
+        button.set_label("Save");
+        return;
+    }
     let count = if picker.config.multiple {
         count
     } else {
@@ -8856,7 +9206,74 @@ fn sync_picker_widget_state(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 }
 
+/// The name in the Save box, with the spaces trimmed off and anything that
+/// is not one plain file name rejected. A caller must only ever be handed a
+/// path inside the folder on screen, so a typed "/" or ".." is refused here
+/// rather than quietly writing somewhere else.
+fn picker_save_typed_name(ui: &Ui) -> String {
+    let Some(entry) = &ui.picker_name else {
+        return String::new();
+    };
+    let text = entry.text().trim().to_string();
+    if text.is_empty() || text.contains('/') || text.contains('\0') || text == "." || text == ".." {
+        return String::new();
+    }
+    text
+}
+
+/// Answers a Save request: the typed name joined to the folder on screen.
+/// An existing file is confirmed first -- the caller is about to overwrite
+/// it and nothing else in the flow asks.
+fn picker_save_submit(state: &Rc<RefCell<AppState>>, ui: &Ui, picker: &PickerState) {
+    let name = picker_save_typed_name(ui);
+    if name.is_empty() {
+        ui.status.set_label("Type a file name to save as");
+        return;
+    }
+    let Some(dir) = state.borrow().cwd.real_path().map(|path| path.to_path_buf()) else {
+        ui.status.set_label("Pick a real folder to save into");
+        return;
+    };
+    let target = dir.join(&name);
+    if target.is_dir() {
+        ui.status.set_label(&format!("\"{name}\" is a folder here"));
+        return;
+    }
+    let paths = vec![target.to_string_lossy().into_owned()];
+    if target.exists() {
+        let picker = picker.clone();
+        let paths_for_confirm = paths.clone();
+        show_confirm_dialog(
+            ui,
+            &format!("Replace \"{name}\"?"),
+            "A file with that name is already in this folder. Saving replaces it.",
+            "Replace",
+            move || picker_write_and_exit(&picker, paths_for_confirm.clone(), 0),
+        );
+        return;
+    }
+    picker_write_and_exit(picker, paths, 0);
+}
+
 fn connect_picker_actions(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    if let Some(entry) = ui.picker_name.clone() {
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            entry.connect_changed(move |_| {
+                let entries = selected_entries(&state, &ui);
+                update_picker_open_button(&state, &ui, &entries);
+            });
+        }
+        let state = state.clone();
+        let ui = ui.clone();
+        // Enter in the name box saves, like every other save box.
+        entry.connect_activate(move |_| {
+            if let Some(picker) = state.borrow().picker.clone() {
+                picker_save_submit(&state, &ui, &picker);
+            }
+        });
+    }
     if let Some(dropdown) = &ui.picker_filter_dropdown {
         let state = state.clone();
         let ui = ui.clone();
@@ -8878,6 +9295,10 @@ fn connect_picker_actions(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             let Some(picker) = state.borrow().picker.clone() else {
                 return;
             };
+            if picker.config.save {
+                picker_save_submit(&state, &ui, &picker);
+                return;
+            }
             let paths = picker_selected_paths(&state, &ui);
             if paths.is_empty() {
                 ui.status.set_label(if picker.config.directory {
@@ -10298,6 +10719,18 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         },
         |_, _, _| {},
     );
+}
+
+/// The toolbar's Trash button and the Delete key. Inside the Trash there is no
+/// "move to Trash" left to do, and asking the system to trash something that is
+/// already trashed destroyed it with no warning at all (he hit this). In the
+/// Trash both therefore mean permanent delete, which asks first.
+fn trash_or_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
+    if viewing_trash(&state) {
+        permanent_delete_selection(state, ui);
+    } else {
+        trash_selection(state, ui);
+    }
 }
 
 fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -12417,11 +12850,16 @@ fn show_background_context_menu(
         }));
     }
     if state.borrow().cwd.real_path().is_some_and(|p| p.to_string_lossy().contains("/Trash/files")) {
-        let state = state.clone();
-        let ui = ui.clone();
-        menu.append(&context_item("user-trash-full-symbolic", "Empty Trash", "", &popover, move || {
-            empty_trash_action(state.clone(), ui.clone())
-        }));
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            menu.append(&context_item("user-trash-full-symbolic", "Empty Trash", "", &popover, move || {
+                empty_trash_action(state.clone(), ui.clone())
+            }));
+        }
+        // The same keep-for rule the sidebar's Trash row offers, so it can be
+        // found from inside the Trash as well as from the sidebar.
+        menu.append(&context_trash_keep_for(&popover, state.clone(), ui.clone()));
     }
     if let Some(cwd) = state.borrow().cwd.real_path_string() {
         let state_for_fav = state.clone();
@@ -14103,6 +14541,7 @@ mod tests {
             config: super::PickerConfig {
                 multiple: false,
                 directory: false,
+                save: false,
                 starting_dir: None,
                 filter: None,
                 window: None,
@@ -14110,6 +14549,10 @@ mod tests {
                     multiple: false,
                     filters: Vec::new(),
                     current_filter: None,
+                    save: false,
+                    current_name: String::new(),
+                    current_folder: None,
+                    current_file: None,
                     choices: vec![super::WireChoiceNative {
                         id: "encoding".to_string(),
                         label: "Encoding".to_string(),
@@ -16361,7 +16804,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(ui.status.label(), refusal, "Terminal refused inside a ZIP");
         {
             state.borrow_mut().picker = Some(PickerState {
-                config: PickerConfig { multiple: false, directory: false, starting_dir: None, filter: None, window: None, request: WireRequestNative::default(), parent_window: None },
+                config: PickerConfig { multiple: false, directory: false, save: false, starting_dir: None, filter: None, window: None, request: WireRequestNative::default(), parent_window: None },
                 out_file: dir.join("picker-zip.out").to_string_lossy().to_string(),
                 meta_path: None,
                 active_filter: Rc::new(RefCell::new(None)),
@@ -30454,6 +30897,178 @@ Broken: Either state is wrong.\n";
         pump();
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-234, the data-loss one he hit: inside the Trash, the toolbar's Trash
+    /// button and the Delete key used to ask the system to trash an item that
+    /// was already trashed, which destroyed it with no question asked. Both
+    /// must now mean permanent delete, which asks first and keeps the item
+    /// when the question is dismissed. Also proves the Trash's own sidebar row
+    /// answers a right-click with Empty Trash and the keep-for rule.
+    #[test]
+    fn trash_button_in_trash_asks_first_d234_alone() {
+        if std::env::var("WAYFINDER_D234_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "run this under xvfb with GDK_BACKEND=x11, not on a live session"
+        );
+        let root = crate::native_core::scratch_root()
+            .join(format!("wf-d234-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let files = home.join(".local/share/Trash/files");
+        let info = home.join(".local/share/Trash/info");
+        for d in [&files, &info, &home.join("Documents")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for name in ["keep.txt", "second.txt", "third.txt"] {
+            std::fs::write(files.join(name), b"payload").unwrap();
+            std::fs::write(
+                info.join(format!("{name}.trashinfo")),
+                format!("[Trash Info]\nPath=/home/zito/gone/{name}\nDeletionDate=2026-11-04T00:00:00\n"),
+            )
+            .unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d234test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(files.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || {
+            state.borrow().cwd.real_path_string().unwrap_or_default() == files.to_string_lossy()
+                && !rows_of(&ui).is_empty()
+        });
+        pump();
+        assert!(viewing_trash(&state), "the test must actually be inside the Trash");
+
+        let question = || {
+            ui.window
+                .visible_dialog()
+                .and_then(|dialog| dialog.downcast::<adw::AlertDialog>().ok())
+        };
+        let target = files.join("keep.txt");
+        let index = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .position(|entry| entry.name == "keep.txt")
+            .expect("keep.txt is listed");
+        select_index(&state, &ui, index);
+        pump();
+
+        // ---- The button that destroyed his file now asks.
+        trash_or_delete_selection(state.clone(), ui.clone());
+        wait_for("the Trash button to ask first", || {
+            pump();
+            question().is_some()
+        });
+        let dialog = question().unwrap();
+        assert!(
+            dialog.heading().unwrap_or_default().contains("permanently"),
+            "the question must be the permanent-delete one, got {:?}",
+            dialog.heading()
+        );
+        assert!(target.exists(), "nothing may be deleted before the question is answered");
+
+        // ---- Dismissed, the file stays.
+        button_labelled(dialog.upcast_ref(), "Cancel")
+            .expect("the question's Cancel button")
+            .emit_clicked();
+        wait_for("the question to close", || {
+            pump();
+            question().is_none()
+        });
+        assert!(target.exists(), "Cancel must keep the file");
+        assert!(
+            info.join("keep.txt.trashinfo").exists(),
+            "Cancel must keep the trash record too"
+        );
+
+        // ---- Confirmed, it goes, and only it.
+        select_index(&state, &ui, index);
+        pump();
+        trash_or_delete_selection(state.clone(), ui.clone());
+        wait_for("the question again", || {
+            pump();
+            question().is_some()
+        });
+        button_labelled(question().unwrap().upcast_ref(), "Delete")
+            .expect("the question's Delete button")
+            .emit_clicked();
+        wait_for("keep.txt to go", || {
+            pump();
+            !target.exists()
+        });
+        assert!(files.join("second.txt").exists() && files.join("third.txt").exists());
+
+        // ---- Outside the Trash the same call still means Move to Trash, not delete.
+        let docs = home.join("Documents");
+        std::fs::write(docs.join("live.txt"), b"live").unwrap();
+        navigate(&state, native_core::Location::real(docs.to_str().unwrap()));
+        wait_for("the Documents listing", || {
+            pump();
+            state.borrow().cwd.real_path_string().unwrap_or_default() == docs.to_string_lossy()
+                && state.borrow().visible_entries.iter().any(|e| e.name == "live.txt")
+        });
+        let live_index = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .position(|entry| entry.name == "live.txt")
+            .unwrap();
+        select_index(&state, &ui, live_index);
+        trash_or_delete_selection(state.clone(), ui.clone());
+        pump();
+        assert!(
+            question().is_none(),
+            "outside the Trash this is Move to Trash and asks nothing"
+        );
+
+        // ---- The sidebar's Trash row answers a right-click.
+        let trash_row = all_widgets(ui.sidebar.upcast_ref())
+            .into_iter()
+            .find(|w| w.widget_name() == "wf-trash-place-row")
+            .and_then(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .expect("the sidebar's Trash row");
+        show_place_context_menu(
+            &trash_row,
+            state.clone(),
+            ui.clone(),
+            files.to_string_lossy().to_string(),
+            1.0,
+            1.0,
+        );
+        pump();
+        let menu = popovers_of(trash_row.upcast_ref())
+            .into_iter()
+            .find(|popover| popover.is_visible())
+            .expect("the Trash row's menu");
+        for label in ["Open", "Open in New Tab", "Empty Trash", "Delete Items After..."] {
+            assert!(
+                button_labelled(menu.upcast_ref(), label).is_some(),
+                "the Trash row's menu must offer {label}"
+            );
+        }
+        menu.popdown();
+        pump();
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
     }
