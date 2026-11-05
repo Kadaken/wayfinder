@@ -12,6 +12,7 @@
 #   headless-gtk-test.sh d226        the standalone no-scroll-flick-on-refresh gate
 #   headless-gtk-test.sh d233        the standalone no-flick-on-permanent-delete gate
 #   headless-gtk-test.sh d234        the standalone trash-safety + Trash-row-menu gate
+#   headless-gtk-test.sh d235        the standalone Save-picker name-box gate
 #   headless-gtk-test.sh -- CMD...   any command (used by the self-check)
 # Env: WF_HEADLESS_TIMEOUT seconds (default 900).
 set -u
@@ -88,6 +89,8 @@ case "$mode" in
         cmd=("${cargo_t[@]}" scroll_flick_d233_alone -- --nocapture);;
   d234) export WAYFINDER_D234_ONLY=1
         cmd=("${cargo_t[@]}" trash_button_in_trash_asks_first_d234_alone -- --nocapture);;
+  d235) export WAYFINDER_D235_ONLY=1
+        cmd=("${cargo_t[@]}" save_picker_row_click_copies_the_name_without_recursing_d235_alone -- --nocapture);;
   d186) export WAYFINDER_D186_ONLY=1
         subgid="$(awk -F: -v u="$(id -un)" '$1==u{print $2":"$3; found=1} END{if(!found) exit 1}' /etc/subgid)" \
           || { echo "no /etc/subgid range for $(id -un): required for the d186 loopback namespace" >&2; exit 97; }

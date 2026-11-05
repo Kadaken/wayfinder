@@ -1192,7 +1192,19 @@ fn initial_choice_selections(request: &WireRequestNative) -> HashMap<String, Str
         .collect()
 }
 
+/// Test-only: a picker cannot be handed to `build_ui` any other way --
+/// the real one is parsed from the real command line, which a test cannot
+/// set. Compiled out of every shipped binary.
+#[cfg(test)]
+thread_local! {
+    static TEST_PICKER_OVERRIDE: RefCell<Option<PickerState>> = const { RefCell::new(None) };
+}
+
 fn parse_picker_state() -> Option<PickerState> {
+    #[cfg(test)]
+    if let Some(picker) = TEST_PICKER_OVERRIDE.with(|cell| cell.borrow_mut().take()) {
+        return Some(picker);
+    }
     let mut args = std::env::args().skip(1);
     let mut pick = false;
     let mut multiple = false;
@@ -2013,6 +2025,7 @@ struct Ui {
     picker_open: Option<gtk::Button>,
     /// The Save file-name box. Present only for a Save request.
     picker_name: Option<gtk::Entry>,
+    picker_name_syncing: Rc<std::cell::Cell<bool>>,
     /// Present only when the request supplied 2+ filters; switches
     /// `PickerState::active_filter`.
     picker_filter_dropdown: Option<gtk::DropDown>,
@@ -4116,6 +4129,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         transfer_cancel: transfer_cancel.clone(),
         picker_open: picker_open.clone(),
         picker_name: picker_name.clone(),
+        picker_name_syncing: Rc::new(std::cell::Cell::new(false)),
         picker_filter_dropdown: picker_filter_dropdown.clone(),
         picker_choice_widgets: picker_choice_widgets.clone(),
         #[cfg(feature = "picker-test-driver")]
@@ -9163,8 +9177,13 @@ fn update_picker_open_button(state: &Rc<RefCell<AppState>>, ui: &Ui, entries: &[
                 .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str())
             {
-                if entry.text() != name {
+                // Re-entrancy guard, not an optimization: see the
+                // `connect_changed` comment. Without it this recursed
+                // through the changed signal until the stack was gone.
+                if entry.text() != name && !ui.picker_name_syncing.get() {
+                    ui.picker_name_syncing.set(true);
                     entry.set_text(name);
+                    ui.picker_name_syncing.set(false);
                 }
             }
             button.set_sensitive(!picker_save_typed_name(ui).is_empty());
@@ -9258,11 +9277,18 @@ fn picker_save_submit(state: &Rc<RefCell<AppState>>, ui: &Ui, picker: &PickerSta
 fn connect_picker_actions(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     if let Some(entry) = ui.picker_name.clone() {
         {
-            let state = state.clone();
             let ui = ui.clone();
+            let button = ui.picker_open.clone();
+            // Only the button's sensitivity, never a write back into the
+            // entry. `set_text` emits `changed` twice -- once for the
+            // delete, once for the insert -- and the first emission reports
+            // an empty entry, so anything here that writes to the entry
+            // recurses until the stack is gone. It did: Save crashed the
+            // picker outright.
             entry.connect_changed(move |_| {
-                let entries = selected_entries(&state, &ui);
-                update_picker_open_button(&state, &ui, &entries);
+                if let Some(button) = &button {
+                    button.set_sensitive(!picker_save_typed_name(&ui).is_empty());
+                }
             });
         }
         let state = state.clone();
@@ -20735,7 +20761,7 @@ Broken: Either state is wrong.\n";
         still_pending("failed open_path");
         // Picker mode (directory picker, so a file is refused and nothing exits).
         state.borrow_mut().picker = Some(PickerState {
-            config: PickerConfig { multiple: false, directory: true, starting_dir: None, filter: None, window: None, request: WireRequestNative::default(), parent_window: None },
+            config: PickerConfig { multiple: false, directory: true, save: false, starting_dir: None, filter: None, window: None, request: WireRequestNative::default(), parent_window: None },
             meta_path: None,
             active_filter: Rc::new(RefCell::new(None)),
             choice_selections: Rc::new(RefCell::new(HashMap::new())),
@@ -30907,6 +30933,132 @@ Broken: Either state is wrong.\n";
     /// must now mean permanent delete, which asks first and keeps the item
     /// when the question is dismissed. Also proves the Trash's own sidebar row
     /// answers a right-click with Empty Trash and the keep-for rule.
+    /// D-235: selecting a row in the Save picker crashed it outright. The
+    /// row's name is copied into the Name box, and `gtk::Entry::set_text`
+    /// emits `changed` twice -- once for the delete, once for the insert --
+    /// with the first emission reporting an EMPTY entry, so the copy
+    /// re-fired forever and overflowed the stack. He hit this: "I can't open
+    /// a file in gemini now", with a core dump whose trace is
+    /// set_text -> changed -> update_picker_open_button -> set_text.
+    ///
+    /// This selects a real row in a real Save picker window and asserts the
+    /// name was copied exactly once, that typing still drives the button,
+    /// and that a name of spaces alone is refused.
+    #[test]
+    fn save_picker_row_click_copies_the_name_without_recursing_d235_alone() {
+        if std::env::var("WAYFINDER_D235_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "run this under xvfb with GDK_BACKEND=x11, not on a live session"
+        );
+        let root = crate::native_core::scratch_root()
+            .join(format!("wf-d235-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("already-here.png"), b"payload").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let picker = PickerState {
+            config: PickerConfig {
+                multiple: false,
+                directory: false,
+                save: true,
+                starting_dir: Some(docs.to_string_lossy().into_owned()),
+                filter: None,
+                window: None,
+                request: WireRequestNative {
+                    save: true,
+                    current_name: "suggested-name.png".to_string(),
+                    current_folder: Some(docs.to_string_lossy().into_owned()),
+                    ..WireRequestNative::default()
+                },
+                parent_window: None,
+            },
+            out_file: root.join("d235.out").to_string_lossy().into_owned(),
+            meta_path: None,
+            active_filter: Rc::new(RefCell::new(None)),
+            choice_selections: Rc::new(RefCell::new(HashMap::new())),
+        };
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d235test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        TEST_PICKER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(picker));
+        build_ui(&app, None, None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || {
+            state.borrow().cwd.real_path_string().unwrap_or_default() == docs.to_string_lossy()
+                && !rows_of(&ui).is_empty()
+        });
+        pump();
+
+        let entry = ui.picker_name.clone().expect("a Save request must have a Name box");
+        let button = ui.picker_open.clone().expect("the picker has a primary button");
+        assert_eq!(button.label().unwrap_or_default(), "Save", "the button must read Save");
+        assert_eq!(
+            entry.text(),
+            "suggested-name.png",
+            "the box must start from the request's own suggestion"
+        );
+
+        // The crash: selecting the row copies its name in.
+        let index = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .position(|e| e.name == "already-here.png")
+            .expect("the fixture file is listed");
+        select_index(&state, &ui, index);
+        pump();
+        assert_eq!(
+            entry.text(),
+            "already-here.png",
+            "clicking a row must copy that row's name into the box, exactly once"
+        );
+        assert!(button.is_sensitive(), "a name in the box must arm Save");
+
+        // Typing still drives the button, and the entry is not written back.
+        entry.set_text("typed-by-hand.png");
+        pump();
+        assert_eq!(entry.text(), "typed-by-hand.png", "typing must survive");
+        assert!(button.is_sensitive());
+
+        entry.set_text("   ");
+        pump();
+        assert!(
+            !button.is_sensitive(),
+            "a name of spaces alone is not a name and must not arm Save"
+        );
+        assert_eq!(picker_save_typed_name(&ui), "");
+
+        entry.set_text("../escape.png");
+        pump();
+        assert_eq!(
+            picker_save_typed_name(&ui),
+            "",
+            "a typed path must never be accepted: the caller only ever gets a path in this folder"
+        );
+        assert!(!button.is_sensitive());
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        println!("D235 MEASURE: name box, row copy, typing and refusals all survived with no recursion");
+    }
+
     #[test]
     fn trash_button_in_trash_asks_first_d234_alone() {
         if std::env::var("WAYFINDER_D234_ONLY").as_deref() != Ok("1") {
