@@ -2,8 +2,9 @@
 // Copyright (C) 2026 LegendofZito (Kadaken)
 
 //! `org.freedesktop.impl.portal.FileChooser` backend contract for
-//! Wayfinder. Exports `OpenFile` and `SaveFile`; `SaveFiles` (a whole
-//! directory of files in one request) is not exported yet.
+//! Wayfinder. Exports all three FileChooser methods: `OpenFile`,
+//! `SaveFile` and `SaveFiles` (several files written into one chosen
+//! folder in a single request).
 //!
 //! Exporting an interface means claiming ALL of it: a registration that
 //! names FileChooser and then answers only `OpenFile` leaves every Save
@@ -79,6 +80,12 @@ pub struct WireRequest {
     /// An existing file the app suggests replacing, absolute.
     #[serde(default)]
     pub current_file: Option<String>,
+    /// True when the app asked for a folder instead of a file
+    /// (`OpenFile` with `directory=true`). The picker is launched with
+    /// `--directory`, and the returned path has to be a directory.
+    /// Never true for a Save: a Save names a file.
+    #[serde(default)]
+    pub directory: bool,
 }
 
 impl Default for WireRequest {
@@ -92,6 +99,7 @@ impl Default for WireRequest {
             current_name: String::new(),
             current_folder: None,
             current_file: None,
+            directory: false,
         }
     }
 }
@@ -543,6 +551,12 @@ impl Chooser for ProcessChooser {
             if request.multiple {
                 command.arg("--multiple");
             }
+            // A folder request puts the picker in folder mode: only
+            // directory rows are selectable and the button reads
+            // "Open folder".
+            if request.directory {
+                command.arg("--directory");
+            }
             // The calling app's exported toplevel handle, straight from
             // the FileChooser request. Without it the picker is a
             // parentless toplevel and the compositor has nothing to
@@ -820,6 +834,132 @@ fn decode_current_name(options: &HashMap<String, OwnedValue>) -> Result<String, 
     Ok(name)
 }
 
+/// The most names one `SaveFiles` request may carry. A browser saving a
+/// page's resources sends a handful; a list longer than this is not a
+/// real request, and every name costs a guard check, so the request is
+/// refused rather than walked.
+const MAX_SAVE_FILES: usize = 256;
+
+/// Decodes the `files` option of `SaveFiles`: the wire type is `aay`, one
+/// NUL-terminated byte string per file name. Each name must be one plain
+/// name -- no separator, no interior NUL, never "." or ".." -- so the app
+/// can never steer a write out of the folder the user chose. Duplicates
+/// are refused too: two identical names would make the app write both
+/// streams to one path. Absent, empty, over-long and malformed lists are
+/// all `Err(())`.
+fn decode_save_files_names(options: &HashMap<String, OwnedValue>) -> Result<Vec<String>, ()> {
+    let value = options.get("files").ok_or(())?;
+    let raw: Vec<Vec<u8>> = Vec::try_from(value.clone()).map_err(|_| ())?;
+    if raw.is_empty() || raw.len() > MAX_SAVE_FILES {
+        return Err(());
+    }
+    let mut names: Vec<String> = Vec::with_capacity(raw.len());
+    for bytes in raw {
+        let trimmed: &[u8] = match bytes.iter().position(|b| *b == 0) {
+            Some(first_nul) => {
+                // Only trailing NULs are tolerated, exactly as for
+                // `current_folder`: an interior NUL means this is not one
+                // name.
+                if bytes[first_nul..].iter().any(|b| *b != 0) {
+                    return Err(());
+                }
+                &bytes[..first_nul]
+            }
+            None => &bytes,
+        };
+        let name = std::str::from_utf8(trimmed).map_err(|_| ())?;
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(());
+        }
+        names.push(name.to_string());
+    }
+    let mut seen = names.clone();
+    seen.sort();
+    seen.dedup();
+    if seen.len() != names.len() {
+        return Err(());
+    }
+    Ok(names)
+}
+
+/// `SaveFiles`: the app supplies the file names and asks only where to
+/// put them, so the picker runs in folder mode and the chosen folder is
+/// joined with each already-validated name. Three guards stand between
+/// the pick and the answer, and they are the same ones the other two
+/// methods use: exactly one path comes back (`SkipCardinality`), it is a
+/// real directory (`SkipDirectory`), and every joined target is writable
+/// as a file (`SkipSaveTarget`). Nothing here can return a path outside
+/// the chosen folder: the names were refused earlier unless they were
+/// plain names.
+pub fn decide_save_files(
+    options: &HashMap<String, OwnedValue>,
+    pick: impl FnOnce(&WireRequest) -> PickOutcome,
+    override_guard: GuardOverride,
+) -> (u32, HashMap<String, OwnedValue>) {
+    // `directory=true` is meaningless here -- this request is already a
+    // folder pick -- so it is refused rather than silently ignored.
+    if option_is_true(options, "directory") {
+        return refuse();
+    }
+    let Ok(names) = decode_save_files_names(options) else {
+        return refuse();
+    };
+    let Ok(current_folder) = decode_path_option(options, "current_folder") else {
+        return refuse();
+    };
+    let Ok(choices) = decode_choices(options) else {
+        return refuse();
+    };
+
+    let request = WireRequest {
+        directory: true,
+        current_folder,
+        choices,
+        ..WireRequest::default()
+    };
+    let pick_outcome = pick(&request);
+    let meta = WireResultMeta {
+        current_filter: None,
+        choices: if pick_outcome.meta.choices.is_empty() {
+            request.choices.iter().map(|c| (c.id.clone(), c.initial.clone())).collect()
+        } else {
+            pick_outcome.meta.choices.clone()
+        },
+    };
+
+    let paths = match pick_outcome.outcome {
+        ChooserOutcome::Cancelled => return (RESPONSE_CANCELLED, HashMap::new()),
+        ChooserOutcome::Failed => return refuse(),
+        ChooserOutcome::Picked(paths) => paths,
+    };
+    if override_guard != GuardOverride::SkipCardinality && paths.len() != 1 {
+        return refuse();
+    }
+    let folder = paths.first().cloned().unwrap_or_default();
+    if !folder.is_absolute() {
+        return refuse();
+    }
+    if override_guard != GuardOverride::SkipDirectory && !folder.is_dir() {
+        return refuse();
+    }
+
+    let mut uris = Vec::with_capacity(names.len());
+    for name in &names {
+        let target = folder.join(name);
+        if override_guard != GuardOverride::SkipSaveTarget && !save_target_is_writable(&target) {
+            return refuse();
+        }
+        match normalize_to_single_file_uri(&target) {
+            Some(uri) => uris.push(uri),
+            None if override_guard == GuardOverride::SkipInvalidOutput => {
+                uris.push("file:///forced-bypass-proof".to_string());
+            }
+            None => return refuse(),
+        }
+    }
+    build_success_results(uris, &meta)
+}
+
 /// Which FileChooser method a `decide` call is answering. Save differs
 /// from Open in exactly two places, and both are decided here rather
 /// than by sniffing the options: which options are decoded, and what a
@@ -858,11 +998,16 @@ fn save_target_is_writable(candidate: &Path) -> bool {
 /// caller, an option value or an environment variable can set anything
 /// else, so this is not a backdoor, only a named decision point for
 /// tests calling the Rust function directly. `multiple`, `filters`,
-/// `current_filter` and `choices` are decoded and honored as of D-222 and
-/// no longer have guards here; `directory` remains refused outright.
+/// `current_filter` and `choices` are decoded and honored as of D-222.
+/// `directory` is honored too: the pre-pick refusal is gone, and
+/// `SkipDirectory` now waives the result guard that a folder request must
+/// be answered with a real directory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GuardOverride {
     None,
+    /// Waives only the folder-result guard, so a mutation proof can show
+    /// that a `directory=true` request answered with a plain file is
+    /// refused by that guard and nothing else.
     SkipDirectory,
     SkipCardinality,
     SkipMissingPath,
@@ -895,7 +1040,11 @@ pub fn decide_with_shape(
     shape: RequestShape,
 ) -> (u32, HashMap<String, OwnedValue>) {
     let save = shape == RequestShape::Save;
-    if override_guard != GuardOverride::SkipDirectory && option_is_true(options, "directory") {
+    // `directory=true` asks for a folder. Open honors it; a Save names a
+    // file, so the same option on a Save is meaningless and the request is
+    // refused outright rather than quietly answered with a folder.
+    let directory = option_is_true(options, "directory");
+    if save && directory {
         return refuse();
     }
 
@@ -935,6 +1084,7 @@ pub fn decide_with_shape(
         current_name,
         current_folder,
         current_file,
+        directory,
     };
     let pick_outcome = pick(&request);
     // The chooser's own reported meta wins when present (a real picker may
@@ -961,7 +1111,15 @@ pub fn decide_with_shape(
             }
             let mut uris = Vec::with_capacity(paths.len());
             for candidate in &paths {
+                if override_guard != GuardOverride::SkipDirectory
+                    && directory
+                    && candidate.is_absolute()
+                    && !candidate.is_dir()
+                {
+                    return refuse();
+                }
                 if override_guard != GuardOverride::SkipMissingPath
+                    && !directory
                     && candidate.is_absolute()
                     && !candidate.is_file()
                 {
@@ -998,6 +1156,14 @@ pub fn decide_with_shape(
                 // can stand in for the other.
                 if override_guard != GuardOverride::SkipSaveTarget
                     && !save_target_is_writable(&candidate)
+                {
+                    return refuse();
+                }
+            } else if directory {
+                // A folder request is answered with a folder or not at all.
+                if override_guard != GuardOverride::SkipDirectory
+                    && candidate.is_absolute()
+                    && !candidate.is_dir()
                 {
                     return refuse();
                 }
@@ -1087,6 +1253,27 @@ impl PortalService {
             |request| chooser.pick(&app_id, &parent_window, &title, request),
             GuardOverride::None,
             RequestShape::Save,
+        )
+    }
+
+    /// `SaveFiles`: the app hands over a list of file names and the portal
+    /// answers with one URI per name inside the folder the user chose.
+    /// Exporting it matters for the same reason `SaveFile` does -- an app
+    /// calling a method this backend does not answer gets no dialog at all.
+    #[zbus(name = "SaveFiles")]
+    fn save_files(
+        &self,
+        _handle: ObjectPath<'_>,
+        app_id: String,
+        parent_window: String,
+        title: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> (u32, HashMap<String, OwnedValue>) {
+        let chooser = &self.chooser;
+        decide_save_files(
+            &options,
+            |request| chooser.pick(&app_id, &parent_window, &title, request),
+            GuardOverride::None,
         )
     }
 }
@@ -1430,6 +1617,44 @@ mod tests {
         );
         fixture.remove();
         finish_base(base);
+    }
+
+    /// A folder request must reach the child as `--directory`: without
+    /// that flag the picker would open in file mode and could only ever
+    /// return a file, which the result guard then refuses -- so the app
+    /// would see a failure instead of a folder.
+    #[test]
+    fn process_chooser_passes_directory_flag_and_returns_the_folder() {
+        let args_dir = scratch_base("directory-flag-args");
+        fs::create_dir_all(&args_dir).expect("create args dir");
+        let args_file = args_dir.join("args");
+        let folder = args_dir.join("picked-folder");
+        fs::create_dir_all(&folder).expect("create folder fixture");
+        let native = FakeNative::scripted(&format!(
+            "printf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}' > \"$3\"\nexit 0\n",
+            args_file.display(),
+            folder.display()
+        ));
+        let base = scratch_base("directory-flag");
+        let chooser =
+            ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(5), base.clone());
+        let request = WireRequest { directory: true, ..WireRequest::default() };
+        let outcome = chooser.pick("app", "", "title", &request);
+        match outcome.outcome {
+            ChooserOutcome::Picked(paths) => assert_eq!(paths, vec![folder.clone()]),
+            other => panic!("expected Picked, got {other:?}"),
+        }
+        let args = fs::read_to_string(&args_file).expect("read recorded child args");
+        assert!(
+            args.lines().any(|line| line == "--directory"),
+            "the child must be launched in folder mode; got {args:?}"
+        );
+        assert!(
+            !args.lines().any(|line| line == "--multiple"),
+            "a single-folder request must not also ask for multiple; got {args:?}"
+        );
+        finish_base(base);
+        fs::remove_dir_all(&args_dir).expect("remove the exact args fixture");
     }
 
     #[test]
@@ -2468,6 +2693,53 @@ mod tests {
         }
     }
 
+    /// The real `SaveFiles` wire call: same five arguments as the other
+    /// two methods, with `files` carried as `aay`.
+    fn call_save_files(
+        client: &Connection,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<(u32, HashMap<String, OwnedValue>)> {
+        let handle = ObjectPath::try_from("/org/freedesktop/portal/desktop/request/t/2")
+            .expect("literal object path");
+        let body = (
+            handle,
+            "org.example.savefiles".to_string(),
+            String::new(),
+            "Save files".to_string(),
+            options,
+        );
+        let message = client.call_method(
+            Some(BUS_NAME),
+            OBJECT_PATH,
+            Some(INTERFACE_NAME),
+            "SaveFiles",
+            &body,
+        )?;
+        message
+            .body()
+            .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+            .map_err(Into::into)
+    }
+
+    /// Builds the `files` option the way the C portal does: one
+    /// NUL-terminated byte string per name.
+    fn files_option(names: &[&str]) -> HashMap<String, OwnedValue> {
+        let raw: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| {
+                let mut bytes = name.as_bytes().to_vec();
+                bytes.push(0);
+                bytes
+            })
+            .collect();
+        let mut options = HashMap::new();
+        options.insert(
+            "files".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(raw)).expect("aay option value"),
+        );
+        options
+    }
+
     fn call_open_file(
         client: &Connection,
         options: HashMap<String, OwnedValue>,
@@ -2587,12 +2859,58 @@ mod tests {
         };
     }
 
+    // `directory=true` is no longer refused before the pick (D-240): the
+    // picker is launched in folder mode. What is still refused is a folder
+    // request answered with a plain file, which is what this proves --
+    // waiving only that guard turns the same refusal into success.
     guard_proof!(
-        decide_refuses_directory_true,
-        decide_bypassing_directory_guard_then_succeeds,
+        decide_refuses_plain_file_for_directory_request,
+        decide_bypassing_directory_result_guard_then_succeeds,
         with_option("directory", true),
         GuardOverride::SkipDirectory
     );
+
+    #[test]
+    fn decide_directory_request_succeeds_on_a_real_folder() {
+        let dir = ScratchFile::create();
+        let path = dir.path().to_path_buf();
+        dir.remove();
+        fs::create_dir_all(&path).expect("create folder fixture");
+        let expected_uri = gio::File::for_path(&path).uri().to_string();
+        let outcome = ChooserOutcome::Picked(vec![path.clone()]);
+        let (response, results) = decide(
+            &with_option("directory", true),
+            |request| {
+                assert!(request.directory, "the decoded request must carry directory=true");
+                outcome.clone().into()
+            },
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_SUCCESS, "a folder request answered with a folder must succeed");
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+        fs::remove_dir_all(&path).expect("remove exact folder fixture");
+    }
+
+    #[test]
+    fn decide_refuses_directory_option_on_a_save() {
+        let dir = ScratchFile::create();
+        let path = dir.path().to_path_buf();
+        dir.remove();
+        fs::create_dir_all(&path).expect("create folder fixture");
+        let mut called = false;
+        let (response, _) = decide_with_shape(
+            &with_option("directory", true),
+            |_| {
+                called = true;
+                ChooserOutcome::Picked(vec![path.clone()]).into()
+            },
+            GuardOverride::None,
+            RequestShape::Save,
+        );
+        assert_eq!(response, RESPONSE_OTHER, "a Save names a file, so directory=true must be refused");
+        assert!(!called, "the refusal must happen before the chooser seam");
+        fs::remove_dir_all(&path).expect("remove exact folder fixture");
+    }
 
     /// [D-222 replacement for `decide_refuses_multiple_true` /
     /// `decide_bypassing_multiple_guard_then_succeeds`]: `multiple` is no
@@ -3062,9 +3380,11 @@ mod tests {
         let client = bus.connect_client();
 
         // D-222 moved `multiple` from a pre-pick refusal to an honored
-        // option, so this proof is now keyed on `directory=true`, the one
-        // pre-pick refusal this round leaves unchanged.
-        let (response, _) = call_open_file(&client, with_option("directory", true)).expect("OpenFile call");
+        // option and D-240 did the same for `directory`, so this proof is
+        // now keyed on a malformed `filters` value -- a bool where the wire
+        // type is an array -- which `decode_filters` still refuses before
+        // the pick.
+        let (response, _) = call_open_file(&client, with_option("filters", true)).expect("OpenFile call");
         assert_eq!(response, RESPONSE_OTHER);
         assert!(
             !marker.exists(),
@@ -3101,7 +3421,48 @@ mod tests {
         };
     }
 
-    dbus_option_refusal!(dbus_openfile_refuses_directory_true, with_option("directory", true));
+    dbus_option_refusal!(dbus_openfile_refuses_malformed_filters, with_option("filters", true));
+
+    /// [D-240 replacement for `dbus_openfile_refuses_directory_true`]:
+    /// `directory=true` over the real D-Bus boundary now reaches the
+    /// chooser and a picked folder comes back as one `file://` URI.
+    #[test]
+    fn dbus_openfile_honors_directory_true() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let dir_fixture = bus.create_fixture_file("picked-folder");
+        fs::remove_file(&dir_fixture).expect("replace the fixture file with a folder");
+        fs::create_dir_all(&dir_fixture).expect("create folder fixture");
+        let expected_uri = gio::File::for_path(&dir_fixture).uri().to_string();
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![dir_fixture.clone()])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, results) =
+            call_open_file(&client, with_option("directory", true)).expect("OpenFile call");
+        assert_eq!(response, RESPONSE_SUCCESS, "a folder request must be honored, not refused");
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+        assert_eq!(chooser.call_count(), 1, "the chooser seam must be reached exactly once");
+        finish_private_bus(bus, server, client);
+    }
+
+    /// The same request answered with a plain file is refused after the
+    /// pick, so a folder request can never hand an app a file.
+    #[test]
+    fn dbus_openfile_directory_true_refuses_a_file_answer() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let fixture = bus.create_fixture_file("not-a-folder.txt");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![fixture])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, _) =
+            call_open_file(&client, with_option("directory", true)).expect("OpenFile call");
+        assert_eq!(response, RESPONSE_OTHER);
+        assert_eq!(chooser.call_count(), 1, "the refusal is after the pick, not before it");
+        finish_private_bus(bus, server, client);
+    }
 
     /// [D-222 replacement for `dbus_openfile_refuses_multiple_true`]:
     /// `multiple=true` over the real D-Bus boundary now reaches the
@@ -3232,30 +3593,183 @@ mod tests {
         );
     }
 
+    /// [D-240 replacement for `dbus_savefiles_is_an_unknown_method`]:
+    /// `SaveFiles` is exported now. The app's names are joined onto the one
+    /// folder the picker returned, in the order the app sent them.
     #[test]
-    fn dbus_savefiles_is_an_unknown_method() {
+    fn dbus_savefiles_returns_one_uri_per_name_in_the_chosen_folder() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let folder = bus.create_fixture_file("save-target-folder");
+        fs::remove_file(&folder).expect("replace the fixture file with a folder");
+        fs::create_dir_all(&folder).expect("create folder fixture");
+        let chooser = ScriptedChooser::new(vec![ChooserOutcome::Picked(vec![folder.clone()])]);
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (response, results) = call_save_files(&client, files_option(&["one.txt", "two bin.dat"]))
+            .expect("SaveFiles call");
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(
+            uris_of(&results),
+            vec![
+                gio::File::for_path(folder.join("one.txt")).uri().to_string(),
+                gio::File::for_path(folder.join("two bin.dat")).uri().to_string(),
+            ],
+            "one URI per requested name, in request order, inside the chosen folder"
+        );
+        assert_eq!(chooser.call_count(), 1);
+        assert!(
+            !folder.join("one.txt").exists(),
+            "the portal names the targets; it must never create them"
+        );
+        finish_private_bus(bus, server, client);
+    }
+
+    /// A name that is not a plain name is refused before the picker ever
+    /// opens, so a `SaveFiles` request can never be steered out of the
+    /// folder the user chose.
+    #[test]
+    fn dbus_savefiles_refuses_a_name_that_escapes_the_folder() {
         let _guard = env_lock();
         let bus = PrivateBus::start();
         let chooser = ScriptedChooser::new(vec![]);
-        let server = bus.connect_server(chooser);
+        let server = bus.connect_server(chooser.clone());
         let client = bus.connect_client();
 
-        let err = client
-            .call_method(
-                Some(BUS_NAME),
-                OBJECT_PATH,
-                Some(INTERFACE_NAME),
-                "SaveFiles",
-                &(),
-            )
-            .expect_err("SaveFiles is never exported");
-        match err {
-            zbus::Error::MethodError(name, ..) => {
-                assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.UnknownMethod");
-            }
-            other => panic!("expected UnknownMethod, got {other:?}"),
+        for name in ["../escape.txt", "sub/escape.txt", "..", ".", "/etc/passwd", ""] {
+            let (response, results) =
+                call_save_files(&client, files_option(&[name])).expect("SaveFiles call");
+            assert_eq!(response, RESPONSE_OTHER, "{name:?} must be refused");
+            assert!(uris_of(&results).is_empty(), "{name:?} must return no URI");
         }
+        assert_eq!(
+            chooser.call_count(),
+            0,
+            "every one of these refusals must happen before the chooser seam"
+        );
         finish_private_bus(bus, server, client);
+    }
+
+    #[test]
+    fn decide_save_files_refuses_an_absent_empty_or_duplicate_list() {
+        let folder = ScratchFile::create();
+        let path = folder.path().to_path_buf();
+        folder.remove();
+        fs::create_dir_all(&path).expect("create folder fixture");
+        let answer = || PickOutcome::from(ChooserOutcome::Picked(vec![path.clone()]));
+
+        let (absent, _) = decide_save_files(&HashMap::new(), |_| answer(), GuardOverride::None);
+        assert_eq!(absent, RESPONSE_OTHER, "no `files` option at all must be refused");
+
+        let mut empty = HashMap::new();
+        empty.insert(
+            "files".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(Vec::<Vec<u8>>::new()))
+                .expect("empty aay"),
+        );
+        let (empty_response, _) = decide_save_files(&empty, |_| answer(), GuardOverride::None);
+        assert_eq!(empty_response, RESPONSE_OTHER, "an empty list must be refused");
+
+        let duplicate = files_option(&["same.txt", "same.txt"]);
+        let (duplicate_response, _) =
+            decide_save_files(&duplicate, |_| answer(), GuardOverride::None);
+        assert_eq!(
+            duplicate_response, RESPONSE_OTHER,
+            "two identical names would make the app write both streams to one path"
+        );
+
+        fs::remove_dir_all(&path).expect("remove exact folder fixture");
+    }
+
+    /// The three result guards a `SaveFiles` answer passes through. For the
+    /// cardinality and save-target cases, waiving exactly that one guard
+    /// turns the refusal into success; the folder case is covered twice over.
+    #[test]
+    fn save_files_result_guards_refuse_every_bad_answer() {
+        let folder = ScratchFile::create();
+        let dir = folder.path().to_path_buf();
+        folder.remove();
+        fs::create_dir_all(&dir).expect("create folder fixture");
+        let options = files_option(&["out.txt"]);
+
+        // Not a directory: the picker answered with a plain file. Two
+        // independent guards refuse this, and neither needs the other:
+        // the folder guard rejects the answer itself, and the save-target
+        // guard rejects every name joined onto it, because a plain file is
+        // not an existing parent directory. Waiving either one on its own
+        // still refuses, which is what defence in depth means here --
+        // unlike the cardinality and save-target cases below, this one has
+        // no single waiver that turns it into success.
+        let file = ScratchFile::create();
+        let file_answer = || PickOutcome::from(ChooserOutcome::Picked(vec![file.path().to_path_buf()]));
+        let (refused, _) = decide_save_files(&options, |_| file_answer(), GuardOverride::None);
+        assert_eq!(refused, RESPONSE_OTHER, "a file is not a folder to save into");
+        let (without_folder_guard, _) =
+            decide_save_files(&options, |_| file_answer(), GuardOverride::SkipDirectory);
+        assert_eq!(
+            without_folder_guard, RESPONSE_OTHER,
+            "with the folder guard waived the save-target guard must still refuse a file answer"
+        );
+        let (without_target_guard, _) =
+            decide_save_files(&options, |_| file_answer(), GuardOverride::SkipSaveTarget);
+        assert_eq!(
+            without_target_guard, RESPONSE_OTHER,
+            "with the save-target guard waived the folder guard must still refuse a file answer"
+        );
+        file.remove();
+
+        // More than one folder: a SaveFiles answer is exactly one.
+        let two = || {
+            PickOutcome::from(ChooserOutcome::Picked(vec![dir.clone(), dir.clone()]))
+        };
+        let (refused_two, _) = decide_save_files(&options, |_| two(), GuardOverride::None);
+        assert_eq!(refused_two, RESPONSE_OTHER, "two folders must be refused");
+        let (waived_two, _) = decide_save_files(&options, |_| two(), GuardOverride::SkipCardinality);
+        assert_eq!(
+            waived_two, RESPONSE_SUCCESS,
+            "waiving only the cardinality guard must let the first folder through"
+        );
+
+        // A target that is itself an existing directory is not writable as
+        // a file.
+        fs::create_dir_all(dir.join("out.txt")).expect("create a directory where the file would go");
+        let dir_answer = || PickOutcome::from(ChooserOutcome::Picked(vec![dir.clone()]));
+        let (refused_target, _) = decide_save_files(&options, |_| dir_answer(), GuardOverride::None);
+        assert_eq!(refused_target, RESPONSE_OTHER, "an existing folder is not a writable file target");
+        let (waived_target, _) =
+            decide_save_files(&options, |_| dir_answer(), GuardOverride::SkipSaveTarget);
+        assert_eq!(
+            waived_target, RESPONSE_SUCCESS,
+            "waiving only the save-target guard must let the same answer through"
+        );
+
+        fs::remove_dir_all(&dir).expect("remove exact folder fixture");
+    }
+
+    /// The request handed to the picker must be a folder pick, or the
+    /// picker would open in file mode and no folder could ever come back.
+    #[test]
+    fn decide_save_files_asks_the_picker_for_a_folder() {
+        let folder = ScratchFile::create();
+        let dir = folder.path().to_path_buf();
+        folder.remove();
+        fs::create_dir_all(&dir).expect("create folder fixture");
+        let mut saw_directory = false;
+        let mut saw_save = true;
+        let (response, _) = decide_save_files(
+            &files_option(&["a.txt"]),
+            |request| {
+                saw_directory = request.directory;
+                saw_save = request.save;
+                ChooserOutcome::Picked(vec![dir.clone()]).into()
+            },
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert!(saw_directory, "the picker must be asked for a folder");
+        assert!(!saw_save, "a SaveFiles request is not a single-file Save");
+        fs::remove_dir_all(&dir).expect("remove exact folder fixture");
     }
 
     #[test]
@@ -3280,6 +3794,7 @@ mod tests {
         assert!(xml.contains(INTERFACE_NAME));
         assert!(xml.contains("OpenFile"));
         assert!(xml.contains("SaveFile\""), "SaveFile must be exported");
+        assert!(xml.contains("SaveFiles\""), "SaveFiles must be exported too");
         // OpenFile's exact signature: handle(o), app_id(s), parent_window(s),
         // title(s), options(a{sv}) in; response(u), results(a{sv}) out.
         let open_file_block = xml
@@ -4378,6 +4893,7 @@ mod tests {
             filters: vec![WireFilter { name: oversized_name, rules: Vec::new() }],
             current_filter: None,
             choices: Vec::new(),
+            directory: false,
         };
         let result = write_request_file(&path, &request);
         assert!(result.is_err(), "an over-limit request must be refused, not written");

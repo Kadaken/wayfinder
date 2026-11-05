@@ -4,6 +4,31 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.1 — 5 November 2026
+
+Two things a file dialog has to do, which it could not do before.
+
+### Added
+- **Choosing a folder works.** `OpenFile` with `directory=true` is honored
+  instead of refused: the picker opens in folder mode, only folders can be
+  selected, and the answer is checked to be a real directory before the app
+  sees it. Apps that ask for a folder -- "choose download location", an
+  importer pointed at a directory -- got a flat failure before this.
+- **`SaveFiles` is exported.** An app that hands over a list of file names and
+  asks where to put them now gets a folder picker and one `file://` URI per
+  name, in request order, inside the folder chosen. The portal names the
+  targets; it never creates them. Every name is checked to be one plain name,
+  so a request can never write outside the chosen folder, duplicates are
+  refused, and the list is capped at 256 names.
+
+### Changed
+- `directory=true` on a `SaveFile` is refused outright: a Save names a file.
+- **A request from outside always opens a new window.** The browser's "open
+  downloads folder", "show in folder" and a launcher with `%U` used to be
+  routed into the window already on screen, which moved that window to
+  another folder and lost the place you were in. Each such request now gets
+  its own window; the window you are working in is never touched.
+
 ## 0.9.0 — 4 November 2026
 
 First public release.
