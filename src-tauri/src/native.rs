@@ -174,25 +174,59 @@ row:focus-visible {
     color: #ffffff;
 }
 
-.wf-icon-button {
-    background: @wf_control;
-    color: @wf_text;
-    border: 1px solid @wf_border;
-    border-radius: 6px;
+/* Toolbar buttons carry no box of their own. A row of bordered, filled
+   chiclets -- and a saturated accent fill on every toggle that happens to be
+   on -- is what made the top of the window look like a toy next to Explorer,
+   whose toolbar buttons are invisible until the pointer is over them and
+   whose active state is a quiet tint, never a block of primary colour.
+   Accent is now spent on one thing at a time, not on every control that is
+   switched on. */
+button.wf-icon-button {
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    color: @wf_text_dim;
+    border: 1px solid transparent;
+    border-radius: 5px;
     min-height: 26px;
     min-width: 28px;
     padding: 0 6px;
     margin: 0;
 }
 
-.wf-icon-button:hover {
-    background: @wf_control_hover;
+button.wf-icon-button:hover {
+    background-color: @wf_control_hover;
+    background-image: none;
+    box-shadow: none;
+    color: @wf_text;
 }
 
-.wf-icon-button:checked {
-    background: @wf_accent;
-    color: #ffffff;
-    border-color: @wf_accent;
+.wf-icon-button:active {
+    background: @wf_control;
+}
+
+/* `button.` on the front, and background-image/box-shadow named explicitly:
+   Adwaita's own `button.toggle:checked` is a more specific selector than a
+   bare class, and it paints with a background image and a shadow as well as a
+   colour. A rule that sets only `background` leaves those in place, which is
+   why the view toggles stayed solid blue. */
+button.wf-icon-button:checked {
+    background-color: alpha(@wf_accent, 0.20);
+    background-image: none;
+    box-shadow: none;
+    color: @wf_accent_hover;
+    border-color: alpha(@wf_accent, 0.38);
+}
+
+button.wf-icon-button:checked:hover {
+    background-color: alpha(@wf_accent, 0.28);
+    background-image: none;
+}
+
+.wf-icon-button:disabled {
+    background: transparent;
+    border-color: transparent;
+    color: @wf_text_muted;
 }
 
 .wf-pathbar {
