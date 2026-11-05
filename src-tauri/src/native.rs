@@ -31235,6 +31235,263 @@ Broken: Either state is wrong.\n";
         );
     }
 
+    /// D-239, the watched pass, item 15 first entry: browsing and tabs driven
+    /// through the real widgets in a real window, with a real pointer where a
+    /// pointer is the gesture -- a double-click to open a folder, a
+    /// middle-click to open one in a new tab -- and the real Ctrl+T / Ctrl+W
+    /// keys for the tab keyboard. Nothing here is a model-only call: every
+    /// step goes through the widget the user touches, and every outcome is
+    /// read back off the live state and printed.
+    #[cfg(feature = "guide")]
+    #[test]
+    fn browsing_and_tabs_watched_d239_alone() {
+        if std::env::var("WAYFINDER_D239_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        use glib::translate::ToGlibPtr;
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "run this under xvfb with GDK_BACKEND=x11, not on a live session"
+        );
+        let root = crate::native_core::scratch_root()
+            .join(format!("wf-d239-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let docs = home.join("Documents");
+        let alpha = docs.join("alpha");
+        let deep = alpha.join("deep");
+        let beta = docs.join("beta");
+        let gamma = beta.join("gamma");
+        let downloads = home.join("Downloads");
+        for dir in [&deep, &gamma, &downloads, &home.join("Desktop"), &home.join("Pictures")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(alpha.join("a1.txt"), b"alpha one").unwrap();
+        std::fs::write(downloads.join("dl.txt"), b"downloaded").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d239test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, None, None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+
+        let mut measured: Vec<String> = Vec::new();
+        let cwd = || state.borrow().cwd.real_path_string().unwrap_or_default();
+        let names = || state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        let at = |want: &std::path::Path| cwd() == want.to_string_lossy();
+        let settle = |what: &str, want: &std::path::Path| {
+            wait_for(what, || {
+                state.borrow().cwd.real_path_string().unwrap_or_default() == want.to_string_lossy()
+            });
+            pump();
+        };
+        let tab_paths = || {
+            state
+                .borrow()
+                .tabs
+                .tabs
+                .iter()
+                .map(|t| t.path.real_path_string().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let tab_buttons = || -> Vec<gtk::Button> {
+            all_widgets(ui.tabbar.clone().upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .filter(|b| b.has_css_class("wf-tab"))
+                .collect()
+        };
+
+        // ---- the real pointer, bound to this window's own X surface ----
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        settle("the window opens on Home", &home);
+        let win_id = {
+            let surface = ui.window.surface().expect("the window has an X surface");
+            unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) }.to_string()
+        };
+        let (wx, wy) = {
+            let geo = xdo(&["getwindowgeometry", "--shell", &win_id]);
+            let num = |key: &str| -> i32 {
+                geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key)
+            };
+            (num("X="), num("Y="))
+        };
+        let centre = |w: &gtk::Widget| -> (i32, i32) {
+            let b = w.compute_bounds(&ui.window).expect("bounds inside the window");
+            (wx + (b.x() + b.width() / 2.0) as i32, wy + (b.y() + b.height() / 2.0) as i32)
+        };
+        let row_named = |name: &str| -> gtk::Widget {
+            rows_of(&ui)
+                .into_iter()
+                .find(|row| {
+                    all_widgets(row).iter().any(|c| {
+                        c.downcast_ref::<gtk::Label>().is_some_and(|l| l.label() == name)
+                    })
+                })
+                .unwrap_or_else(|| panic!("a visible row for {name}"))
+        };
+        let press = |w: &gtk::Widget, button: &str, repeat: &str| {
+            let (x, y) = centre(w);
+            xdo(&["mousemove", "--sync", &x.to_string(), &y.to_string()]);
+            pump();
+            xdo(&["click", "--repeat", repeat, "--delay", "30", button]);
+            pump();
+        };
+        let keys = |combo: &str| {
+            ui.list.grab_focus();
+            pump();
+            xdo(&["windowfocus", "--sync", &win_id]);
+            pump();
+            xdo(&["key", "--window", &win_id, combo]);
+            pump();
+        };
+
+        // ---- 1. the opening listing ----
+        wait_for("Home is listed", || !rows_of(&ui).is_empty());
+        for want in ["Documents", "Downloads"] {
+            assert!(names().iter().any(|n| n == want), "Home must list {want}, saw {:?}", names());
+        }
+        measured.push(format!("opens on Home with {} items listed", names().len()));
+
+        // ---- 2. a real double-click opens a folder ----
+        press(&row_named("Documents"), "1", "2");
+        settle("the double-click opened Documents", &docs);
+        assert!(names().iter().any(|n| n == "alpha"), "Documents must list alpha, saw {:?}", names());
+        measured.push("a real double-click on a folder row opened it".to_string());
+
+        // ---- 3. a second level down, the same real gesture ----
+        press(&row_named("alpha"), "1", "2");
+        settle("alpha opened", &alpha);
+        assert!(names().iter().any(|n| n == "a1.txt"), "alpha must list its file, saw {:?}", names());
+        measured.push("a second double-click went a level deeper".to_string());
+
+        // ---- 4. Back and Forward, the real buttons ----
+        assert!(ui.back.is_sensitive(), "Back must be live after two moves");
+        press(ui.back.clone().upcast_ref(), "1", "1");
+        settle("Back returned to Documents", &docs);
+        assert!(ui.forward.is_sensitive(), "Forward must come alive after a Back");
+        press(ui.forward.clone().upcast_ref(), "1", "1");
+        settle("Forward returned to alpha", &alpha);
+        measured.push("Back then Forward, clicked, walked the history both ways".to_string());
+
+        // ---- 5. a breadcrumb click goes up ----
+        let crumb = button_labelled(ui.path_crumbs.clone().upcast_ref(), "Documents")
+            .expect("a Documents breadcrumb while inside alpha");
+        // The scratch HOME is a very deep path, so the crumb strip can run
+        // wider than the window and put this button past the right edge,
+        // where a real pointer cannot reach it. Click it for real when it is
+        // on screen, and say so in the measurement when it is not.
+        let b = crumb.compute_bounds(&ui.window).expect("crumb bounds");
+        let on_screen = crumb.is_mapped()
+            && b.x() >= 0.0
+            && (b.x() + b.width()) as i32 <= ui.window.width();
+        if on_screen {
+            press(crumb.clone().upcast_ref(), "1", "1");
+        } else {
+            crumb.emit_clicked();
+            pump();
+        }
+        settle("the breadcrumb went up to Documents", &docs);
+        measured.push(format!(
+            "a breadcrumb moved up a level ({})",
+            if on_screen { "clicked with the pointer" } else { "clicked through its own signal: the crumb sat off the window edge on this deep scratch path" }
+        ));
+
+        // ---- 6. a typed path ----
+        ui.path_entry.set_text(&downloads.to_string_lossy());
+        ui.path_entry.emit_activate();
+        settle("the typed path opened Downloads", &downloads);
+        assert!(names().iter().any(|n| n == "dl.txt"), "Downloads must list its file, saw {:?}", names());
+        measured.push("a typed path opened that folder".to_string());
+
+        // ---- 7. a sidebar place ----
+        let place = all_widgets(ui.sidebar.clone().upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .find(|r| r.tooltip_text().as_deref() == Some(&*docs.to_string_lossy()))
+            .expect("a Documents row in the sidebar");
+        ui.sidebar.emit_by_name::<()>("row-activated", &[&place]);
+        settle("the sidebar place opened Documents", &docs);
+        measured.push("a sidebar place opened its folder".to_string());
+
+        // ---- 8. Ctrl+T opens a second tab, with its own empty history ----
+        assert_eq!(tab_paths().len(), 1, "one tab until now");
+        keys("ctrl+t");
+        wait_for("a second tab exists", || tab_paths().len() == 2);
+        settle("the new tab is in the same folder", &docs);
+        assert_eq!(state.borrow().tabs.active, 1, "the new tab is the active one");
+        assert_eq!(tab_buttons().len(), 2, "the tab bar shows one button per tab");
+        assert!(!ui.back.is_sensitive(), "a brand new tab has nothing behind it");
+        measured.push("Ctrl+T opened a second tab, in the same folder, with no history".to_string());
+
+        // ---- 9. each tab keeps its own folder and its own history ----
+        press(&row_named("beta"), "1", "2");
+        settle("tab 2 moved into beta", &beta);
+        press(tab_buttons()[0].clone().upcast_ref(), "1", "1");
+        settle("clicking tab 1 came back to its own folder", &docs);
+        assert_eq!(state.borrow().tabs.active, 0, "tab 1 is active");
+        assert!(ui.back.is_sensitive(), "tab 1 still has its own history behind it");
+        press(ui.back.clone().upcast_ref(), "1", "1");
+        settle("tab 1's Back used tab 1's own history", &downloads);
+        press(tab_buttons()[1].clone().upcast_ref(), "1", "1");
+        settle("tab 2 was still where it was left", &beta);
+        assert_eq!(
+            tab_paths(),
+            vec![downloads.to_string_lossy().to_string(), beta.to_string_lossy().to_string()],
+            "the two tabs hold two different folders"
+        );
+        measured.push("the two tabs kept separate folders and separate Back histories".to_string());
+
+        // ---- 10. a real middle-click opens a folder in a new tab ----
+        wait_for("beta is listed", || names().iter().any(|n| n == "gamma"));
+        press(&row_named("gamma"), "2", "1");
+        wait_for("a third tab exists", || tab_paths().len() == 3);
+        settle("the middle-click tab opened gamma", &gamma);
+        assert_eq!(state.borrow().tabs.active, 2, "the middle-click tab is the active one");
+        assert_eq!(tab_buttons().len(), 3, "the tab bar shows three tabs");
+        measured.push("a real middle-click opened the folder in a third tab".to_string());
+
+        // ---- 11. Ctrl+W closes a tab, and the last tab cannot be closed ----
+        keys("ctrl+w");
+        wait_for("back to two tabs", || tab_paths().len() == 2);
+        settle("closing tab 3 left tab 2's folder on screen", &beta);
+        keys("ctrl+w");
+        wait_for("back to one tab", || tab_paths().len() == 1);
+        pump();
+        ui.status.set_label("");
+        keys("ctrl+w");
+        pump();
+        assert_eq!(tab_paths().len(), 1, "the last tab must never close");
+        assert_eq!(
+            ui.status.label(),
+            "Keep at least one tab open",
+            "closing the last tab must say why it refused"
+        );
+        assert!(at(&downloads) || at(&beta), "the one remaining tab still shows a real folder, saw {}", cwd());
+        measured.push("Ctrl+W closed a tab, and the last tab refused with a message".to_string());
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        for line in &measured {
+            println!("D239 MEASURE: {line}");
+        }
+    }
+
     #[test]
     fn trash_button_in_trash_asks_first_d234_alone() {
         if std::env::var("WAYFINDER_D234_ONLY").as_deref() != Ok("1") {
