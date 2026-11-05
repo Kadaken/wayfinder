@@ -4,6 +4,16 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.2 — 5 November 2026
+
+### Changed
+- **The toolbar stopped looking like a toy.** Every button sat in its own
+  filled, bordered box, and any toggle that was switched on was painted a
+  block of saturated blue. Buttons are now invisible until the pointer is over
+  them, and an active toggle is a quiet 20% accent tint with an accent glyph,
+  the way a native file manager's toolbar reads. Accent is spent on one thing
+  at a time instead of on every control that happens to be on.
+
 ## 0.9.1 — 5 November 2026
 
 Two things a file dialog has to do, which it could not do before.
