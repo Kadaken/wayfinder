@@ -3272,6 +3272,23 @@ fn main() {
     // Its own id also means a window rule written for the file manager
     // cannot drag the picker onto another screen.
     let picking = std::env::args().any(|arg| arg == "--pick");
+    // D-238: the window's identity to the desktop, which is NOT the
+    // GApplication id. GTK takes the Wayland app_id (and the X11 WM_CLASS)
+    // from the program name, which defaults to the name of whatever binary
+    // was run -- "wayfinder" from the installed copy, "wayfinder-native"
+    // from the build. The desktop entry is `com.kadaken.wayfinder.desktop`,
+    // so neither of those matched it: Plasma could not tell which program
+    // the window belonged to and put a second, iconless entry in the task
+    // bar beside the launcher. Set here, before any window exists, so the
+    // identity is the desktop entry's own name whatever the binary is
+    // called, and the picker carries its own so a window rule written for
+    // the file manager cannot reach it.
+    glib::set_prgname(Some(if picking {
+        "com.kadaken.wayfinder.picker"
+    } else {
+        "com.kadaken.wayfinder"
+    }));
+    glib::set_application_name("Wayfinder");
     let app = adw::Application::builder()
         .application_id(if picking {
             "com.kadaken.wayfinder.picker"
