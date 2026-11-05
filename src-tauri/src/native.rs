@@ -978,6 +978,12 @@ struct WireRequestNative {
     current_folder: Option<String>,
     #[serde(default)]
     current_file: Option<String>,
+    /// Mirrors the portal's `directory` field. The picker's folder mode is
+    /// driven by the `--directory` flag, not by this value; it is carried
+    /// so the mirror stays complete and a request file that has it still
+    /// parses.
+    #[serde(default)]
+    directory: bool,
 }
 
 /// Mirrors `portal_service::WireResultMeta`, written back by this process
@@ -3337,45 +3343,23 @@ fn main() {
         app.add_action(&open_window);
     });
     app.connect_activate(|app| {
-        if let Some((_, ui)) = active_window() {
-            ui.window.present();
-        } else {
-            build_ui(
-                app,
-                native_core::start_path_from_args(),
-                native_core::select_path_from_args(),
-            );
-        }
+        // Every request that arrives from outside Wayfinder gets its own
+        // window. Presenting an existing window instead used to yank the
+        // window the user was already working in to somewhere else.
+        build_ui(
+            app,
+            native_core::start_path_from_args(),
+            native_core::select_path_from_args(),
+        );
     });
     app.connect_open(|app, files, _| {
-        // Chrome's download button opens the completed file through the desktop
-        // handler.  When Wayfinder is already running, route that request into
-        // the existing window instead of creating a second, disconnected view.
-        // This both focuses the file manager and leaves the exact download
-        // selected for the user.
+        // A request from outside -- the browser's "open downloads folder",
+        // "show in folder", a desktop launcher with %U -- always gets a new
+        // window. Routing it into the window already on screen moved that
+        // window to another folder, losing the place the user was in.
         let initial_path = initial_path_from_files(files);
         let select_path = select_path_from_files(files);
-        if let Some((state, ui)) = active_window() {
-            if let Some(target) = select_path {
-                state.borrow_mut().pinned_top = Some(target.clone());
-                let parent = Path::new(&target)
-                    .parent()
-                    .map(|path| native_core::Location::real(path))
-                    .unwrap_or_else(|| state.borrow().cwd.clone());
-                navigate(&state, parent);
-                select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&target));
-            } else if let Some(path) = initial_path {
-                navigate(&state, native_core::Location::real(path));
-            }
-            ui.window.present();
-        } else {
-            build_ui(app, initial_path, select_path);
-            // A first launch that arrives as a GApplication `open` request
-            // does not also emit `activate`.  Activate after creating the
-            // window so GTK keeps the application alive just as it does for a
-            // normal launcher click, without replacing the requested folder.
-            app.activate();
-        }
+        build_ui(app, initial_path, select_path);
     });
     // GApplication turns positional file and folder arguments into `open`
     // requests.  Do not discard those arguments: desktop launchers use `%U`
@@ -14660,6 +14644,7 @@ mod tests {
                 window: None,
                 request: super::WireRequestNative {
                     multiple: false,
+                    directory: false,
                     filters: Vec::new(),
                     current_filter: None,
                     save: false,
