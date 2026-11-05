@@ -1192,17 +1192,14 @@ fn initial_choice_selections(request: &WireRequestNative) -> HashMap<String, Str
         .collect()
 }
 
-/// Test-only: a picker cannot be handed to `build_ui` any other way --
-/// the real one is parsed from the real command line, which a test cannot
-/// set. Compiled out of every shipped binary.
-#[cfg(test)]
-thread_local! {
-    static TEST_PICKER_OVERRIDE: RefCell<Option<PickerState>> = const { RefCell::new(None) };
-}
-
 fn parse_picker_state() -> Option<PickerState> {
-    #[cfg(test)]
-    if let Some(picker) = TEST_PICKER_OVERRIDE.with(|cell| cell.borrow_mut().take()) {
+    // A test cannot set this process's command line, so this is the only
+    // seam by which a test can hand `build_ui` a picker. The seam itself
+    // lives in the test-seam cluster far below the locked drag code, for
+    // the D-188 reason written there -- and this comment must not spell the
+    // test-configuration attribute out, because the gate searches this
+    // file's text for it and would stop here.
+    if let Some(picker) = take_test_picker_override() {
         return Some(picker);
     }
     let mut args = std::env::args().skip(1);
@@ -8250,12 +8247,19 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                     .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
                     .map(|b| b.borrow::<Entry>().source.clone())
                 {
-                    let mut state = state_for_unbind.borrow_mut();
-                    let ours = state.meta_labels.get(&source).is_some_and(|(size, _)| {
-                        size.upgrade().is_some_and(|l| l.upcast_ref::<gtk::Widget>() == &children[2])
-                    });
-                    if ours {
-                        state.meta_labels.remove(&source);
+                    // D-237: a GTK unbind cannot unwind, so a panic here
+                    // kills the whole process. Rows are unbound from inside
+                    // widget teardown, which can run while another handler
+                    // holds the state, so this never insists on the borrow.
+                    // What it would have dropped is a Weak that is already
+                    // dead, and every later reader ignores a dead Weak.
+                    if let Ok(mut state) = state_for_unbind.try_borrow_mut() {
+                        let ours = state.meta_labels.get(&source).is_some_and(|(size, _)| {
+                            size.upgrade().is_some_and(|l| l.upcast_ref::<gtk::Widget>() == &children[2])
+                        });
+                        if ours {
+                            state.meta_labels.remove(&source);
+                        }
                     }
                 }
                 ui_for_unbind.columns.size.remove_widget(&children[2]);
@@ -9321,7 +9325,10 @@ fn connect_picker_actions(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         let ui = ui.clone();
         // Enter in the name box saves, like every other save box.
         entry.connect_activate(move |_| {
-            if let Some(picker) = state.borrow().picker.clone() {
+            // Same D-237 rule: take the picker out of the cell first, so
+            // nothing downstream of submit runs under a live borrow.
+            let active_picker = state.borrow().picker.clone();
+            if let Some(picker) = active_picker {
                 picker_save_submit(&state, &ui, &picker);
             }
         });
@@ -9481,7 +9488,15 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
 }
 
 fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
-    if let Some(picker) = state.borrow().picker.clone() {
+    // D-237: the borrow ends on this line. Written as
+    // `if let Some(picker) = state.borrow().picker.clone()`, the temporary
+    // `Ref` lives until the end of the whole if-let body (2021 edition), so
+    // `navigate` below ran with the state still borrowed. Navigating replaces
+    // the list model, which unbinds every live row, and the unbind handler
+    // takes `borrow_mut` -- in a callback that cannot unwind, so the picker
+    // aborted instead of opening the folder.
+    let active_picker = state.borrow().picker.clone();
+    if let Some(picker) = active_picker {
         if !entry.is_dir && picker_entry_can_submit(&picker, &entry) {
             if let Some(real_path) = entry.source.real_path_string() {
                 picker_write_and_exit(&picker, vec![real_path], 0);
@@ -13943,6 +13958,10 @@ thread_local! {
     /// below the locked drag code, never above it.
     #[cfg(test)]
     static TEST_DRIVE_SCAN: RefCell<Option<DriveScan>> = const { RefCell::new(None) };
+    /// The only way a test can hand `build_ui` a picker; see
+    /// `parse_picker_state`.
+    #[cfg(test)]
+    static TEST_PICKER_OVERRIDE: RefCell<Option<PickerState>> = const { RefCell::new(None) };
     #[cfg(test)]
     static TEST_OPEN_WITH_APPS: RefCell<Option<Vec<native_core::AppEntry>>> = const { RefCell::new(None) };
     #[cfg(test)]
@@ -13979,6 +13998,18 @@ thread_local! {
     /// its own thread instead of merely waiting for the final result.
     #[cfg(test)]
     static TEST_JOB_POLL_TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// See `parse_picker_state`. In a shipped binary there is no test hook at
+/// all: this returns `None` and the optimizer removes the check.
+#[cfg(not(test))]
+fn take_test_picker_override() -> Option<PickerState> {
+    None
+}
+
+#[cfg(test)]
+fn take_test_picker_override() -> Option<PickerState> {
+    TEST_PICKER_OVERRIDE.with(|cell| cell.borrow_mut().take())
 }
 
 /// Hands `path` to the external launcher the same way for an ordinary real
@@ -31083,6 +31114,108 @@ Broken: Either state is wrong.\n";
             None => std::env::remove_var("HOME"),
         }
         println!("D235 MEASURE: name box, row copy, typing and refusals all survived with no recursion");
+    }
+
+    /// D-237: double-clicking a folder in the Save picker closed the picker
+    /// instead of opening the folder. `open_entry` read the picker out of the
+    /// state inside an `if let` scrutinee, so the borrow was still live when
+    /// `navigate` ran, and navigating takes the state mutably. In the real
+    /// picker the panic landed in a GTK unbind callback, which cannot unwind,
+    /// so the process aborted. Here it fails as a plain panic.
+    #[test]
+    fn save_picker_opens_a_folder_instead_of_closing_d237_alone() {
+        if std::env::var("WAYFINDER_D237_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        assert!(
+            display.type_().name().contains("X11") && !display.name().contains("wayland"),
+            "run this under xvfb with GDK_BACKEND=x11, not on a live session"
+        );
+        let root = crate::native_core::scratch_root()
+            .join(format!("wf-d237-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let docs = home.join("Documents");
+        let inner = docs.join("inner-folder");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("inside.png"), b"payload").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let out_file = root.join("d237.out");
+        let picker = PickerState {
+            config: PickerConfig {
+                multiple: false,
+                directory: false,
+                save: true,
+                starting_dir: Some(docs.to_string_lossy().into_owned()),
+                filter: None,
+                window: None,
+                request: WireRequestNative {
+                    save: true,
+                    current_name: "suggested-name.png".to_string(),
+                    current_folder: Some(docs.to_string_lossy().into_owned()),
+                    ..WireRequestNative::default()
+                },
+                parent_window: None,
+            },
+            out_file: out_file.to_string_lossy().into_owned(),
+            meta_path: None,
+            active_filter: Rc::new(RefCell::new(None)),
+            choice_selections: Rc::new(RefCell::new(HashMap::new())),
+        };
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d237test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        TEST_PICKER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(picker));
+        build_ui(&app, None, None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || {
+            state.borrow().cwd.real_path_string().unwrap_or_default() == docs.to_string_lossy()
+                && !rows_of(&ui).is_empty()
+        });
+        pump();
+
+        let folder = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .find(|e| e.name == "inner-folder")
+            .cloned()
+            .expect("the fixture folder is listed");
+        assert!(folder.is_dir, "the fixture must be listed as a folder");
+
+        // This is the double-click path, and with the bug it panics here.
+        open_entry(&state, &ui, folder);
+        wait_for("the folder opened", || {
+            state.borrow().cwd.real_path_string().unwrap_or_default() == inner.to_string_lossy()
+        });
+        pump();
+        assert!(
+            state.borrow().visible_entries.iter().any(|e| e.name == "inside.png"),
+            "opening the folder must show what is inside it"
+        );
+        assert!(
+            !out_file.exists(),
+            "opening a folder must not answer the request: the app gets a path only from Save"
+        );
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        println!(
+            "D237 MEASURE: folder opened, listing moved to {}, nothing written to the out file",
+            inner.display()
+        );
     }
 
     #[test]
