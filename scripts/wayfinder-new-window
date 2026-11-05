@@ -16,5 +16,10 @@ if gdbus call --session --dest com.kadaken.wayfinder \
   exit 0
 fi
 
-# Not running: a plain launch gives the first window.
+# Not running: a plain launch gives the first window. Prefer the binary that
+# was installed beside this script, so an install outside PATH still works.
+self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+if [ -x "$self_dir/wayfinder" ]; then
+  exec "$self_dir/wayfinder" "$dir"
+fi
 exec wayfinder "$dir"

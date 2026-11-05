@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 LegendofZito (Kadaken)
+
 //! `org.freedesktop.impl.portal.FileChooser` backend contract for
 //! Wayfinder. Exports `OpenFile` and `SaveFile`; `SaveFiles` (a whole
 //! directory of files in one request) is not exported yet.

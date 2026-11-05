@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 LegendofZito (Kadaken)
+
 //! Guide sitting: Wayfinder's adapter for the shared app-owned attached-card
 //! protocol (D-154). Guide builds only.
 //!

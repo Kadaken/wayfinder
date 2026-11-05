@@ -1,11 +1,11 @@
 [Desktop Entry]
 Name=Wayfinder
 Comment=A fast, native file manager for Linux with a docked preview pane
-Exec=/home/zito/.local/bin/wayfinder %U
+Exec=@BINDIR@/wayfinder %U
 Icon=com.kadaken.wayfinder
 Terminal=false
 Type=Application
-Categories=FileManager;System;
+Categories=FileManager;System;Utility;
 Keywords=files;file manager;preview;browser;
 StartupWMClass=com.kadaken.wayfinder
 Actions=new-window;
@@ -13,4 +13,4 @@ MimeType=inode/directory;application/x-gnome-saved-search;
 
 [Desktop Action new-window]
 Name=New Window
-Exec=/home/zito/bin/wayfinder-new-window
+Exec=@BINDIR@/wayfinder-new-window

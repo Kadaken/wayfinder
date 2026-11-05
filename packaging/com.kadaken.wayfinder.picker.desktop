@@ -4,7 +4,7 @@
 # its icon instead of a nameless placeholder. NoDisplay keeps it out of menus.
 Name=Wayfinder
 Comment=File chooser
-Exec=/home/zito/.local/bin/wayfinder-native --pick
+Exec=@BINDIR@/wayfinder-native --pick
 Icon=com.kadaken.wayfinder
 Terminal=false
 Type=Application

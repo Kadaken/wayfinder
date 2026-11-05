@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 LegendofZito (Kadaken)
+
 use adw::gtk::gio;
 use adw::gtk::gio::prelude::FileExt;
 use adw::gtk::glib;
@@ -868,7 +871,13 @@ pub fn index_zip<R: Read + std::io::Seek>(
         let entry = archive
             .by_index_raw(i)
             .map_err(|e| ZipIndexError::Corrupt(e.to_string()))?;
-        let raw_name = entry.name().to_string();
+        // zip 9 can fail to decode a member name (bad UTF-8 flags, a broken
+        // extra field). A name we cannot read is a name we cannot validate, so
+        // the archive is refused rather than guessed at.
+        let raw_name = entry
+            .name()
+            .map_err(|e| ZipIndexError::Corrupt(e.to_string()))?
+            .to_string();
         if raw_name.len() > limits.max_name_len {
             return Err(ZipIndexError::NameTooLong(raw_name));
         }
@@ -7690,7 +7699,7 @@ mod zip_index_tests_d188 {
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let buf = Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(buf);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (name, content) in entries {
             if name.ends_with('/') {
@@ -7851,7 +7860,7 @@ mod zip_index_tests_d188 {
     fn rejects_symlink_entries_through_the_real_archive_path_d188() {
         let buf = Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(buf);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         writer.add_symlink("link", "/etc/passwd", options).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
@@ -7880,7 +7889,7 @@ mod zip_extraction_tests_d188 {
     fn write_zip_file(entries: &[(&str, &[u8])], at: &Path) {
         let file = std::fs::File::create(at).unwrap();
         let mut writer = zip::ZipWriter::new(file);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (name, content) in entries {
             writer.start_file(*name, options).unwrap();

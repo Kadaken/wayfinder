@@ -1,0 +1,7 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.wayfinder
+Interfaces=org.freedesktop.impl.portal.FileChooser;
+# No UseIn= line on purpose. UseIn restricts a backend to named desktops and is
+# deprecated since xdg-desktop-portal 1.17; which backend wins is decided by
+# ~/.config/xdg-desktop-portal/portals.conf, which install.sh writes. Leaving
+# it out is what makes Wayfinder available on every desktop and not only KDE.

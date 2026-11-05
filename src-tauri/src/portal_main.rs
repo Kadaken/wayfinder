@@ -1,15 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 LegendofZito (Kadaken)
+
 //! Stage-one entry point for the `org.freedesktop.impl.portal.desktop.wayfinder`
 //! backend. Owns the bus name and exports only
 //! `org.freedesktop.impl.portal.FileChooser.OpenFile`. Must never import
 //! or call into `native.rs`, and must never initialize GTK, GStreamer or
 //! a display -- see `portal_service.rs` for all service logic.
 
+mod crash;
 mod portal_service;
 
 use portal_service::{PortalService, ProcessChooser, BUS_NAME, OBJECT_PATH};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    crash::install("wayfinder-portal");
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("wayfinder-portal {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let chooser = Arc::new(ProcessChooser::production());
     let service = PortalService::new(chooser);
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 LegendofZito (Kadaken)
+
+mod crash;
 mod native_core;
 mod native_smb;
 #[cfg(feature = "guide")]
@@ -3251,6 +3255,15 @@ fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
 }
 
 fn main() {
+    // First, before anything can fail: a crash that says nothing is a bug
+    // report nobody can file.
+    crash::install("wayfinder");
+    // A bug report is worth little without the version it came from, so both
+    // binaries answer --version with one line and nothing else.
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("wayfinder {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     #[cfg(feature = "guide")]
     let _ = guide_markers_inert();
     if std::env::args().any(|arg| arg == "--pick-capable") {
@@ -16677,7 +16690,7 @@ Broken: Either state is wrong.\n";
         {
             let file = std::fs::File::create(&archive_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> =
+            let options: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.add_directory("docs/", options).unwrap();
             writer.start_file("docs/readme.txt", options).unwrap();
@@ -17193,7 +17206,7 @@ Broken: Either state is wrong.\n";
         let write_swap_archive = |first: &str, second: &str| {
             let file = std::fs::File::create(&swap_archive).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> =
+            let options: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             for name in [first, second] {
                 writer.start_file(name, options).unwrap();
@@ -17439,7 +17452,7 @@ Broken: Either state is wrong.\n";
         // for this test's full limits-reading lifetime (D-188 DEFECT 2).
         let _zip_limits_guard = native_core::TestZipLimitsGuard::new(None);
 
-        let stored_options: zip::write::FileOptions<'_, ()> =
+        let stored_options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
         // ---- Not a zip at all: garbage bytes.
@@ -17948,7 +17961,7 @@ Broken: Either state is wrong.\n";
         std::fs::create_dir_all(&xdg_dir).unwrap();
         let _xdg_guard = XdgRuntimeDirGuard::set(&xdg_dir);
 
-        let stored_options: zip::write::FileOptions<'_, ()> =
+        let stored_options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
         // Same scan-and-match technique as `patch_cd_u16`/`patch_unix_mode`
@@ -18378,7 +18391,7 @@ Broken: Either state is wrong.\n";
         {
             let file = std::fs::File::create(&archive_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> =
+            let options: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("big.bin", options).unwrap();
             std::io::Write::write_all(&mut writer, &vec![0x5Au8; KILL_MEMBER_LEN]).unwrap();
@@ -18523,7 +18536,7 @@ Broken: Either state is wrong.\n";
         {
             let file = std::fs::File::create(&archive_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> =
+            let options: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.add_directory("a/", options).unwrap();
             writer.start_file("a/one.txt", options).unwrap();
@@ -18665,7 +18678,7 @@ Broken: Either state is wrong.\n";
         {
             let file = std::fs::File::create(&archive_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> =
+            let options: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.add_directory("slow/", options).unwrap();
             for i in 0..20 {
@@ -20498,7 +20511,7 @@ Broken: Either state is wrong.\n";
         {
             let file = std::fs::File::create(&archive_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> =
+            let options: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("member.txt", options).unwrap();
             std::io::Write::write_all(&mut writer, b"inside the zip").unwrap();

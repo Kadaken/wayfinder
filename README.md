@@ -1,6 +1,9 @@
 # Wayfinder
 
-> Current native app (2026-08-13): Wayfinder is a Rust + GTK 4/libadwaita desktop application, and nothing else. The Tauri/Svelte/WebKit shell was **removed** on 2026-08-13 — there is no JavaScript toolchain, no `package.json`, and no library target. All work belongs in `src-tauri/src/native.rs` and `native_core.rs`. What the old shell did is recorded in `OLD-VERSION-CARRYOVER.md`.
+> Wayfinder is a Rust + GTK 4/libadwaita desktop application, and nothing
+> else. The Tauri/Svelte/WebKit shell was removed on 13 August 2026: there is
+> no JavaScript toolchain, no `package.json` and no library target. All work
+> belongs in `src-tauri/src/native.rs` and `native_core.rs`.
 
 **A fast, native file manager for Linux** — built for GTK 4/libadwaita, Wayland, and X11 without Electron or a webview in the primary app.
 
@@ -16,20 +19,48 @@ Wayfinder is a dark, keyboard-driven file manager with a docked preview pane, Wi
 
 ## Install
 
-Grab a packaged build from the [**Releases**](https://github.com/LegendofZito/wayfinder/releases) page when one is available, then make it executable:
+Wayfinder is two programs from one source tree: the file manager, and the file
+dialog that other programs open when they ask you to pick a file. The installer
+sets up both.
 
 ```bash
-chmod +x wayfinder-linux-x86_64
-./wayfinder-linux-x86_64
+git clone https://github.com/LegendofZito/wayfinder.git
+cd wayfinder
+./packaging/install.sh
 ```
 
-Or install the RPM on Fedora/RHEL:
+That builds the release binaries if they are not already built, installs them
+under `~/.local`, registers the desktop entries, the two D-Bus services and the
+portal backend, writes the icons, and points
+`~/.config/xdg-desktop-portal/portals.conf` at Wayfinder for file dialogs.
+Nothing outside your home directory is touched.
 
-```bash
-sudo rpm -i Wayfinder-0.1.0-1.x86_64.rpm
-```
+Other ways to install:
 
-For a local native build, see [Build from Source](#build-from-source).
+| Command | What it does |
+|---------|--------------|
+| `./packaging/install.sh --system` | For every user, under `/usr/local`. Needs root. |
+| `./packaging/install.sh --prefix /opt/wayfinder` | Somewhere else. |
+| `./packaging/install.sh --destdir /tmp/stage` | Stage the tree without touching the live system, for distribution packagers. |
+| `./packaging/install.sh --no-portal` | File manager only, leave the system file dialog alone. |
+| `./packaging/install.sh --dry-run` | Print every step, change nothing. |
+| `./packaging/install.sh --uninstall` | Remove everything it installed. Your settings in `~/.config/wayfinder` are kept. |
+
+If `~/.local/bin` is not in your `PATH`, the installer says so.
+
+**The file dialog.** Programs that ask the desktop for a file get Wayfinder.
+GTK programs reach it once `GTK_USE_PORTAL=1` is set, which most distributions
+already do. KDE and other Qt programs draw their own dialog in the program
+itself and never ask the desktop, so they keep showing the KDE dialog unless
+you set `QT_QPA_PLATFORMTHEME=xdgdesktopportal`, which also makes those
+programs take their theme from the portal instead of from Plasma.
+
+Requires `xdg-desktop-portal` 1.17 or newer, which is where
+`portals.conf` replaced the old per-desktop `UseIn=` restriction.
+
+**Flatpak.** `flatpak/com.kadaken.wayfinder.yml` builds the file manager only:
+a sandboxed program cannot be the system file dialog. The manifest has not been
+through a real `flatpak-builder` run yet.
 
 ---
 
@@ -338,20 +369,9 @@ cargo build --release --manifest-path src-tauri/Cargo.toml
 scripts/install-daily.sh <change-label> src-tauri/target/release/wayfinder-native
 ```
 
-**Hard rule: no daily replacement without an explicitly authorized identity
-and a verified rollback copy first.** The candidate's SHA-256 must equal the
-single identity in `scripts/daily-approved.sha256`; changing that tracked pin
-requires matching `scripts/daily-approved.authorization` text from the
-Coordinator naming the accepted commit and SHA-256. Only the Coordinator moves
-those two records, in writing, after acceptance runs; a guide, card or sitting
-round never changes them or installs the daily. The production approval cannot
-be overridden by a flag or environment variable, and every identity refusal
-names the candidate and pin and confirms that no file or rollback was written.
-`scripts/install-daily.sh` saves the current `~/.local/bin/wayfinder` as
-`wayfinder.pre-<change-label>-<old-short-sha>`, verifies it, and only then
-swaps in the new binary atomically. Never copy over the daily by hand. Its
-fixture tests are `scripts/test-install-daily.sh`. Guide builds are installed
-under their own round-specific names and never through this installer.
+`scripts/install-daily.sh` is a maintainer tool for replacing the author's own
+daily binary; it refuses anything whose SHA-256 is not the approved pin and
+keeps a verified rollback copy. Contributors do not need it.
 
 The `--features native` flag is gone: GTK is no longer optional, because there
 is no other shell to build. The old `npm run native:build` script is gone too —
@@ -362,6 +382,16 @@ use the `cargo` commands above.
 
 ## License
 
-© 2026 LegendofZito — All Rights Reserved.
+Wayfinder is free software: **GPL-3.0-or-later**. You may use, study, change
+and share it, and anything you distribute that is built from this source must
+come with the same freedoms and its source. The full text is in
+[LICENSE](LICENSE).
 
-Personal use is permitted. Modification, redistribution, and commercial use are prohibited without written permission. See [LICENSE](LICENSE) for full terms.
+Copyright (C) 2026 LegendofZito (Kadaken).
+
+The licences of every dependency and of the GTK, libadwaita and GStreamer
+system libraries are listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Both files must travel with
+any binary you hand to someone else.
+
+Release history is in [CHANGELOG.md](CHANGELOG.md).

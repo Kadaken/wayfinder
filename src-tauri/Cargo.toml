@@ -1,15 +1,15 @@
 [package]
 name = "wayfinder"
-version = "0.1.0"
+version = "0.9.0"
 description = "A fast, native file manager for Linux with a docked preview pane"
 authors = ["LegendofZito"]
-license = "LicenseRef-Proprietary"
+license = "GPL-3.0-or-later"
 edition = "2021"
 exclude = ["src/guide-names.json"]
 
 # The Tauri/WebKit shell was removed on 2026-08-13. This crate is now a single
 # GTK4/libadwaita binary; there is no library target, no build script and no
-# JavaScript toolchain. See OLD-VERSION-CARRYOVER.md for what the old shell did.
+# JavaScript toolchain.
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +24,7 @@ libc = "0.2"
 gstreamer = "0.25"
 gstreamer-app = "0.25"
 sha2 = "0.10"
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 zbus = "5.19.0"
 gdk4-wayland = "0.11"
 

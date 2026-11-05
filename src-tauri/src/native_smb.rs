@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 LegendofZito (Kadaken)
+
 //! D-156 (connect): SMB address parsing, remembered locations and the async
 //! connect flow. Everything here is GTK-free: the network is reached only
 //! through the `SmbBackend` trait, so tests drive the whole flow with a fake.
