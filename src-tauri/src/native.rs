@@ -3264,16 +3264,39 @@ fn main() {
     // preview). No-op cost if a folder is never opened.
     gst::init().expect("gstreamer init");
 
+    // A picker must be its own process with its own window. Registering the
+    // app id the ordinary file manager already holds made this a REMOTE
+    // instance: GApplication forwarded `activate` to the running Wayfinder,
+    // which simply raised its existing window -- wherever that window was --
+    // and the picker process exited without ever answering the request. He
+    // hit exactly that: "upload files button still doesnt open wayfinder, if
+    // it does it's not doing it where it should".
+    //
+    // Its own id also means a window rule written for the file manager
+    // cannot drag the picker onto another screen.
+    let picking = std::env::args().any(|arg| arg == "--pick");
     let app = adw::Application::builder()
-        .application_id("com.kadaken.wayfinder")
-        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .application_id(if picking {
+            "com.kadaken.wayfinder.picker"
+        } else {
+            "com.kadaken.wayfinder"
+        })
+        .flags(if picking {
+            gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::NON_UNIQUE
+        } else {
+            gio::ApplicationFlags::HANDLES_OPEN
+        })
         .build();
 
-    app.connect_startup(|app| {
+    app.connect_startup(move |app| {
         app.style_manager()
             .set_color_scheme(adw::ColorScheme::PreferDark);
         install_app_css();
-        export_file_manager1(app);
+        // The file-manager interface belongs to the one real Wayfinder, not
+        // to a throwaway picker process.
+        if !picking {
+            export_file_manager1(app);
+        }
         // `app.open-window <folder>`: the same independent window Ctrl+N makes,
         // reachable from outside (gdbus / desktop actions) without a keystroke.
         let open_window = gio::SimpleAction::new("open-window", Some(glib::VariantTy::STRING));
@@ -4372,6 +4395,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         .and_then(|picker| picker.config.parent_window.clone())
     {
         attach_to_exported_parent(&ui.window, &handle);
+        // Modal as well as parented: a compositor places a modal child over
+        // the window that owns it, which is the screen the caller is on.
+        ui.window.set_modal(true);
     }
 
     ui.window.present();

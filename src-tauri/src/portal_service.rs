@@ -3317,6 +3317,86 @@ mod tests {
         finish_private_bus(bus, server, client);
     }
 
+    /// D-236, and he hit it: "upload files button still doesnt open
+    /// wayfinder, if it does it's not doing it where it should". The picker
+    /// registered the SAME GApplication id as the ordinary file manager, so
+    /// whenever Wayfinder was already running the picker process became a
+    /// REMOTE instance: GApplication forwarded `activate` to the running
+    /// window, raised it wherever it happened to be, and the picker exited
+    /// without ever answering the request.
+    ///
+    /// This reproduces that condition exactly -- a real primary Wayfinder
+    /// already running on the same bus and display -- and requires the
+    /// request to still be answered by the picker's own window.
+    #[test]
+    fn a_running_wayfinder_does_not_swallow_the_picker_d236() {
+        let _guard = env_lock();
+        let (driver, _driver_target) = build_picker_test_driver("picker-test-driver-pick");
+        let xvfb = PrivateXvfb::start();
+        let old_display = std::env::var("DISPLAY").ok();
+        let old_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        std::env::set_var("DISPLAY", &xvfb.display);
+        std::env::remove_var("WAYLAND_DISPLAY");
+
+        let bus = PrivateBus::start();
+        let base = scratch_base("d236-base");
+        let fixture_dir_root = OwnedScratchDir::create(scratch_base("d236-fixture-home"));
+        let fixture_file = fixture_dir_root.path().join("d236-fixture.txt");
+        fs::write(&fixture_file, b"d236 fixture\n").expect("write fixture file");
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fixture_dir_root.path());
+
+        // The ordinary file manager, already running, on this bus and this
+        // display. This is the whole point of the test.
+        let mut primary = Command::new(&driver)
+            .env("DISPLAY", &xvfb.display)
+            .env("HOME", fixture_dir_root.path())
+            .spawn()
+            .expect("spawn an ordinary Wayfinder");
+        // Long enough for it to own its application id on this bus.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            primary.try_wait().expect("poll the primary").is_none(),
+            "the primary Wayfinder must still be running for this test to mean anything"
+        );
+
+        let chooser: Arc<dyn Chooser> =
+            Arc::new(ProcessChooser::for_test(driver.clone(), Duration::from_secs(30), base.clone()));
+        let server = bus.connect_server(chooser);
+        let client = bus.connect_client();
+
+        let call = call_open_file(&client, HashMap::new());
+
+        let _ = primary.kill();
+        let _ = primary.wait();
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let (response, results) = call.expect("OpenFile call");
+        let expected_uri = gio::File::for_path(&fixture_file).uri().to_string();
+        assert_eq!(
+            response, RESPONSE_SUCCESS,
+            "a request made while Wayfinder is running must still be answered by the picker"
+        );
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+
+        finish_private_bus(bus, server, client);
+        match old_display {
+            Some(v) => std::env::set_var("DISPLAY", v),
+            None => std::env::remove_var("DISPLAY"),
+        }
+        match old_wayland {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+        xvfb.finish();
+        fixture_dir_root.finish();
+    }
+
+
     #[test]
     fn dbus_no_desktop_oracle_runs_without_display_wayland_or_gdk_backend() {
         let _guard = env_lock();
