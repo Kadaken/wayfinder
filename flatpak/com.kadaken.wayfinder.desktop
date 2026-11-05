@@ -8,7 +8,7 @@ Type=Application
 Categories=System;FileManager;
 Actions=new-window;
 Keywords=files;file manager;preview;browser;
-StartupWMClass=wayfinder
+StartupWMClass=com.kadaken.wayfinder
 MimeType=inode/directory;
 
 [Desktop Action new-window]
