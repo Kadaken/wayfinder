@@ -4,7 +4,7 @@
   <name>Wayfinder</name>
   <summary>Fast, native Linux file manager with a docked preview pane</summary>
   <metadata_license>MIT</metadata_license>
-  <project_license>LicenseRef-Proprietary</project_license>
+  <project_license>GPL-3.0-or-later</project_license>
 
   <description>
     <p>
@@ -46,6 +46,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.0" date="2026-11-04">
+      <description>
+        <p>First public release. The source is now GPL-3.0-or-later. Wayfinder can
+        act as the system file dialog through a desktop portal backend, installs
+        on any desktop with packaging/install.sh, and writes a crash report
+        instead of vanishing. Also: the file dialog, tabbed browsing, a docked
+        preview pane, drives and network shares, trash with undo, and archive
+        browsing.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-06-21">
       <description>
         <p>Initial release. Core file management, preview pane, tabbed browsing, audio playback, and rubber-band multi-select.</p>

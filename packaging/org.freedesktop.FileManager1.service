@@ -1,0 +1,7 @@
+[D-BUS Service]
+# Lets "Show in folder" work even when Wayfinder is not already running:
+# D-Bus starts it, waits for it to claim the name, then delivers the ShowItems
+# call, which Wayfinder turns into "open the parent folder and select this file".
+# The path must be absolute: D-Bus activation does not search PATH.
+Name=org.freedesktop.FileManager1
+Exec=@BINDIR@/wayfinder

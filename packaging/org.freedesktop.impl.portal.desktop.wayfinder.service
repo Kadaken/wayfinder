@@ -1,0 +1,6 @@
+[D-BUS Service]
+# D-Bus starts the portal backend on demand, the first time a program asks the
+# desktop for a file dialog. The path must be absolute: D-Bus activation does
+# not search PATH. install.sh substitutes the real one.
+Name=org.freedesktop.impl.portal.desktop.wayfinder
+Exec=@BINDIR@/wayfinder-portal
