@@ -4,6 +4,16 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.3 — 5 November 2026
+
+### Fixed
+- **Selecting a large text file froze the window.** The preview read 256 KB
+  and put all of it in one label; the toolkit lays out and measures every
+  character of that before the window can draw again, so a multi-megabyte
+  .txt locked the app up for seconds. The read is unchanged -- it is what
+  tells text from binary -- but what is shown is now capped at 300 lines and
+  16 KB, with the truncation said on screen.
+
 ## 0.9.2 — 5 November 2026
 
 ### Changed

@@ -2539,11 +2539,46 @@ pub fn read_text_preview(path: &str) -> Result<String, String> {
     if buf.contains(&0) {
         return Err("binary".into());
     }
-    let mut text = String::from_utf8_lossy(&buf).into_owned();
-    if md.len() as usize > n {
-        text.push_str("\n\n... (preview truncated, showing the first 256 KB)");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    // D-240: what is read and what is shown are different sizes. The preview
+    // is one GtkLabel, and Pango lays out and measures every character in it
+    // before the window can draw again, so handing it a quarter of a megabyte
+    // froze the whole app for many seconds when a large plain-text file was
+    // selected -- the Blender manual exported as .txt is what found this.
+    // Reading 256 KB is still right (it is what the binary check needs), but
+    // only the first part of it is displayed. A preview is there to say what
+    // the file is, not to read it in.
+    let shown = preview_cut(&text);
+    let truncated = shown.len() < text.len() || md.len() as usize > n;
+    let mut out = shown.to_string();
+    if truncated {
+        out.push_str("\n\n... (preview truncated)");
     }
-    Ok(text)
+    Ok(out)
+}
+
+/// The longest slice of `text` a preview label is allowed to hold: at most
+/// `PREVIEW_SHOW_LINES` lines and `PREVIEW_SHOW_BYTES` bytes, always ending on
+/// a character boundary so the string stays valid UTF-8.
+fn preview_cut(text: &str) -> &str {
+    const PREVIEW_SHOW_BYTES: usize = 16 * 1024;
+    const PREVIEW_SHOW_LINES: usize = 300;
+
+    let mut end = text.len().min(PREVIEW_SHOW_BYTES);
+    while end < text.len() && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut lines = 0;
+    for (index, byte) in text.as_bytes().iter().enumerate().take(end) {
+        if *byte == b'\n' {
+            lines += 1;
+            if lines == PREVIEW_SHOW_LINES {
+                end = index;
+                break;
+            }
+        }
+    }
+    &text[..end]
 }
 
 /// Explorer numbering: "New Folder", then "New Folder (2)", "New Folder (3)"...
@@ -7925,6 +7960,38 @@ mod zip_extraction_tests_d188 {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// D-240: a big plain-text file froze the window because the whole read
+    /// went into one label for Pango to lay out. What is shown is capped, in
+    /// lines and in bytes, whatever the file's size.
+    #[test]
+    fn text_preview_is_capped_in_bytes_and_lines() {
+        let dir = scratch("preview-cap");
+
+        // One enormous line: the byte cap is the only thing that can stop it.
+        let wide = dir.join("wide.txt");
+        std::fs::write(&wide, "x".repeat(400 * 1024)).unwrap();
+        let shown = read_text_preview(&wide.to_string_lossy()).unwrap();
+        assert!(shown.len() < 20 * 1024, "one long line not capped: {} bytes", shown.len());
+        assert!(shown.ends_with("... (preview truncated)"), "no truncation note");
+
+        // Many short lines: the line cap bites first.
+        let tall = dir.join("tall.txt");
+        std::fs::write(&tall, "line\n".repeat(5_000)).unwrap();
+        let shown = read_text_preview(&tall.to_string_lossy()).unwrap();
+        assert!(
+            shown.lines().count() <= 302,
+            "line cap not applied: {} lines",
+            shown.lines().count()
+        );
+
+        // A small file is shown whole, with no note invented for it.
+        let small = dir.join("small.txt");
+        std::fs::write(&small, "two\nlines\n").unwrap();
+        assert_eq!(read_text_preview(&small.to_string_lossy()).unwrap(), "two\nlines\n");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
