@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const IMG_EXT: [&str; 12] = [
+const IMG_EXT: [&str; 15] = [
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
+    // D-251: these three were missing, so they were not even treated as images.
+    "heif", "avifs", "jxl",
 ];
 const AUDIO_EXT: [&str; 13] = [
     "mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma", "aiff", "aif", "alac", "oga", "spx",
@@ -1577,11 +1579,45 @@ pub fn standard_dirs() -> Vec<(String, String)> {
     out
 }
 
+/// D-265: the path a launch points at, wherever it sits on the command line.
+/// `--select <path>` and `--select=<path>` name it outright, which is the line
+/// an agent or a script uses to open a folder with one file already on the
+/// blue bar. Otherwise the first argument that is not a flag is taken, so the
+/// path no longer has to come first: `wayfinder --new-window FILE` works as
+/// well as `wayfinder FILE`. Anything after a bare `--` is a path, never a flag.
+pub fn launch_path_in_args(args: &[String]) -> Option<String> {
+    let mut rest = args.iter();
+    let mut positional: Option<String> = None;
+    while let Some(arg) = rest.next() {
+        if let Some(value) = arg.strip_prefix("--select=") {
+            if !value.is_empty() {
+                return Some(arg_to_path(value));
+            }
+        } else if arg == "--select" {
+            if let Some(value) = rest.next() {
+                if !value.is_empty() {
+                    return Some(arg_to_path(value));
+                }
+            }
+        } else if arg == "--" {
+            if positional.is_none() {
+                positional = rest.next().map(|value| arg_to_path(value));
+            }
+            break;
+        } else if !arg.starts_with('-') && positional.is_none() {
+            positional = Some(arg_to_path(arg));
+        }
+    }
+    positional
+}
+
+fn launch_path_from_env() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    launch_path_in_args(&args)
+}
+
 pub fn start_path_from_args() -> Option<String> {
-    let arg = std::env::args()
-        .nth(1)
-        .filter(|arg| !arg.starts_with('-'))?;
-    let arg = arg_to_path(&arg);
+    let arg = launch_path_from_env()?;
     let path = Path::new(&arg);
     if path.is_dir() {
         Some(arg)
@@ -1593,13 +1629,10 @@ pub fn start_path_from_args() -> Option<String> {
 }
 
 /// The file to highlight when launched pointing at a FILE (e.g. a browser's
-/// "show in folder" after a download). `start_path_from_args` only yields the
-/// containing folder, so the filename would otherwise be lost.
+/// "show in folder" after a download, or `--select`). `start_path_from_args`
+/// only yields the containing folder, so the filename would otherwise be lost.
 pub fn select_path_from_args() -> Option<String> {
-    let arg = std::env::args()
-        .nth(1)
-        .filter(|arg| !arg.starts_with('-'))?;
-    let arg = arg_to_path(&arg);
+    let arg = launch_path_from_env()?;
     Path::new(&arg).is_file().then_some(arg)
 }
 
@@ -1777,23 +1810,134 @@ pub fn list_zip_dir_cancellable(
     Ok(DirectoryListing { entries, metadata_unavailable: 0, unreadable_entries: 0 })
 }
 
+/// What a search walked away with, and why it stopped early if it did.
+pub struct SearchReport {
+    pub entries: Vec<Entry>,
+    /// Plain words for the status bar when the search did not finish, or None.
+    pub stopped: Option<String>,
+}
+
+/// How long a search may run before it gives back what it has. Searching from
+/// `/` with no limit looked exactly like a broken button: the status bar said
+/// "Searching / ..." and nothing ever replaced it (9 November 2026).
+const SEARCH_SECONDS: u64 = 25;
+
+/// Filesystems a search must never walk into.
+///
+/// `/proc` and `/sys` are the kernel answering questions, not files, and they
+/// are effectively bottomless. A FUSE or network mount answers every single
+/// `read_dir` over a pipe or a wire -- the 4 TB Google Drive mount alone is
+/// more than a search from `/` will ever finish. None of this is skipped when
+/// it is the folder you are standing in: go into the drive and search there
+/// and it is searched.
+fn is_unsearchable_fstype(fstype: &str) -> bool {
+    // `fuse.<helper>` is a program answering for a filesystem -- rclone for
+    // Google Drive, gvfsd, the portal, kio-fuse, gocryptfs. `fuseblk` is NOT
+    // one of these: it is how the kernel mounts an ordinary NTFS disk, and
+    // Gaming and Storage are both mounted that way. Skipping anything simply
+    // starting with "fuse" would have dropped two real hard drives out of
+    // every search (caught 9 November 2026, before it shipped).
+    is_remote_fstype(fstype)
+        || fstype == GVFS_FSTYPE
+        || fstype.starts_with("fuse.")
+        || matches!(
+            fstype,
+            "proc"
+                | "sysfs"
+                | "devtmpfs"
+                | "devpts"
+                | "cgroup"
+                | "cgroup2"
+                | "securityfs"
+                | "debugfs"
+                | "tracefs"
+                | "pstore"
+                | "bpf"
+                | "configfs"
+                | "mqueue"
+                | "hugetlbfs"
+                | "autofs"
+                | "binfmt_misc"
+                | "efivarfs"
+                | "fusectl"
+                | "nsfs"
+                | "ramfs"
+                | "selinuxfs"
+        )
+}
+
+/// Mount points of everything `is_unsearchable_fstype` names, read from the
+/// kernel's own list so nothing is guessed from a path.
+pub fn unsearchable_mounts_from(mounts: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in mounts.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let mountpoint = decode_mount_field(fields[1]);
+        if !mountpoint.starts_with('/') {
+            continue;
+        }
+        if is_unsearchable_fstype(fields[2]) {
+            out.push(mountpoint);
+        }
+    }
+    out
+}
+
+fn unsearchable_mounts() -> Vec<PathBuf> {
+    fs::read_to_string("/proc/self/mounts")
+        .map(|text| {
+            unsearchable_mounts_from(&text)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn search_dir(
     root: &str,
     query: &str,
     content: bool,
     show_hidden: bool,
 ) -> Result<Vec<Entry>, String> {
+    search_dir_report(root, query, content, show_hidden).map(|report| report.entries)
+}
+
+pub fn search_dir_report(
+    root: &str,
+    query: &str,
+    content: bool,
+    show_hidden: bool,
+) -> Result<SearchReport, String> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return Ok(vec![]);
+        return Ok(SearchReport { entries: vec![], stopped: None });
     }
 
     const MAX_RESULTS: usize = 2000;
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(SEARCH_SECONDS);
+    let root_path = PathBuf::from(root);
+    // Only mounts the search would descend INTO are skipped. One you are
+    // already standing in is the thing you asked to search.
+    let skip: Vec<PathBuf> = unsearchable_mounts()
+        .into_iter()
+        .filter(|m| *m != root_path && !root_path.starts_with(m))
+        .collect();
+    let mut stopped = None;
     let mut out = Vec::new();
-    let mut stack = vec![PathBuf::from(root)];
+    let mut stack = vec![root_path];
 
     while let Some(dir) = stack.pop() {
         if out.len() >= MAX_RESULTS {
+            stopped = Some(format!("stopped at the first {MAX_RESULTS} matches"));
+            break;
+        }
+        if started.elapsed() >= deadline {
+            stopped = Some(format!("stopped after {SEARCH_SECONDS} seconds"));
             break;
         }
         let rd = match fs::read_dir(&dir) {
@@ -1836,10 +1980,11 @@ pub fn search_dir(
                     metadata_error: None,
                 });
                 if out.len() >= MAX_RESULTS {
+                    stopped = Some(format!("stopped at the first {MAX_RESULTS} matches"));
                     break;
                 }
             }
-            if is_dir && !is_symlink {
+            if is_dir && !is_symlink && !skip.iter().any(|m| *m == path) {
                 stack.push(path);
             }
         }
@@ -1850,7 +1995,7 @@ pub fn search_dir(
             .cmp(&a.is_dir)
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(out)
+    Ok(SearchReport { entries: out, stopped })
 }
 
 /// Remote filesystem kinds shown as network rows. Portal, AppImage, archive,
@@ -4332,6 +4477,109 @@ pub fn archive_stem(path: &str) -> String {
     }
 }
 
+/// D-242, the install-location convention. Nothing on Linux agrees on where
+/// hand-installed software goes: packages land in /usr, Flatpaks in
+/// ~/.var/app, and an AppImage or a downloaded tarball lands wherever it was
+/// dropped. Wayfinder has an opinion, because it is the one program present at
+/// both moments that decide it -- the Save dialog and the unpack.
+///
+/// Package-managed installs are left alone on purpose: dnf, rpm, Flatpak and
+/// Snap each have a convention already, and fighting them helps nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    /// A single self-contained executable file. Belongs in ~/Applications.
+    AppImage,
+    /// An unpacked program directory. Belongs in ~/opt/<name>.
+    AppTree,
+}
+
+/// The convention folder for a kind, created on demand by the caller.
+pub fn install_dir(kind: InstallKind) -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    Ok(install_dir_in(Path::new(&home), kind))
+}
+
+/// The same answer for a HOME handed in rather than read from the environment,
+/// so a test can prove the rule without touching the real one.
+pub fn install_dir_in(home: &Path, kind: InstallKind) -> PathBuf {
+    home.join(match kind {
+        InstallKind::AppImage => "Applications",
+        InstallKind::AppTree => "opt",
+    })
+}
+
+/// What a NAME alone can settle. An AppImage says what it is in its own
+/// extension, so a Save dialog can send it home before it exists. A `.tar.gz`
+/// says nothing -- it is as likely to be a backup -- so a tarball is never
+/// judged here, only after it is unpacked and its contents can be read.
+pub fn install_kind_for_name(name: &str) -> Option<InstallKind> {
+    let lower = Path::new(name)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| name.to_lowercase());
+    // A part-written download is still the file it is about to be.
+    let lower = lower
+        .strip_suffix(".part")
+        .or_else(|| lower.strip_suffix(".crdownload"))
+        .unwrap_or(&lower)
+        .to_string();
+    lower.ends_with(".appimage").then_some(InstallKind::AppImage)
+}
+
+/// Whether an unpacked folder is a program rather than documents or data: its
+/// top level holds a `bin` folder, or a file anyone may execute. Read from the
+/// real folder, never guessed from the archive's name.
+pub fn looks_like_an_app_tree(dir: &Path) -> bool {
+    let kids = |at: &Path| -> Vec<PathBuf> {
+        fs::read_dir(at)
+            .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default()
+    };
+    let marked = |list: &[PathBuf]| -> bool {
+        list.iter().any(|path| {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if path.is_dir() {
+                return name == "bin" || name == "usr" || name == "lib";
+            }
+            is_executable_file(path) || name.ends_with(".AppImage") || name.ends_with(".desktop")
+        })
+    };
+    let top = kids(dir);
+    if top.is_empty() {
+        return false;
+    }
+    if marked(&top) {
+        return true;
+    }
+    // A single wrapper folder is the usual tarball shape -- Thing-1.2/bin/... --
+    // so look through it once, but only after the top level has had its say.
+    match top.as_slice() {
+        [only] if only.is_dir() => marked(&kids(only)),
+        _ => false,
+    }
+}
+
+/// An ordinary file carrying any execute bit.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// The desktop entry that makes a saved AppImage appear in the menu like any
+/// other program. Written beside the user's other entries, never in /usr.
+pub fn appimage_desktop_entry(exec: &str, name: &str) -> String {
+    // A literal newline or an Exec that splits on spaces would make an entry
+    // the desktop silently ignores, so the path is quoted and the name is
+    // flattened to one line.
+    let name = name.replace(['\n', '\r'], " ");
+    let exec = exec.replace('"', "\\\"");
+    format!(
+        "[Desktop Entry]\nType=Application\nName={name}\nExec=\"{exec}\"\nTerminal=false\nCategories=Utility;\nX-Wayfinder-Installed=true\n"
+    )
+}
+
 /// Extract into a NEW folder named after the archive, the way Explorer's
 /// "Extract All" does. Without this an archive holding loose files scatters
 /// them across whatever folder you were looking at, which is impossible to undo
@@ -4836,6 +5084,73 @@ fn unique_target(dest_dir: &str, name: &str) -> PathBuf {
     }
 }
 
+/// Like `unique_target`, but a name is "taken" when `symlink_metadata`
+/// succeeds rather than when `exists()` does. `exists()` follows the link, so a
+/// broken symlink already sitting there reads as absent and `symlink` then
+/// fails with EEXIST instead of picking the next number.
+fn unique_link_target(dest_dir: &str, name: &str) -> PathBuf {
+    let base = Path::new(dest_dir);
+    let taken = |path: &Path| fs::symlink_metadata(path).is_ok();
+    let first = base.join(name);
+    if !taken(&first) {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let mut n = 2;
+    loop {
+        let cand = base.join(format!("{} ({}){}", stem, n, ext));
+        if !taken(&cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// The drop menu's "Link": one symbolic link per source inside `dest_dir`,
+/// pointing at the source's own path. Nothing is ever overwritten -- a taken
+/// name is numbered "name (2)" the way a paste is numbered.
+///
+/// All or nothing: if any link cannot be made, every link this call already
+/// made is removed before the error is returned, so a half-linked folder is
+/// never left behind. Returns the created paths in source order, which is what
+/// Undo needs to remove exactly them and nothing else.
+pub fn link_into(srcs: &[String], dest_dir: &str) -> Result<Vec<String>, String> {
+    if srcs.is_empty() {
+        return Err("Nothing to link".to_string());
+    }
+    if !Path::new(dest_dir).is_dir() {
+        return Err(format!("Not a folder: {dest_dir}"));
+    }
+    let mut created: Vec<String> = Vec::new();
+    for src in srcs {
+        let src_path = Path::new(src);
+        let Some(name) = src_path.file_name().and_then(|n| n.to_str()) else {
+            return Err(unwind_links(created, format!("Cannot link {src}")));
+        };
+        let target = unique_link_target(dest_dir, name);
+        if let Err(err) = std::os::unix::fs::symlink(src_path, &target) {
+            return Err(unwind_links(created, format!("Could not create link: {err}")));
+        }
+        created.push(target.to_string_lossy().into_owned());
+    }
+    Ok(created)
+}
+
+/// Remove links already made by a `link_into` call that then failed, and return
+/// the message to report. Only symlinks are removed, and only the exact paths
+/// this call created, so nothing of the user's can be caught by it.
+fn unwind_links(created: Vec<String>, message: String) -> String {
+    for path in created {
+        if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    message
+}
+
 fn app_dirs() -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     vec![
@@ -4912,7 +5227,7 @@ fn icon_name(path: &Path, is_dir: bool) -> &'static str {
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "wmv" | "m4v" | "mpg" | "mpeg" | "3gp" | "flv"
         | "ts" => "video-x-generic",
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "svg" | "ico"
-        | "avif" | "heic" => "image-x-generic",
+        | "avif" | "heic" | "heif" | "avifs" | "jxl" => "image-x-generic",
         "pdf" => "application-pdf",
         "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "lz" | "lzma"
         | "cab" => "application-x-archive",
@@ -5961,6 +6276,125 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// D-236: the drop menu's Link. Real symlinks, Explorer numbering on a
+    /// clash, and nothing of the user's touched.
+    #[test]
+    fn link_into_creates_symlinks_and_never_overwrites_d236() {
+        let dir = test_dir("link-into");
+        let src_dir = dir.join("src");
+        let dest = dir.join("dest");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src_dir.join("note.txt"), "body").unwrap();
+        fs::create_dir(src_dir.join("folder")).unwrap();
+        let srcs = vec![
+            src_dir.join("note.txt").to_string_lossy().into_owned(),
+            src_dir.join("folder").to_string_lossy().into_owned(),
+        ];
+        let dest_str = dest.to_str().unwrap();
+
+        let made = link_into(&srcs, dest_str).unwrap();
+        assert_eq!(
+            made,
+            vec![
+                dest.join("note.txt").to_string_lossy().into_owned(),
+                dest.join("folder").to_string_lossy().into_owned(),
+            ],
+            "returned in source order, so Undo removes exactly these"
+        );
+        // Real symlinks, pointing at the sources, readable through the link.
+        for path in &made {
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+        }
+        assert_eq!(fs::read_link(dest.join("note.txt")).unwrap(), src_dir.join("note.txt"));
+        assert_eq!(fs::read_to_string(dest.join("note.txt")).unwrap(), "body");
+        assert!(dest.join("folder").is_dir(), "a link to a folder resolves as a folder");
+
+        // A second drop numbers instead of overwriting, and the first link is
+        // left exactly as it was.
+        let again = link_into(&srcs, dest_str).unwrap();
+        assert_eq!(
+            again,
+            vec![
+                dest.join("note (2).txt").to_string_lossy().into_owned(),
+                dest.join("folder (2)").to_string_lossy().into_owned(),
+            ]
+        );
+        assert_eq!(fs::read_link(dest.join("note.txt")).unwrap(), src_dir.join("note.txt"));
+
+        // A real file of the user's with the next name is never replaced.
+        fs::write(dest.join("note (3).txt"), "keep").unwrap();
+        let third = link_into(&srcs[..1], dest_str).unwrap();
+        assert_eq!(third, vec![dest.join("note (4).txt").to_string_lossy().into_owned()]);
+        assert_eq!(fs::read_to_string(dest.join("note (3).txt")).unwrap(), "keep");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A broken link already holding the name counts as taken. `exists()`
+    /// follows the link and reports false for one, which is why `link_into`
+    /// asks `symlink_metadata` instead: otherwise `symlink` fails with EEXIST
+    /// and the whole drop is reported as an error.
+    #[test]
+    fn link_into_sees_a_broken_link_as_a_taken_name_d236() {
+        let dir = test_dir("link-broken");
+        let dest = dir.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dir.join("note.txt"), "body").unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), dest.join("note.txt")).unwrap();
+        assert!(!dest.join("note.txt").exists(), "a broken link reads as absent");
+
+        let srcs = vec![dir.join("note.txt").to_string_lossy().into_owned()];
+        let made = link_into(&srcs, dest.to_str().unwrap()).unwrap();
+        assert_eq!(made, vec![dest.join("note (2).txt").to_string_lossy().into_owned()]);
+        assert_eq!(fs::read_link(dest.join("note.txt")).unwrap(), dir.join("gone"), "the broken link is untouched");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// All or nothing: a source that cannot be linked removes the links the
+    /// same call already made, so no half-linked folder is left behind.
+    #[test]
+    fn link_into_unwinds_everything_it_made_when_one_fails_d236() {
+        let dir = test_dir("link-unwind");
+        let dest = dir.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        // A destination that is not writable makes the second link fail.
+        let srcs = vec![
+            dir.join("a.txt").to_string_lossy().into_owned(),
+            dir.join("b.txt").to_string_lossy().into_owned(),
+        ];
+        fs::write(dir.join("b.txt"), "b").unwrap();
+        // Force the failure by taking the write bit away after the first link.
+        let made = link_into(&srcs[..1], dest.to_str().unwrap()).unwrap();
+        assert_eq!(made.len(), 1);
+        fs::remove_file(&made[0]).unwrap();
+        let mut perms = fs::metadata(&dest).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o500);
+        }
+        fs::set_permissions(&dest, perms).unwrap();
+        let err = link_into(&srcs, dest.to_str().unwrap()).unwrap_err();
+        assert!(err.starts_with("Could not create link:"), "got {err}");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(
+            fs::read_dir(&dest).unwrap().next().is_none(),
+            "a failed drop leaves no links behind at all"
+        );
+
+        // Empty input and a destination that is not a folder are refused
+        // before anything is created.
+        assert_eq!(link_into(&[], dest.to_str().unwrap()).unwrap_err(), "Nothing to link");
+        assert!(link_into(&srcs, dir.join("a.txt").to_str().unwrap()).unwrap_err().starts_with("Not a folder:"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn rename_path_refuses_illegal_names() {
         let dir = test_dir("rename-illegal");
@@ -6878,6 +7312,30 @@ mod tests {
     }
 
     #[test]
+    /// Searching from `/` walked into /proc, /sys and the Google Drive FUSE
+    /// mount and never came back: the status bar said "Searching /" and that
+    /// was the whole of it (9 November 2026).
+    fn a_search_does_not_walk_into_the_kernel_or_a_network_drive() {
+        let mounts = "\
+/dev/sda2 / ext4 rw 0 0
+proc /proc proc rw 0 0
+sysfs /sys sysfs rw 0 0
+/dev/sdb1 /run/media/user/Disk1 ext4 rw 0 0
+/dev/sdc1 /run/media/user/Disk2 fuseblk rw 0 0
+drive: /home/user/GoogleDrive fuse.rclone rw 0 0
+//nas/share /mnt/nas cifs rw 0 0
+";
+        let skipped = unsearchable_mounts_from(mounts);
+        for gone in ["/proc", "/sys", "/home/user/GoogleDrive", "/mnt/nas"] {
+            assert!(skipped.iter().any(|m| m == gone), "{gone} should be skipped");
+        }
+        // fuseblk is an ordinary NTFS disk, not a FUSE helper.
+        for kept in ["/", "/run/media/user/Disk1", "/run/media/user/Disk2"] {
+            assert!(!skipped.iter().any(|m| m == kept), "{kept} is a real disk");
+        }
+    }
+
+    #[test]
     fn recursive_search_finds_nested_names() {
         let dir = test_dir("search");
         let nested = dir.join("nested");
@@ -7115,7 +7573,7 @@ mod tests {
         // The one that started this: an AppImage is an ELF with a squashfs
         // stapled on, so it never looked like an archive, and the user was left
         // with no way to extract it.
-        assert!(is_archive_path("/home/user/Downloads/CodeOp-linux-4.0.0-beta+2 (1).AppImage"));
+        assert!(is_archive_path("/home/user/Downloads/Tunebox-linux-4.0.0-beta+2 (1).AppImage"));
         assert!(is_archive_path("/tmp/Thing-x86_64.appimage"), "case-insensitive");
         for path in [
             "/tmp/pkg.deb",
@@ -7134,7 +7592,81 @@ mod tests {
             assert!(!is_archive_path(path), "{path} is not an archive");
         }
         // And the extracted folder gets a sensible name.
-        assert_eq!(archive_stem("/tmp/CodeOp-linux-4.0.0-beta+2 (1).AppImage"), "CodeOp-linux-4.0.0-beta+2 (1)");
+        assert_eq!(archive_stem("/tmp/Tunebox-linux-4.0.0-beta+2 (1).AppImage"), "Tunebox-linux-4.0.0-beta+2 (1)");
+    }
+
+    /// D-242: a name settles an AppImage and nothing else. A tarball is as
+    /// likely to be a backup as a program, so it is never judged by its name.
+    #[test]
+    fn install_kind_reads_only_what_a_name_can_prove() {
+        use InstallKind::*;
+        assert_eq!(install_kind_for_name("/home/user/Downloads/Thing-x86_64.AppImage"), Some(AppImage));
+        assert_eq!(install_kind_for_name("thing.appimage"), Some(AppImage), "case does not matter");
+        assert_eq!(
+            install_kind_for_name("Thing.AppImage.part"),
+            Some(AppImage),
+            "a part-written download is still what it is about to be"
+        );
+        assert_eq!(install_kind_for_name("Thing.AppImage.crdownload"), Some(AppImage));
+        for name in ["backup.tar.gz", "photos.zip", "notes.txt", "appimage", "Thing.AppImage.txt"] {
+            assert_eq!(install_kind_for_name(name), None, "{name} is not settled by its name");
+        }
+    }
+
+    /// D-242: the two convention folders, under the real HOME, never /usr.
+    #[test]
+    fn install_dirs_sit_under_home() {
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(install_dir(InstallKind::AppImage).unwrap(), PathBuf::from(&home).join("Applications"));
+        assert_eq!(install_dir(InstallKind::AppTree).unwrap(), PathBuf::from(&home).join("opt"));
+    }
+
+    /// D-242: a program is told from documents by what is actually in the
+    /// folder -- a bin/usr/lib folder, or something executable -- read once
+    /// through a single wrapper folder, which is the usual tarball shape.
+    #[test]
+    fn app_tree_is_told_from_a_folder_of_documents() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root().join(format!("wf-d242-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("a.txt"), "x").unwrap();
+        fs::write(docs.join("b.pdf"), "x").unwrap();
+        assert!(!looks_like_an_app_tree(&docs), "text and a PDF are not a program");
+
+        let binned = root.join("binned");
+        fs::create_dir_all(binned.join("bin")).unwrap();
+        assert!(looks_like_an_app_tree(&binned), "a bin folder is a program");
+
+        let wrapped = root.join("wrapped");
+        fs::create_dir_all(wrapped.join("Thing-1.2/lib")).unwrap();
+        assert!(looks_like_an_app_tree(&wrapped), "one wrapper folder is looked through");
+
+        let exe = root.join("exe");
+        fs::create_dir_all(&exe).unwrap();
+        let run = exe.join("thing");
+        fs::write(&run, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(looks_like_an_app_tree(&exe), "an executable file is a program");
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!looks_like_an_app_tree(&exe), "the same file without the bit is not");
+
+        assert!(!looks_like_an_app_tree(&root.join("missing")), "a folder that is not there is not a program");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// D-242: the entry a saved AppImage gets, so it reaches the menu.
+    #[test]
+    fn appimage_desktop_entry_survives_spaces_and_newlines() {
+        let entry = appimage_desktop_entry("/home/user/Applications/My App.AppImage", "My App\nx86_64");
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("Exec=\"/home/user/Applications/My App.AppImage\"\n"), "{entry}");
+        assert!(entry.contains("Name=My App x86_64\n"), "the name is one line: {entry}");
+        assert_eq!(entry.lines().filter(|l| l.starts_with("Name=")).count(), 1);
+        assert!(entry.contains("X-Wayfinder-Installed=true"), "ours, and removable as a set");
     }
 
     #[test]
@@ -7399,11 +7931,11 @@ gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0
 gvfsd-fuse /run/user/1001/gvfs fuse.gvfsd-fuse rw 0 0
 portal /run/user/1000/doc fuse.portal rw 0 0
 appimage /tmp/.mount_App fuse.appimagefs rw 0 0
-encfs /home/user/vault fuse.encfs rw 0 0
+encfs /home/user/private fuse.encfs rw 0 0
 ratarmount /home/user/arch fuse.ratarmount rw 0 0
 /dev/loop0 /mnt/local ext4 rw 0 0
 tmpfs /run/user/1000 tmpfs rw 0 0
-rclone: /home/user/CloudDrive fuse.rclone rw 0 0
+rclone: /home/user/GoogleDrive fuse.rclone rw 0 0
 ";
 
     fn d156_children(root: &str) -> Option<Vec<String>> {
@@ -7444,7 +7976,7 @@ rclone: /home/user/CloudDrive fuse.rclone rw 0 0
 
     #[test]
     fn network_rows_direct_gvfs_dedup_order_and_decoys_d156() {
-        let taken: std::collections::HashSet<String> = ["/home/user/CloudDrive".to_string()].into();
+        let taken: std::collections::HashSet<String> = ["/home/user/GoogleDrive".to_string()].into();
         let rows = network_drives(D156_MOUNTS, &taken, &d156_children);
         let got: Vec<(&str, &str)> = rows.iter().map(|d| (d.name.as_str(), d.path.as_str())).collect();
         assert_eq!(
@@ -7475,7 +8007,7 @@ rclone: /home/user/CloudDrive fuse.rclone rw 0 0
     #[test]
     fn network_discovery_before_after_and_scale_d156() {
         let before = d156_legacy_rows(D156_MOUNTS);
-        let after = network_drives(D156_MOUNTS, &["/home/user/CloudDrive".to_string()].into(), &d156_children);
+        let after = network_drives(D156_MOUNTS, &["/home/user/GoogleDrive".to_string()].into(), &d156_children);
         let mut big = String::new();
         for i in 0..1000 {
             big.push_str(&format!("//h{i}/s{i} /mnt/n{i} cifs rw 0 0\n"));
@@ -9704,5 +10236,616 @@ mod clip_format_tests_d232 {
         // A control character in an entry never reaches the status line.
         assert_eq!(refused(uri_only("file:///tmp/a\0b\r\n")), "file:///tmp/a\u{FFFD}b is not a valid file address");
         assert_eq!(refused(gnome("copy\nbell\u{7}here")), "bell\u{FFFD}here is not a file address");
+    }
+}
+
+/// Vault content must never be listed anywhere Wayfinder shows things again:
+/// the Recent files strip and the Recent folders list both read from disk
+/// history, and a vault's whole point is that its contents are not advertised
+/// on a Home page somebody else can see over your shoulder.
+///
+/// A path counts as vault content when any folder in it is named for a vault,
+/// matched on the lowercased name containing "vault". That is deliberately
+/// wide: `Vaults`, `Obsidian Vault` and `Field-Notes-Vault-notes` are all
+/// caught, and the cost of catching one folder too many is a file missing
+/// from a convenience list, while the cost of missing one is private content
+/// on screen.
+pub fn is_vault_content(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("vault")
+    })
+}
+
+#[cfg(test)]
+mod vault_privacy_tests {
+    use super::is_vault_content;
+
+    /// D-247: what the Recent lists must refuse, and what they must not.
+    #[test]
+    fn vault_content_is_recognised_wherever_it_sits_d247() {
+        for private in [
+            "/home/user/Vaults/Daily Logs/one.md",
+            "/home/user/References/Vaults/two.md",
+            "/home/user/Obsidian/Field Notes Vault/note.md",
+            "/home/user/Documents/Obsidian Vault/note.md",
+            "/home/user/References/Field-Notes-Vault-notes/note.md",
+            "/home/user/vaults/lower.md",
+        ] {
+            assert!(is_vault_content(private), "{private} must never be listed");
+        }
+        for ordinary in [
+            "/home/user/Documents/report.odt",
+            "/home/user/Projects/Open Projects/wayfinder/README.md",
+            "/home/user/Pictures/holiday.jpg",
+        ] {
+            assert!(!is_vault_content(ordinary), "{ordinary} is ordinary");
+        }
+    }
+}
+
+/// D-251: gdk-pixbuf on this machine has no AVIF, HEIC or JPEG-XL loader, so a
+/// thumbnail for one of those files decoded to nothing and the tile kept its
+/// plain file icon forever. These are the extensions that have to be decoded
+/// by an outside tool first and thumbnailed from the result.
+const TRANSCODE_THUMB_EXT: [&str; 5] = ["avif", "heic", "heif", "avifs", "jxl"];
+
+pub fn needs_transcoded_thumbnail(path: &str) -> bool {
+    has_extension(path, &TRANSCODE_THUMB_EXT)
+}
+
+/// D-260: Details, List and Compact can draw a thumbnail in the same slot the
+/// row already reserves for its file-type icon, behind a setting. The rules
+/// that decide whether a row earns a decode and how big that decode is need no
+/// GTK, so they live here and are unit-tested without a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListThumbnailMetrics {
+    /// Edge of the square the picture is drawn in, in logical pixels.
+    pub display: i32,
+    /// Edge handed to the decoder. Twice `display`, so the scaled decode stays
+    /// sharp without paying to decode the full-size picture.
+    pub decode: i32,
+}
+
+/// The icon each list view already draws, from `file_icon` in native.rs:
+/// Details reserves a 32x28 slot with a 28x24 icon, Compact a 20x18 slot with
+/// a 16x16 icon, and both use the shorter edge as the exact pixel size. The
+/// thumbnail must match that shorter edge or the row height would change.
+pub fn list_thumbnail_metrics(icon_zoom: f64, compact: bool) -> ListThumbnailMetrics {
+    let icon_base = if compact { 16.0 } else { 24.0 };
+    let display = (icon_base * icon_zoom).round().max(1.0) as i32;
+    ListThumbnailMetrics {
+        display,
+        decode: (display * 2).max(1),
+    }
+}
+
+/// A row earns a thumbnail only when a real image file is behind it. Folders
+/// have no picture, and a ZIP member has no filesystem path to decode from
+/// (D-188), so both keep the ordinary file-type icon. Video rows are excluded
+/// here as well: this setting covers still images only, while Grid's own video
+/// poster queue is unchanged.
+pub fn wants_image_thumbnail(entry: &Entry) -> bool {
+    entry.is_image
+        && !entry.is_dir
+        && !entry.source.is_zip()
+        && entry.source.real_path().is_some()
+}
+
+#[cfg(test)]
+mod list_thumbnail_tests {
+    use super::{
+        is_image_path, list_thumbnail_metrics, needs_transcoded_thumbnail, wants_image_thumbnail,
+        Entry, EntrySource, ListThumbnailMetrics,
+    };
+
+    fn row(name: &str, is_image: bool, is_dir: bool, source: EntrySource) -> Entry {
+        Entry {
+            name: name.to_string(),
+            source,
+            is_dir,
+            size: 0,
+            modified: 0,
+            is_image,
+            icon: String::new(),
+            metadata_error: None,
+        }
+    }
+
+    #[test]
+    fn thumbnail_metrics_match_the_icon_each_list_view_draws_d260() {
+        assert_eq!(
+            list_thumbnail_metrics(1.0, false),
+            ListThumbnailMetrics { display: 24, decode: 48 },
+            "Details draws a 28x24 icon, so the shorter edge is 24"
+        );
+        assert_eq!(
+            list_thumbnail_metrics(1.0, true),
+            ListThumbnailMetrics { display: 16, decode: 32 },
+            "Compact draws a 16x16 icon"
+        );
+        assert_eq!(list_thumbnail_metrics(1.5, false), ListThumbnailMetrics { display: 36, decode: 72 });
+        assert_eq!(list_thumbnail_metrics(2.0, true), ListThumbnailMetrics { display: 32, decode: 64 });
+        // Zoom is clamped to 0.6..=2.4 in the app; the floor still holds.
+        assert_eq!(list_thumbnail_metrics(0.1, true).display, 2);
+    }
+
+    #[test]
+    fn only_real_still_images_earn_a_list_thumbnail_d260() {
+        let png = row("a.png", true, false, EntrySource::real("/tmp/a.png"));
+        assert!(wants_image_thumbnail(&png));
+
+        // D-251: an outside-decoder image is still an image and is transcoded
+        // by the same queue, so it must be eligible here.
+        for name in ["one.avif", "two.heic", "three.heif", "four.avifs", "five.jxl"] {
+            let path = format!("/tmp/{name}");
+            assert!(is_image_path(&path) && needs_transcoded_thumbnail(&path));
+            let e = row(name, true, false, EntrySource::real(path));
+            assert!(wants_image_thumbnail(&e), "{name} must be queued like any image");
+        }
+
+        // Not an image.
+        assert!(!wants_image_thumbnail(&row("a.mp4", false, false, EntrySource::real("/tmp/a.mp4"))));
+        // A folder whose name happens to end in an image extension.
+        assert!(!wants_image_thumbnail(&row("a.png", true, true, EntrySource::real("/tmp/a.png"))));
+        // A ZIP member has no real path to decode from (D-188).
+        let member = EntrySource::zip_member("/tmp/a.zip", "inside.png", 10, 0, 100, 0);
+        assert!(!wants_image_thumbnail(&row("inside.png", true, false, member)));
+    }
+}
+
+#[cfg(test)]
+mod transcoded_thumbnail_tests {
+    use super::{is_image_path, needs_transcoded_thumbnail};
+
+    #[test]
+    fn avif_and_heic_want_an_outside_decoder_but_png_does_not_d251() {
+        for name in [
+            "/home/user/Pictures/one.avif",
+            "/home/user/Pictures/ONE.AVIF",
+            "/home/user/Pictures/two.heic",
+            "/home/user/Pictures/three.heif",
+            "/home/user/Pictures/four.jxl",
+        ] {
+            assert!(needs_transcoded_thumbnail(name), "{name} needs decoding");
+            assert!(is_image_path(name), "{name} is still an image");
+        }
+        for name in [
+            "/home/user/Pictures/five.png",
+            "/home/user/Pictures/six.jpg",
+            "/home/user/Pictures/seven.webp",
+            "/home/user/Videos/eight.mp4",
+            "/home/user/Documents/nine",
+        ] {
+            assert!(!needs_transcoded_thumbnail(name), "{name} decodes in-process");
+        }
+    }
+}
+
+/// D-262: what the address bar does with whatever was typed or pasted into it.
+///
+/// the owner, 11 November 2026: he pasted `example-project/art/anim/comet/`
+/// and nothing happened, then `example-project/art/anim/` and nothing
+/// happened again. Both are real folders; neither is an absolute path. The bar
+/// handed the text straight to the lister, which can only open an absolute
+/// path, and a failure said nothing at all.
+///
+/// A path copied out of a terminal, an editor or a chat message arrives with
+/// quotes around it, a `file://` on the front, `%20` for every space, a `~`
+/// for the home folder, a trailing slash, or as a fragment relative to
+/// something other than the folder on screen. All of that is answered here,
+/// with no GTK, so each rule is a unit test rather than a thing to click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathKind {
+    Dir,
+    File,
+    Missing,
+}
+
+/// Strips the decoration off a pasted path and expands `~`. The result is not
+/// guaranteed to exist; `resolve_typed_path` decides that.
+pub fn clean_typed_path(text: &str, home: &str) -> String {
+    let mut s = text.trim().to_string();
+    // A paste from a terminal or a chat often carries quotes.
+    for (open, close) in [('"', '"'), ('\'', '\''), ('`', '`'), ('\u{201c}', '\u{201d}')] {
+        if s.len() >= 2 && s.starts_with(open) && s.ends_with(close) {
+            s = s[open.len_utf8()..s.len() - close.len_utf8()].trim().to_string();
+        }
+    }
+    // A file manager, a browser or a GTK dialog hands out file:// URIs.
+    if let Some(rest) = s.strip_prefix("file://") {
+        s = percent_decode(rest.trim_start_matches("localhost"));
+    } else if s.contains("%20") || s.contains("%2F") {
+        s = percent_decode(&s);
+    }
+    // Shell escapes: `cd` output and tab completion escape spaces.
+    if s.contains("\\ ") {
+        s = s.replace("\\ ", " ");
+    }
+    if s == "~" {
+        return home.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        s = format!("{}/{}", home.trim_end_matches('/'), rest);
+    } else if let Some(rest) = s.strip_prefix("$HOME/") {
+        s = format!("{}/{}", home.trim_end_matches('/'), rest);
+    }
+    // One trailing slash is how most people copy a folder; more than one, and
+    // doubled separators inside, come from joining two halves by hand.
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    while s.contains("//") {
+        s = s.replace("//", "/");
+    }
+    s
+}
+
+// `percent_decode` already lives above, next to the command-line parsing.
+
+/// Where the address bar should go for `text`, or `None` when nothing matches.
+///
+/// `kind` answers whether a candidate is a folder, a file or missing, so this
+/// is pure and testable. The order is deliberate and stops at the first hit:
+///
+/// 1. An absolute path, as given. A FILE lands in its folder, because pasting
+///    a file's path means "show me this".
+/// 2. The fragment under the folder on screen.
+/// 3. The fragment under each ancestor of the folder on screen, nearest
+///    first. This is what makes a repo-relative path work: standing anywhere
+///    inside a project, `art/anim/comet` finds the project's own folder.
+/// 4. The fragment under home.
+/// 5. The fragment under each extra root, in the order given — the sidebar's
+///    own folders, so a path copied out of a project reachable from the
+///    sidebar still lands.
+pub fn resolve_typed_path(
+    text: &str,
+    cwd: &str,
+    home: &str,
+    roots: &[String],
+    kind: &dyn Fn(&str) -> PathKind,
+) -> Option<String> {
+    let cleaned = clean_typed_path(text, home);
+    if cleaned.is_empty() {
+        return None;
+    }
+    let settle = |candidate: String| -> Option<String> {
+        match kind(&candidate) {
+            PathKind::Dir => Some(candidate),
+            PathKind::File => Path::new(&candidate)
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned()),
+            PathKind::Missing => None,
+        }
+    };
+    if cleaned.starts_with('/') {
+        return settle(cleaned);
+    }
+    let join = |base: &str| -> String {
+        format!("{}/{}", base.trim_end_matches('/'), cleaned)
+    };
+    let mut bases: Vec<String> = Vec::new();
+    if !cwd.is_empty() {
+        bases.push(cwd.to_string());
+        let mut here = Path::new(cwd);
+        while let Some(parent) = here.parent() {
+            let parent_str = parent.to_string_lossy().into_owned();
+            if parent_str.is_empty() {
+                break;
+            }
+            bases.push(parent_str);
+            here = parent;
+        }
+    }
+    if !home.is_empty() {
+        bases.push(home.to_string());
+    }
+    bases.extend(roots.iter().cloned());
+    let mut seen: Vec<String> = Vec::new();
+    for base in bases {
+        let base = base.trim_end_matches('/').to_string();
+        if base.is_empty() || seen.contains(&base) {
+            continue;
+        }
+        seen.push(base.clone());
+        if let Some(found) = settle(join(&base)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// D-262, the last resort: a fragment that belongs to a tree somewhere else.
+/// `example-project/art/anim/comet/` pasted while standing in home is
+/// below no ancestor of home, so `resolve_typed_path` cannot see it. This
+/// walks a bounded number of folders under the places that are already known
+/// — the folder on screen, home, the sidebar's folders — widest-first, and
+/// tries the fragment under each one. Hidden folders are skipped, and the
+/// walk stops at `max_depth` levels or `max_dirs` folders, whichever comes
+/// first, so a deep or enormous tree cannot stall the window.
+pub fn search_for_fragment(
+    fragment: &str,
+    roots: &[String],
+    max_depth: usize,
+    max_dirs: usize,
+    child_dirs: &dyn Fn(&str) -> Vec<String>,
+    kind: &dyn Fn(&str) -> PathKind,
+) -> Option<String> {
+    if fragment.is_empty() || fragment.starts_with('/') {
+        return None;
+    }
+    let settle = |candidate: String| -> Option<String> {
+        match kind(&candidate) {
+            PathKind::Dir => Some(candidate),
+            PathKind::File => Path::new(&candidate)
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned()),
+            PathKind::Missing => None,
+        }
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut level: Vec<String> = Vec::new();
+    for root in roots {
+        let root = root.trim_end_matches('/').to_string();
+        if !root.is_empty() && !seen.contains(&root) {
+            seen.push(root.clone());
+            level.push(root);
+        }
+    }
+    let mut visited = 0usize;
+    for _ in 0..=max_depth {
+        if level.is_empty() {
+            return None;
+        }
+        let mut next: Vec<String> = Vec::new();
+        for dir in &level {
+            visited += 1;
+            if visited > max_dirs {
+                return None;
+            }
+            if let Some(found) = settle(format!("{dir}/{fragment}")) {
+                return Some(found);
+            }
+            for child in child_dirs(dir) {
+                if child.starts_with('.') {
+                    continue;
+                }
+                let path = format!("{dir}/{child}");
+                if !seen.contains(&path) {
+                    seen.push(path.clone());
+                    next.push(path);
+                }
+            }
+        }
+        level = next;
+    }
+    None
+}
+
+#[cfg(test)]
+mod typed_path_tests {
+    use super::{clean_typed_path, resolve_typed_path, search_for_fragment, PathKind};
+    use std::path::Path;
+
+    const HOME: &str = "/home/user";
+
+    fn kind_from(dirs: &'static [&'static str], files: &'static [&'static str]) -> impl Fn(&str) -> PathKind {
+        move |p: &str| {
+            if dirs.contains(&p) {
+                PathKind::Dir
+            } else if files.contains(&p) {
+                PathKind::File
+            } else {
+                PathKind::Missing
+            }
+        }
+    }
+
+    #[test]
+    fn a_fragment_from_another_tree_is_found_by_a_bounded_walk_d262() {
+        // What he actually pasted, while standing in home: the tree is four
+        // folders down a path home knows nothing about.
+        let dirs: &[&str] = &[
+            "/home/user",
+            "/home/user/Projects",
+            "/home/user/Projects/Scratch",
+            "/home/user/Projects/Scratch/audit",
+            "/home/user/Projects/Scratch/audit/example-project",
+            "/home/user/Projects/Scratch/audit/example-project/art",
+            "/home/user/Projects/Scratch/audit/example-project/art/anim",
+            "/home/user/Projects/Scratch/audit/example-project/art/anim/comet",
+            "/home/user/.cache",
+            "/home/user/.cache/huge",
+        ];
+        let children = |dir: &str| -> Vec<String> {
+            dirs.iter()
+                .filter(|d| Path::new(d).parent().map(|p| p.to_string_lossy().into_owned()).as_deref() == Some(dir))
+                .filter_map(|d| Path::new(d).file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect()
+        };
+        let kind = kind_from(dirs, &[]);
+        let found = resolve_typed_path(
+            "example-project/art/anim/comet/",
+            HOME,
+            HOME,
+            &[HOME.to_string()],
+            &kind,
+        );
+        assert_eq!(found, None, "the plain rules cannot see another tree");
+        let found = search_for_fragment(
+            "example-project/art/anim/comet",
+            &[HOME.to_string()],
+            5,
+            4000,
+            &children,
+            &kind,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some("/home/user/Projects/Scratch/audit/example-project/art/anim/comet"),
+            "the bounded walk must find the tree he pasted from"
+        );
+    }
+
+    #[test]
+    fn the_walk_gives_up_instead_of_stalling_d262() {
+        let children = |dir: &str| -> Vec<String> {
+            // An endlessly wide, endlessly deep tree.
+            (0..50).map(|n| format!("{}-{n}", dir.len())).collect()
+        };
+        let kind = kind_from(&[], &[]);
+        assert_eq!(
+            search_for_fragment("nowhere/at/all", &[HOME.to_string()], 6, 500, &children, &kind),
+            None,
+            "a tree with no match must end on the caps, not run forever"
+        );
+    }
+
+    #[test]
+    fn decoration_comes_off_a_pasted_path_d262() {
+        assert_eq!(clean_typed_path("  /tmp/a  ", HOME), "/tmp/a");
+        assert_eq!(clean_typed_path("\"/tmp/a b\"", HOME), "/tmp/a b");
+        assert_eq!(clean_typed_path("'/tmp/a'", HOME), "/tmp/a");
+        assert_eq!(clean_typed_path("file:///tmp/a%20b", HOME), "/tmp/a b");
+        assert_eq!(clean_typed_path("file://localhost/tmp/a", HOME), "/tmp/a");
+        assert_eq!(clean_typed_path("/tmp/a\\ b", HOME), "/tmp/a b");
+        assert_eq!(clean_typed_path("~", HOME), HOME);
+        assert_eq!(clean_typed_path("~/Pictures/", HOME), "/home/user/Pictures");
+        assert_eq!(clean_typed_path("$HOME/Pictures", HOME), "/home/user/Pictures");
+        assert_eq!(clean_typed_path("/tmp//a///b//", HOME), "/tmp/a/b");
+        // A relative fragment stays relative: resolving it is a separate job.
+        assert_eq!(clean_typed_path("art/anim/comet/", HOME), "art/anim/comet");
+    }
+
+    #[test]
+    fn an_absolute_path_is_taken_as_given_and_a_file_lands_in_its_folder_d262() {
+        let kind = kind_from(&["/tmp/pics"], &["/tmp/pics/a.png"]);
+        assert_eq!(
+            resolve_typed_path("/tmp/pics/", "/home/user", HOME, &[], &kind).as_deref(),
+            Some("/tmp/pics")
+        );
+        assert_eq!(
+            resolve_typed_path("/tmp/pics/a.png", "/home/user", HOME, &[], &kind).as_deref(),
+            Some("/tmp/pics")
+        );
+        assert_eq!(resolve_typed_path("/tmp/nope", "/home/user", HOME, &[], &kind), None);
+    }
+
+    /// The reported case: a project-relative fragment pasted while standing
+    /// somewhere else inside the same project.
+    #[test]
+    fn a_project_relative_fragment_resolves_up_the_tree_d262() {
+        let kind = kind_from(
+            &["/home/user/Projects/demo/art/anim/comet", "/home/user/Projects/demo/art/anim"],
+            &[],
+        );
+        let cwd = "/home/user/Projects/demo/art/sprites";
+        assert_eq!(
+            resolve_typed_path("art/anim/comet/", cwd, HOME, &[], &kind).as_deref(),
+            Some("/home/user/Projects/demo/art/anim/comet")
+        );
+        assert_eq!(
+            resolve_typed_path("art/anim/", cwd, HOME, &[], &kind).as_deref(),
+            Some("/home/user/Projects/demo/art/anim")
+        );
+        // Nearest ancestor wins: standing in the folder itself, the plain name
+        // of a child resolves to the child, not to a cousin higher up.
+        let kind = kind_from(&["/home/user/Projects/demo/art/anim", "/home/user/anim"], &[]);
+        assert_eq!(
+            resolve_typed_path("anim", "/home/user/Projects/demo/art", HOME, &[], &kind).as_deref(),
+            Some("/home/user/Projects/demo/art/anim")
+        );
+    }
+
+    #[test]
+    fn home_and_the_sidebar_roots_are_the_last_tries_d262() {
+        let kind = kind_from(&["/home/user/Pictures", "/mnt/work/shared/art"], &[]);
+        assert_eq!(
+            resolve_typed_path("Pictures", "/tmp", HOME, &[], &kind).as_deref(),
+            Some("/home/user/Pictures")
+        );
+        let roots = vec!["/mnt/work/shared".to_string()];
+        assert_eq!(
+            resolve_typed_path("art", "/tmp", HOME, &roots, &kind).as_deref(),
+            Some("/mnt/work/shared/art")
+        );
+        assert_eq!(resolve_typed_path("", "/tmp", HOME, &roots, &kind), None);
+        assert_eq!(resolve_typed_path("   ", "/tmp", HOME, &roots, &kind), None);
+        assert_eq!(resolve_typed_path("no/such/thing", "/tmp", HOME, &roots, &kind), None);
+    }
+}
+
+#[cfg(test)]
+mod launch_arg_tests_d265 {
+    use super::launch_path_in_args;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bare_path_is_still_the_target_d265() {
+        assert_eq!(
+            launch_path_in_args(&args(&["/home/user/notes.md"])),
+            Some("/home/user/notes.md".to_string())
+        );
+    }
+
+    #[test]
+    fn select_names_the_file_outright_d265() {
+        assert_eq!(
+            launch_path_in_args(&args(&["--select", "/home/user/notes.md"])),
+            Some("/home/user/notes.md".to_string())
+        );
+        assert_eq!(
+            launch_path_in_args(&args(&["--select=/home/user/notes.md"])),
+            Some("/home/user/notes.md".to_string())
+        );
+    }
+
+    #[test]
+    fn select_wins_over_a_positional_path_d265() {
+        assert_eq!(
+            launch_path_in_args(&args(&["/home/user", "--select", "/home/user/notes.md"])),
+            Some("/home/user/notes.md".to_string())
+        );
+    }
+
+    #[test]
+    fn a_path_after_a_flag_is_found_d265() {
+        assert_eq!(
+            launch_path_in_args(&args(&["--new-window", "/home/user/notes.md"])),
+            Some("/home/user/notes.md".to_string())
+        );
+    }
+
+    #[test]
+    fn a_path_that_looks_like_a_flag_survives_a_double_dash_d265() {
+        assert_eq!(
+            launch_path_in_args(&args(&["--", "--odd-name"])),
+            Some("--odd-name".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_uri_is_decoded_either_way_d265() {
+        assert_eq!(
+            launch_path_in_args(&args(&["file:///home/user/my%20notes.md"])),
+            Some("/home/user/my notes.md".to_string())
+        );
+        assert_eq!(
+            launch_path_in_args(&args(&["--select", "file:///home/user/my%20notes.md"])),
+            Some("/home/user/my notes.md".to_string())
+        );
+    }
+
+    #[test]
+    fn flags_alone_point_at_nothing_d265() {
+        assert_eq!(launch_path_in_args(&args(&["--pick"])), None);
+        assert_eq!(launch_path_in_args(&args(&["--select"])), None);
+        assert_eq!(launch_path_in_args(&[]), None);
     }
 }

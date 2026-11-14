@@ -27,6 +27,18 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 
+# The codecs come with the app. A flatpak carries its own runtime, so a person
+# who downloads this gets AVIF, HEIC and JPEG-XL pictures and every common
+# video decoding straight away, with nothing to install by hand (7 Nov 2026,
+# the owner: "wayfinder comes with any codecs or drivers or whatever needed").
+add-extensions:
+  org.freedesktop.Platform.ffmpeg-full:
+    directory: lib/ffmpeg
+    version: '24.08'
+    add-ld-path: .
+    no-autodownload: false
+    autodelete: false
+
 command: wayfinder
 
 finish-args:
@@ -46,6 +58,9 @@ finish-args:
   - --talk-name=org.freedesktop.portal.FileChooser
   # Mounting and unmounting drives
   - --system-talk-name=org.freedesktop.UDisks2
+  # The bundled codecs
+  - --env=LD_LIBRARY_PATH=/app/lib/ffmpeg
+  - --env=GST_PLUGIN_SYSTEM_PATH=/app/lib/ffmpeg/gstreamer-1.0:/app/lib/gstreamer-1.0:/usr/lib/extensions/gstreamer-1.0
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
@@ -57,6 +72,9 @@ modules:
   - name: wayfinder
     buildsystem: simple
     build-commands:
+      # The mount point for the bundled codec extension. flatpak refuses to
+      # mount an extension whose directory the app does not create.
+      - mkdir -p /app/lib/ffmpeg
       - cargo build --release --offline --manifest-path src-tauri/Cargo.toml
       - install -Dm755 src-tauri/target/release/wayfinder-native /app/bin/wayfinder
       - install -Dm755 scripts/wayfinder-new-window /app/bin/wayfinder-new-window
@@ -81,7 +99,7 @@ modules:
       - type: git
         url: https://github.com/Kadaken/wayfinder.git
         # Point this at the release you are packaging.
-        tag: v0.1.0
+        tag: v0.9.22
       # Regenerate whenever Cargo.lock changes:
       #   python3 flatpak-cargo-generator.py src-tauri/Cargo.lock \
       #     -o flatpak/cargo-sources.json

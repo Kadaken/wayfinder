@@ -95,6 +95,20 @@ case "$mode" in
         cmd=("${cargo_t[@]}" browsing_and_tabs_watched_d239_alone -- --nocapture);;
   d237) export WAYFINDER_D237_ONLY=1
         cmd=("${cargo_t[@]}" save_picker_opens_a_folder_instead_of_closing_d237_alone -- --nocapture);;
+  d260) export WAYFINDER_D260_ONLY=1
+        cmd=("${cargo_t[@]}" details_thumbnail_regression_alone_d260 -- --nocapture);;
+  d261) export WAYFINDER_D261_ONLY=1
+        cmd=("${cargo_t[@]}" image_formats_alone_d261 -- --nocapture);;
+  d262) export WAYFINDER_D262_ONLY=1
+        cmd=("${cargo_t[@]}" pasted_address_alone_d262 -- --nocapture);;
+  d263) export WAYFINDER_D263_ONLY=1
+        cmd=("${cargo_t[@]}" odd_picture_thumbnail_alone_d263 -- --nocapture);;
+  d264) export WAYFINDER_D264_ONLY=1
+        cmd=("${cargo_t[@]}" open_at_file_alone_d264 -- --nocapture);;
+  d267) export WAYFINDER_D267_ONLY=1
+        cmd=("${cargo_t[@]}" grid_columns_alone_d267 -- --nocapture);;
+  d268) export WAYFINDER_D268_ONLY=1
+        cmd=("${cargo_t[@]}" folder_preview_alone_d268 -- --nocapture);;
   d186) export WAYFINDER_D186_ONLY=1
         subgid="$(awk -F: -v u="$(id -un)" '$1==u{print $2":"$3; found=1} END{if(!found) exit 1}' /etc/subgid)" \
           || { echo "no /etc/subgid range for $(id -un): required for the d186 loopback namespace" >&2; exit 97; }

@@ -1308,6 +1308,9 @@ mod tests {
     /// unwind-safe).
     struct PrivateBus {
         root: PathBuf,
+        /// D-259: the bus socket lives outside `root`, in a short folder, so
+        /// its path stays under the kernel's limit. It is removed on drop.
+        socket_path: PathBuf,
         address: String,
         daemon: Child,
         old_tmpdir: Option<String>,
@@ -1333,15 +1336,37 @@ mod tests {
             fs::create_dir_all(&run_dir).expect("create scratch root");
             fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
                 .expect("restrict scratch run dir");
-            let socket_path = root.join("bus.sock");
+            let socket_path = private_socket_path("b");
 
+            // D-259: the daemon used to be started with its complaints thrown
+            // away, so when it refused to start the only thing the suite could
+            // say was "printed no address", which names no cause. Its words go
+            // to a file beside the socket now and the assert reads them out.
+            let daemon_err = root.join("dbus-daemon.err");
+            // D-259: the daemon must not be able to start services of its
+            // own. It reads the service folders of whatever HOME and
+            // XDG_DATA_DIRS it is given, and since Wayfinder was registered
+            // as this machine's picker on 3 November there is a service file
+            // for the portal backend in the real home. Any app on this bus
+            // asking for a file dialog started that backend, which then owned
+            // the name the test was about to take, and the test failed with
+            // NameTaken. These point at an empty folder instead.
+            let empty_data = root.join("no-services");
+            fs::create_dir_all(&empty_data).expect("create the empty data dir");
             let mut daemon = Command::new("dbus-daemon")
                 .arg("--session")
                 .arg(format!("--address=unix:path={}", socket_path.display()))
                 .arg("--nofork")
                 .arg("--print-address")
+                .env("TMPDIR", &root)
+                .env("XDG_RUNTIME_DIR", &run_dir)
+                .env("HOME", &root)
+                .env("XDG_DATA_HOME", &empty_data)
+                .env("XDG_DATA_DIRS", &empty_data)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::from(
+                    fs::File::create(&daemon_err).expect("create the daemon error file"),
+                ))
                 .spawn()
                 .expect("spawn a private dbus-daemon");
             let mut reader = BufReader::new(daemon.stdout.take().expect("daemon stdout piped"));
@@ -1352,7 +1377,8 @@ mod tests {
             let address = address.trim().to_string();
             assert!(
                 !address.is_empty(),
-                "private dbus-daemon printed no address"
+                "private dbus-daemon printed no address; it said: {}",
+                fs::read_to_string(&daemon_err).unwrap_or_default()
             );
 
             let old_tmpdir = std::env::var("TMPDIR").ok();
@@ -1368,6 +1394,7 @@ mod tests {
 
             Self {
                 root,
+                socket_path,
                 address,
                 daemon,
                 old_tmpdir,
@@ -1433,7 +1460,9 @@ mod tests {
                 Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
                 None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
             }
+            let _ = fs::remove_file(&self.socket_path);
             if !self.root_removed.get() {
+                unmount_everything_under(&self.root);
                 let _ = fs::remove_dir_all(&self.root);
             }
         }
@@ -1447,6 +1476,7 @@ mod tests {
         let root = bus.root().to_path_buf();
         drop(client);
         drop(server);
+        unmount_everything_under(&root);
         fs::remove_dir_all(&root).expect("remove the round-owned scratch root");
         bus.root_removed.set(true);
         drop(bus);
@@ -1522,6 +1552,75 @@ mod tests {
     /// calls land on the same clock tick still never collide on the same
     /// scratch path -- the nanosecond stamp alone is not collision-safe
     /// under parallel test execution.
+    /// D-259: a private bus socket lives here, not inside the test's own
+    /// scratch folder.
+    ///
+    /// A Unix socket path is cut off at about 100 characters by the kernel.
+    /// The scratch folders are named to say which test made them, so they run
+    /// to 90 characters on their own, and `bus.sock` on the end pushed them
+    /// over: `dbus-daemon` answered "Socket name too long" and the suite only
+    /// reported that no address was printed. The names grew past the line as
+    /// the process id and the counter in them got longer, which is why the
+    /// same tests used to pass. This folder is short and flat, so the length
+    /// no longer depends on the test's name.
+    /// D-259: unmounts anything that appeared under `root` before it is
+    /// removed.
+    ///
+    /// A test that drives the real picker lets real helpers start, and
+    /// `gvfsd-fuse` and the document portal mount themselves inside the
+    /// private runtime folder. A directory with a mount on it cannot be
+    /// removed: the removal came back "Device or resource busy" and failed
+    /// the test after it had already proved its point.
+    fn unmount_everything_under(root: &Path) {
+        let Ok(mounts) = fs::read_to_string("/proc/self/mountinfo") else {
+            return;
+        };
+        let prefix = format!("{}/", root.display());
+        let mut points: Vec<String> = mounts
+            .lines()
+            .filter_map(|line| line.split(' ').nth(4))
+            .filter(|point| point.starts_with(&prefix))
+            .map(|point| point.to_string())
+            .collect();
+        // Deepest first, so a mount inside a mount comes off in order.
+        points.sort_by_key(|point| std::cmp::Reverse(point.len()));
+        for point in points {
+            let done = Command::new("fusermount")
+                .arg("-u")
+                .arg("-z")
+                .arg(&point)
+                .status()
+                .map(|code| code.success())
+                .unwrap_or(false);
+            if !done {
+                let _ = Command::new("umount").arg("-l").arg(&point).status();
+            }
+        }
+    }
+
+    fn private_socket_path(tag: &str) -> PathBuf {
+        // Not under HOME: several tests point HOME at a fake home inside
+        // another test's scratch folder, and those nest, so a path built from
+        // HOME grew to 250 characters. The per-user runtime folder is short,
+        // is always on a local disk, and is emptied at logout.
+        let dir = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+            .join("wf-bus");
+        let dir = if fs::create_dir_all(&dir).is_ok() {
+            dir
+        } else {
+            let fallback = PathBuf::from("/tmp").join(format!("wf-bus-{}", unsafe { libc::getuid() }));
+            fs::create_dir_all(&fallback).expect("create the private bus socket folder");
+            fallback
+        };
+        let path = dir.join(format!("{}-{}-{}.sock", tag, std::process::id(), next_unique_id()));
+        assert!(
+            path.as_os_str().len() < 100,
+            "private bus socket path is too long for the kernel: {}",
+            path.display()
+        );
+        path
+    }
+
     fn next_unique_id() -> u64 {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -5733,6 +5832,7 @@ mod tests {
     /// service-activation directories resolve to our private
     /// `.service` file) and owns reaping it.
     struct PrivateActivationBus {
+        socket_path: PathBuf,
         address: String,
         daemon: Child,
         reaped: Cell<bool>,
@@ -5740,14 +5840,18 @@ mod tests {
 
     impl PrivateActivationBus {
         fn start(root: &Path) -> Self {
-            let socket_path = root.join("activation-bus.sock");
+            let socket_path = private_socket_path("a");
+            let daemon_err = root.join("activation-dbus-daemon.err");
             let mut daemon = Command::new("dbus-daemon")
                 .arg("--session")
                 .arg(format!("--address=unix:path={}", socket_path.display()))
                 .arg("--nofork")
                 .arg("--print-address")
+                .env("TMPDIR", root)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::from(
+                    fs::File::create(&daemon_err).expect("create the daemon error file"),
+                ))
                 .spawn()
                 .expect("spawn a private activation dbus-daemon");
             let mut reader = BufReader::new(daemon.stdout.take().expect("daemon stdout piped"));
@@ -5756,8 +5860,13 @@ mod tests {
                 .read_line(&mut address)
                 .expect("read private activation bus address");
             let address = address.trim().to_string();
-            assert!(!address.is_empty(), "private activation dbus-daemon printed no address");
+            assert!(
+                !address.is_empty(),
+                "private activation dbus-daemon printed no address; it said: {}",
+                fs::read_to_string(&daemon_err).unwrap_or_default()
+            );
             Self {
+                socket_path,
                 address,
                 daemon,
                 reaped: Cell::new(false),
@@ -5802,6 +5911,7 @@ mod tests {
 
     impl Drop for PrivateActivationBus {
         fn drop(&mut self) {
+            let _ = fs::remove_file(&self.socket_path);
             if self.reaped.get() {
                 return;
             }

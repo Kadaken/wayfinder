@@ -35,6 +35,14 @@ const DRAG_GHOST_OPACITY: f64 = 0.55;
 const DRAG_GHOST_MAX_WIDTH: i32 = 240;
 const DRAG_GHOST_ICON: i32 = 20;
 const MAX_GRID_THUMBNAILS: usize = 60;
+/// D-267: Icons view is a picture grid, not a column of stamps. A tile's
+/// picture is this many points square at zoom 1.0; Ctrl+scroll scales it with
+/// `icon_zoom` (0.6x to 2.4x), so a tile runs from 90 to 360 points.
+const GRID_TILE_SIZE: f64 = 150.0;
+/// However far the zoom goes, no tile decodes a thumbnail larger than this —
+/// sixty of them are held at once, and a folder of 4K pictures would otherwise
+/// cost hundreds of megabytes of texture.
+const MAX_GRID_THUMBNAIL_PIXELS: i32 = 384;
 // D-84: measured on a real ~1,214-image folder. 4 concurrent decodes bunch up
 // behind the shared GIO async I/O thread pool and delay the FIRST visible
 // thumbnail by roughly 1.1s (median first-thumbnail-paint 1147ms, n=5); at 2
@@ -411,6 +419,10 @@ progressbar.wf-space-bar.horizontal progress {
     background: @wf_control;
 }
 
+/* Size now sits left in its column like Type and Modified, so the right inset
+   that kept a right-aligned heading off the next divider is gone: it would
+   only push heading and values apart again. */
+
 /* The handle needs a 10px grab target but must READ as a hairline divider.
    Painting its background filled all 10px with near-black, which showed up as
    a black block between the headings. Paint a 1px border instead. */
@@ -446,9 +458,14 @@ progressbar.wf-space-bar.horizontal progress {
    the 1px content box, and background-image: none stops the theme drawing its
    own handle over the top. */
 paned > separator {
-    background-color: @wf_line;
+    background-color: @wf_border;
     background-image: none;
     background-clip: content-box;
+    /* The theme also paints the separator's own 7px box, which put a second,
+       paler hairline 3px from every divider. One line per boundary. */
+    border: none;
+    box-shadow: none;
+    outline: none;
     min-width: 1px;
     min-height: 1px;
     margin: 0 -3px;
@@ -489,12 +506,23 @@ scrollbar slider:hover {
     background: rgba(255, 255, 255, 0.30);
 }
 
+/* At rest GTK shrinks an overlay scrollbar to a thin indicator. The blanket
+   slider background above painted that indicator too, so a pale hairline sat
+   a few pixels from each pane divider and every boundary looked like two
+   ragged lines. The indicator is invisible until the pointer is on it. */
+
 scrollbar slider:active {
     background: @wf_accent;
 }
 
 .wf-list {
     background: @wf_base;
+    /* Empty space that belongs to the list, not to a row. Without it a folder
+       whose rows fill the view left nowhere to right-click for "New folder":
+       every pixel was owned by a file. The left strip gives that target even
+       before scrolling to the end of a long list. */
+    padding-left: 12px;
+    padding-bottom: 64px;
 }
 
 .wf-list row {
@@ -515,6 +543,9 @@ scrollbar slider:active {
 .wf-list row:selected {
     background: @wf_accent;
     color: #ffffff;
+    /* D-266: the divider is hidden under the selection, so a run of selected
+       rows is one unbroken block instead of being cut by a line per row. */
+    border-bottom-color: transparent;
 }
 
 .wf-file-row {
@@ -551,12 +582,45 @@ scrollbar slider:active {
 }
 
 .wf-list.wf-list-compact .wf-file-row {
-    min-height: 24px;
+    min-height: 18px;
+    padding: 0 12px;
+}
+
+.wf-list.wf-list-compact .wf-file-icon {
+    min-width: 16px;
+    min-height: 16px;
 }
 
 .wf-list.wf-list-compact .wf-file-name,
 .wf-list.wf-list-compact .wf-file-meta {
-    font-size: 14px;
+    font-size: 13px;
+}
+
+.wf-quick-access {
+    padding: 10px 12px 4px 12px;
+}
+
+.wf-quick-tile {
+    padding: 6px 10px;
+    border-radius: 6px;
+}
+
+.wf-quick-tile-name {
+    font-weight: 600;
+}
+
+/* D-254: the sidebar divider is not a control any more, so it gets no width
+   to grab and no highlight on hover. */
+.wf-main > separator {
+    min-width: 1px;
+    background-image: none;
+}
+.wf-sidebar-twisty {
+    min-width: 12px;
+    min-height: 16px;
+    padding: 0;
+    margin: 0;
+    opacity: 0.7;
 }
 
 .wf-grid {
@@ -640,6 +704,41 @@ scrollbar slider:active {
     font-size: 14px;
 }
 
+.wf-preview-folder {
+    background: @wf_base;
+    padding-bottom: 24px;
+}
+
+/* A row here is a button so the click target is explicit, but it must read as
+   a file-list row: no frame, no rounding, the list's own hover colour. */
+.wf-preview-folder-row {
+    background: none;
+    background-image: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 0;
+    min-height: 0;
+    color: @wf_text;
+    border-bottom: 1px solid rgba(255,255,255,0.025);
+}
+
+.wf-preview-folder-row:hover {
+    background: @wf_control_hover;
+}
+
+.wf-preview-folder-row:active {
+    background: @wf_accent;
+    color: #ffffff;
+}
+
+.wf-preview-folder-head {
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.wf-preview-folder-title {
+    font-weight: 700;
+}
 .wf-preview-empty {
     color: @wf_text_muted;
     font-size: 14px;
@@ -737,6 +836,71 @@ popover contents {
     background: @wf_border;
     min-height: 1px;
     margin: 4px 6px;
+}
+
+/* D-256 depth. Every edge in here used to be one flat hairline, so the bars,
+   the sidebar and the listing all sat on the same plane. Each rule below adds
+   a soft dark shadow under or beside an edge that is already there, so the
+   toolbars read as sitting above the files and the sidebar as sitting beside
+   them (7 Nov 2026, the owner: "add any shadowing effects around the app that may
+   give it more dynamics"). Kept small on purpose: a wide shadow smears when a
+   long listing scrolls under it. */
+.wf-titlebar {
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.30);
+}
+
+.wf-pathbar {
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.26);
+}
+
+.wf-commandbar {
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.34);
+}
+
+/* D-257: no side shadow and no inset edge on the sidebar or the preview.
+   Both drew a second line inside the panel, a hairline away from the divider
+   that was already there, and the strip between the two read as a grey gap
+   (7 Nov 2026, the owner: "there should not be a slight gray space between them
+   and their adjacent sections"). The vertical joins are one flat line, flush
+   on both sides. Depth is done with the horizontal edges only. */
+
+/* The headings stay readable while rows scroll under them. */
+.wf-column-header {
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.30);
+}
+
+/* A tile lifts under the pointer instead of only changing colour. */
+.wf-quick-tile:hover {
+    background: @wf_control;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.34);
+}
+
+.wf-grid-child:hover {
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.32);
+}
+
+.wf-grid-child:selected {
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.40);
+}
+
+/* D-266: no outline on a selected row. Two neighbouring selected rows put
+   outline against outline, with the row divider between them, and the run of
+   blue read as split by a double line. The block of colour is the selection;
+   it needs no edge of its own. */
+
+/* D-257: a sibling painted after a bar covers that bar's shadow, which is why
+   the bars alone showed nothing. The shadow is drawn inside the widget below
+   instead, where nothing paints over it. */
+.wf-files-stack {
+    box-shadow: inset 0 4px 5px -4px rgba(0, 0, 0, 0.55);
+}
+
+.wf-list {
+    box-shadow: inset 0 4px 5px -4px rgba(0, 0, 0, 0.55);
+}
+
+.wf-grid {
+    box-shadow: inset 0 4px 5px -4px rgba(0, 0, 0, 0.55);
 }
 "#;
 
@@ -964,6 +1128,42 @@ struct AppConfig {
     /// never starts deleting anybody's Trash without being asked.
     #[serde(default)]
     trash_keep_days: u32,
+    /// Opt-in: ask Copy / Move / Link on every drag and drop instead of
+    /// deciding from the modifier keys and the device. Off by default, so the
+    /// Explorer habit (Ctrl copies, Shift moves) keeps working untouched for
+    /// anyone who already has it and never gets a prompt they did not ask for.
+    #[serde(default)]
+    drop_ask: bool,
+    /// Set once the first-run setup has been answered, however it was answered.
+    /// An upgrade from a version without this field reads false and therefore
+    /// shows the setup once; that is deliberate, since the options it offers
+    /// are new.
+    #[serde(default)]
+    onboarded: bool,
+    /// D-242: send hand-installed software to one place instead of leaving it
+    /// wherever it was downloaded. On by default -- the whole point is that
+    /// nothing else on the system has an opinion, so neither would an opt-in.
+    #[serde(default = "default_true")]
+    install_convention: bool,
+    /// D-246: files opened from the listing, newest first. Folders were
+    /// already kept in `recents`; nothing ever kept the files, so the Home
+    /// page could not show the half of the list people look for. Defaulted,
+    /// so a config written by an older build reads as an empty list rather
+    /// than refusing to load.
+    #[serde(default)]
+    recent_files: Vec<Bookmark>,
+    /// D-260: draw image thumbnails in Details, List and Compact rows in the
+    /// slot each row already reserves for its file-type icon. Off by default:
+    /// Details is the view people use to read a folder quickly, and a decode
+    /// per visible row is a cost nobody asked for. Defaulted, so an existing
+    /// config reads as off rather than refusing to load.
+    #[serde(default)]
+    details_thumbnails: bool,
+}
+
+/// Serde needs a function for a default that is not the type's own.
+fn default_true() -> bool {
+    true
 }
 
 /// Mirrors `portal_service::WireFilter`. Defined separately rather than
@@ -1342,6 +1542,17 @@ fn picker_save_starting_dir(request: &WireRequestNative) -> Option<String> {
     if !request.save {
         return None;
     }
+    // D-242: an AppImage has one right home, and the app asking to save it has
+    // no idea where that is -- a browser suggests Downloads for everything.
+    // The convention wins over that suggestion, but never over a replacement:
+    // saving over a file that already exists keeps that file's folder.
+    if let Some(dir) = convention_save_dir(
+        request,
+        load_config().install_convention,
+        Path::new(&std::env::var("HOME").unwrap_or_default()),
+    ) {
+        return Some(dir);
+    }
     let from_folder = request.current_folder.as_deref().map(PathBuf::from);
     let from_file = request
         .current_file
@@ -1354,6 +1565,34 @@ fn picker_save_starting_dir(request: &WireRequestNative) -> Option<String> {
         .flatten()
         .find(|dir| dir.is_absolute() && dir.is_dir())
         .map(|dir| dir.to_string_lossy().into_owned())
+}
+
+/// D-242: the convention folder a Save should open in, when the name alone
+/// settles what is being saved. `None` means the ordinary rules apply: the
+/// convention is switched off, the name proves nothing, or the request names
+/// an existing file to replace, which is a folder the user already chose.
+fn convention_save_dir(
+    request: &WireRequestNative,
+    enabled: bool,
+    home: &Path,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let replacing = request
+        .current_file
+        .as_deref()
+        .map(Path::new)
+        .is_some_and(|path| path.is_file());
+    if replacing {
+        return None;
+    }
+    let kind = native_core::install_kind_for_name(&picker_save_initial_name(request))?;
+    let dir = native_core::install_dir_in(home, kind);
+    // Created on demand: a convention that only works once the user has made
+    // the folder by hand is not a default.
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.to_string_lossy().into_owned())
 }
 
 /// The name a Save box starts with: the app's suggestion, else the name of
@@ -1596,6 +1835,11 @@ impl Default for AppConfig {
             columns: ColumnVisibility::default(),
             remembered_networks: Vec::new(),
             trash_keep_days: 0,
+            drop_ask: false,
+            onboarded: false,
+            install_convention: true,
+            recent_files: Vec::new(),
+            details_thumbnails: false,
         }
     }
 }
@@ -1617,10 +1861,16 @@ fn load_config() -> AppConfig {
 }
 
 fn read_config_at(path: &Path) -> AppConfig {
-    fs::read_to_string(path)
+    let mut config: AppConfig = fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // D-247: a config written before the vault rule existed can already hold
+    // vault paths. Dropping them on every read means the next write removes
+    // them from the file as well, so nothing has to be cleaned up by hand.
+    config.recents.retain(|b| !native_core::is_vault_content(&b.path));
+    config.recent_files.retain(|b| !native_core::is_vault_content(&b.path));
+    config
 }
 
 /// Reads the config as it is on disk NOW, applies one change, writes it back.
@@ -1655,12 +1905,28 @@ fn config_search_in_files(config: &mut AppConfig, value: bool) {
     config.search_in_files = value;
 }
 
+fn config_drop_ask(config: &mut AppConfig, value: bool) {
+    config.drop_ask = value;
+}
+
+fn config_onboarded(config: &mut AppConfig, value: bool) {
+    config.onboarded = value;
+}
+
+fn config_install_convention(config: &mut AppConfig, value: bool) {
+    config.install_convention = value;
+}
+
 fn config_trash_keep_days(config: &mut AppConfig, value: u32) {
     config.trash_keep_days = value;
 }
 
 fn config_view_mode(config: &mut AppConfig, mode: ViewMode) {
     config.view_mode = view_mode_id(mode).to_string();
+}
+
+fn config_details_thumbnails(config: &mut AppConfig, value: bool) {
+    config.details_thumbnails = value;
 }
 
 fn config_column(config: &mut AppConfig, column: MetaColumn, shown: bool) {
@@ -1710,12 +1976,27 @@ fn bookmark_for_path(path: &str) -> Bookmark {
 }
 
 fn push_recent(recents: &mut Vec<Bookmark>, path: &str) {
-    if !Path::new(path).is_dir() {
+    // D-247: a vault is never advertised in a Recent list.
+    if !Path::new(path).is_dir() || native_core::is_vault_content(path) {
         return;
     }
     recents.retain(|bookmark| bookmark.path != path);
     recents.insert(0, bookmark_for_path(path));
     recents.truncate(12);
+}
+
+/// D-246: the same rule as `push_recent` -- newest first, no duplicate, twelve
+/// kept -- against a file instead of a folder. A path that is not a file is
+/// refused rather than stored, so the Recent strip can never offer a row that
+/// opens nothing.
+fn push_recent_file(recent_files: &mut Vec<Bookmark>, path: &str) {
+    // D-247: a vault is never advertised in a Recent list.
+    if !Path::new(path).is_file() || native_core::is_vault_content(path) {
+        return;
+    }
+    recent_files.retain(|bookmark| bookmark.path != path);
+    recent_files.insert(0, bookmark_for_path(path));
+    recent_files.truncate(12);
 }
 
 fn add_favorite(favorites: &mut Vec<Bookmark>, path: &str) {
@@ -1905,8 +2186,13 @@ struct AppState {
     pinned_top: Option<String>,
     filter_text: String,
     show_hidden: bool,
+    /// Mirror of `AppConfig::drop_ask`, read on every drop.
+    drop_ask: bool,
     search_in_files: bool,
     view_mode: ViewMode,
+    /// D-260: mirror of `AppConfig::details_thumbnails`. Read when a row binds,
+    /// so the visible rows alone decide which decodes are queued.
+    details_thumbnails: bool,
     icon_zoom: f64,
     preview_zoom: f64,
     sort_key: SortKey,
@@ -1918,12 +2204,19 @@ struct AppState {
     trash_keep_days: u32,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
+    /// D-246: files opened from the listing, newest first, for the Recent
+    /// strip on the Home page.
+    recent_files: Vec<Bookmark>,
     /// D-156 connect: saved shares, the one flow of this window and its dialog.
     remembered_networks: Vec<native_smb::RememberedNetwork>,
     smb_backend: Option<Rc<dyn native_smb::SmbBackend>>,
     smb_flow: Option<Rc<native_smb::SmbFlow>>,
     smb_dialog: Option<SmbDialog>,
     tree_expanded: HashSet<String>,
+    /// D-244: Home is the parent of Desktop, Documents and the rest in the
+    /// Places list, the way Explorer shows them. Open to begin with: a list
+    /// that starts collapsed hides the folders people click most.
+    places_expanded: bool,
     tree_children: HashMap<String, Vec<(String, String, bool)>>,
     typeahead: String,
     typeahead_at: Instant,
@@ -1999,12 +2292,30 @@ struct ThumbnailJob {
     picture: gtk::Picture,
     width: i32,
     height: i32,
+    /// D-260: `false` while the asking row is still on screen. A virtualized
+    /// list row that scrolls out of view unbinds and flips this, so the job's
+    /// result is dropped instead of painted into a row that no longer shows it.
+    alive: Rc<Cell<bool>>,
+}
+
+/// D-260: what a list row owns while its thumbnail is in flight.
+struct ThumbnailRow {
+    /// Flipped to `false` when this exact row leaves the screen.
+    alive: Rc<Cell<bool>>,
+    /// The row's picture, held weakly. A recycled `ListItem` can unbind AFTER
+    /// the same path has already bound into a fresh row, and without this
+    /// identity check that stale unbind would cancel the new row's job.
+    picture: glib::WeakRef<gtk::Picture>,
 }
 
 struct ThumbnailQueue {
     cancelled: gio::Cancellable,
     pending: VecDeque<ThumbnailJob>,
     active: usize,
+    /// D-260: the live row for each file that asked for a thumbnail, keyed by
+    /// its real path. Grid jobs are not registered here: Grid builds one
+    /// widget per file and never recycles a row.
+    row_tokens: HashMap<String, ThumbnailRow>,
 }
 
 struct VideoPosterJob {
@@ -2035,7 +2346,17 @@ struct Ui {
     back: gtk::Button,
     forward: gtk::Button,
     hidden: gtk::ToggleButton,
+    /// The "search file contents" checkbox beside the path bar. Held here so
+    /// the setup dialog can flip the real control rather than writing the
+    /// setting behind its back and leaving the checkbox showing the old value.
+    search_scope: gtk::CheckButton,
     files_stack: gtk::Stack,
+    /// D-245: the pinned-folder tiles above the listing at Home.
+    quick_access: gtk::Box,
+    quick_access_tiles: gtk::FlowBox,
+    /// D-246: the recently opened files, under the pinned folders at Home.
+    recent_files_strip: gtk::Box,
+    recent_files_tiles: gtk::FlowBox,
     column_header: gtk::Box,
     columns: ColumnSizing,
     path_stack: gtk::Stack,
@@ -2050,6 +2371,10 @@ struct Ui {
     list_scroll: gtk::ScrolledWindow,
     grid: gtk::FlowBox,
     preview_stack: gtk::Stack,
+    /// D-268: the preview pane's folder listing -- one clickable row per child
+    /// of the selected folder, so a folder is something you can look into
+    /// without leaving the folder you are in.
+    preview_folder: gtk::Box,
     preview_scroll: gtk::ScrolledWindow,
     file_preview: gtk::Paned,
     preview_toggle: gtk::ToggleButton,
@@ -2086,6 +2411,31 @@ struct Ui {
     rename: gtk::Button,
     trash: gtk::Button,
     terminal: gtk::Button,
+    /// D-241 split view: the whole single-pane body (tabs, path bar, command
+    /// bar, sidebar, list, preview, status). Held so the split toggle can lift
+    /// it out of `split_slot` and put it on the left of a new Paned.
+    body: gtk::Box,
+    /// The one child slot under the titlebar. Holds `body` alone at rest, or a
+    /// Paned of this pane's body and the second pane's body when split.
+    split_slot: gtk::Box,
+    /// Some only while split. The second pane owns its own AppState and Ui;
+    /// closing the split unregisters it and drops its widgets.
+    split: Rc<RefCell<Option<SplitPane>>>,
+}
+
+/// The live second pane: the Paned holding both bodies, and the pane's own
+/// state, kept so closing the split can unregister it.
+#[derive(Clone)]
+struct SplitPane {
+    paned: gtk::Paned,
+    state: Rc<RefCell<AppState>>,
+}
+
+/// Where a second pane puts itself: the window it shares and the Paned whose
+/// end child it becomes. Passed only by `toggle_split`.
+struct SplitHost {
+    window: adw::ApplicationWindow,
+    paned: gtk::Paned,
 }
 
 /// The interface Chrome, Brave, Firefox and most GTK/Qt apps call to say
@@ -3304,6 +3654,28 @@ fn main() {
         println!("wayfinder {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
+    // D-265: an agent that cannot see the flags guesses, and a guess that is
+    // wrong opens the wrong thing silently. --help says the whole command line.
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        println!("wayfinder {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            r#"
+Usage:
+  wayfinder                open the last folder
+  wayfinder FOLDER         open that folder
+  wayfinder FILE           open the file's folder, with the file highlighted
+  wayfinder --select FILE  the same, said outright
+
+Options:
+  --select FILE   highlight FILE and scroll to it; its folder is opened
+  --pick          run as a file picker and print the choice
+  --version, -V   print the version
+  --help, -h      print this
+
+A path may be a plain path or a file:// address."#
+        );
+        std::process::exit(0);
+    }
     #[cfg(feature = "guide")]
     let _ = guide_markers_inert();
     if std::env::args().any(|arg| arg == "--pick-capable") {
@@ -3451,10 +3823,28 @@ fn gtk_launch_args(raw_args: &[String]) -> Vec<String> {
     });
 
     if uses_picker_flags {
-        vec![program]
-    } else {
-        raw_args.to_vec()
+        return vec![program];
     }
+
+    // D-265: GTK itself reads this list, and a flag it does not know makes it
+    // print "Unknown option" and quit before a window ever opens. --select is
+    // ours, so it is turned back into a plain path before GTK sees it.
+    let mut out = vec![program];
+    let mut rest = raw_args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if let Some(value) = arg.strip_prefix("--select=") {
+            if !value.is_empty() {
+                out.push(value.to_string());
+            }
+        } else if arg == "--select" {
+            if let Some(value) = rest.next() {
+                out.push(value.to_string());
+            }
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
 }
 
 fn initial_path_from_files(files: &[gio::File]) -> Option<String> {
@@ -3552,6 +3942,19 @@ fn build_picker_filter_and_choice_controls(
 }
 
 fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: Option<String>) {
+    build_ui_in(app, initial_path, select_path, None);
+}
+
+/// Builds one file pane with its own state. With `host` set it is the second
+/// pane of a split: it reuses that window, skips the titlebar, the window
+/// registry and the first-run setup, and hides its own sidebar, so the window
+/// keeps one set of window chrome and one Places list.
+fn build_ui_in(
+    app: &adw::Application,
+    initial_path: Option<String>,
+    select_path: Option<String>,
+    host: Option<SplitHost>,
+) -> Rc<RefCell<AppState>> {
     let config = load_config();
     let picker = parse_picker_state();
     let initial_cwd = initial_path
@@ -3579,8 +3982,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         pinned_top: select_path.clone(),
         filter_text: String::new(),
         show_hidden: config.show_hidden,
+        drop_ask: config.drop_ask,
         search_in_files: config.search_in_files,
         view_mode: view_mode_from_id(&config.view_mode),
+        details_thumbnails: config.details_thumbnails,
         icon_zoom: 1.0,
         preview_zoom: 1.0,
         sort_key: visible_sort(config.sort_key, config.sort_ascending, config.columns).0,
@@ -3590,11 +3995,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         trash_keep_days: config.trash_keep_days,
         favorites: config.favorites,
         recents: config.recents,
+        recent_files: config.recent_files,
         remembered_networks: config.remembered_networks,
         smb_backend: None,
         smb_flow: None,
         smb_dialog: None,
         tree_expanded: HashSet::new(),
+        places_expanded: true,
         tree_children: HashMap::new(),
         typeahead: String::new(),
         typeahead_at: Instant::now(),
@@ -3708,7 +4115,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         .activate_on_single_click(false)
         .homogeneous(true)
         .min_children_per_line(1)
-        .max_children_per_line(8)
+        // D-267: tiles are picture-sized now; a wide window fits more than eight.
+        .max_children_per_line(16)
         .row_spacing(8)
         .column_spacing(8)
         .valign(gtk::Align::Start)
@@ -3757,7 +4165,12 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     preview_media_box.set_size_request(0, 0);
     preview_media_box.append(&preview_media_picture);
     preview_media_box.append(&preview_media_controls);
+    let preview_folder = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    preview_folder.set_hexpand(true);
+    preview_folder.set_valign(gtk::Align::Start);
+    preview_folder.add_css_class("wf-preview-folder");
     let preview_stack = gtk::Stack::new();
+    preview_stack.add_named(&preview_folder, Some("folder"));
     preview_stack.add_named(&preview, Some("text"));
     preview_stack.add_named(&preview_picture, Some("image"));
     preview_stack.add_named(&preview_media_box, Some("media"));
@@ -3969,11 +4382,15 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     files_stack.add_named(&grid_scroll, Some("grid"));
     files_stack.set_visible_child_name("list");
     let (column_header, columns) = details_header();
+    let (quick_access, quick_access_tiles) = build_tile_strip("Quick access");
+    let (recent_files_strip, recent_files_tiles) = build_tile_strip("Recent files");
     let files_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
     files_pane.add_css_class("wf-files-pane");
     files_pane.set_hexpand(true);
     files_pane.set_vexpand(true);
     files_pane.set_size_request(-1, 0);
+    files_pane.append(&quick_access);
+    files_pane.append(&recent_files_strip);
     files_pane.append(&column_header);
     files_pane.append(&files_stack);
     let preview_scroll = gtk::ScrolledWindow::builder()
@@ -4015,8 +4432,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     main.set_shrink_end_child(true);
     main.set_start_child(Some(&sidebar_scroll));
     main.set_end_child(Some(&file_preview));
-    main.set_position(200);
-    clamp_paned_position(&main, 150, 320);
+    main.set_position(SIDEBAR_FIXED_WIDTH);
+    lock_sidebar_width(&main);
     // Keep the files pane wide enough that the Name column never crushes (its
     // fixed overhead is ~388px), and the preview at least usable.
     clamp_paned_position(&file_preview, 480, 190);
@@ -4119,15 +4536,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     body.append(&status_row);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.add_css_class("wf-root");
-    content.set_size_request(1, 1);
-    content.append(&titlebar);
-    content.append(&body);
-
-    let root_overlay = gtk::Overlay::new();
-    root_overlay.set_size_request(1, 1);
-    root_overlay.set_child(Some(&content));
+    // The one slot under the titlebar. `body` alone at rest; a Paned of two
+    // bodies while split.
+    let split_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    split_slot.set_hexpand(true);
+    split_slot.set_vexpand(true);
+    split_slot.set_size_request(0, 0);
+    split_slot.append(&body);
 
     let picker_window = picker
         .as_ref()
@@ -4148,20 +4563,45 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
     let files_pos = (available - 300).max(480);
     file_preview.set_position(files_pos);
 
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Wayfinder")
-        .decorated(false)
-        .resizable(true)
-        .default_width(picker_window.width)
-        .default_height(picker_window.height)
-        .content(&root_overlay)
-        .build();
-    window.set_size_request(1, 1);
-    window.add_css_class("wayfinder-window");
-    connect_window_drag(&path_drag_handle, &window);
-    connect_titlebar_buttons(&window, minimize_button, maximize_button, close_button);
-    add_resize_grips(&root_overlay, &window);
+    // One window per pane pair. The first pane builds it; a second pane takes
+    // the one it was handed and hangs its body off the split's Paned.
+    let embedded = host.is_some();
+    let window = match host {
+        Some(host) => {
+            host.paned.set_end_child(Some(&split_slot));
+            // One Places list per window: the left pane's.
+            sidebar_scroll.set_visible(false);
+            main.set_position(0);
+            host.window
+        }
+        None => {
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.add_css_class("wf-root");
+            content.set_size_request(1, 1);
+            content.append(&titlebar);
+            content.append(&split_slot);
+
+            let root_overlay = gtk::Overlay::new();
+            root_overlay.set_size_request(1, 1);
+            root_overlay.set_child(Some(&content));
+
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .title("Wayfinder")
+                .decorated(false)
+                .resizable(true)
+                .default_width(picker_window.width)
+                .default_height(picker_window.height)
+                .content(&root_overlay)
+                .build();
+            window.set_size_request(1, 1);
+            window.add_css_class("wayfinder-window");
+            connect_window_drag(&path_drag_handle, &window);
+            connect_titlebar_buttons(&window, minimize_button, maximize_button, close_button);
+            add_resize_grips(&root_overlay, &window);
+            window
+        }
+    };
 
     let ui = Ui {
         window,
@@ -4169,7 +4609,12 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         back: back.clone(),
         forward: forward.clone(),
         hidden: hidden.clone(),
+        search_scope: search_in_files.clone(),
         files_stack,
+        quick_access,
+        quick_access_tiles,
+        recent_files_strip,
+        recent_files_tiles,
         column_header,
         columns,
         path_stack,
@@ -4184,6 +4629,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         list_scroll: files_scroll.clone(),
         grid,
         preview_stack,
+        preview_folder,
         preview_scroll: preview_scroll.clone(),
         file_preview: file_preview.clone(),
         preview_toggle: preview_toggle.clone(),
@@ -4210,17 +4656,29 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         rename: rename.clone(),
         trash: trash.clone(),
         terminal: terminal.clone(),
+        body: body.clone(),
+        split_slot: split_slot.clone(),
+        split: Rc::new(RefCell::new(None)),
     };
     // GtkApplication keeps an activation-created window alive automatically,
     // but an initial GApplication `open` request can otherwise return before
     // GTK has taken that hold. Pair an explicit hold with the window lifecycle
     // so folder launches and regular launches behave identically.
+    // Both panes register. Every listing renders through `ui_for_state`, so an
+    // unregistered pane navigates and paints nothing. The entries are told
+    // apart by their own ListView, never by the window they share.
     register_window(&state, &ui, app.hold());
     update_command_bar_zip_state(&state, &ui);
     wire_transfer_cancel(&state, &ui);
-    {
+    if !embedded {
         let state = state.clone();
+        let split = ui.split.clone();
         ui.window.connect_close_request(move |_| {
+            // The second pane holds its own application hold. Left registered,
+            // it would keep the process alive after its window is gone.
+            if let Some(pane) = split.borrow_mut().take() {
+                unregister_window(&pane.state);
+            }
             unregister_window(&state);
             glib::Propagation::Proceed
         });
@@ -4228,10 +4686,12 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
 
     rebuild_tabs(&state, &ui);
     rebuild_sidebar(&state, &ui);
-    if picker.is_none() {
+    if picker.is_none() && !embedded {
         sweep_expired_trash(&state, &ui);
     }
-    start_drive_refresh(&state);
+    if !embedded {
+        start_drive_refresh(&state);
+    }
     #[cfg(feature = "guide")]
     start_guide_watch(&state);
     {
@@ -4321,7 +4781,14 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
             if native_smb::looks_like_smb(&path) {
                 smb_flow(&state, &ui).connect(&path);
             } else if !path.is_empty() {
-                navigate(&state, native_core::Location::real(&path));
+                // D-262: the text is cleaned and resolved before anything is
+                // listed. A relative fragment, a file:// URI, a quoted paste,
+                // a `~` or a file's own path all used to be handed straight
+                // to the lister, which silently did nothing.
+                match resolve_address_text(&state, &path) {
+                    Some(target) => navigate(&state, native_core::Location::real(&target)),
+                    None => ui.status.set_label(&format!("No folder called \u{201c}{path}\u{201d}")),
+                }
             }
         });
     }
@@ -4445,12 +4912,56 @@ fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: O
         ui.window.set_modal(true);
     }
 
-    ui.window.present();
+    if !embedded {
+        ui.window.present();
+    }
+
+    // First run only, and never in a picker: a file dialog belongs to another
+    // program and must not be interrupted by our setup. Shown from an idle
+    // after present() for the same reason the picker's focus grab is -- before
+    // the window is mapped there is nothing for a dialog to be parented to.
+    // Every headless test runs on a brand new HOME, so without this gate the
+    // welcome dialog opens over each test window and swallows the real pointer
+    // input the guide and drag proofs depend on. WF_TEST_FIRST_RUN=1 lets a
+    // test ask for the dialog on purpose.
+    let headless_no_first_run = std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() == Ok("1")
+        && std::env::var("WF_TEST_FIRST_RUN").as_deref() != Ok("1");
+    if state.borrow().picker.is_none() && !embedded && !headless_no_first_run && !load_config().onboarded {
+        let state_for_setup = state.clone();
+        let ui_for_setup = ui.clone();
+        glib::idle_add_local_once(move || {
+            show_setup_dialog(state_for_setup, ui_for_setup, true);
+        });
+    }
+
+    // A Save picker opens ready to type. The name was selected but nothing
+    // held the keyboard, so the first keystroke went to the file list's
+    // type-ahead and the highlighted name just sat there: the user had to
+    // click the box first. The grab happens after present() -- before the
+    // window is mapped a grab does not stick -- and the stem is selected
+    // again afterwards, because taking focus selects the whole text and that
+    // would let the first keystroke eat the extension.
+    if let Some(entry) = ui.picker_name.clone() {
+        let window = ui.window.clone();
+        glib::idle_add_local_once(move || {
+            GtkWindowExt::set_focus(&window, Some(&entry));
+            entry.grab_focus();
+            let text = entry.text();
+            let stem_len = Path::new(text.as_str())
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.chars().count() as i32)
+                .unwrap_or(-1);
+            entry.select_region(0, stem_len);
+        });
+    }
 
     #[cfg(feature = "picker-test-driver")]
     if ui.picker_open.is_some() {
         schedule_picker_test_driver(&state, &ui);
     }
+
+    state
 }
 
 /// Exists only in the non-default `picker-test-driver` feature build. Fires
@@ -4558,6 +5069,41 @@ fn schedule_picker_test_driver(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 /// Select+focus the row for `path` in the current listing, if it is present.
+/// D-264: put a whole selection back after the rows were rebuilt. The first
+/// one clears what the view had; the rest are added, so more than one file
+/// stays selected across a view change.
+fn reselect_sources(state: &Rc<RefCell<AppState>>, ui: &Ui, sources: &[native_core::EntrySource]) {
+    let indexes: Vec<usize> = {
+        let state_ref = state.borrow();
+        sources
+            .iter()
+            .filter_map(|source| {
+                state_ref
+                    .visible_entries
+                    .iter()
+                    .position(|entry| &entry.source == source)
+            })
+            .collect()
+    };
+    let Some((first, rest)) = indexes.split_first() else {
+        return;
+    };
+    select_index(state, ui, *first);
+    let view_mode = state.borrow().view_mode;
+    for index in rest {
+        match view_mode {
+            ViewMode::Grid => {
+                if let Some(child) = ui.grid.child_at_index(*index as i32) {
+                    ui.grid.select_child(&child);
+                }
+            }
+            ViewMode::Details | ViewMode::Compact => {
+                ui.list_selection.select_item(*index as u32, false);
+            }
+        }
+    }
+}
+
 fn select_entry_by_source(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::EntrySource) {
     let index = state
         .borrow()
@@ -4610,6 +5156,33 @@ fn size_toolbar_button(button: &impl IsA<gtk::Widget>) {
     button.set_height_request(24);
 }
 
+/// D-254: the one width of the sidebar. Wide enough that "Downloads" under
+/// Home shows in full at its indent.
+const SIDEBAR_FIXED_WIDTH: i32 = 230;
+
+/// Hold the sidebar at one width. The divider used to be draggable, and a
+/// stray drag squashed the names or shut the sidebar altogether with nothing
+/// to say it had happened (7 Nov 2026, the owner: "remove the resize feature for
+/// the side bar so I can't accidentally collapse it"). Position 0 is left
+/// alone: that is a second pane deliberately hiding its own copy of the list,
+/// not a drag.
+fn lock_sidebar_width(paned: &gtk::Paned) {
+    let holding = Rc::new(RefCell::new(false));
+    paned.connect_position_notify(move |pane| {
+        if *holding.borrow() {
+            return;
+        }
+        let position = pane.position();
+        if position == 0 || position == SIDEBAR_FIXED_WIDTH {
+            return;
+        }
+        *holding.borrow_mut() = true;
+        pane.set_position(SIDEBAR_FIXED_WIDTH);
+        *holding.borrow_mut() = false;
+    });
+}
+
+#[allow(dead_code)]
 fn clamp_paned_position(paned: &gtk::Paned, min_start: i32, min_end: i32) {
     let adjusting = Rc::new(RefCell::new(false));
     let adjusting_for_notify = adjusting.clone();
@@ -4859,7 +5432,7 @@ fn connect_titlebar_buttons(
 //   Type    "SHA256 file"       ~86px
 //   Modified"07/13/2026 8:13 PM"~140px
 // Name is flexible (hexpand) and takes whatever is left.
-const COL_SIZE_W: i32 = 60;
+const COL_SIZE_W: i32 = 70;
 const COL_KIND_W: i32 = 88;
 const COL_MODIFIED_W: i32 = 148;
 const COL_MIN_W: i32 = 44;
@@ -5015,7 +5588,11 @@ fn column_button(text: &str, name: &str, width_chars: i32) -> gtk::Button {
     // does so in details_header().
     let label = gtk::Label::builder()
         .label(text)
-        .xalign(if name == "sort-size" { 1.0 } else { 0.0 })
+        // Every column heading sits at the left edge of its own column, Size
+        // included. A right-aligned Size heading pushed the word up against
+        // Type while Type and Modified sat left, so the three headings read as
+        // if they belonged to different columns.
+        .xalign(0.0)
         .yalign(0.5)
         .hexpand(false)
         .halign(gtk::Align::Fill)
@@ -5179,6 +5756,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             row.set_tooltip_text(Some(&favorite.path));
             row.set_widget_name("wf-place-row");
             connect_place_context(&row, state.clone(), ui.clone(), favorite.path.clone());
+            connect_sidebar_drop(&row, state, ui, &favorite.path);
             mark_sidebar_active(
                 &row,
                 &cwd,
@@ -5192,11 +5770,43 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 
     append_sidebar_heading(&ui.sidebar, "Places");
+    let home_path = std::env::var("HOME").unwrap_or_default();
+    let places_expanded = state.borrow().places_expanded;
     for (name, path) in native_core::standard_dirs() {
+        // D-244: anything sitting directly inside Home is drawn as a child of
+        // Home and hidden while Home is closed, the way Explorer draws it. Root
+        // is not inside Home and Trash is three folders down, so both stay at
+        // the top level.
+        let is_home = !home_path.is_empty() && path == home_path;
+        let under_home = !is_home
+            && !home_path.is_empty()
+            && Path::new(&path).parent() == Some(Path::new(&home_path));
+        if under_home && !places_expanded {
+            continue;
+        }
         let row = sidebar_row(&name, "", place_icon(&name));
+        if under_home {
+            indent_sidebar_row(&row);
+        } else if !is_home {
+            // Root and Trash carry no twisty, so they take its width as blank
+            // space and their icons sit under Home's.
+            reserve_sidebar_gutter(&row);
+        }
+        if is_home {
+            let arrow = sidebar_expander(places_expanded);
+            prepend_sidebar_arrow(&row, &arrow);
+            let state = state.clone();
+            let ui = ui.clone();
+            arrow.connect_clicked(move |_| {
+                let open_now = !state.borrow().places_expanded;
+                state.borrow_mut().places_expanded = open_now;
+                rebuild_sidebar(&state, &ui);
+            });
+        }
         row.set_tooltip_text(Some(&path));
         row.set_widget_name(if place_is_trash(&path) { "wf-trash-place-row" } else { "wf-place-row" });
         connect_place_context(&row, state.clone(), ui.clone(), path.clone());
+        connect_sidebar_drop(&row, state, ui, &path);
         mark_sidebar_active(
             &row,
             &cwd,
@@ -5234,8 +5844,41 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             } else {
                 &drive.mountpoint
             }));
+            // D-252: a device opens into its own folder tree, the way the
+            // drives do in Explorer and in Dolphin.
+            let mount = drive.mountpoint.clone();
             connect_drive_context(&row, state.clone(), ui.clone(), drive);
+            let show_hidden = state.borrow().show_hidden;
+            let tree_open = !mount.is_empty() && state.borrow().tree_expanded.contains(&mount);
+            let can_open = !mount.is_empty() && dir_has_subdirs(&mount, show_hidden);
+            if can_open {
+                let arrow = sidebar_expander(tree_open);
+                prepend_sidebar_arrow(&row, &arrow);
+                let state_for_arrow = state.clone();
+                let ui_for_arrow = ui.clone();
+                let mount_for_arrow = mount.clone();
+                arrow.connect_clicked(move |_| {
+                    toggle_tree_only(&state_for_arrow, &ui_for_arrow, &mount_for_arrow);
+                });
+            } else {
+                reserve_sidebar_gutter(&row);
+            }
             ui.sidebar.append(&row);
+            if tree_open && can_open {
+                for (child_name, child_path, has_children) in ensure_tree_children(state, &mount) {
+                    append_tree_row(
+                        state,
+                        ui,
+                        &child_name,
+                        &child_path,
+                        has_children,
+                        1,
+                        &cwd,
+                        sidebar_active_key.as_deref(),
+                        &mut active_target,
+                    );
+                }
+            }
         }
     }
     state.borrow_mut().drive_rows = drive_rows;
@@ -5260,38 +5903,20 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let folders = folder_tree_roots();
     if !folders.is_empty() {
         append_sidebar_heading(&ui.sidebar, "Folders");
+        let show_hidden = state.borrow().show_hidden;
         for (name, path) in folders {
-            let expanded = state.borrow().tree_expanded.contains(&path);
-            let label = format!("{}  {name}", if expanded { "▾" } else { "▸" });
-            let row = sidebar_row(&label, "", "asset:folders");
-            row.set_tooltip_text(Some(&path));
-            mark_sidebar_active(
-                &row,
-                &cwd,
-                &label,
+            let has_children = dir_has_subdirs(&path, show_hidden);
+            append_tree_row(
+                state,
+                ui,
+                &name,
                 &path,
+                has_children,
+                0,
+                &cwd,
                 sidebar_active_key.as_deref(),
                 &mut active_target,
             );
-            ui.sidebar.append(&row);
-            if expanded {
-                let children = ensure_tree_children(state, &path);
-                for (child_name, child_path, has_children) in children {
-                    let child_label =
-                        format!("  {}  {child_name}", if has_children { "▸" } else { " " });
-                    let child_row = sidebar_row(&child_label, "", "asset:folders");
-                    child_row.set_tooltip_text(Some(&child_path));
-                    mark_sidebar_active(
-                        &child_row,
-                        &cwd,
-                        &child_label,
-                        &child_path,
-                        sidebar_active_key.as_deref(),
-                        &mut active_target,
-                    );
-                    ui.sidebar.append(&child_row);
-                }
-            }
         }
     }
 
@@ -5300,8 +5925,12 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     if !recents.is_empty() {
         append_sidebar_heading(&ui.sidebar, "Recent");
         for recent in recents {
-            let row = sidebar_row(&recent.name, "", "asset:recent");
+            // D-250: there has never been a packaged "recent" asset, so this
+            // asked the icon theme for a name called "asset:recent", got
+            // nothing, and every Recent row drew the red broken-image square.
+            let row = sidebar_row(&recent.name, "", "document-open-recent-symbolic");
             row.set_tooltip_text(Some(&recent.path));
+            connect_sidebar_drop(&row, state, ui, &recent.path);
             mark_sidebar_active(
                 &row,
                 &cwd,
@@ -5313,6 +5942,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             ui.sidebar.append(&row);
         }
     }
+    rebuild_quick_access(state, ui);
     #[cfg(feature = "guide")]
     guide_resolve_drive_space_later(state);
 }
@@ -5341,11 +5971,6 @@ fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListB
         return;
     };
     state.borrow_mut().sidebar_active_key = Some(sidebar_key(&label, &path));
-
-    if label.trim_start().starts_with('▸') || label.trim_start().starts_with('▾') {
-        toggle_tree_path(state, ui, &path);
-        return;
-    }
 
     let cached = state
         .borrow()
@@ -6081,6 +6706,106 @@ fn ensure_tree_children(state: &Rc<RefCell<AppState>>, path: &str) -> Vec<(Strin
     children
 }
 
+/// How deep the sidebar tree will open. A guard, not a preference: a symlink
+/// loop or a very deep tree must not be able to build an endless sidebar.
+const SIDEBAR_TREE_MAX_DEPTH: i32 = 12;
+
+/// Is there at least one subfolder to open into? Cheap on purpose: it stops at
+/// the first one instead of listing the whole folder.
+fn dir_has_subdirs(path: &str, show_hidden: bool) -> bool {
+    let Ok(read_dir) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// D-252: one sidebar tree row, and its children under it when it is open.
+/// Explorer and Dolphin both let any folder in the sidebar open into its own
+/// subfolders at any depth. This used to stop after one level, and the row
+/// carried a text arrow inside its own words, so clicking the folder toggled
+/// it instead of opening it (7 Nov 2026, the owner: "Windows explorer and dolphin
+/// appear to have file trees under their devices and other folders in the
+/// side bar"). The arrow is now a real button: the arrow opens the branch,
+/// the name opens the folder.
+#[allow(clippy::too_many_arguments)]
+fn append_tree_row(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    name: &str,
+    path: &str,
+    has_children: bool,
+    depth: i32,
+    cwd: &str,
+    sidebar_active_key: Option<&str>,
+    active_target: &mut Option<String>,
+) {
+    let row = sidebar_row(name, "", "asset:folders");
+    row.set_tooltip_text(Some(path));
+    let expanded = state.borrow().tree_expanded.contains(path);
+    let openable = has_children && depth < SIDEBAR_TREE_MAX_DEPTH;
+    if openable {
+        let arrow = sidebar_expander(expanded);
+        prepend_sidebar_arrow(&row, &arrow);
+        let state_for_arrow = state.clone();
+        let ui_for_arrow = ui.clone();
+        let path_for_arrow = path.to_string();
+        arrow.connect_clicked(move |_| {
+            toggle_tree_only(&state_for_arrow, &ui_for_arrow, &path_for_arrow);
+        });
+    } else {
+        reserve_sidebar_gutter(&row);
+    }
+    if depth > 0 {
+        if let Some(line) = row.child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
+            line.set_margin_start(line.margin_start() + depth * SIDEBAR_INDENT);
+        }
+    }
+    connect_sidebar_drop(&row, state, ui, path);
+    mark_sidebar_active(&row, cwd, name, path, sidebar_active_key, active_target);
+    ui.sidebar.append(&row);
+    if !expanded || !openable {
+        return;
+    }
+    for (child_name, child_path, child_has_children) in ensure_tree_children(state, path) {
+        append_tree_row(
+            state,
+            ui,
+            &child_name,
+            &child_path,
+            child_has_children,
+            depth + 1,
+            cwd,
+            sidebar_active_key,
+            active_target,
+        );
+    }
+}
+
+/// Open or close one branch and nothing else. The old toggle also navigated
+/// into the folder, which is wrong for an arrow: in Explorer the arrow never
+/// changes which folder is on screen.
+fn toggle_tree_only(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+    {
+        let mut state_ref = state.borrow_mut();
+        if state_ref.tree_expanded.contains(path) {
+            state_ref.tree_expanded.remove(path);
+        } else {
+            state_ref.tree_expanded.insert(path.to_string());
+        }
+    }
+    rebuild_sidebar(state, ui);
+}
+
+#[allow(dead_code)]
 fn toggle_tree_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
     {
         let mut state_ref = state.borrow_mut();
@@ -6196,8 +6921,225 @@ fn append_sidebar_heading(sidebar: &gtk::ListBox, text: &str) -> gtk::ListBoxRow
     row
 }
 
+/// D-245: Explorer's Quick access strip -- the folders you pinned shown as
+/// tiles at the top of Home, not only as rows down the side.
+/// One titled strip of tiles above the listing. Two of them exist: the pinned
+/// folders and, under them, the files opened most recently (D-246). They are
+/// the same widget built twice rather than two near-identical builders, so a
+/// change to the look cannot land on one and miss the other.
+fn build_tile_strip(heading_words: &str) -> (gtk::Box, gtk::FlowBox) {
+    let strip = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    strip.add_css_class("wf-quick-access");
+    let heading = gtk::Label::builder().label(heading_words).xalign(0.0).build();
+    heading.add_css_class("wf-sidebar-heading");
+    let tiles = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .row_spacing(6)
+        .column_spacing(6)
+        .homogeneous(true)
+        .min_children_per_line(2)
+        .max_children_per_line(6)
+        .build();
+    strip.append(&heading);
+    strip.append(&tiles);
+    // Hidden until something is pinned and the window is actually at Home: an
+    // empty strip would take height from the listing for nothing.
+    strip.set_visible(false);
+    (strip, tiles)
+}
+
+/// D-246: remember a file that just opened, in the config and in this window,
+/// so the Recent strip survives a restart and updates without one.
+fn remember_recent_file(state: &Rc<RefCell<AppState>>, path: &str) {
+    match update_config(|config| push_recent_file(&mut config.recent_files, path)) {
+        Some(config) => state.borrow_mut().recent_files = config.recent_files,
+        None => push_recent_file(&mut state.borrow_mut().recent_files, path),
+    }
+}
+
+/// One tile: a big icon, the name, and where it came from underneath.
+fn tile_for(entry: &Bookmark, icon_name: &str, home: &str) -> (gtk::Button, gtk::Box) {
+    let tile = gtk::Button::new();
+    tile.add_css_class("flat");
+    tile.add_css_class("wf-quick-tile");
+    tile.set_tooltip_text(Some(&entry.path));
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let icon = gtk::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(28);
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    words.set_hexpand(true);
+    let name = gtk::Label::builder()
+        .label(&entry.name)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    name.add_css_class("wf-quick-tile-name");
+    let folder = native_core::parent_dir(&entry.path);
+    let where_label = gtk::Label::builder()
+        .label(&if folder == home { "Home".to_string() } else { folder })
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    where_label.add_css_class("wf-sidebar-detail");
+    words.append(&name);
+    words.append(&where_label);
+    line.append(&icon);
+    line.append(&words);
+    tile.set_child(Some(&line));
+    (tile, line)
+}
+
+fn clear_tiles(tiles: &gtk::FlowBox) {
+    while let Some(child) = tiles.first_child() {
+        tiles.remove(&child);
+    }
+}
+
+/// Fill both Home strips -- the pinned folders and the recent files -- or hide
+/// them. Called wherever the listing, the favourites or the recent list change,
+/// so neither strip can show yesterday's contents.
+fn rebuild_quick_access(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    clear_tiles(&ui.quick_access_tiles);
+    clear_tiles(&ui.recent_files_tiles);
+    let home = std::env::var("HOME").unwrap_or_default();
+    let at_home = !home.is_empty()
+        && state
+            .borrow()
+            .cwd
+            .real_path()
+            .is_some_and(|path| path.to_string_lossy() == home);
+    let favorites = state.borrow().favorites.clone();
+    if !at_home || favorites.is_empty() {
+        ui.quick_access.set_visible(false);
+    } else {
+        for favorite in favorites {
+            let (tile, _) = tile_for(&favorite, "folder", &home);
+            let state = state.clone();
+            let path = favorite.path.clone();
+            tile.connect_clicked(move |_| {
+                navigate(&state, native_core::Location::real(&path));
+            });
+            ui.quick_access_tiles.insert(&tile, -1);
+        }
+        ui.quick_access.set_visible(true);
+    }
+    // D-246: a remembered file can be deleted or moved between openings, and a
+    // tile that opens nothing is worse than no tile, so the list is filtered
+    // against the disk every time the strip is drawn rather than trusted.
+    let recent_files: Vec<Bookmark> = state
+        .borrow()
+        .recent_files
+        .iter()
+        .filter(|file| {
+            // D-247: also filtered here, not only on the way in, so a vault
+            // path written by an older build disappears on the next draw
+            // instead of waiting for the list to age out.
+            Path::new(&file.path).is_file() && !native_core::is_vault_content(&file.path)
+        })
+        .take(6)
+        .cloned()
+        .collect();
+    if !at_home || recent_files.is_empty() {
+        ui.recent_files_strip.set_visible(false);
+        return;
+    }
+    for file in recent_files {
+        let (tile, _) = tile_for(&file, "text-x-generic", &home);
+        let path = file.path.clone();
+        let status = ui.status.clone();
+        let name = file.name.clone();
+        tile.connect_clicked(move |_| {
+            if let Err(err) = launch_path(&path) {
+                status.set_label(&format!("Open failed: {err}"));
+            } else {
+                status.set_label(&format!("Opened {name}"));
+            }
+        });
+        ui.recent_files_tiles.insert(&tile, -1);
+    }
+    ui.recent_files_strip.set_visible(true);
+}
+
 fn sidebar_row(name: &str, detail: &str, icon_name: &str) -> gtk::ListBoxRow {
     sidebar_row_with_bar(name, detail, icon_name, None).0
+}
+
+/// D-244: the twisty in front of Home. A button of its own, so clicking the
+/// name still opens the folder and only the arrow opens or closes the list.
+fn sidebar_expander(expanded: bool) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(if expanded {
+        "pan-down-symbolic"
+    } else {
+        "pan-end-symbolic"
+    });
+    button.add_css_class("flat");
+    button.add_css_class("wf-sidebar-twisty");
+    button.set_valign(gtk::Align::Center);
+    button.set_can_focus(false);
+    button.set_tooltip_text(Some(if expanded { "Collapse" } else { "Expand" }));
+    button
+}
+
+/// Put the twisty at the head of a row's line. The name label stays the LAST
+/// child of the line, which is what `sidebar_row_label` reads, so nothing that
+/// identifies a row by its words is disturbed.
+fn prepend_sidebar_arrow(row: &gtk::ListBoxRow, arrow: &gtk::Button) {
+    if let Some(line) = row.child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
+        // The row keeps its ordinary left margin, so the twisty pushes Home in
+        // from the panel edge the way Explorer does. Pulling the margin back
+        // to the edge made Home sit flush and the nesting did not read
+        // (7 Nov 2026, the owner: "should not be flush but offset").
+        line.prepend(arrow);
+    }
+}
+
+/// The twisty plus the gap after it. A Places row with no twisty of its own
+/// takes this as blank space, so Root and Trash line up with Home instead of
+/// starting further left than it (7 Nov 2026, the owner: "home is not offset, it
+/// has only received an arrow" -- the arrow had pushed Home's icon right and
+/// left every other row where it was).
+const SIDEBAR_TWISTY_GUTTER: i32 = 20;
+
+/// One step of nesting, on top of the gutter: a child of Home sits a little
+/// past Home's own icon. Small on purpose. At 20 the children were pushed far
+/// enough right that "Documents" and "Downloads" ellipsised to "Doc... nts"
+/// and "Do... ads" in a sidebar of ordinary width (7 Nov 2026). Explorer's
+/// step is about this size, and the owner asked for the same subtlety.
+const SIDEBAR_INDENT: i32 = 12;
+
+/// Reserve the twisty's width on a row that has no twisty.
+fn reserve_sidebar_gutter(row: &gtk::ListBoxRow) {
+    if let Some(line) = row.child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
+        line.set_margin_start(line.margin_start() + SIDEBAR_TWISTY_GUTTER);
+    }
+}
+
+/// D-248: a sidebar entry is a folder, so it must accept a drop like any
+/// other folder does. Nothing in the sidebar had a drop target at all, so
+/// dragging a file onto Videos or onto a favourite did nothing and gave no
+/// reason (7 Nov 2026, found by dragging a video from Downloads to Videos).
+/// The controller goes on the row's line, which is the widget that fills the
+/// row, so the whole entry is a target and not just the text.
+fn connect_sidebar_drop(
+    row: &gtk::ListBoxRow,
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    path: &str,
+) {
+    // Trash is not a folder to copy into; dropping there means delete, which
+    // is its own decision and is not what this does.
+    if place_is_trash(path) || !Path::new(path).is_dir() {
+        return;
+    }
+    if let Some(line) = row.child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
+        connect_file_drop_to_dir(&line, state.clone(), ui.clone(), PathBuf::from(path));
+    }
+}
+
+fn indent_sidebar_row(row: &gtk::ListBoxRow) {
+    if let Some(line) = row.child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
+        line.set_margin_start(line.margin_start() + SIDEBAR_TWISTY_GUTTER + SIDEBAR_INDENT);
+    }
 }
 
 /// The one sidebar row layout; a drive row adds a fill bar below its words.
@@ -6223,7 +7165,13 @@ fn sidebar_row_with_bar(
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
         .build();
-    name.set_max_width_chars(12);
+    // D-254: this cut every name to twelve characters, so "Documents" and
+    // "Downloads" read as "Doc...nts" and "Do...ads" no matter how wide the
+    // sidebar was. The sidebar now has a fixed width, so the label simply
+    // takes what is there and only shortens a name that genuinely will not
+    // fit (7 Nov 2026, the owner: "untruncate the side bar").
+    name.set_max_width_chars(-1);
+    name.set_width_chars(-1);
     name.add_css_class("wf-sidebar-title");
     let detail = gtk::Label::builder()
         .label(detail)
@@ -6288,28 +7236,41 @@ fn drive_icon(drive: &Drive) -> &'static str {
     }
 }
 
+/// D-255: the sidebar icon, a step larger than it was. At 16px in an 18px
+/// slot they read as small against the full-length names (7 Nov 2026, the owner:
+/// "I think the icons should be SLIGHTLY bigger").
+const SIDEBAR_ICON_PIXELS: i32 = 28;
+const SIDEBAR_ICON_SLOT: i32 = 30;
+
 fn sidebar_icon(icon_name: &str) -> gtk::Box {
     let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    slot.set_size_request(18, 18);
+    slot.set_size_request(SIDEBAR_ICON_SLOT, SIDEBAR_ICON_SLOT);
     slot.set_halign(gtk::Align::Center);
     slot.set_valign(gtk::Align::Center);
 
+    // D-250: a name that asks for an asset must never reach the icon theme
+    // with its "asset:" prefix still on it. The theme has no such icon, so it
+    // answered with the broken-image square -- a red block in the sidebar
+    // with nothing to say which asset was missing.
+    let mut icon_name = icon_name;
     if let Some(asset_name) = icon_name.strip_prefix("asset:") {
         if let Some(texture) = packaged_icon_texture(SIDEBAR_ICON_BYTES, asset_name) {
             let icon = gtk::Picture::for_paintable(&texture);
             icon.set_can_shrink(true);
             icon.set_content_fit(gtk::ContentFit::Contain);
-            icon.set_size_request(18, 18);
+            icon.set_size_request(SIDEBAR_ICON_SLOT, SIDEBAR_ICON_SLOT);
             icon.set_halign(gtk::Align::Center);
             icon.set_valign(gtk::Align::Center);
             slot.append(&icon);
             return slot;
         }
+        eprintln!("wf-event: no packaged sidebar icon called {asset_name:?}");
+        icon_name = "folder-symbolic";
     }
 
     let icon = gtk::Image::from_icon_name(icon_name);
-    icon.set_pixel_size(16);
-    icon.set_size_request(18, 18);
+    icon.set_pixel_size(SIDEBAR_ICON_PIXELS);
+    icon.set_size_request(SIDEBAR_ICON_SLOT, SIDEBAR_ICON_SLOT);
     icon.set_halign(gtk::Align::Center);
     icon.set_valign(gtk::Align::Center);
     slot.append(&icon);
@@ -6318,6 +7279,16 @@ fn sidebar_icon(icon_name: &str) -> gtk::Box {
 
 /// Every custom sidebar PNG, compiled into the executable so an installed
 /// build never looks for icon files in a build tree, HOME or the working folder.
+///
+/// D-258: these are `static/icons/sidebar/`, which is now the 96px originals
+/// shrunk to exactly the 30 pixels the sidebar draws, by
+/// `scripts/make-sidebar-icons.sh`. Two earlier tries were soft: the old 18px
+/// copies were being stretched past their own size, and handing the window
+/// the 96px original let the graphics card shrink it by plain averaging,
+/// which rounds every edge. The script shrinks with Lanczos and a light
+/// sharpen instead, so the edges stay hard (7 Nov 2026, the owner: "they need to
+/// look crisp"). Change `SIDEBAR_ICON_SLOT` and you must run that script
+/// again with the new number.
 const SIDEBAR_ICON_BYTES: &[(&str, &[u8])] = &[
     ("desktop", include_bytes!("../../static/icons/sidebar/desktop.png")),
     ("documents", include_bytes!("../../static/icons/sidebar/documents.png")),
@@ -6569,6 +7540,131 @@ fn set_preview_visible(state: &Rc<RefCell<AppState>>, ui: &Ui, visible: bool) {
 /// The one Show Hidden path: only the flag and its config field change, then the
 /// current folder reloads without a history visit. Setting the current value is
 /// a no-op.
+/// The one drop-menu path. Writes the single field it changed, so a window
+/// holding stale values never writes them over another window's change.
+fn set_drop_ask(state: &Rc<RefCell<AppState>>, value: bool) {
+    if state.borrow().drop_ask == value {
+        return;
+    }
+    state.borrow_mut().drop_ask = value;
+    update_config(|config| config_drop_ask(config, value));
+}
+
+/// D-260: the one path for the row-thumbnail setting. Repopulating is what
+/// makes it take effect immediately: it cancels the old queue, creates one
+/// when turning on, and drops every row back to its type icon when turning
+/// off. Only the field this setting owns is written.
+fn set_details_thumbnails(state: &Rc<RefCell<AppState>>, value: bool) {
+    if state.borrow().details_thumbnails == value {
+        return;
+    }
+    state.borrow_mut().details_thumbnails = value;
+    update_config(|config| config_details_thumbnails(config, value));
+    if let Some(ui) = ui_for_state(state) {
+        repopulate_rows(state, &ui);
+    }
+}
+
+/// First-run setup. One window, every option visible at once with what it does
+/// written next to it, rather than a sequence of pages: a wizard that has to be
+/// clicked through cannot be scanned, cannot be gone back through, and has no
+/// state worth the bugs it costs.
+///
+/// Each switch starts at the current setting, so reopening it from the options
+/// menu shows the truth rather than the defaults again. Nothing is written
+/// until Done is pressed, and Skip writes only the "asked already" flag -- so
+/// Skip never silently changes a setting, and the setup never appears twice
+/// whichever button was pressed.
+fn show_setup_dialog(state: Rc<RefCell<AppState>>, ui: Ui, first_run: bool) {
+    let (drop_ask, show_hidden, search_in_files, details_thumbnails) = {
+        let st = state.borrow();
+        (
+            st.drop_ask,
+            st.show_hidden,
+            st.search_in_files,
+            st.details_thumbnails,
+        )
+    };
+    let trash_days = load_config().trash_keep_days;
+
+    let heading = if first_run { "Welcome to Wayfinder" } else { "Setup" };
+    let body = if first_run {
+        "These are the settings people change first. Everything here can be changed again later from the options menu."
+    } else {
+        "The settings people change first. The rest are in the options menu and the sidebar."
+    };
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+
+    let group = adw::PreferencesGroup::new();
+
+    let drop_row = adw::SwitchRow::new();
+    drop_row.set_title("Ask on every drag and drop");
+    drop_row.set_subtitle("Choose Copy, Move or Link each time, instead of it being decided for you. Holding Ctrl or Shift still answers without a prompt.");
+    drop_row.set_active(drop_ask);
+    group.add(&drop_row);
+
+    let hidden_row = adw::SwitchRow::new();
+    hidden_row.set_title("Show hidden files");
+    hidden_row.set_subtitle("Files and folders whose names begin with a dot.");
+    hidden_row.set_active(show_hidden);
+    group.add(&hidden_row);
+
+    let search_row = adw::SwitchRow::new();
+    search_row.set_title("Search inside file contents");
+    search_row.set_subtitle("Slower, and it reads every file in the folder. Off searches names only.");
+    search_row.set_active(search_in_files);
+    group.add(&search_row);
+
+    // D-260: one switch, off by default, for the list views only. Icons view
+    // keeps its own thumbnails whatever this says, which the subtitle states
+    // so turning it off there is not read as a bug.
+    let thumbnail_row = adw::SwitchRow::new();
+    thumbnail_row.set_title("Thumbnails in Details, List and Compact");
+    thumbnail_row.set_subtitle("Show a preview of each picture in the row, in place of its file-type icon. Icons view already does this. Off keeps folders and large listings at their fastest.");
+    thumbnail_row.set_active(details_thumbnails);
+    group.add(&thumbnail_row);
+
+    let trash_row = adw::ComboRow::new();
+    trash_row.set_title("Empty the Trash automatically");
+    trash_row.set_subtitle("Deleting for good is not undoable, so the default is never.");
+    let trash_model = gtk::StringList::new(&["Never", "After 30 days", "After 60 days", "After 90 days"]);
+    trash_row.set_model(Some(&trash_model));
+    trash_row.set_selected(match trash_days {
+        30 => 1,
+        60 => 2,
+        90 => 3,
+        _ => 0,
+    });
+    group.add(&trash_row);
+
+    let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    holder.append(&group);
+    dialog.set_extra_child(Some(&holder));
+
+    dialog.add_responses(&[("skip", if first_run { "Skip" } else { "Cancel" }), ("done", "Done")]);
+    dialog.set_response_appearance("done", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("done"));
+    dialog.set_close_response("skip");
+    dialog.connect_response(None, move |_, response| {
+        if response == "done" {
+            set_drop_ask(&state, drop_row.is_active());
+            ui.hidden.set_active(hidden_row.is_active());
+            ui.search_scope.set_active(search_row.is_active());
+            set_details_thumbnails(&state, thumbnail_row.is_active());
+            let days = match trash_row.selected() {
+                1 => 30,
+                2 => 60,
+                3 => 90,
+                _ => 0,
+            };
+            update_config(|config| config_trash_keep_days(config, days));
+            ui.status.set_label("Setup saved");
+        }
+        update_config(|config| config_onboarded(config, true));
+    });
+    dialog.present(Some(&ui.window));
+}
+
 fn set_show_hidden(state: &Rc<RefCell<AppState>>, value: bool) {
     if state.borrow().show_hidden == value {
         return;
@@ -6585,6 +7681,12 @@ fn set_show_hidden(state: &Rc<RefCell<AppState>>, value: bool) {
 }
 
 fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
+    // D-264: each view keeps its own GTK selection, and switching cleared the
+    // other one's without ever carrying it over. Whatever was selected was
+    // lost the moment the view changed — including the file Wayfinder was
+    // opened at, when the saved view was not the one the selection landed in.
+    // Read it before anything is cleared.
+    let carried = selected_sources(state, ui);
     {
         let mut state_ref = state.borrow_mut();
         state_ref.view_mode = mode;
@@ -6613,6 +7715,10 @@ fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
     // Construct only the active presentation. Previously every refresh built
     // both the list and grid, including image thumbnails hidden behind Details.
     repopulate_rows(state, ui);
+    // D-264: put the selection back, in the view that now shows it. The grid
+    // builds its children from the model during repopulate, so by here the
+    // child for each index exists.
+    reselect_sources(state, ui, &carried);
     update_selection(state, ui);
 }
 
@@ -6843,6 +7949,51 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         menu.append(&row);
     }
     {
+        // Checked mirror of the setting; `set_drop_ask` is the only path that
+        // writes it, here as everywhere else.
+        let checked = state.borrow().drop_ask;
+        let state = state.clone();
+        let row = context_item(
+            if checked { "object-select-symbolic" } else { "" },
+            "Ask on Drag and Drop",
+            "",
+            &popover,
+            move || set_drop_ask(&state, !state.borrow().drop_ask),
+        );
+        row.set_widget_name("wf-drop-ask-option");
+        if checked {
+            row.add_css_class("wf-checked");
+        }
+        menu.append(&row);
+    }
+    {
+        // Checked while the second pane is up; the same row closes it.
+        let checked = ui.split.borrow().is_some();
+        let state = state.clone();
+        let ui = ui.clone();
+        let row = context_item(
+            if checked { "object-select-symbolic" } else { "" },
+            "Split View",
+            "F3",
+            &popover,
+            move || toggle_split(&state, &ui),
+        );
+        row.set_widget_name("wf-split-option");
+        if checked {
+            row.add_css_class("wf-checked");
+        }
+        menu.append(&row);
+    }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        let row = context_item("emblem-system-symbolic", "Setup...", "", &popover, move || {
+            show_setup_dialog(state.clone(), ui.clone(), false)
+        });
+        row.set_widget_name("wf-setup-option");
+        menu.append(&row);
+    }
+    {
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("", "Invert Selection", "", &popover, move || {
@@ -6956,6 +8107,84 @@ fn nearest_real_dir(loc: &native_core::Location) -> String {
 }
 
 /// Opens `path` in its own independent window of this same application.
+/// D-241 split view: opens or closes the second pane.
+///
+/// The second pane is a whole pane of its own -- its own tabs, history,
+/// selection, sort, view mode and preview -- built by the same builder that
+/// makes the first. That is the point: every action already written against
+/// `(state, ui)` works inside it unchanged, with no "which pane" argument
+/// threaded through the window. Closing the split drops its widgets, and with
+/// them its state.
+/// The pane that owns the split this `ui` sits in, or None when `ui` is that
+/// owner (or there is no split).
+fn split_owner_of(ui: &Ui) -> Option<(Rc<RefCell<AppState>>, Ui)> {
+    WINDOWS.with(|windows| {
+        windows.borrow().windows().into_iter().find(|(_, other)| {
+            other.window == ui.window && other.list != ui.list && other.split.borrow().is_some()
+        })
+    })
+}
+
+fn toggle_split(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let open = ui.split.borrow_mut().take();
+    if let Some(pane) = open {
+        // Unparent the kept body BEFORE the Paned goes, or GTK destroys it
+        // with its parent and the window is left empty.
+        pane.paned.set_start_child(None::<&gtk::Widget>);
+        pane.paned.set_end_child(None::<&gtk::Widget>);
+        ui.split_slot.remove(&pane.paned);
+        ui.split_slot.append(&ui.body);
+        unregister_window(&pane.state);
+        // Reparenting the body drops the keyboard focus. Put it back in this
+        // pane's list, or the next keypress goes nowhere.
+        ui.list.grab_focus();
+        eprintln!("wf-event: split off");
+        return;
+    }
+    let Some(app) = ui
+        .window
+        .application()
+        .and_then(|app| app.downcast::<adw::Application>().ok())
+    else {
+        return;
+    };
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    paned.add_css_class("wf-split");
+    paned.set_hexpand(true);
+    paned.set_vexpand(true);
+    paned.set_size_request(0, 0);
+    paned.set_wide_handle(true);
+    paned.set_resize_start_child(true);
+    paned.set_resize_end_child(true);
+    paned.set_shrink_start_child(true);
+    paned.set_shrink_end_child(true);
+    ui.split_slot.remove(&ui.body);
+    paned.set_start_child(Some(&ui.body));
+    ui.split_slot.append(&paned);
+    let half = (ui.window.width() / 2).max(320);
+    paned.set_position(half);
+    clamp_paned_position(&paned, 300, 300);
+    // The new pane starts where this one is looking, which is what people
+    // reach for the split to do: the same folder twice, then navigate one.
+    let start = nearest_real_dir(&state.borrow().cwd);
+    let pane_state = build_ui_in(
+        &app,
+        Some(start),
+        None,
+        Some(SplitHost {
+            window: ui.window.clone(),
+            paned: paned.clone(),
+        }),
+    );
+    // Focus lands in the new pane: it is the one the user just asked for, and
+    // reparenting the first pane's body has dropped the focus anyway.
+    if let Some(pane_ui) = ui_for_state(&pane_state) {
+        pane_ui.list.grab_focus();
+    }
+    *ui.split.borrow_mut() = Some(SplitPane { paned, state: pane_state });
+    eprintln!("wf-event: split on");
+}
+
 fn open_new_window(ui: &Ui, path: String) {
     if let Some(app) = ui
         .window
@@ -6968,7 +8197,6 @@ fn open_new_window(ui: &Ui, path: String) {
 
 fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
     let key = gtk::EventControllerKey::new();
-    let window = ui.window.clone();
     let state_for_keys = state.clone();
     let ui_for_keys = ui.clone();
     key.connect_key_pressed(move |_, key, _, mods| {
@@ -6992,8 +8220,19 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             trash_or_delete_selection(state_for_keys.clone(), ui_for_keys.clone());
             return glib::Propagation::Stop;
         }
-        if (ctrl && (key == gdk::Key::F || key == gdk::Key::f)) || key == gdk::Key::F3 {
+        if ctrl && (key == gdk::Key::F || key == gdk::Key::f) {
             ui_for_keys.search.grab_focus();
+            return glib::Propagation::Stop;
+        }
+        // F3 is split view everywhere else on this desktop, so it is split
+        // view here. Search keeps Ctrl+F and the box itself.
+        if key == gdk::Key::F3 {
+            // Pressed inside the second pane it still closes the split, which
+            // is the one thing F3 means; it never nests a split in a split.
+            match split_owner_of(&ui_for_keys) {
+                Some((owner_state, owner_ui)) => toggle_split(&owner_state, &owner_ui),
+                None => toggle_split(&state_for_keys, &ui_for_keys),
+            }
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F4 || (alt && (key == gdk::Key::D || key == gdk::Key::d)) {
@@ -7125,7 +8364,61 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
 
         glib::Propagation::Proceed
     });
-    window.add_controller(key);
+    // Per PANE. Attached to the window, a split's two panes would both act on
+    // one press and the wrong pane would answer. `body` holds everything a
+    // pane can focus, so the press reaches exactly the pane the user is in.
+    ui.body.add_controller(key);
+}
+
+/// D-262: the address bar's text turned into a folder to open. The rules live
+/// in `native_core::resolve_typed_path`; this supplies the three things only
+/// the running window knows — the folder on screen, home, and the sidebar's
+/// own folders as extra roots — and the one filesystem question the rules ask.
+fn resolve_address_text(state: &Rc<RefCell<AppState>>, text: &str) -> Option<String> {
+    let (cwd, mut roots) = {
+        let st = state.borrow();
+        let cwd = st.cwd.real_path_string().unwrap_or_default();
+        let roots: Vec<String> = st
+            .favorites
+            .iter()
+            .map(|favorite| favorite.path.clone())
+            .collect();
+        (cwd, roots)
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    if !roots.contains(&home) {
+        roots.push(home.clone());
+    }
+    let kind = |candidate: &str| match std::fs::metadata(candidate) {
+        Ok(meta) if meta.is_dir() => native_core::PathKind::Dir,
+        Ok(_) => native_core::PathKind::File,
+        Err(_) => native_core::PathKind::Missing,
+    };
+    if let Some(found) = native_core::resolve_typed_path(text, &cwd, &home, &roots, &kind) {
+        return Some(found);
+    }
+    // Last resort: the fragment may name a tree that is neither below the
+    // folder on screen nor below any of its parents — pasting
+    // `project/art/anim` while standing in home. A bounded widest-first walk
+    // under the known places finds it; the caps keep the window responsive.
+    let fragment = native_core::clean_typed_path(text, &home);
+    let mut bases = vec![cwd.clone()];
+    for root in &roots {
+        if !bases.contains(root) {
+            bases.push(root.clone());
+        }
+    }
+    native_core::search_for_fragment(&fragment, &bases, 5, 4000, &|dir| {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }, &kind)
 }
 
 fn navigate(state: &Rc<RefCell<AppState>>, path: native_core::Location) {
@@ -7768,7 +9061,9 @@ fn ui_for_state(state: &Rc<RefCell<AppState>>) -> Option<Ui> {
 }
 
 fn state_for_ui(ui: &Ui) -> Option<Rc<RefCell<AppState>>> {
-    WINDOWS.with(|windows| windows.borrow().state_for_ui(|other| other.window == ui.window))
+    // Per PANE, not per window: a split puts two states on one window, and
+    // each pane's ListView is its own.
+    WINDOWS.with(|windows| windows.borrow().state_for_ui(|other| other.list == ui.list))
 }
 
 fn active_window() -> Option<(Rc<RefCell<AppState>>, Ui)> {
@@ -8148,7 +9443,32 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
         )));
 
-        let icon = file_icon(&entry, icon_zoom);
+        // D-243: Compact is a different ROW, not the same row with less air --
+        // a small icon, one line of name and tight leading, the way Explorer's
+        // List and Dolphin's compact mode read. Spacing alone was invisible.
+        let (compact, details_thumbnails, thumbnail_queue) = {
+            let st = state.borrow();
+            (
+                st.view_mode == ViewMode::Compact,
+                st.details_thumbnails,
+                st.thumbnail_queue.clone(),
+            )
+        };
+        // D-260: only the rows GTK actually realizes are asked for a decode.
+        // This is the whole reason the list can stay smooth: no matter how big
+        // the folder, the work is bounded by what is on screen.
+        let wants_thumbnail = details_thumbnails
+            && thumbnail_queue.is_some()
+            && native_core::wants_image_thumbnail(&entry);
+        let (icon, thumbnail) = file_icon(&entry, icon_zoom, compact, wants_thumbnail);
+        if let (Some(picture), Some(queue), Some(real_path)) = (
+            thumbnail,
+            thumbnail_queue,
+            wants_thumbnail.then(|| entry.source.real_path_string()).flatten(),
+        ) {
+            let metrics = native_core::list_thumbnail_metrics(icon_zoom, compact);
+            queue_list_thumbnail(&queue, real_path, picture, metrics);
+        }
         // Show full file names: short names stay on one line (compact); long names
         // wrap to a second line rather than being truncated. Only names too long
         // for two lines fall back to an ellipsis.
@@ -8156,9 +9476,9 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .label(&entry.name)
             .xalign(0.0)
             .hexpand(true)
-            .wrap(true)
+            .wrap(!compact)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .lines(2)
+            .lines(if compact { 1 } else { 2 })
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         name.add_css_class("wf-file-name");
@@ -8181,11 +9501,13 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         // the shared SizeGroups, so dragging a column resizes every row with it.
         let size = gtk::Label::builder()
             .label(&size_text)
-            .xalign(1.0)
+            // Left, with its heading: see column_button.
+            .xalign(0.0)
             .max_width_chars(4)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         size.add_css_class("wf-file-meta");
+        size.add_css_class("wf-meta-size");
         ui.columns.size.add_widget(&size);
         let kind = gtk::Label::builder()
             .label(&native_core::kind_label(&entry))
@@ -8315,6 +9637,30 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 ui_for_unbind.columns.modified.remove_widget(&children[4]);
             }
         }
+        // D-260: this row is leaving the screen. Stop its thumbnail job: drop
+        // it if still queued, mark it dead if already decoding. The list is
+        // virtualized, so a row binding is the only thing that queues work and
+        // this is what stops a fast scroll from building a backlog.
+        if let Some(path) = item
+            .item()
+            .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
+            .and_then(|b| b.borrow::<Entry>().source.real_path_string())
+        {
+            // Same rule as the SizeGroup cleanup above: unbind runs inside
+            // widget teardown and must never insist on the state borrow.
+            let queue = state_for_unbind
+                .try_borrow()
+                .ok()
+                .and_then(|state| state.thumbnail_queue.clone());
+            if let Some(queue) = queue {
+                if let Some(picture) = item
+                    .child()
+                    .and_then(|row| find_row_thumbnail(&row))
+                {
+                    cancel_list_thumbnail(&queue, &path, &picture);
+                }
+            }
+        }
         #[cfg(feature = "guide")]
         if guide_waits_for_open_file(&state_for_unbind)
             && item.child().is_some_and(|c| c.widget_name() == GUIDE_OPEN_FILE)
@@ -8346,6 +9692,9 @@ fn selected_indices(ui: &Ui) -> Vec<usize> {
 }
 
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    // D-245: the strip belongs to the folder on screen, so it is rebuilt with
+    // the rows, not left behind from the last folder.
+    rebuild_quick_access(state, ui);
     #[cfg(feature = "guide")]
     {
         guide_sync_crucial(state, ui);
@@ -8364,7 +9713,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.grid.remove(&child);
     }
 
-    let (entries, filter_text, sort_key, sort_ascending, view_mode, icon_zoom) = {
+    let (entries, filter_text, sort_key, sort_ascending, view_mode, icon_zoom, details_thumbnails) = {
         let state = state.borrow();
         (
             state.entries.clone(),
@@ -8373,6 +9722,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             state.sort_ascending,
             state.view_mode,
             state.icon_zoom,
+            state.details_thumbnails,
         )
     };
     let mut visible_entries: Vec<Entry> = if filter_text.is_empty() {
@@ -8408,11 +9758,15 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             }
         }
         state_ref.visible_entries = visible_entries.clone();
-        let thumbs = (view_mode == ViewMode::Grid).then(|| {
+        // D-260: one queue serves both views. Grid always wants it; a list
+        // view wants it only while the setting is on. Turning the setting off
+        // takes this same branch, cancels the old queue and leaves none.
+        let thumbs = (view_mode == ViewMode::Grid || details_thumbnails).then(|| {
             let queue = Rc::new(RefCell::new(ThumbnailQueue {
                 cancelled: gio::Cancellable::new(),
                 pending: VecDeque::new(),
                 active: 0,
+                row_tokens: HashMap::new(),
             }));
             state_ref.thumbnail_queue = Some(queue.clone());
             queue
@@ -8429,10 +9783,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         });
         (thumbs, posters)
     };
-    let thumbnail_size = (
-        ((58.0 * icon_zoom).round() as i32).max(1) * 2,
-        ((48.0 * icon_zoom).round() as i32).max(1) * 2,
-    );
+    // D-267: the tile is square and large, so the thumbnail it holds is decoded
+    // at twice the tile, capped, rather than at the old 116x96 stamp.
+    let grid_thumbnail_px = (grid_tile_px(icon_zoom) * 2).min(MAX_GRID_THUMBNAIL_PIXELS);
+    let thumbnail_size = (grid_thumbnail_px, grid_thumbnail_px);
 
     ui.list_placeholder.set_label(if !filter_text.is_empty() {
         "No items match your search"
@@ -8495,17 +9849,27 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 
             let wants_thumbnail = thumbnail_queue.is_some() && index < MAX_GRID_THUMBNAILS;
             let (icon, thumbnail) = grid_file_icon(&entry, icon_zoom, wants_thumbnail);
+            let tile_px = grid_tile_px(icon_zoom);
+            // D-267: `max_width_chars` only caps a label that can be broken, and the
+            // default WORD wrap cannot break `Gemini_Generated_Image_2kwp542kwp542kwp`,
+            // so such a name asked for its full 337px and `homogeneous(true)` handed
+            // that width to every column -- one tile per row. WORD_CHAR lets the name
+            // break mid-word, and the explicit size request pins the tile to the
+            // picture's width whatever the name is.
             let name = gtk::Label::builder()
                 .label(&entry.name)
                 .xalign(0.5)
                 .justify(gtk::Justification::Center)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                .max_width_chars(12)
-                .width_chars(12)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(8)
+                .width_chars(8)
                 .lines(2)
                 .wrap(true)
                 .build();
             name.add_css_class("wf-grid-name");
+            name.set_size_request(tile_px, -1);
+            grid_item.set_size_request(tile_px, -1);
             grid_item.append(&icon);
             let editing = state
                 .borrow()
@@ -8545,6 +9909,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                         picture,
                         width: thumbnail_size.0,
                         height: thumbnail_size.1,
+                        // Grid never recycles a row, so its jobs are never
+                        // cancelled individually; the folder's own cancel ends
+                        // them.
+                        alive: Rc::new(Cell::new(true)),
                     });
                 }
             }
@@ -8705,11 +10073,25 @@ fn natural_name_key(name: &str) -> Vec<NameToken> {
     key
 }
 
-fn file_icon(entry: &Entry, zoom: f64) -> gtk::Box {
-    let slot_w = (32.0 * zoom).round() as i32;
-    let slot_h = (28.0 * zoom).round() as i32;
-    let icon_w = (28.0 * zoom).round() as i32;
-    let icon_h = (24.0 * zoom).round() as i32;
+/// D-260: takes `wants_thumbnail` and returns the picture to fill, if any.
+/// The file-type icon is ALWAYS the child of the slot, so a decode that fails
+/// or is still running leaves exactly what the row showed before. Only when
+/// the setting is on and the row is a real image does the picture join it.
+fn file_icon(
+    entry: &Entry,
+    zoom: f64,
+    compact: bool,
+    wants_thumbnail: bool,
+) -> (gtk::Box, Option<gtk::Picture>) {
+    // Compact keeps the same zoom but a smaller slot: the icon, not the
+    // padding, is what sets a row's height, so trimming padding alone changed
+    // almost nothing on screen.
+    let (slot_base_w, slot_base_h, icon_base_w, icon_base_h) =
+        if compact { (20.0, 18.0, 16.0, 16.0) } else { (32.0, 28.0, 28.0, 24.0) };
+    let slot_w = (slot_base_w * zoom).round() as i32;
+    let slot_h = (slot_base_h * zoom).round() as i32;
+    let icon_w = (icon_base_w * zoom).round() as i32;
+    let icon_h = (icon_base_h * zoom).round() as i32;
     let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     slot.add_css_class("wf-file-icon");
     slot.set_size_request(slot_w, slot_h);
@@ -8727,9 +10109,54 @@ fn file_icon(entry: &Entry, zoom: f64) -> gtk::Box {
     icon.set_valign(gtk::Align::Center);
     icon.set_hexpand(false);
     icon.set_vexpand(false);
-    slot.append(&icon);
 
-    slot
+    if !wants_thumbnail {
+        slot.append(&icon);
+        return (slot, None);
+    }
+
+    // The picture is exactly the size of the icon it replaces, never the size
+    // of the slot, so turning the setting on cannot change a single row's
+    // height. It sits over the type icon and is transparent until a decode
+    // paints it, so the fallback shows through while the job runs.
+    // Read from the same rule the queue decodes with, so the drawn size and
+    // the decoded size can never drift apart.
+    let side = native_core::list_thumbnail_metrics(zoom, compact).display;
+    let overlay = gtk::Overlay::new();
+    // The overlay is exactly the icon's square, not the wider slot. A slot-sized
+    // overlay let the picture be allocated the whole slot (32x28 in Details),
+    // and ContentFit::Cover then cropped to that non-square box.
+    overlay.set_size_request(side, side);
+    overlay.set_halign(gtk::Align::Center);
+    overlay.set_valign(gtk::Align::Center);
+    overlay.set_child(Some(&icon));
+    let thumb = gtk::Picture::new();
+    // Named so a test can find this exact picture inside a recycled ListView
+    // row without guessing at Overlay's internal child order.
+    thumb.set_widget_name("wf-row-thumbnail");
+    thumb.set_can_shrink(true);
+    thumb.set_content_fit(gtk::ContentFit::Cover);
+    thumb.set_size_request(side, side);
+    thumb.set_halign(gtk::Align::Center);
+    thumb.set_valign(gtk::Align::Center);
+    overlay.add_overlay(&thumb);
+    // `set_size_request` is only a minimum, and a Picture's natural size is the
+    // texture's size (the decode is 2x display), so the picture would inflate
+    // the overlay's measured size and be allocated more than `side`. Excluding
+    // it from the overlay's measure leaves `side` as both minimum and natural,
+    // which is what makes the picture's allocation exactly `side` x `side`.
+    // Must follow `add_overlay`: GTK only has a layout child to configure once
+    // the picture is a child of this overlay.
+    overlay.set_measure_overlay(&thumb, false);
+    slot.append(&overlay);
+
+    (slot, Some(thumb))
+}
+
+/// D-267: one place that says how large a grid tile's picture is, so the tile,
+/// its name label and the thumbnail decoded for it can never drift apart.
+fn grid_tile_px(zoom: f64) -> i32 {
+    ((GRID_TILE_SIZE * zoom).round() as i32).max(1)
 }
 
 fn grid_file_icon(
@@ -8737,10 +10164,12 @@ fn grid_file_icon(
     zoom: f64,
     wants_thumbnail: bool,
 ) -> (gtk::Box, Option<gtk::Picture>) {
-    let slot_w = (58.0 * zoom).round() as i32;
-    let slot_h = (48.0 * zoom).round() as i32;
-    let icon_w = (44.0 * zoom).round() as i32;
-    let icon_h = (38.0 * zoom).round() as i32;
+    // D-267: a square tile the size of a real picture, not the 58x48 stamp the
+    // grid used to draw, which made Icons view read as a list of thumbnails.
+    let slot_w = grid_tile_px(zoom);
+    let slot_h = slot_w;
+    let icon_w = ((slot_w as f64) * 0.56).round() as i32;
+    let icon_h = icon_w;
     let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     slot.set_size_request(slot_w, slot_h);
     slot.set_halign(gtk::Align::Center);
@@ -8785,6 +10214,88 @@ fn grid_file_icon(
     (slot, None)
 }
 
+/// D-260: queue one row's thumbnail. Re-binding the same file (scroll away and
+/// back) replaces its earlier job rather than decoding the same picture twice,
+/// and the old job is marked dead so a late result cannot paint the new row.
+fn queue_list_thumbnail(
+    queue: &Rc<RefCell<ThumbnailQueue>>,
+    path: String,
+    picture: gtk::Picture,
+    metrics: native_core::ListThumbnailMetrics,
+) {
+    let alive = Rc::new(Cell::new(true));
+    {
+        let mut queue_ref = queue.borrow_mut();
+        // A rebind of the same file owns a NEW picture, so whatever the old
+        // row still had in flight is retired here.
+        if let Some(previous) = queue_ref.row_tokens.remove(&path) {
+            previous.alive.set(false);
+        }
+        queue_ref.pending.retain(|job| job.path != path);
+        queue_ref.row_tokens.insert(
+            path.clone(),
+            ThumbnailRow {
+                alive: alive.clone(),
+                picture: picture.downgrade(),
+            },
+        );
+        queue_ref.pending.push_back(ThumbnailJob {
+            path,
+            picture,
+            width: metrics.decode,
+            height: metrics.decode,
+            alive,
+        });
+    }
+    start_thumbnail_jobs(queue.clone());
+}
+
+/// D-260: a row that scrolled out of view. Drop its queued work outright and
+/// mark any decode already in flight dead, so the result is discarded. Never
+/// touches the queue's own `Cancellable`, which belongs to the whole folder.
+///
+/// `picture` is the identity check: this only cancels if the path's CURRENT
+/// row still owns that exact widget. A stale unbind from a recycled
+/// `ListItem` therefore cannot kill the job of the row that replaced it.
+fn cancel_list_thumbnail(
+    queue: &Rc<RefCell<ThumbnailQueue>>,
+    path: &str,
+    picture: &gtk::Picture,
+) {
+    let Ok(mut queue_ref) = queue.try_borrow_mut() else {
+        return;
+    };
+    let ours = queue_ref.row_tokens.get(path).is_some_and(|row| {
+        row.picture
+            .upgrade()
+            .is_some_and(|current| current == *picture)
+    });
+    if !ours {
+        return;
+    }
+    if let Some(row) = queue_ref.row_tokens.remove(path) {
+        row.alive.set(false);
+    }
+    queue_ref
+        .pending
+        .retain(|job| job.path != path || job.picture != *picture);
+}
+
+/// D-260: depth-first search for the thumbnail picture inside one list row.
+fn find_row_thumbnail(widget: &gtk::Widget) -> Option<gtk::Picture> {
+    if widget.widget_name() == "wf-row-thumbnail" {
+        return widget.clone().downcast::<gtk::Picture>().ok();
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(found) = find_row_thumbnail(&current) {
+            return Some(found);
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
 fn start_thumbnail_jobs(queue: Rc<RefCell<ThumbnailQueue>>) {
     loop {
         let (job, cancelled) = {
@@ -8799,23 +10310,159 @@ fn start_thumbnail_jobs(queue: Rc<RefCell<ThumbnailQueue>>) {
             let Some(job) = queue_ref.pending.pop_front() else {
                 return;
             };
+            // D-260: a row cancelled between being queued and being picked up
+            // costs nothing at all — no decode starts for it.
+            if !job.alive.get() {
+                continue;
+            }
             queue_ref.active += 1;
             (job, queue_ref.cancelled.clone())
         };
         let queue_for_read = queue.clone();
         let picture = job.picture.clone();
+        // The row token's key is the file the row names, never the cached PNG a
+        // transcoded file is read from.
+        let row_path = job.path.clone();
         let width = job.width;
         let height = job.height;
-        let file = gio::File::for_path(job.path);
         let cancelled_for_read = cancelled.clone();
+        let alive_for_read = job.alive.clone();
+        // D-251: AVIF and HEIC have no gdk-pixbuf loader on this machine, so
+        // the decode returned nothing and the tile kept its plain file icon.
+        // Those are decoded once by ffmpeg into a small cached PNG, off the
+        // main thread, and the thumbnail is read from that instead.
+        if native_core::needs_transcoded_thumbnail(&job.path) {
+            let source = job.path.clone();
+            let want_w = width.max(height).max(64);
+            let queue_for_outside = queue.clone();
+            let picture_for_outside = picture.clone();
+            let cancelled_for_outside = cancelled.clone();
+            let alive_for_outside = job.alive.clone();
+            let row_path_for_outside = row_path.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let cached =
+                    gio::spawn_blocking(move || transcoded_thumbnail_file(&source, want_w)).await;
+                let Ok(Some(cached)) = cached else {
+                    finish_thumbnail_job(
+                        &queue_for_outside,
+                        &row_path_for_outside,
+                        &picture_for_outside,
+                    );
+                    return;
+                };
+                if cancelled_for_outside.is_cancelled() || !alive_for_outside.get() {
+                    finish_thumbnail_job(
+                        &queue_for_outside,
+                        &row_path_for_outside,
+                        &picture_for_outside,
+                    );
+                    return;
+                }
+                read_thumbnail_from_path(
+                    queue_for_outside,
+                    picture_for_outside,
+                    cached,
+                    row_path_for_outside,
+                    width,
+                    height,
+                    cancelled_for_outside,
+                    alive_for_outside,
+                    false,
+                );
+            });
+            continue;
+        }
+        read_thumbnail_from_path(
+            queue_for_read,
+            picture,
+            PathBuf::from(&job.path),
+            row_path,
+            width,
+            height,
+            cancelled_for_read,
+            alive_for_read,
+            true,
+        );
+    }
+}
+
+/// D-263: a picture that no decoder on this machine could read is written to
+/// a small log, with the reason and the time. the owner reported pictures that
+/// would not preview and then moved the files, and nothing had been kept, so
+/// there was nothing left to look at. The log is appended to, capped, and
+/// never contains anything but paths and decoder messages.
+fn note_media_failure(path: &str, stage: &str, reason: &str) {
+    use std::io::Write;
+    let base = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.local/state",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+        )
+    });
+    let dir = PathBuf::from(base).join("wayfinder");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let log = dir.join("media-failures.log");
+    // Keep the newest half when it grows past a quarter of a megabyte, so it
+    // can never fill a disk or become too long to read.
+    if fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > 256 * 1024 {
+        if let Ok(text) = fs::read_to_string(&log) {
+            let lines: Vec<&str> = text.lines().collect();
+            let keep = lines[lines.len() / 2..].join("\n");
+            let _ = fs::write(&log, format!("{keep}\n"));
+        }
+    }
+    let when = glib::DateTime::now_local()
+        .and_then(|now| now.format("%Y-%m-%d %H:%M:%S"))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    if let Ok(mut fh) = fs::OpenOptions::new().create(true).append(true).open(&log) {
+        let _ = writeln!(fh, "{when}\t{stage}\t{reason}\t{path}");
+    }
+}
+
+/// D-251: the second half of a thumbnail job — read one image file and paint
+/// it into the tile. Split out so an AVIF decoded to a cached PNG can reuse
+/// exactly the same path as an ordinary PNG.
+fn read_thumbnail_from_path(
+    queue_for_read: Rc<RefCell<ThumbnailQueue>>,
+    picture: gtk::Picture,
+    path: PathBuf,
+    row_path: String,
+    width: i32,
+    height: i32,
+    cancelled: gio::Cancellable,
+    alive: Rc<Cell<bool>>,
+    // D-263: true on the first try. When gdk-pixbuf refuses a file whose name
+    // says it should be readable — a long path, an odd colour type, a PNG
+    // written by something unusual — the tile used to keep its plain file
+    // icon for good, while the preview pane had already learnt to fall back
+    // to the outside decoder. False on the retry, so a failure cannot loop.
+    retry_outside: bool,
+) {
+    if !alive.get() {
+        finish_thumbnail_job(&queue_for_read, &row_path, &picture);
+        return;
+    }
+    let source_for_retry = path.to_string_lossy().to_string();
+    let file = gio::File::for_path(path);
+    let cancelled_for_read = cancelled.clone();
+    {
         file.read_async(glib::Priority::DEFAULT, Some(&cancelled), move |stream| {
-            let Ok(stream) = stream else {
-                finish_thumbnail_job(&queue_for_read);
-                return;
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(err) => {
+                    note_media_failure(&row_path, "thumbnail: could not read the file", &err.to_string());
+                    finish_thumbnail_job(&queue_for_read, &row_path, &picture);
+                    return;
+                }
             };
             let queue_for_decode = queue_for_read.clone();
             let cancelled_for_decode = cancelled_for_read.clone();
             let cancelled_for_result = cancelled_for_decode.clone();
+            let alive_for_result = alive.clone();
+            let row_path_for_decode = row_path.clone();
             Pixbuf::from_stream_at_scale_async(
                 &stream,
                 width,
@@ -8823,27 +10470,157 @@ fn start_thumbnail_jobs(queue: Rc<RefCell<ThumbnailQueue>>) {
                 true,
                 Some(&cancelled_for_decode),
                 move |pixbuf| {
-                    if let Ok(pixbuf) = pixbuf {
-                        if !cancelled_for_result.is_cancelled() {
-                            #[allow(deprecated)]
-                            let texture = gdk::Texture::for_pixbuf(&pixbuf);
-                            picture.set_paintable(Some(&texture));
+                    match pixbuf {
+                        Ok(pixbuf) => {
+                            // D-260: the folder cancelling and the row scrolling
+                            // away are different events; either one drops the paint.
+                            if !cancelled_for_result.is_cancelled() && alive_for_result.get() {
+                                #[allow(deprecated)]
+                                let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                                picture.set_paintable(Some(&texture));
+                            }
+                        }
+                        Err(err) => {
+                            // D-263: the same last resort the preview pane takes.
+                            if retry_outside
+                                && !cancelled_for_result.is_cancelled()
+                                && alive_for_result.get()
+                            {
+                                let want_w = width.max(height).max(64);
+                                let source = source_for_retry.clone();
+                                let queue = queue_for_decode.clone();
+                                let row = row_path_for_decode.clone();
+                                let pic = picture.clone();
+                                let cancelled = cancelled_for_result.clone();
+                                let alive = alive_for_result.clone();
+                                glib::MainContext::default().spawn_local(async move {
+                                    let cached = gio::spawn_blocking(move || {
+                                        transcoded_thumbnail_file(&source, want_w)
+                                    })
+                                    .await;
+                                    match cached {
+                                        Ok(Some(cached)) => read_thumbnail_from_path(
+                                            queue, pic, cached, row, width, height, cancelled,
+                                            alive, false,
+                                        ),
+                                        _ => finish_thumbnail_job(&queue, &row, &pic),
+                                    }
+                                });
+                                return;
+                            }
+                            note_media_failure(
+                                &row_path_for_decode,
+                                "thumbnail: nothing on this machine could decode it",
+                                &err.to_string(),
+                            );
                         }
                     }
-                    finish_thumbnail_job(&queue_for_decode);
+                    finish_thumbnail_job(&queue_for_decode, &row_path_for_decode, &picture);
                 },
             );
         });
     }
 }
 
-fn finish_thumbnail_job(queue: &Rc<RefCell<ThumbnailQueue>>) {
+/// D-251: decode one AVIF/HEIC/JXL file into a small cached PNG with ffmpeg
+/// and return that file. The cache key is the path, size and modification
+/// time, so an edited picture is decoded again and an unchanged one is
+/// decoded only once. Runs on a worker thread, never the main loop.
+/// How wide an AVIF/HEIC/JXL picture is decoded for the preview pane. Big
+/// enough to look like a photograph, small enough to decode in a blink.
+const PREVIEW_DECODE_WIDTH: i32 = 1024;
+
+fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = fs::metadata(source).ok()?;
+    let stamp = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    stamp.hash(&mut hasher);
+    want_w.hash(&mut hasher);
+    let key = hasher.finish();
+    let home = std::env::var("HOME").ok()?;
+    let dir = PathBuf::from(home)
+        .join(".cache")
+        .join("wayfinder")
+        .join("image-thumbs");
+    fs::create_dir_all(&dir).ok()?;
+    let cached = dir.join(format!("{key:016x}.png"));
+    if cached.is_file() {
+        return Some(cached);
+    }
+    // The half-written name still ends in .png: ffmpeg picks the output
+    // format from the extension, and a name ending ".part" made it refuse
+    // with "Unable to choose an output format" every single time, so no
+    // AVIF ever decoded (7 Nov 2026, found on the owner's screen).
+    let part = dir.join(format!("{key:016x}.part.png"));
+    let status = std::process::Command::new("ffmpeg")
+        .arg("-nostdin")
+        .arg("-v")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(source)
+        .arg("-frames:v")
+        .arg("1")
+        // Belt and braces: say the format outright as well, so a future
+        // change to the temporary name cannot break this again.
+        .arg("-f")
+        .arg("image2")
+        .arg("-c:v")
+        .arg("png")
+        .arg("-vf")
+        .arg(format!("scale={}:-1:flags=bilinear", want_w.clamp(16, 1024)))
+        .arg(&part)
+        .status();
+    match status {
+        Ok(code) if code.success() && part.is_file() => {
+            // Rename last, so a half-written file is never read as a thumbnail.
+            fs::rename(&part, &cached).ok()?;
+            Some(cached)
+        }
+        other => {
+            let _ = fs::remove_file(&part);
+            eprintln!("wf-event: no preview for {source:?}, ffmpeg said {other:?}");
+            None
+        }
+    }
+}
+
+/// D-260: release one job slot. `path` and `picture` are the job's row token,
+/// so a job that ends normally (paint, decode error, or a dropped result) also
+/// removes its entry from `row_tokens`; otherwise every file ever decoded
+/// during a folder's queue life would keep a dead row there.
+///
+/// The token is removed only when it still holds this exact `Picture`. A
+/// recycled `ListItem` that rebound the same path owns a different picture and
+/// keeps its token, which is the same identity rule `cancel_list_thumbnail`
+/// already enforces.
+fn finish_thumbnail_job(
+    queue: &Rc<RefCell<ThumbnailQueue>>,
+    path: &str,
+    picture: &gtk::Picture,
+) {
     {
         let mut queue_ref = queue.borrow_mut();
         queue_ref.active = queue_ref.active.saturating_sub(1);
         if queue_ref.cancelled.is_cancelled() {
             queue_ref.pending.clear();
             return;
+        }
+        let ours = queue_ref.row_tokens.get(path).is_some_and(|row| {
+            row.picture
+                .upgrade()
+                .is_some_and(|current| current == *picture)
+        });
+        if ours {
+            queue_ref.row_tokens.remove(path);
         }
     }
     start_thumbnail_jobs(queue.clone());
@@ -9590,11 +11367,16 @@ fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
         eprintln!("wf-event: open {real_path}");
         match launch_path(&real_path) {
             Err(err) => ui.status.set_label(&format!("Open failed: {err}")),
-            // D-75: only a launch that succeeded clears the tutorial.
-            #[cfg(feature = "guide")]
-            Ok(()) => guide_note_opened(state, &entry),
-            #[cfg(not(feature = "guide"))]
-            Ok(()) => {}
+            Ok(()) => {
+                // D-246: a file is recent once it actually opened. Recording
+                // the click instead would fill the strip with files that
+                // failed to launch.
+                remember_recent_file(state, &real_path);
+                rebuild_quick_access(state, ui);
+                // D-75: only a launch that succeeded clears the tutorial.
+                #[cfg(feature = "guide")]
+                guide_note_opened(state, &entry);
+            }
         }
     }
 }
@@ -10379,6 +12161,95 @@ where
         apply_conflict_response(response, &on_choice);
     });
     dialog.present(Some(&ui.window));
+}
+
+/// The opt-in drag-and-drop action menu: Copy / Move / Link / Cancel, asked
+/// once for the whole drop. Cancel, Escape and closing the window all start
+/// nothing. It is only ever reached with no modifier held: Ctrl and Shift are
+/// answers in themselves and skip the prompt, so the setting never gets in the
+/// way of the Explorer habit.
+///
+/// The negotiated tuple is already consumed by the time this runs, so the
+/// dialog cannot be answered twice into two transfers: a second drop has to
+/// negotiate its own tuple first.
+fn show_drop_action_dialog(state: Rc<RefCell<AppState>>, ui: Ui, txn: DropTxn) {
+    let count = txn.srcs.len();
+    let heading = if count == 1 {
+        let name = txn.srcs[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("Drop \"{name}\" here?")
+    } else {
+        format!("Drop {count} items here?")
+    };
+    let dest_name = txn
+        .dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| txn.dest.to_string_lossy().into_owned());
+    let detail = format!(
+        "Into \"{dest_name}\".\n\nHold Ctrl while dropping to copy, or Shift to move, without being asked."
+    );
+    let parent = ui.window.clone();
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&detail));
+    dialog.add_responses(&[
+        ("cancel", "Cancel"),
+        ("link", "Link"),
+        ("move", "Move"),
+        ("copy", "Copy"),
+    ]);
+    dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("copy"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        eprintln!("wf-event: drop_menu response={response}");
+        match response {
+            "copy" | "move" => {
+                let mut transfer = txn.clone().into_transfer();
+                transfer.is_copy = response == "copy";
+                transfer_with_preflight(state.clone(), ui.clone(), transfer);
+            }
+            "link" => link_drop_action(
+                state.clone(),
+                ui.clone(),
+                txn.srcs.clone(),
+                txn.dest.clone(),
+            ),
+            _ => {}
+        }
+    });
+    dialog.present(Some(&parent));
+}
+
+/// "Link" from the drop menu. Symlinks are not a transfer -- nothing is read,
+/// written or moved -- so this does not go through `transfer_with_preflight`
+/// and its clash dialog; a taken name is numbered instead. The created paths go
+/// on the undo stack as `Created`, which Undo removes to the Trash like any
+/// other created item.
+fn link_drop_action(state: Rc<RefCell<AppState>>, ui: Ui, srcs: Vec<PathBuf>, dest: PathBuf) {
+    let str_srcs: Vec<String> = srcs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let dest_str = dest.to_string_lossy().into_owned();
+    let label = if str_srcs.len() == 1 {
+        "Creating link".to_string()
+    } else {
+        format!("Creating {} links", str_srcs.len())
+    };
+    run_job(
+        state,
+        ui,
+        label,
+        move || {
+            let paths = native_core::link_into(&str_srcs, &dest_str)?;
+            let message = if paths.len() == 1 {
+                format!("Linked {}", paths[0])
+            } else {
+                format!("Created {} links", paths.len())
+            };
+            Ok(JobOutcome::undo(message, UndoAction::Created { paths }))
+        },
+        |_, _, _| {},
+    );
 }
 
 /// The disk work of every transfer: one transaction for the whole batch, checked
@@ -11183,7 +13054,7 @@ fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) 
     std::thread::spawn({
         let query = query.clone();
         move || {
-            let _ = tx.send(native_core::search_dir(
+            let _ = tx.send(native_core::search_dir_report(
                 &root,
                 &query,
                 search_in_files,
@@ -11193,19 +13064,23 @@ fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) 
     });
 
     glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
-        Ok(Ok(entries)) => {
+        Ok(Ok(report)) => {
+            let stopped = report.stopped.clone();
             {
                 let mut state = state.borrow_mut();
-                state.entries = entries;
+                state.entries = report.entries;
                 state.visible_entries.clear();
                 state.filter_text = query.clone();
             }
             repopulate_rows(&state, &ui);
             update_selection(&state, &ui);
+            // A search that gave up has to say so. Silently showing fewer
+            // results than exist reads as "the file is not on this computer".
             ui.status.set_label(&format!(
-                "Search results for \"{}\"  -  {} shown",
+                "Search results for \"{}\"  -  {} shown{}",
                 query,
-                state.borrow().visible_entries.len()
+                state.borrow().visible_entries.len(),
+                stopped.map(|why| format!("  -  {why}")).unwrap_or_default()
             ));
             glib::ControlFlow::Break
         }
@@ -13658,6 +15533,12 @@ struct DropTxn {
     dest: PathBuf,
     srcs: Vec<PathBuf>,
     is_copy: bool,
+    /// Whether Ctrl or Shift was held when this tuple was negotiated. A
+    /// modifier is an answer in itself, so the opt-in drop menu is skipped when
+    /// this is true. Recorded here rather than read again at drop time, because
+    /// modifiers are read only in motion and a key released during the drop
+    /// must not change the action that was already negotiated and shown.
+    modified: bool,
 }
 
 impl DropTxn {
@@ -13667,6 +15548,7 @@ impl DropTxn {
             dest: dest.to_path_buf(),
             srcs: srcs.to_vec(),
             is_copy: native_core::drag_is_copy(srcs, dest, ctrl, shift),
+            modified: ctrl || shift,
         }
     }
 
@@ -13800,6 +15682,13 @@ fn build_drop_target(
             "wf-event: drop to_row={} dest={} copy={} srcs={:?}",
             txn.to_row, txn.dest.display(), txn.is_copy, txn.srcs
         );
+        // Opt-in drop menu. A modifier is already an answer, so it is only
+        // asked when neither Ctrl nor Shift was held; the negotiated tuple has
+        // been consumed above either way, so nothing is left dangling.
+        if state.borrow().drop_ask && !txn.modified {
+            show_drop_action_dialog(state.clone(), ui.clone(), txn);
+            return true;
+        }
         transfer_with_preflight(state.clone(), ui.clone(), txn.into_transfer());
         true
     });
@@ -13866,8 +15755,18 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     if !ui.preview_scroll.is_visible() {
         return;
     }
+    // D-268: every preview takes the next generation, so a folder listing that
+    // comes back from its worker after the user has selected something else is
+    // dropped instead of painting over the newer preview.
+    let generation = next_preview_generation();
+
     if entry.is_dir {
-        set_preview_text(ui, &native_core::entry_summary(entry));
+        match &entry.source {
+            native_core::EntrySource::Real(path) => {
+                set_preview_folder(ui, entry, path.clone(), generation)
+            }
+            _ => set_preview_text(ui, &native_core::entry_summary(entry)),
+        }
         return;
     }
 
@@ -13946,6 +15845,165 @@ fn set_preview_text(ui: &Ui, text: &str) {
     ui.preview_stack.set_visible_child_name("text");
 }
 
+thread_local! {
+    /// D-253: which selection the preview pane is currently showing. An AVIF
+    /// has to be decoded by an outside program, which takes a moment, and in
+    /// that moment the user can select something else. The decode result is
+    /// only painted when this number is still the one it started with, so a
+    /// slow picture can never land on top of a newer selection.
+    static PREVIEW_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// D-268: one place that moves the preview generation on. Any preview that
+/// finishes work off the main thread captures this and paints only if it is
+/// still the current one.
+fn next_preview_generation() -> u64 {
+    PREVIEW_GENERATION.with(|gen| {
+        let next = gen.get().wrapping_add(1);
+        gen.set(next);
+        next
+    })
+}
+
+/// D-268: how many children the folder preview lists. The pane is a glance at
+/// what is inside, not a second file list, and a folder of 40,000 files must
+/// not build 40,000 widgets on the main thread.
+const PREVIEW_FOLDER_ROWS: usize = 200;
+
+/// D-268: show a selected folder's contents in the preview pane. Each row
+/// opens: a child folder is navigated into, a file is opened, exactly as
+/// double-clicking it in the file list would. The header opens the folder
+/// itself.
+fn set_preview_folder(ui: &Ui, entry: &Entry, path: std::path::PathBuf, generation: u64) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
+    ui.preview_media_controls
+        .set_media_stream(None::<&gtk::MediaStream>);
+    ui.preview_media_picture
+        .set_paintable(None::<&gdk::Paintable>);
+    while let Some(child) = ui.preview_folder.first_child() {
+        ui.preview_folder.remove(&child);
+    }
+
+    let header = gtk::Button::builder()
+        .has_frame(false)
+        .tooltip_text("Open this folder")
+        .build();
+    // D-269: the pane is built from the file list's own parts -- Wayfinder's
+    // icon art through `file_icon`, the same row padding and the same name
+    // font -- so a folder's contents read as this program and not as the
+    // stock GTK picker (14 Nov 2026, the owner: "does not look like wayfinder, it
+    // looks like the basic file picker").
+    let header_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header_row.add_css_class("wf-file-row");
+    let (header_icon, _) = file_icon(entry, 1.0, false, false);
+    let header_name = gtk::Label::builder()
+        .label(&entry.name)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    header_name.add_css_class("wf-file-name");
+    header_name.add_css_class("wf-preview-folder-title");
+    header_row.append(&header_icon);
+    header_row.append(&header_name);
+    header.set_child(Some(&header_row));
+    header.add_css_class("wf-preview-folder-row");
+    header.add_css_class("wf-preview-folder-head");
+    {
+        let open_at = entry.source.to_location();
+        let ui_for_header = ui.clone();
+        header.connect_clicked(move |_| {
+            if let Some(state) = state_for_ui(&ui_for_header) {
+                navigate(&state, open_at.clone());
+            }
+        });
+    }
+    ui.preview_folder.append(&header);
+
+    let counting = gtk::Label::builder()
+        .label("Reading\u{2026}")
+        .xalign(0.0)
+        .build();
+    counting.add_css_class("dim-label");
+    ui.preview_folder.append(&counting);
+    ui.preview_stack.set_visible_child_name("folder");
+
+    let show_hidden = state_for_ui(ui)
+        .map(|state| state.borrow().show_hidden)
+        .unwrap_or(false);
+    let ui_for_result = ui.clone();
+    glib::spawn_future_local(async move {
+        let listed = gio::spawn_blocking(move || {
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            native_core::list_dir_cancellable(&path, show_hidden, &cancelled)
+        })
+        .await;
+        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+            return;
+        }
+        let ui = ui_for_result;
+        ui.preview_folder.remove(&counting);
+        let mut entries = match listed {
+            Ok(Ok(listing)) => listing.entries,
+            Ok(Err(native_core::ListDirError::Open(why))) => {
+                let failed = gtk::Label::builder().label(&why).xalign(0.0).wrap(true).build();
+                failed.add_css_class("dim-label");
+                ui.preview_folder.append(&failed);
+                return;
+            }
+            _ => return,
+        };
+        if entries.is_empty() {
+            let empty = gtk::Label::builder().label("Empty folder").xalign(0.0).build();
+            empty.add_css_class("dim-label");
+            ui.preview_folder.append(&empty);
+            return;
+        }
+        // Folders first, then names, so the pane reads the way the file list does.
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let total = entries.len();
+        for child in entries.into_iter().take(PREVIEW_FOLDER_ROWS) {
+            let row = gtk::Button::builder().has_frame(false).build();
+            row.add_css_class("wf-preview-folder-row");
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.add_css_class("wf-file-row");
+            let (icon, _) = file_icon(&child, 1.0, false, false);
+            let label = gtk::Label::builder()
+                .label(&child.name)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                .build();
+            label.add_css_class("wf-file-name");
+            line.append(&icon);
+            line.append(&label);
+            row.set_child(Some(&line));
+            row.set_tooltip_text(Some(&child.name));
+            let ui_for_row = ui.clone();
+            row.connect_clicked(move |_| {
+                if let Some(state) = state_for_ui(&ui_for_row) {
+                    open_entry(&state, &ui_for_row, child.clone());
+                }
+            });
+            ui.preview_folder.append(&row);
+        }
+        if total > PREVIEW_FOLDER_ROWS {
+            let more = gtk::Label::builder()
+                .label(format!("+{} more", total - PREVIEW_FOLDER_ROWS))
+                .xalign(0.0)
+                .build();
+            more.add_css_class("dim-label");
+            ui.preview_folder.append(&more);
+        }
+    });
+}
+
 fn set_preview_image(ui: &Ui, path: &str) {
     if !ui.preview_scroll.is_visible() {
         return;
@@ -13954,7 +16012,6 @@ fn set_preview_image(ui: &Ui, path: &str) {
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
         .set_paintable(None::<&gdk::Paintable>);
-    let file = gio::File::for_path(PathBuf::from(path));
     let zoom = preview_zoom_for(ui);
     let size = if zoom <= 1.0 {
         0
@@ -13962,8 +16019,126 @@ fn set_preview_image(ui: &Ui, path: &str) {
         (420.0 * zoom).round() as i32
     };
     ui.preview_picture.set_size_request(size, size);
-    ui.preview_picture.set_file(Some(&file));
-    ui.preview_stack.set_visible_child_name("image");
+    let generation = PREVIEW_GENERATION.with(|gen| {
+        let next = gen.get().wrapping_add(1);
+        gen.set(next);
+        next
+    });
+
+    // D-253: the preview pane paints through GdkTexture, which has no AVIF,
+    // HEIC or JPEG-XL decoder, so selecting one of those left the pane blank
+    // with no reason given while JPEG and PNG were fine (7 Nov 2026, the owner:
+    // "the preview window to the right which shows jpg and png files, but not
+    // avif files"). Those are decoded once by ffmpeg into a cached PNG, off
+    // the main thread, and that is what the pane shows.
+    if native_core::needs_transcoded_thumbnail(path) {
+        ui.preview_picture.set_file(None::<&gio::File>);
+        ui.preview.set_label("Opening preview\u{2026}");
+        ui.preview_stack.set_visible_child_name("text");
+        let source = path.to_string();
+        let picture = ui.preview_picture.clone();
+        let stack = ui.preview_stack.clone();
+        let words = ui.preview.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let decoded =
+                gio::spawn_blocking(move || transcoded_thumbnail_file(&source, PREVIEW_DECODE_WIDTH))
+                    .await;
+            if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+                return;
+            }
+            match decoded {
+                Ok(Some(cached)) => {
+                    picture.set_file(Some(&gio::File::for_path(cached)));
+                    stack.set_visible_child_name("image");
+                }
+                _ => {
+                    words.set_label(
+                        "No preview for this picture.\nIt needs ffmpeg on the machine to decode.",
+                    );
+                    stack.set_visible_child_name("text");
+                }
+            }
+        });
+        return;
+    }
+
+    // D-261: never hand the pane a path and hope. `GtkPicture::set_file`
+    // decodes through GdkTexture, whose own loaders are PNG, JPEG and TIFF;
+    // anything else depends on an outside loader that can be missing or
+    // sandboxed, and when it fails the pane goes blank with no reason given
+    // (the owner, 11 November 2026: "not previewing all images... WEBP files and
+    // some PNG files"). So decode with gdk-pixbuf, which reads every format
+    // this machine has a loader for, off the main thread, at preview size
+    // rather than full size, and fall back to the outside decoder and then to
+    // words. A very large picture also stops holding the window still while
+    // it decodes.
+    let source = path.to_string();
+    let picture = ui.preview_picture.clone();
+    let stack = ui.preview_stack.clone();
+    let words = ui.preview.clone();
+    ui.preview_picture.set_file(None::<&gio::File>);
+    ui.preview_picture.set_paintable(None::<&gdk::Paintable>);
+    ui.preview.set_label("Opening preview\u{2026}");
+    ui.preview_stack.set_visible_child_name("text");
+    glib::MainContext::default().spawn_local(async move {
+        // The header alone says how big it is, so the decode can scale down
+        // without ever scaling up: `from_stream_at_scale` with a width would
+        // blow a 16px icon up to the pane and show a blurred smear, and -1
+        // means "leave this dimension alone".
+        let header = Pixbuf::file_info_future(source.clone()).await;
+        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+            return;
+        }
+        let too_big = matches!(
+            header,
+            Ok(Some((_, w, h))) if w > PREVIEW_DECODE_WIDTH || h > PREVIEW_DECODE_WIDTH
+        );
+        let width = if too_big { PREVIEW_DECODE_WIDTH } else { -1 };
+        let file = gio::File::for_path(PathBuf::from(&source));
+        let decoded = match file.read_future(glib::Priority::DEFAULT).await {
+            Ok(stream) => Pixbuf::from_stream_at_scale_future(&stream, width, -1, true)
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+            return;
+        }
+        if let Some(pixbuf) = decoded {
+            #[allow(deprecated)]
+            let texture = gdk::Texture::for_pixbuf(&pixbuf);
+            picture.set_paintable(Some(&texture));
+            stack.set_visible_child_name("image");
+            return;
+        }
+        // Nothing here could read it. The outside decoder is the last resort,
+        // the same one AVIF and HEIC take.
+        let fallback_source = source.clone();
+        let cached = gio::spawn_blocking(move || {
+            transcoded_thumbnail_file(&fallback_source, PREVIEW_DECODE_WIDTH)
+        })
+        .await;
+        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+            return;
+        }
+        match cached {
+            Ok(Some(cached)) => {
+                picture.set_file(Some(&gio::File::for_path(cached)));
+                stack.set_visible_child_name("image");
+            }
+            _ => {
+                note_media_failure(
+                    &source,
+                    "preview: nothing on this machine could decode it",
+                    "gdk-pixbuf and the outside decoder both refused it",
+                );
+                words.set_label(
+                    "No preview for this picture.\nNothing on this machine can decode it.",
+                );
+                stack.set_visible_child_name("text");
+            }
+        }
+    });
 }
 
 fn set_preview_media(ui: &Ui, path: &str) {
@@ -14967,6 +17142,19 @@ mod tests {
         *slot.borrow_mut() = Some(DropTxn::negotiate(true, &target, &srcs, true, false));
         let txn = take_drop_txn(&slot, true, &target, &srcs).expect("exact tuple");
         assert!(txn.is_copy);
+        // D-236: a held modifier is itself the answer, so the opt-in drop menu
+        // is not asked for this drop. The flag is recorded at negotiate time,
+        // not read again at drop time, so releasing the key mid-drag cannot
+        // turn a settled Ctrl COPY into a prompt.
+        assert!(txn.modified, "Ctrl negotiated: no prompt");
+        assert!(
+            DropTxn::negotiate(true, &target, &srcs, false, true).modified,
+            "Shift negotiated: no prompt"
+        );
+        assert!(
+            !DropTxn::negotiate(true, &target, &srcs, false, false).modified,
+            "no modifier: the drop menu may ask"
+        );
         assert!(slot.borrow().is_none(), "drop consumes the transaction once");
         let ino = std::fs::metadata(s("copy-me.txt")).unwrap().ino();
         let t = txn.into_transfer();
@@ -15300,7 +17488,9 @@ mod tests {
         let sidebar_pictures: Vec<gtk::Picture> = widgets
             .iter()
             .filter_map(|w| w.clone().downcast::<gtk::Picture>().ok())
-            .filter(|p| p.width_request() == 18)
+            // D-259: was a hardcoded 18. The sidebar icons have grown since,
+            // so this found nothing and the suite reported an empty sidebar.
+            .filter(|p| p.width_request() == SIDEBAR_ICON_SLOT)
             .collect();
         if sidebar_pictures.len() < 3 {
             failures.push(format!("sidebar has {} icon pictures, expected at least 3", sidebar_pictures.len()));
@@ -18843,6 +21033,7 @@ Broken: Either state is wrong.\n";
         guide_toolbar_and_transfer_targets_d194b();
         #[cfg(feature = "guide")]
         guide_zip_targets_d194c();
+        split_view_opens_a_second_real_pane_d241();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         {
             let root = crate::native_core::scratch_root().join(format!("wf-d80-{}", std::process::id()));
@@ -18888,6 +21079,11 @@ Broken: Either state is wrong.\n";
         child_apps_launch_with_the_window_context_d57();
         thumbnail_queue_caps_concurrency_and_drains_on_cancel_d84();
         corrupt_image_keeps_fallback_and_queue_drains_to_follower_d152();
+        details_thumbnails_in_list_rows_d260();
+        every_image_format_previews_and_thumbnails_d261();
+        a_pasted_address_opens_the_folder_d262();
+        a_picture_no_loader_reads_still_gets_a_thumbnail_d263();
+        opening_at_a_file_selects_it_d264();
         video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
@@ -18944,9 +21140,11 @@ Broken: Either state is wrong.\n";
                         picture: gtk::Picture::new(),
                         width: 32,
                         height: 32,
+                        alive: Rc::new(Cell::new(true)),
                     })
                     .collect(),
                 active: 0,
+                row_tokens: HashMap::new(),
             }))
         };
 
@@ -19029,10 +21227,11 @@ Broken: Either state is wrong.\n";
         let queue = Rc::new(RefCell::new(ThumbnailQueue {
             cancelled: gio::Cancellable::new(),
             pending: VecDeque::from(vec![
-                ThumbnailJob { path: corrupt_path.to_string_lossy().to_string(), picture: corrupt_picture.clone(), width: 32, height: 32 },
-                ThumbnailJob { path: follower_path.to_string_lossy().to_string(), picture: follower_picture.clone(), width: 32, height: 32 },
+                ThumbnailJob { path: corrupt_path.to_string_lossy().to_string(), picture: corrupt_picture.clone(), width: 32, height: 32, alive: Rc::new(Cell::new(true)) },
+                ThumbnailJob { path: follower_path.to_string_lossy().to_string(), picture: follower_picture.clone(), width: 32, height: 32, alive: Rc::new(Cell::new(true)) },
             ]),
             active: 0,
+            row_tokens: HashMap::new(),
         }));
 
         start_thumbnail_jobs(queue.clone());
@@ -19059,6 +21258,992 @@ Broken: Either state is wrong.\n";
         // bounded loop above (not by panic or abort): the app stayed
         // responsive through the corrupt decode, exactly as a real corrupt
         // file dropped into a live Grid folder would.
+    }
+
+    /// D-260: a real Details row paints a real decoded thumbnail when the
+    /// setting is on, leaves non-images on their file-type icon, keeps the row
+    /// height unchanged, and loses both the picture and the queue when the
+    /// setting goes off. The direct queue check at the end is the scroll-away
+    /// half: it needs no pointer input, which this suite refuses to fake on
+    /// the owner's desktop.
+    fn details_thumbnails_in_list_rows_d260() {
+        gtk::init().expect("gtk init on the virtual display");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d260-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("pics");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // The CRC-correct 1x1 PNG this file's D-152 test proves real gdk-pixbuf
+        // decodes; an extension-only placeholder would prove nothing.
+        const VALID_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x60, 0x60, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x2b, 0x09, 0x4d, 0x84,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let png = dir.join("a.png");
+        std::fs::write(&png, VALID_PNG).unwrap();
+        std::fs::write(dir.join("b.txt"), "not a picture").unwrap();
+        let png_path = png.to_string_lossy().to_string();
+        let txt_path = dir.join("b.txt").to_string_lossy().to_string();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d260test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 600);
+        ui.window.present();
+        wait_for("d260 listing", || state.borrow().visible_entries.len() == 2);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+
+        let row_of = |path: &str| -> gtk::Widget {
+            state
+                .borrow()
+                .meta_labels
+                .get(&native_core::EntrySource::real(path))
+                .and_then(|(size, _)| size.upgrade())
+                .and_then(|label| label.parent())
+                .expect("the row is realized")
+        };
+        let thumb_of = |path: &str| -> Option<gtk::Picture> {
+            all_widgets(&row_of(path))
+                .into_iter()
+                .find(|w| w.widget_name() == "wf-row-thumbnail")
+                .and_then(|w| w.downcast::<gtk::Picture>().ok())
+        };
+
+        // Off by default: the picture widget is never even built.
+        assert!(!state.borrow().details_thumbnails);
+        assert!(thumb_of(&png_path).is_none(), "no thumbnail widget while the setting is off");
+        let height_without = row_of(&png_path).measure(gtk::Orientation::Vertical, -1).1;
+
+        set_details_thumbnails(&state, true);
+        assert!(state.borrow().details_thumbnails);
+        assert!(state.borrow().thumbnail_queue.is_some(), "the same queue now serves the list");
+        wait_for("the png row thumbnail", || {
+            thumb_of(&png_path).is_some_and(|p| p.paintable().is_some())
+        });
+
+        // D-260 follow-up: the drawn square is the icon's edge, never the wider
+        // slot. A Picture's natural size is its texture's size and the decode
+        // is twice display, so this allocation is exact only because the
+        // picture is excluded from the overlay's measure and the overlay itself
+        // is exactly `side` square.
+        pump();
+        let details_thumb = thumb_of(&png_path).expect("the png row keeps its picture");
+        let details_side = native_core::list_thumbnail_metrics(1.0, false).display;
+        assert_eq!(
+            (details_thumb.width(), details_thumb.height()),
+            (details_side, details_side),
+            "Details must allocate the picture at exactly {details_side}px square, not the 32x28 slot"
+        );
+
+        // Compact shares the same rule at its own smaller edge.
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        wait_for("the compact png row thumbnail", || {
+            thumb_of(&png_path).is_some_and(|p| p.paintable().is_some())
+        });
+        pump();
+        let compact_thumb = thumb_of(&png_path).expect("the compact png row has its picture");
+        let compact_side = native_core::list_thumbnail_metrics(1.0, true).display;
+        assert_eq!(
+            (compact_thumb.width(), compact_thumb.height()),
+            (compact_side, compact_side),
+            "Compact must allocate the picture at exactly {compact_side}px square"
+        );
+        set_view_mode(&state, &ui, ViewMode::Details);
+        wait_for("back to Details with a thumbnail", || {
+            thumb_of(&png_path).is_some_and(|p| p.paintable().is_some())
+        });
+        pump();
+
+        // A text row never gets a picture: it keeps its file-type icon.
+        assert!(thumb_of(&txt_path).is_none(), "only images are decoded");
+
+        // The picture is exactly the icon's edge, so the row height is unchanged.
+        let height_with = row_of(&png_path).measure(gtk::Orientation::Vertical, -1).1;
+        assert_eq!(height_without, height_with, "a thumbnail must not change the row height");
+
+        set_details_thumbnails(&state, false);
+        assert!(state.borrow().thumbnail_queue.is_none(), "turning it off cancels the queue");
+        wait_for("row rebuilt after turning off", || {
+            state.borrow().meta_labels.contains_key(&native_core::EntrySource::real(&png_path))
+        });
+        assert!(thumb_of(&png_path).is_none(), "and removes every row picture");
+        assert!(!read_config_at(&config_path().unwrap()).details_thumbnails);
+
+        // The scroll-away half: a queued job for a row that left the screen is
+        // dropped outright, and any decode already running is marked dead so
+        // its result cannot paint into the recycled row.
+        let queue = Rc::new(RefCell::new(ThumbnailQueue {
+            cancelled: gio::Cancellable::new(),
+            pending: VecDeque::new(),
+            active: 0,
+            row_tokens: HashMap::new(),
+        }));
+        let alive = Rc::new(Cell::new(true));
+        let picture = gtk::Picture::new();
+        queue.borrow_mut().row_tokens.insert(
+            png_path.clone(),
+            ThumbnailRow { alive: alive.clone(), picture: picture.downgrade() },
+        );
+        queue.borrow_mut().pending.push_back(ThumbnailJob {
+            path: png_path.clone(),
+            picture: picture.clone(),
+            width: 48,
+            height: 48,
+            alive: alive.clone(),
+        });
+        // A stale unbind carries the OLD picture and must be ignored: the row
+        // that replaced it owns the path now.
+        let stale = gtk::Picture::new();
+        cancel_list_thumbnail(&queue, &png_path, &stale);
+        assert_eq!(queue.borrow().pending.len(), 1, "a stale unbind must not cancel the live row");
+        assert!(alive.get(), "the live row's decode is still allowed to paint");
+
+        cancel_list_thumbnail(&queue, &png_path, &picture);
+        assert!(queue.borrow().pending.is_empty(), "queued work for a row off screen is dropped");
+        assert!(!alive.get(), "an in-flight decode for that row is marked dead");
+        assert!(queue.borrow().row_tokens.get(&png_path).is_none());
+
+        // D-260 follow-up: a job that ends normally must not leave its token in
+        // `row_tokens` for the life of the folder's queue. The identity rule
+        // holds here too: finishing with a picture the token does not hold
+        // leaves the live row's token alone.
+        let live = gtk::Picture::new();
+        let stale = gtk::Picture::new();
+        queue.borrow_mut().row_tokens.insert(
+            png_path.clone(),
+            ThumbnailRow { alive: Rc::new(Cell::new(true)), picture: live.downgrade() },
+        );
+        finish_thumbnail_job(&queue, &png_path, &stale);
+        assert!(
+            queue.borrow().row_tokens.get(&png_path).is_some(),
+            "a job whose picture is not the live row's must not drop that row's token"
+        );
+        finish_thumbnail_job(&queue, &png_path, &live);
+        assert!(
+            queue.borrow().row_tokens.get(&png_path).is_none(),
+            "a finished job must drop its row token"
+        );
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-261: the owner, 11 November 2026: "wayfinder is not previewing all images.
+    /// only some. WEBP files and some PNG files." Every format the listing
+    /// calls an image has to actually paint, in the preview pane AND as a Grid
+    /// tile. Real encoded bytes for each format, never an extension on a stub,
+    /// because an extension proves nothing about a decoder.
+    fn every_image_format_previews_and_thumbnails_d261() {
+        gtk::init().expect("gtk init on the virtual display");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d261-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("pics");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A real 2x2 lossy WEBP (RIFF/VP8), libwebp-encoded.
+        const WEBP: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x36, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x20, 0x2a, 0x00, 0x00, 0x00, 0xd0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x02, 0x00,
+            0x02, 0x00, 0x02, 0x00, 0x34, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x01, 0xf8, 0x00, 0x03,
+            0xb0, 0x00, 0xfe, 0xec, 0xbd, 0x8f, 0xfc, 0xf4, 0xcd, 0x79, 0x83, 0xfc, 0x9c, 0xff,
+            0xb7, 0x26, 0x5e, 0x6d, 0xb0, 0x00,
+        ];
+        // A real 2x2 palette PNG with cHRM, tIME and three tEXt chunks: the
+        // shape a screenshot or an exported picture actually has, not the
+        // 1x1 minimum the other tests use.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x01, 0x03, 0x00, 0x00,
+            0x00, 0x48, 0x78, 0x9f, 0x67, 0x00, 0x00, 0x00, 0x20, 0x63, 0x48, 0x52, 0x4d, 0x00,
+            0x00, 0x7a, 0x26, 0x00, 0x00, 0x80, 0x84, 0x00, 0x00, 0xfa, 0x00, 0x00, 0x00, 0x80,
+            0xe8, 0x00, 0x00, 0x75, 0x30, 0x00, 0x00, 0xea, 0x60, 0x00, 0x00, 0x3a, 0x98, 0x00,
+            0x00, 0x17, 0x70, 0x9c, 0xba, 0x51, 0x3c, 0x00, 0x00, 0x00, 0x03, 0x50, 0x4c, 0x54,
+            0x45, 0x33, 0x66, 0xcc, 0x20, 0x22, 0x24, 0xa9, 0x00, 0x00, 0x00, 0x07, 0x74, 0x49,
+            0x4d, 0x45, 0x07, 0xea, 0x0b, 0x0b, 0x10, 0x10, 0x32, 0x45, 0xe9, 0xc4, 0xf5, 0x00,
+            0x00, 0x00, 0x25, 0x74, 0x45, 0x58, 0x74, 0x64, 0x61, 0x74, 0x65, 0x3a, 0x63, 0x72,
+            0x65, 0x61, 0x74, 0x65, 0x00, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x31, 0x31, 0x2d, 0x31,
+            0x31, 0x54, 0x31, 0x36, 0x3a, 0x31, 0x36, 0x3a, 0x35, 0x30, 0x2b, 0x30, 0x30, 0x3a,
+            0x30, 0x30, 0x5c, 0xbc, 0x42, 0xf6, 0x00, 0x00, 0x00, 0x25, 0x74, 0x45, 0x58, 0x74,
+            0x64, 0x61, 0x74, 0x65, 0x3a, 0x6d, 0x6f, 0x64, 0x69, 0x66, 0x79, 0x00, 0x32, 0x30,
+            0x32, 0x36, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x31, 0x54, 0x31, 0x36, 0x3a, 0x31, 0x36,
+            0x3a, 0x35, 0x30, 0x2b, 0x30, 0x30, 0x3a, 0x30, 0x30, 0x2d, 0xe1, 0xfa, 0x4a, 0x00,
+            0x00, 0x00, 0x28, 0x74, 0x45, 0x58, 0x74, 0x64, 0x61, 0x74, 0x65, 0x3a, 0x74, 0x69,
+            0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x00, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x31,
+            0x31, 0x2d, 0x31, 0x31, 0x54, 0x31, 0x36, 0x3a, 0x31, 0x36, 0x3a, 0x35, 0x30, 0x2b,
+            0x30, 0x30, 0x3a, 0x30, 0x30, 0x7a, 0xf4, 0xdb, 0x95, 0x00, 0x00, 0x00, 0x0c, 0x49,
+            0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x04, 0x00,
+            0x01, 0x27, 0x34, 0x27, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+            0x42, 0x60, 0x82,
+        ];
+        let cases: [(&str, &[u8]); 2] = [("shot.webp", WEBP), ("shot.png", PNG)];
+        for (name, bytes) in cases {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d261test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1000, 700);
+        ui.window.present();
+        wait_for("d261 listing", || state.borrow().visible_entries.len() == cases.len());
+
+        // 1. The preview pane, which paints through GdkTexture.
+        ui.preview_toggle.set_active(true);
+        wait_for("the preview pane is up", || ui.preview_scroll.is_mapped());
+        for (name, _) in cases {
+            let path = dir.join(name).to_string_lossy().to_string();
+            select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&path));
+            wait_for(&format!("the {name} preview"), || {
+                ui.preview_stack.visible_child_name().as_deref() == Some("image")
+                    && ui.preview_picture.paintable().is_some()
+            });
+            let paintable = ui.preview_picture.paintable().expect("a decoded preview");
+            assert!(
+                paintable.intrinsic_width() > 0 && paintable.intrinsic_height() > 0,
+                "{name}: the preview pane must show real pixels, got {}x{}",
+                paintable.intrinsic_width(),
+                paintable.intrinsic_height()
+            );
+        }
+
+        // A file that is named like a picture but holds nothing decodable must
+        // SAY so. A blank pane with no words is the bug D-261 was reported as.
+        let broken = dir.join("broken.png");
+        std::fs::write(&broken, b"this is not a picture at all").unwrap();
+        wait_for("the broken file is listed", || {
+            state.borrow().visible_entries.len() == cases.len() + 1
+        });
+        select_entry_by_source(
+            &state,
+            &ui,
+            &native_core::EntrySource::real(broken.to_string_lossy().to_string()),
+        );
+        wait_for("the refusal is in words", || {
+            ui.preview_stack.visible_child_name().as_deref() == Some("text")
+                && ui.preview.label().contains("No preview for this picture")
+        });
+
+        // 2. The Grid tile, which paints through gdk-pixbuf.
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        pump();
+        for (name, _) in cases {
+            let path = dir.join(name).to_string_lossy().to_string();
+            wait_for(&format!("the {name} grid thumbnail"), || {
+                all_widgets(ui.window.upcast_ref())
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Picture>().ok())
+                    .any(|p| p.paintable().is_some())
+                    && state.borrow().thumbnail_queue.as_ref().is_some_and(|q| {
+                        let q = q.borrow();
+                        q.pending.is_empty() && q.active == 0
+                    })
+            });
+            assert!(
+                native_core::is_image_path(&path),
+                "{name} must be listed as an image in the first place"
+            );
+        }
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-264: opened pointing AT a file, the way an agent or a browser does
+    /// it. The folder must come up with that one file selected — the blue
+    /// bar, not just the right folder.
+    fn opening_at_a_file_selects_it_d264() {
+        gtk::init().expect("gtk init on the virtual display");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d264-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("folder");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["aaa.txt", "wanted.txt", "zzz.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let wanted = dir.join("wanted.txt").to_string_lossy().to_string();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d264test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        // Exactly what `wayfinder /path/to/wanted.txt` ends up calling.
+        build_ui(
+            &app,
+            Some(dir.to_string_lossy().to_string()),
+            Some(wanted.clone()),
+        );
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 650);
+        ui.window.present();
+        wait_for("d264 listing", || state.borrow().visible_entries.len() == 3);
+
+        let selected_now = {
+            let state = state.clone();
+            let ui = ui.clone();
+            move || -> Vec<String> {
+                match state.borrow().view_mode {
+                    ViewMode::Grid => ui
+                        .grid
+                        .selected_children()
+                        .iter()
+                        .filter_map(|child| {
+                            state
+                                .borrow()
+                                .visible_entries
+                                .get(child.index() as usize)
+                                .and_then(|entry| entry.source.real_path_string())
+                        })
+                        .collect(),
+                    _ => (0..ui.list_selection.n_items())
+                        .filter(|i| ui.list_selection.is_selected(*i))
+                        .filter_map(|i| {
+                            state
+                                .borrow()
+                                .visible_entries
+                                .get(i as usize)
+                                .and_then(|entry| entry.source.real_path_string())
+                        })
+                        .collect(),
+                }
+            }
+        };
+        wait_for("the wanted file is the selection", || {
+            selected_now() == vec![wanted.clone()]
+        });
+
+        // And it must still be the selection in every view, not only the one
+        // that happened to be saved.
+        for mode in [ViewMode::Grid, ViewMode::Compact, ViewMode::Details] {
+            set_view_mode(&state, &ui, mode);
+            for _ in 0..40 {
+                pump();
+            }
+            assert_eq!(
+                selected_now(),
+                vec![wanted.clone()],
+                "{mode:?}: the file it was opened at must stay selected"
+            );
+        }
+
+        // A selection of more than one file survives the switch too, not just
+        // the first of them.
+        let two: Vec<native_core::EntrySource> = ["aaa.txt", "zzz.txt"]
+            .iter()
+            .map(|name| native_core::EntrySource::real(dir.join(name).to_string_lossy().to_string()))
+            .collect();
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+        reselect_sources(&state, &ui, &two);
+        pump();
+        let mut want: Vec<String> = two
+            .iter()
+            .filter_map(|source| source.real_path_string())
+            .collect();
+        want.sort();
+        for mode in [ViewMode::Grid, ViewMode::Compact, ViewMode::Details] {
+            set_view_mode(&state, &ui, mode);
+            for _ in 0..20 {
+                pump();
+            }
+            let mut got = selected_now();
+            got.sort();
+            assert_eq!(got, want, "{mode:?}: both files must stay selected");
+        }
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-264 on its own, under a private display, without the full suite.
+    #[test]
+    fn open_at_file_alone_d264() {
+        if std::env::var("WAYFINDER_D264_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        opening_at_a_file_selects_it_d264();
+    }
+
+    /// D-263: a file whose name says picture and whose contents gdk-pixbuf
+    /// cannot read. The preview pane already falls back to the outside
+    /// decoder; the tile did not, and kept a plain file icon for good. A real
+    /// mp4 named `.png` is the cheapest thing that no pixbuf loader reads and
+    /// ffmpeg does, so it stands in for the shape of the fault.
+    fn a_picture_no_loader_reads_still_gets_a_thumbnail_d263() {
+        gtk::init().expect("gtk init on the virtual display");
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            // The fallback IS ffmpeg; without it there is nothing to prove.
+            eprintln!("d263 SKIPPED: no ffmpeg on this machine");
+            return;
+        }
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d263-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("odd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mislabelled = dir.join("mislabelled.png");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=64x64", "-frames:v", "1",
+                   "-f", "mp4", "-y"])
+            .arg(&mislabelled)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(made, "the stand-in file must be written");
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d263test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 650);
+        ui.window.present();
+        wait_for("d263 listing", || state.borrow().visible_entries.len() == 1);
+
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        pump();
+        wait_for("the tile painted through the outside decoder", || {
+            all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Picture>().ok())
+                .any(|picture| {
+                    picture
+                        .paintable()
+                        .is_some_and(|p| p.intrinsic_width() > 0 && p.intrinsic_height() > 0)
+                })
+                && state.borrow().thumbnail_queue.as_ref().is_some_and(|q| {
+                    let q = q.borrow();
+                    q.pending.is_empty() && q.active == 0
+                })
+        });
+
+        eprintln!("d263 PROVED: the tile painted through the outside decoder");
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-263 on its own, under a private display, without the full suite.
+    #[test]
+    fn odd_picture_thumbnail_alone_d263() {
+        if std::env::var("WAYFINDER_D263_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        a_picture_no_loader_reads_still_gets_a_thumbnail_d263();
+    }
+
+    /// D-267: Icons view drew one tile per row in the owner's picker, every tile
+    /// stretched to the full width of the file pane with the whole filename
+    /// under it. This measures what the real grid actually allocates for a
+    /// folder of pictures with long names, so the cause is a number and not a
+    /// guess.
+    fn grid_lays_tiles_in_columns_d267() {
+        gtk::init().expect("gtk init on the virtual display");
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("d267 SKIPPED: no ffmpeg on this machine");
+            return;
+        }
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d267-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("shots");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..8 {
+            let name = format!("OpenAI Playground 2026-11-14 at 08.5{i}.50.png");
+            let made = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=1024x1536", "-frames:v", "1", "-y"])
+                .arg(dir.join(&name))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(made, "the picture fixture must be written");
+        }
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d267test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1180, 760);
+        ui.window.present();
+        wait_for("d267 listing", || state.borrow().visible_entries.len() == 8);
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        wait_for("d267 grid children", || ui.grid.child_at_index(7).is_some());
+        wait_for("d267 laid out", || ui.grid.child_at_index(0).map(|c| c.width() > 0).unwrap_or(false));
+        // Give the thumbnail workers their turn: the tiles start with plain
+        // icons and only take their real size once the pictures land.
+        for _ in 0..400 {
+            pump();
+        }
+
+        let mut rows: std::collections::BTreeMap<i32, Vec<i32>> = std::collections::BTreeMap::new();
+        for index in 0..8 {
+            let child = ui.grid.child_at_index(index).expect("grid child");
+            let alloc = child.allocation();
+            rows.entry(alloc.y()).or_default().push(alloc.width());
+        }
+        eprintln!("d267 grid pane width: {}", ui.grid.width());
+        for (y, widths) in &rows {
+            eprintln!("d267 row y={y}: {} tile(s), width {}", widths.len(), widths[0]);
+        }
+        let columns = rows.values().map(|w| w.len()).max().unwrap_or(0);
+
+        // The same folder through a real picker window, which is where he saw
+        // one tile per row, and then his own Downloads if it is readable from
+        // here: the picker is the only thing his run had that this one did not.
+        let mut picker_columns = Vec::new();
+        for (tag, folder) in [
+            ("fixture", dir.to_string_lossy().into_owned()),
+            ("downloads-copy", {
+                // Hard links to the real Downloads folder the bug was seen
+                // in, minus the videos (a video poster needs a gst pipeline
+                // this test has not started). Same names, same bytes, same
+                // thumbnails. Opt-in only: a test run must never walk the
+                // home folder of whoever is running it, so this stays off
+                // unless WAYFINDER_D267_REAL_DOWNLOADS is set.
+                let mirror = root.join("downloads-copy");
+                std::fs::create_dir_all(&mirror).unwrap();
+                let mut linked = 0;
+                let real_downloads = std::env::var_os("WAYFINDER_D267_REAL_DOWNLOADS")
+                    .and_then(|_| std::env::var_os("HOME"))
+                    .map(|home| std::path::PathBuf::from(home).join("Downloads"));
+                if let Ok(entries) = std::fs::read_dir(
+                    real_downloads.unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
+                ) {
+                    for entry in entries.flatten().take(400) {
+                        let path = entry.path();
+                        if !path.is_file() || linked >= 160 {
+                            continue;
+                        }
+                        let lower = path.to_string_lossy().to_lowercase();
+                        if native_core::is_video_path(&lower) {
+                            continue;
+                        }
+                        if let Some(name) = path.file_name() {
+                            if std::fs::hard_link(&path, mirror.join(name)).is_ok() {
+                                linked += 1;
+                            }
+                        }
+                    }
+                }
+                eprintln!("d267 downloads-copy: {linked} file(s) linked");
+                mirror.to_string_lossy().into_owned()
+            }),
+        ] {
+            if !Path::new(&folder).is_dir() {
+                eprintln!("d267 picker {tag}: no folder, skipped");
+                continue;
+            }
+            let picker = PickerState {
+                config: PickerConfig {
+                    multiple: false,
+                    directory: false,
+                    save: false,
+                    starting_dir: Some(folder.clone()),
+                    filter: None,
+                    window: None,
+                    request: WireRequestNative::default(),
+                    parent_window: None,
+                },
+                out_file: root.join(format!("d267-{tag}.out")).to_string_lossy().into_owned(),
+                meta_path: None,
+                active_filter: Rc::new(RefCell::new(None)),
+                choice_selections: Rc::new(RefCell::new(HashMap::new())),
+            };
+            let app = adw::Application::builder()
+                .application_id(format!("com.kadaken.wayfinder.d267pick{tag}"))
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).expect("register picker test application");
+            TEST_PICKER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(picker));
+            build_ui(&app, None, None);
+            let (pstate, pui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the picker window is registered");
+            wait_for("d267 picker listing", || !pstate.borrow().visible_entries.is_empty());
+            set_view_mode(&pstate, &pui, ViewMode::Grid);
+            wait_for("d267 picker grid", || pui.grid.child_at_index(0).is_some());
+            wait_for("d267 picker laid out", || pui.grid.child_at_index(0).map(|c| c.width() > 0).unwrap_or(false));
+            for _ in 0..600 {
+                pump();
+            }
+            let mut prows: std::collections::BTreeMap<i32, Vec<i32>> = std::collections::BTreeMap::new();
+            let shown = pstate.borrow().visible_entries.len().min(24);
+            for index in 0..shown as i32 {
+                if let Some(child) = pui.grid.child_at_index(index) {
+                    let alloc = child.allocation();
+                    prows.entry(alloc.y()).or_default().push(alloc.width());
+                }
+            }
+            // Which tile is forcing the column width: homogeneous means the
+            // widest natural request wins for every one of them.
+            let mut widest: Vec<(i32, String)> = Vec::new();
+            for index in 0..pstate.borrow().visible_entries.len() as i32 {
+                let Some(child) = pui.grid.child_at_index(index) else { break };
+                let (_, nat, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+                let name = pstate
+                    .borrow()
+                    .visible_entries
+                    .get(index as usize)
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                widest.push((nat, name));
+            }
+            widest.sort_by(|a, b| b.0.cmp(&a.0));
+            for (nat, name) in widest.iter().take(5) {
+                eprintln!("d267 {tag} widest tile: {nat}px  {name}");
+            }
+            let cols = prows.values().map(|w| w.len()).max().unwrap_or(0);
+            eprintln!(
+                "d267 picker {tag}: {} items, pane {}px, {} per row, tile {}px",
+                pstate.borrow().visible_entries.len(),
+                pui.grid.width(),
+                cols,
+                prows.values().next().map(|w| w[0]).unwrap_or(-1)
+            );
+            picker_columns.push((tag, cols));
+            pui.window.destroy();
+            pump();
+        }
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(
+            columns >= 4,
+            "Icons view must lay pictures out in columns, got {columns} per row in a {}px pane",
+            ui.grid.width()
+        );
+        for (tag, cols) in picker_columns {
+            assert!(cols >= 4, "the picker's Icons view must lay out in columns, got {cols} per row ({tag})");
+        }
+    }
+
+    /// D-268: selecting a folder shows what is inside it in the preview pane,
+    /// and every row there opens. Before this the pane said only "Folder" and
+    /// its path (14 Nov 2026, the owner: "when you select a folder down here, its
+    /// contents appear in the viewer to the right, and you could click them if
+    /// you want or open the folder so it's centered").
+    fn folder_preview_lists_and_opens_d268() {
+        gtk::init().expect("gtk init on the virtual display");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d268-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("start");
+        let folder = dir.join("Photos");
+        let nested = folder.join("Nested");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("loose.txt"), b"top level").unwrap();
+        for name in ["alpha.txt", "beta.txt"] {
+            std::fs::write(folder.join(name), b"inside").unwrap();
+        }
+        std::fs::write(nested.join("deep.txt"), b"deeper").unwrap();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d268test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1100, 720);
+        ui.window.present();
+        wait_for("d268 listing", || state.borrow().visible_entries.len() == 2);
+        ui.preview_toggle.set_active(true);
+        wait_for("the preview pane is up", || ui.preview_scroll.is_mapped());
+
+        let folder_source = native_core::EntrySource::real(folder.to_string_lossy().to_string());
+        select_entry_by_source(&state, &ui, &folder_source);
+        wait_for("the folder preview is built", || {
+            ui.preview_stack.visible_child_name().as_deref() == Some("folder")
+                && button_labelled(ui.preview_folder.clone().upcast_ref(), "alpha.txt").is_some()
+        });
+        let shown: Vec<String> = all_widgets(ui.preview_folder.clone().upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.label().to_string())
+            .collect();
+        eprintln!("d268 preview rows: {shown:?}");
+        for expected in ["Photos", "Nested", "alpha.txt", "beta.txt"] {
+            assert!(
+                shown.iter().any(|row| row == expected),
+                "the folder preview must list {expected}, got {shown:?}"
+            );
+        }
+        assert!(
+            !shown.iter().any(|row| row == "loose.txt"),
+            "the preview lists the SELECTED folder, not the folder being browsed: {shown:?}"
+        );
+
+        // A file in a folder the user has not entered is one click away.
+        let nested_row = button_labelled(ui.preview_folder.clone().upcast_ref(), "Nested")
+            .expect("a row for the nested folder");
+        nested_row.emit_clicked();
+        wait_for("clicking a preview row opens that folder", || {
+            state.borrow().cwd.display_string() == nested.to_string_lossy()
+        });
+        assert_eq!(
+            state.borrow().cwd.display_string(),
+            nested.to_string_lossy(),
+            "a row in the folder preview opens what it names"
+        );
+
+        // And the header opens the folder the preview is showing.
+        navigate(&state, native_core::Location::RealDir(dir.clone()));
+        wait_for("back at the start folder", || {
+            state.borrow().cwd.display_string() == dir.to_string_lossy()
+        });
+        select_entry_by_source(&state, &ui, &folder_source);
+        wait_for("the folder preview is built again", || {
+            button_labelled(ui.preview_folder.clone().upcast_ref(), "alpha.txt").is_some()
+        });
+        let header = button_labelled(ui.preview_folder.clone().upcast_ref(), "Photos")
+            .expect("the preview header");
+        header.emit_clicked();
+        wait_for("the header opens the folder itself", || {
+            state.borrow().cwd.display_string() == folder.to_string_lossy()
+        });
+        assert_eq!(
+            state.borrow().cwd.display_string(),
+            folder.to_string_lossy(),
+            "the preview header opens the folder it names"
+        );
+
+        ui.window.close();
+        pump();
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-268 on its own, under a private display, without the full suite.
+    #[test]
+    fn folder_preview_alone_d268() {
+        if std::env::var("WAYFINDER_D268_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        folder_preview_lists_and_opens_d268();
+    }
+
+    /// D-267 on its own, under a private display, without the full suite.
+    #[test]
+    fn grid_columns_alone_d267() {
+        if std::env::var("WAYFINDER_D267_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        grid_lays_tiles_in_columns_d267();
+    }
+
+    /// D-262: a pasted address. The bar used to hand its text straight to the
+    /// lister, so anything that was not already a plain absolute folder path
+    /// did nothing at all and said nothing: a relative fragment copied out of
+    /// a project, a `file://` URI from a browser, a quoted paste from a
+    /// terminal, a `~` path, or a file's own path instead of its folder.
+    fn a_pasted_address_opens_the_folder_d262() {
+        gtk::init().expect("gtk init on the virtual display");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d262-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let project = home.join("Projects").join("example-project");
+        let comet = project.join("art").join("anim").join("comet");
+        let src = project.join("src");
+        std::fs::create_dir_all(&comet).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        std::fs::write(comet.join("tail.png"), b"x").unwrap();
+        std::fs::write(src.join("main.rs"), b"fn main() {}").unwrap();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d262test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(src.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1000, 700);
+        ui.window.present();
+
+        let here = {
+            let state = state.clone();
+            move || state.borrow().cwd.real_path_string().unwrap_or_default()
+        };
+        let paste = |text: &str| {
+            ui.path_entry.set_text(text);
+            ui.path_entry.emit_activate();
+            pump();
+        };
+        let lands = |what: &str, text: &str, want: &std::path::Path| {
+            paste(text);
+            let want = want.to_string_lossy().to_string();
+            wait_for(&format!("{what} opened {want}"), || here() == want);
+        };
+
+        // 1. The exact paste he reported: a fragment relative to the project
+        // he was standing inside, with a trailing slash.
+        lands("a project-relative fragment", "art/anim/comet/", &comet);
+
+        // 2. The same fragment one level shorter, also from his report.
+        lands("a shorter fragment", "art/anim", &project.join("art").join("anim"));
+
+        // 3. An absolute path still works.
+        lands("an absolute path", &comet.to_string_lossy(), &comet);
+
+        // 4. A file's own path opens the folder that holds it.
+        lands("a file's path", &src.join("main.rs").to_string_lossy(), &src);
+
+        // 5. What a browser or a file manager puts on the clipboard.
+        lands(
+            "a file:// URI",
+            &format!("file://{}", comet.to_string_lossy()),
+            &comet,
+        );
+
+        // 6. What a terminal paste looks like.
+        lands(
+            "a quoted path",
+            &format!("\"{}\"", comet.to_string_lossy()),
+            &comet,
+        );
+
+        // 7. A tilde path.
+        lands("a ~ path", "~/Documents", &home.join("Documents"));
+
+        // 8. The exact shape of his report: the whole fragment, pasted from
+        // home, naming a tree that is below none of home's parents. Only the
+        // bounded walk can find this one.
+        lands("home, to stand somewhere else first", &home.to_string_lossy(), &home);
+        lands(
+            "a fragment found by the bounded walk",
+            "example-project/art/anim/comet/",
+            &comet,
+        );
+
+        // 9. Nothing that matches must SAY so and leave the folder alone.
+        let before = here();
+        paste("no/such/folder/anywhere");
+        wait_for("the failure is in words", || {
+            ui.status.label().contains("no/such/folder/anywhere")
+        });
+        assert_eq!(here(), before, "a failed address must not move the window");
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-262 on its own, under a private display, without the full suite.
+    #[test]
+    fn pasted_address_alone_d262() {
+        if std::env::var("WAYFINDER_D262_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        a_pasted_address_opens_the_folder_d262();
+    }
+
+    /// D-261 on its own, under a private display, without the full suite.
+    #[test]
+    fn image_formats_alone_d261() {
+        if std::env::var("WAYFINDER_D261_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        every_image_format_previews_and_thumbnails_d261();
+    }
+
+    /// D-260 on its own, under a private display, without the full suite.
+    #[test]
+    fn details_thumbnail_regression_alone_d260() {
+        if std::env::var("WAYFINDER_D260_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        details_thumbnails_in_list_rows_d260();
     }
 
     /// D-85: a disposable synthetic short H.264/mp4 clip (never an owner
@@ -20509,6 +23694,87 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-241 split view: F3 builds a whole second pane in the same window --
+    /// its own list, its own folder, its own tabs -- and F3 again takes it
+    /// away and leaves the first pane's body intact and mapped.
+    fn split_view_opens_a_second_real_pane_d241() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d241-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let left = root.join("left");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("one.txt"), "1").unwrap();
+        std::fs::write(left.join("two.txt"), "2").unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d241test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(left.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing the left folder", || state.borrow().visible_entries.len() == 2);
+        pump();
+
+        let list_views = || {
+            all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter(|w| w.is::<gtk::ListView>())
+                .count()
+        };
+        let before = list_views();
+        assert!(ui.split.borrow().is_none(), "no split at rest");
+
+        toggle_split(&state, &ui);
+        pump();
+        assert!(ui.split.borrow().is_some(), "the split paned is recorded");
+        let paned = ui.split.borrow().clone().expect("the split pane").paned;
+        assert_eq!(paned.start_child().as_ref(), Some(&ui.body.clone().upcast::<gtk::Widget>()), "the first pane's body is the left child");
+        let second = paned.end_child().expect("the second pane's body is the right child");
+        assert!(second != ui.body.clone().upcast::<gtk::Widget>(), "the second pane is not the first pane's body again");
+        wait_for("a second real list view", || list_views() > before);
+        let pane_state = ui.split.borrow().clone().expect("the split pane").state;
+        wait_for("the second pane lists the same folder", || {
+            pane_state.borrow().visible_entries.len() == 2
+        });
+        assert!(
+            !Rc::ptr_eq(&pane_state, &state),
+            "the second pane has its own state, not the first pane's"
+        );
+        assert!(ui.body.is_mapped(), "the first pane stays mapped inside the split");
+        assert!(second.is_mapped(), "the second pane is mapped");
+        // Exactly one Places list in the window: the second pane hides its own.
+        let visible_sidebars = all_widgets(ui.window.upcast_ref())
+            .into_iter()
+            .filter(|w| w.is::<gtk::ListBox>() && w.is_mapped())
+            .count();
+        assert!(visible_sidebars >= 1, "the window still shows a Places list");
+
+        toggle_split(&state, &ui);
+        pump();
+        assert!(ui.split.borrow().is_none(), "the split is closed");
+        assert_eq!(
+            ui.body.parent().as_ref(),
+            Some(&ui.split_slot.clone().upcast::<gtk::Widget>()),
+            "the kept body goes back into the slot, not away with the paned"
+        );
+        assert!(ui.body.is_mapped(), "the first pane survives closing the split");
+        wait_for("the second list view is gone", || list_views() == before);
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     /// D-194: the three ZIP targets. `zip-archive-row` names only the real `.zip` file's own
     /// row, never a decoy real file or a member row once browsed inside; `zip-member-open` and
     /// `zip-copy-out` name only the real context-menu buttons built for an eligible regular
@@ -21043,8 +24309,15 @@ Broken: Either state is wrong.\n";
         let magenta = |png: &std::path::Path, x: i32, y: i32, w: i32, h: i32| -> f64 {
             let out = std::process::Command::new("/usr/bin/magick")
                 .arg(png)
-                .args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage", "-fuzz", "8%", "-fill", "black", "+opaque", "#ff2fd0"])
-                .args(["-fill", "white", "-opaque", "#ff2fd0", "-format", "%[fx:mean*w*h]", "info:"])
+                // Guide magenta by signature, not by exact value: the software X
+                // renderer on the virtual display lays the stroke down at half
+                // intensity (#7f176b), so an exact #ff2fd0 match counted zero
+                // pixels of a ring that is plainly there. Red well above green
+                // and blue well above green is magenta and nothing else on this
+                // UI: grey, the dark chrome, the blue selection and any warm
+                // accent all fail it.
+                .args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
+                .args(["-fx", "(r-g>=0.25 && b-g>=0.20 && r>=0.35) ? 1 : 0", "-format", "%[fx:mean*w*h]", "info:"])
                 .output()
                 .expect("magick");
             assert!(out.status.success(), "magick crop: {}", String::from_utf8_lossy(&out.stderr));
@@ -21210,7 +24483,7 @@ Broken: Either state is wrong.\n";
             let (left, right) = (magenta(&shot, bx, by, bw / 6, bh), magenta(&shot, bx + bw - bw / 6, by, bw / 6, bh));
             let centre = magenta(&shot, bx + bw / 4, by + bh / 4, bw / 2, bh / 2);
             let _ = std::fs::remove_file(&shot);
-            assert!(whole > 150.0, "stroke pixels inside the button bounds: {whole}");
+            assert!(whole > 150.0, "stroke pixels inside the button bounds: {whole} (crop {bx},{by} {bw}x{bh}, window {wx},{wy})");
             assert!(top > 0.0 && bottom > 0.0 && left > 0.0 && right > 0.0, "stroke on every side: {top} {bottom} {left} {right}");
             assert_eq!(centre, 0.0, "the icon centre is left clear: {centre} (crop {bx},{by} {bw}x{bh}, window {wx},{wy})");
         }
@@ -21289,6 +24562,13 @@ Broken: Either state is wrong.\n";
         // Baseline with no request: what an ordinary click does to focus.
         put("", "");
         click();
+        {
+            let (sx, sy) = gtk::prelude::NativeExt::surface_transform(&ui.window);
+            eprintln!("wf-dbg click: b=({},{}) c=({cx},{cy}) st=({sx},{sy}) win=({wx},{wy}) pick={:?} clicks={}",
+                b.x(), b.y(),
+                ui.window.pick(cx as f64, cy as f64, gtk::PickFlags::DEFAULT).map(|w| w.widget_name().to_string()),
+                clicks.get());
+        }
         assert_eq!(clicks.get(), 1, "ordinary click fires once");
         let plain_focus = GtkWindowExt::focus(&ui.window);
         assert!(ui.status.label().contains("Terminal failed"), "the real handler ran: {}", ui.status.label());
@@ -28742,7 +32022,7 @@ Broken: Either state is wrong.\n";
 
         // ---- Ctrl+Shift+N through the window's real key controller.
         let handled = ui
-            .window
+            .body
             .observe_controllers()
             .into_iter()
             .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -28865,7 +32145,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .window
+                .body
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -28972,7 +32252,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .window
+                .body
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -29061,7 +32341,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .window
+                .body
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -29152,7 +32432,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .window
+                .body
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -29254,7 +32534,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .window
+                .body
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -30870,6 +34150,42 @@ Broken: Either state is wrong.\n";
         assert_eq!(transfer_strip(true, E::Verifying).text, "Verifying copy");
         assert_eq!(transfer_strip(true, E::Verifying).fraction, None);
         assert!(!transfer_strip(false, E::Committing).cancel_enabled);
+    }
+
+    /// D-246: the Recent files rule. Newest first, one entry per path however
+    /// often it is opened, twelve kept, and a folder or a missing path is
+    /// refused -- the strip must never offer a tile that opens nothing.
+    #[test]
+    fn recent_files_keep_newest_first_without_duplicates_d246() {
+        let dir = crate::native_core::scratch_root()
+            .join(format!("wf-d246-recent-{}", std::process::id()));
+        let _cleanup = ScratchCleanup(dir.clone());
+        std::fs::create_dir_all(&dir).expect("scratch folder");
+        let file = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").expect("write");
+            path.to_string_lossy().into_owned()
+        };
+        let (one, two) = (file("one.txt"), file("two.txt"));
+        let mut recent = Vec::new();
+        push_recent_file(&mut recent, &one);
+        push_recent_file(&mut recent, &two);
+        assert_eq!(recent.iter().map(|b| b.path.clone()).collect::<Vec<_>>(),
+                   vec![two.clone(), one.clone()],
+                   "the newest opened file comes first");
+        push_recent_file(&mut recent, &one);
+        assert_eq!(recent.iter().map(|b| b.path.clone()).collect::<Vec<_>>(),
+                   vec![one.clone(), two.clone()],
+                   "reopening moves it to the front, it does not appear twice");
+        // A folder belongs in `recents`, not here, and a path that is gone
+        // must not be stored at all.
+        push_recent_file(&mut recent, &dir.to_string_lossy());
+        push_recent_file(&mut recent, &dir.join("never-existed").to_string_lossy());
+        assert_eq!(recent.len(), 2, "a folder and a missing path are both refused");
+        for n in 0..14 {
+            push_recent_file(&mut recent, &file(&format!("f{n}.txt")));
+        }
+        assert_eq!(recent.len(), 12, "twelve are kept and the rest fall off");
     }
 
     /// D-157 pure config: an old file with no `columns` field keeps everything
@@ -32717,6 +36033,35 @@ Broken: Either state is wrong.\n";
         assert_ne!(c.view_mode, want.view_mode);
         assert!(!include_str!("native.rs").contains(concat!("save_view", "_settings(")), "no whole-snapshot view write");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D-260: the row-thumbnail setting starts off, an older config without the
+    /// key still loads (as off), and the setter writes that one field only.
+    #[test]
+    fn details_thumbnails_default_off_and_persist_alone_d260() {
+        let dir = crate::native_core::scratch_root().join(format!("wf-thumbs-cfg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _cleanup = ScratchCleanup(dir.clone());
+        let path = dir.join("native-config.json");
+        update_config_at(&path, |c| *c = AppConfig::default());
+        assert!(!read_config_at(&path).details_thumbnails, "off by default");
+
+        // A config written before this field existed: the serialized defaults
+        // with the key removed. It must load and read as off, not fail the way
+        // a missing required field would.
+        let mut old = serde_json::to_value(AppConfig::default()).unwrap();
+        old.as_object_mut().unwrap().remove("details_thumbnails");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(!read_config_at(&path).details_thumbnails, "an older config reads as off");
+
+        update_config_at(&path, |c| config_details_thumbnails(c, true));
+        assert!(read_config_at(&path).details_thumbnails);
+        update_config_at(&path, |c| config_view_mode(c, ViewMode::Grid));
+        let c = read_config_at(&path);
+        assert!(c.details_thumbnails, "changing the view must not reset the thumbnail setting");
+        assert_eq!(c.view_mode, "grid");
+        update_config_at(&path, |c| config_details_thumbnails(c, false));
+        assert!(!read_config_at(&path).details_thumbnails);
     }
 
     /// The pre-D-82 comparator, kept as the reference the cached key must match.
