@@ -18,6 +18,9 @@
 #          as passed by silence. A human or a model must answer it.
 #
 # Usage:  scripts/audit-mechanical.sh [--repo <path>]
+#
+# It contains no absolute personal path by design. Anything machine-specific is
+# read from the environment, so the script is safe to publish with the source.
 set -uo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -203,16 +206,23 @@ if (( $(git rev-list --all --count) > 0 )); then
                 || fail K6.3 "$hp distinct paths in history match a CERTAIN probe: $(git grep -IlE "$CERTAIN" $(git rev-list --all -n 300) -- . | cut -d: -f2- | sort -u | tr '\n' ' ')"
 else skip K6.3 "no history"; fi
 # S2: the builder's own machine must not be in the tree or the artifact.
-l="$(git grep -In "/home/zito" -- . 2>/dev/null | wc -l)"
-(( l == 0 )) && pass S2.1 "no /home/zito in tracked files" \
-             || fail S2.1 "$l tracked lines contain /home/zito"
+# Built from the environment, never written as a literal: a hardcoded home path
+# or username in a public repo is itself the leak this check exists to catch,
+# and the first version of this script failed its own S2.1 for exactly that.
+USERNAME="$(id -un)"
+mapfile -t leaks < <(git grep -In -e "$HOME" -e "$USERNAME" -- . 2>/dev/null | cut -c1-100)
+if ((${#leaks[@]} == 0)); then pass S2.1 "no home path or username in tracked files"
+else
+  fail S2.1 "${#leaks[@]} tracked lines contain the home path or username:"
+  for l in "${leaks[@]}"; do printf '                 %s\n' "$l"; done
+fi
 
 # ---------------------------------------------------------------- S2 artifact leakage
 echo; echo "-- S2 artifact leakage (needs a release build)"
 for b in wayfinder-native wayfinder-portal; do
   p="src-tauri/target/release/$b"
   if [[ -x "$p" ]]; then
-    for probe in "/home/zito" ".cargo/registry" ".rustup" "cgzito"; do
+    for probe in "$HOME" "$(id -un)" ".cargo/registry" ".rustup"; do
       c="$(strings -a "$p" 2>/dev/null | grep -cF -- "$probe")"
       (( c == 0 )) && pass S2.2 "$b: 0 hits for '$probe'" \
                    || fail S2.2 "$b: $c hits for '$probe'"
