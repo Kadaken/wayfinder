@@ -4040,7 +4040,7 @@ fn build_ui_in(
         guide_watch_dir: None,
     }));
 
-    // Each path segment is its own button, so "Computer > home > zito > Downloads"
+    // Each path segment is its own button, so "Computer > home > user > Downloads"
     // lets you jump straight back to any ancestor instead of pressing Up N times.
     let path_crumbs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     path_crumbs.add_css_class("wf-address");

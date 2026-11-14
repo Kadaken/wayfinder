@@ -7320,8 +7320,8 @@ mod tests {
 /dev/sda2 / ext4 rw 0 0
 proc /proc proc rw 0 0
 sysfs /sys sysfs rw 0 0
-/dev/sdb1 /run/media/zito/Storage ext4 rw 0 0
-/dev/sdc1 /run/media/zito/Gaming fuseblk rw 0 0
+/dev/sdb1 /run/media/testuser/Storage ext4 rw 0 0
+/dev/sdc1 /run/media/testuser/Gaming fuseblk rw 0 0
 drive: /home/user/GoogleDrive fuse.rclone rw 0 0
 //nas/share /mnt/nas cifs rw 0 0
 ";
@@ -7330,7 +7330,7 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
             assert!(skipped.iter().any(|m| m == gone), "{gone} should be skipped");
         }
         // fuseblk is an ordinary NTFS disk, not a FUSE helper.
-        for kept in ["/", "/run/media/zito/Storage", "/run/media/zito/Gaming"] {
+        for kept in ["/", "/run/media/testuser/Storage", "/run/media/testuser/Gaming"] {
             assert!(!skipped.iter().any(|m| m == kept), "{kept} is a real disk");
         }
     }
@@ -7926,7 +7926,7 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
 /dev/nvme0n1p2 / ext4 rw 0 0
 //nas/Media /mnt/nas-media cifs rw 0 0
 //bob:hunter2@nas/Media /mnt/nas-media cifs rw 0 0
-srv:/export/Photos /run/media/zito/My\\040Share nfs4 rw 0 0
+srv:/export/Photos /run/media/testuser/My\\040Share nfs4 rw 0 0
 gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0
 gvfsd-fuse /run/user/1001/gvfs fuse.gvfsd-fuse rw 0 0
 portal /run/user/1000/doc fuse.portal rw 0 0
@@ -7986,7 +7986,7 @@ rclone: /home/user/GoogleDrive fuse.rclone rw 0 0
                 ("example.com", "/run/user/1000/gvfs/sftp:host=example.com,user=bob"),
                 ("Media on nas", "/mnt/nas-media"),
                 ("Network share", "/run/user/1000/gvfs/weird:user=bob,password=hunter2"),
-                ("Photos on srv", "/run/media/zito/My Share"),
+                ("Photos on srv", "/run/media/testuser/My Share"),
             ]
         );
         assert!(rows.iter().all(|d| d.kind == "network" && d.mountpoint == d.path && !d.removable));
