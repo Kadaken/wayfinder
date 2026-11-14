@@ -15,6 +15,17 @@
 # Other flags:
 #   --destdir DIR   stage the whole tree under DIR (for distribution packagers)
 #   --no-portal     do not install the file-dialog backend or touch portals.conf
+#   --kde-apps      also send KDE/Qt apps through the portal, so they use
+#                   Wayfinder too. Off by default: it makes Qt apps take their
+#                   theming from the portal as well, and some people would
+#                   rather keep KDE's own file dialog. Takes effect at the next
+#                   login. Undone by --uninstall, or by --no-kde-apps.
+#   --no-kde-apps   remove that setting and give KDE apps their own dialog back
+#   --with-codecs   install the codecs and helpers Wayfinder needs for picture
+#                   previews, video posters and network shares. Without this
+#                   the installer only says what is missing and leaves it.
+#   --check         only say what is on the machine and what is missing, then
+#                   stop. Installs nothing.
 #   --no-build      stop instead of building when the binaries are missing
 #   --dry-run       print every step, change nothing
 #
@@ -30,9 +41,12 @@ prefix=""
 destdir=""
 system=0
 with_portal=1
+kde_apps=
 build=1
 dry=0
 uninstall=0
+with_codecs=0
+check_only=0
 
 die() { printf 'wayfinder install: %s\n' "$1" >&2; exit 1; }
 say() { printf '%s\n' "$1"; }
@@ -48,10 +62,14 @@ while [ $# -gt 0 ]; do
     --destdir)    shift; [ $# -gt 0 ] || die "--destdir needs a directory"; destdir="$1" ;;
     --destdir=*)  destdir="${1#*=}" ;;
     --no-portal)  with_portal=0 ;;
+    --kde-apps)   kde_apps=1 ;;
+    --no-kde-apps) kde_apps=0 ;;
+    --with-codecs) with_codecs=1 ;;
+    --check)      check_only=1 ;;
     --no-build)   build=0 ;;
     --dry-run)    dry=1 ;;
     --uninstall)  uninstall=1 ;;
-    -h|--help)    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)            die "unknown option: $1" ;;
   esac
   shift
@@ -59,6 +77,17 @@ done
 
 if [ -z "$prefix" ]; then
   if [ "$system" = 1 ]; then prefix="/usr/local"; else prefix="${HOME}/.local"; fi
+fi
+
+# What Wayfinder leans on besides its own binaries: codecs, decoders and the
+# portal. Kept in its own file so it can be run on its own as well.
+# shellcheck source=packaging/dependencies.sh
+. "$here/dependencies.sh"
+
+if [ "$check_only" = 1 ]; then
+  wf_dep_report || true
+  wf_dep_advise "$with_codecs" || true
+  exit 0
 fi
 
 bindir="$prefix/bin"
@@ -74,6 +103,10 @@ icons="$d$datadir/icons/hicolor"
 
 conf_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 portals_conf="$conf_home/xdg-desktop-portal/portals.conf"
+# KDE/Qt apps do not ask the portal at all unless Qt is told to use it. This
+# file is the switch, and it is written only when the user asks for it.
+qt_env_conf="$conf_home/environment.d/95-wayfinder-qt.conf"
+qt_env_marker="# written by the Wayfinder installer (--kde-apps)"
 
 icon_sizes="32x32:32x32.png 64x64:64x64.png 128x128:128x128.png 256x256:128x128@2x.png 512x512:icon.png"
 
@@ -111,6 +144,32 @@ restart_portal() {
   fi
 }
 
+# Writes or removes the one line that sends KDE/Qt apps through the portal.
+# Only a file this installer wrote is ever removed.
+write_qt_env() {
+  if [ "$dry" = 1 ]; then
+    printf '  would: write %s\n' "$qt_env_conf"
+    return 0
+  fi
+  mkdir -p "$(dirname "$qt_env_conf")"
+  printf '%s\nQT_QPA_PLATFORMTHEME=xdgdesktopportal\n' "$qt_env_marker" > "$qt_env_conf"
+  say "  wrote $qt_env_conf -- KDE apps use Wayfinder from your next login"
+}
+
+remove_qt_env() {
+  [ -f "$qt_env_conf" ] || return 0
+  if ! head -n1 "$qt_env_conf" | grep -qF -- "$qt_env_marker"; then
+    say "  leaving $qt_env_conf alone: this installer did not write it"
+    return 0
+  fi
+  if [ "$dry" = 1 ]; then
+    printf '  would: remove %s\n' "$qt_env_conf"
+    return 0
+  fi
+  rm -f "$qt_env_conf"
+  say "  removed $qt_env_conf -- KDE apps get their own dialog back at next login"
+}
+
 # ---------------------------------------------------------------- uninstall
 if [ "$uninstall" = 1 ]; then
   say "Removing Wayfinder from $prefix"
@@ -133,6 +192,7 @@ if [ "$uninstall" = 1 ]; then
     fi
   fi
 
+  remove_qt_env
   refresh_caches
   restart_portal
   say "Done. Your own settings in ~/.config/wayfinder were left alone."
@@ -148,8 +208,26 @@ if [ ! -x "$bin_src/wayfinder-native" ] || [ ! -x "$bin_src/wayfinder-portal" ];
   if [ "$dry" = 1 ]; then
     printf '  would: cargo build --release --manifest-path %s\n' "$root/src-tauri/Cargo.toml"
   else
-    cargo build --release --manifest-path "$root/src-tauri/Cargo.toml"
+    # Built through the remap flags, so the binaries never carry the path
+    # they were built from. scripts/release-rustflags.sh says why.
+    if [ -x "$root/scripts/release-rustflags.sh" ]; then
+      CARGO_ENCODED_RUSTFLAGS="$("$root/scripts/release-rustflags.sh")" \
+        cargo build --release --manifest-path "$root/src-tauri/Cargo.toml"
+    else
+      cargo build --release --manifest-path "$root/src-tauri/Cargo.toml"
+    fi
   fi
+fi
+
+# Announced before anything is copied, so nobody finds out weeks later that
+# previews were silently doing nothing (7 Nov 2026, Zito: "it should be
+# announced upon install").
+wf_dep_report || true
+if [ -n "${WF_DEPS_MISSING:-}" ] && [ "$with_codecs" = 1 ] && [ "$dry" != 1 ] && [ -z "$destdir" ]; then
+  wf_dep_advise 1 || say "Could not install everything. Wayfinder is still installed below."
+  say ""
+  say "Checking again:"
+  wf_dep_report || true
 fi
 
 say "Installing Wayfinder into $prefix"
@@ -225,6 +303,14 @@ else
   say "  skipping the file-dialog backend (--no-portal)"
 fi
 
+# KDE/Qt apps: only ever on request, either way.
+if [ -z "$destdir" ]; then
+  case "$kde_apps" in
+    1) write_qt_env ;;
+    0) remove_qt_env ;;
+  esac
+fi
+
 refresh_caches
 
 if [ -z "$destdir" ]; then
@@ -243,7 +329,26 @@ case ":${PATH}:" in
   *) say ""; say "Note: $bindir is not in your PATH. Add it, or run $bindir/wayfinder directly." ;;
 esac
 
+if [ -n "${WF_DEPS_MISSING:-}" ]; then
+  say ""
+  say "Before you finish: the features marked MISSING above will do nothing"
+  say "until those packages are on the machine."
+  wf_dep_advise 0 || true
+else
+  say ""
+  say "Every codec and helper Wayfinder needs is present: picture previews,"
+  say "video posters and network shares will all work."
+fi
+
 say ""
 say "Run 'wayfinder' to open it. Programs asking for a file will use Wayfinder"
 say "once the portal has restarted; log out and back in if an app still shows"
 say "the old dialog. Remove everything again with: $0 --uninstall"
+
+if [ "$kde_apps" != 1 ] && [ "${XDG_CURRENT_DESKTOP:-}" = "KDE" ]; then
+  say ""
+  say "KDE apps (KWrite, Dolphin, Gwenview) draw their own file dialog and never"
+  say "ask the portal, so they will not use Wayfinder. Run this installer again"
+  say "with --kde-apps to send them through it; Qt apps then take their theming"
+  say "from the portal as well. --no-kde-apps undoes it."
+fi

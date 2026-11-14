@@ -108,7 +108,7 @@ pub fn install(program: &'static str) {
         match written {
             Some(path) => eprintln!(
                 "A full report is in {}. Attach it to a bug report at\n\
-                 https://github.com/LegendofZito/wayfinder/issues",
+                 https://github.com/Kadaken/wayfinder/issues",
                 path.display()
             ),
             None => eprintln!(

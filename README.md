@@ -23,8 +23,21 @@ Wayfinder is two programs from one source tree: the file manager, and the file
 dialog that other programs open when they ask you to pick a file. The installer
 sets up both.
 
+**A built archive, nothing to compile** — from
+[kadaken.com](https://kadaken.com/#wayfinder) or the
+[releases page](https://github.com/Kadaken/wayfinder/releases):
+
 ```bash
-git clone https://github.com/LegendofZito/wayfinder.git
+tar xzf wayfinder-*-linux.tar.gz
+cd wayfinder-*-linux
+./packaging/install.sh
+```
+
+**Or from source**, which needs a Rust toolchain and the GTK4 development
+packages listed under [Requirements](#requirements):
+
+```bash
+git clone https://github.com/Kadaken/wayfinder.git
 cd wayfinder
 ./packaging/install.sh
 ```
@@ -355,7 +368,7 @@ sudo dnf install gtk4-devel libadwaita-devel gdk-pixbuf2-devel
 ```
 
 ```bash
-git clone https://github.com/LegendofZito/wayfinder.git
+git clone https://github.com/Kadaken/wayfinder.git
 cd wayfinder
 
 # Test suite
@@ -379,6 +392,17 @@ use the `cargo` commands above.
 
 
 ---
+
+## Help build it
+
+Alpha, and open about it. Bug reports, arguments about how it should behave and
+rough patches are all welcome, and none of them need permission first:
+[CONTRIBUTING.md](CONTRIBUTING.md) says where each one goes.
+
+Found a security hole? **Do not open a public issue** — see
+[SECURITY.md](SECURITY.md). The file dialog half of this program is a service
+every app on your machine can talk to, so that is the part worth attacking,
+and a deliberate attack on it has never been written.
 
 ## License
 

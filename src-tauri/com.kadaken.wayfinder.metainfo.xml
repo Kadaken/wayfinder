@@ -29,9 +29,9 @@
 
   <launchable type="desktop-id">com.kadaken.wayfinder.desktop</launchable>
 
-  <url type="homepage">https://github.com/LegendofZito/wayfinder</url>
-  <url type="bugtracker">https://github.com/LegendofZito/wayfinder/issues</url>
-  <url type="vcs-browser">https://github.com/LegendofZito/wayfinder</url>
+  <url type="homepage">https://github.com/Kadaken/wayfinder</url>
+  <url type="bugtracker">https://github.com/Kadaken/wayfinder/issues</url>
+  <url type="vcs-browser">https://github.com/Kadaken/wayfinder</url>
 
   <developer>
     <name>LegendofZito</name>
@@ -41,11 +41,23 @@
   <screenshots>
     <screenshot type="default">
       <caption>Browse files with a docked preview pane</caption>
-      <image type="source">https://raw.githubusercontent.com/LegendofZito/wayfinder/main/screenshots/screenshot-details.png</image>
+      <image type="source">https://raw.githubusercontent.com/Kadaken/wayfinder/main/screenshots/screenshot-details.png</image>
     </screenshot>
   </screenshots>
 
   <releases>
+    <release version="0.9.22" date="2026-11-14">
+      <description>
+        <p>Selecting a folder now lists its contents in the preview pane, each row
+        clickable. Icons view lays out as a real grid again, with picture-sized
+        tiles that zoom with Ctrl+scroll. A new sidebar icon set. Every picture
+        previews or says why it cannot, and a refusal is written to a log. A
+        pasted address resolves to its folder. Search skips mounts it cannot
+        finish walking and says when it truncated. The selection survives a
+        change of view, and wayfinder --select opens a folder with one file
+        highlighted.</p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-11-04">
       <description>
         <p>First public release. The source is now GPL-3.0-or-later. Wayfinder can
