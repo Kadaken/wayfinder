@@ -115,7 +115,14 @@ if have desktop-file-validate; then
     b="$(basename "$d")"
     if grep -q "error:" <<<"$out"; then fail S18.1 "$b: $(grep -m1 'error:' <<<"$out")"
     elif grep -q "warning:" <<<"$out"; then fail S18.1 "$b: $(grep -m1 'warning:' <<<"$out")"
-    elif grep -q "more than one main category" <<<"$out"; then
+    elif grep -q "more than one main category" <<<"$out" \
+         || grep -q "can be extended with another category" <<<"$out"; then
+      # A NoDisplay entry never reaches a menu, so menu-placement advice about it
+      # is not a finding at any level. The picker entry is one of those.
+      if grep -q "^NoDisplay=true" "$d"; then
+        pass S18.1 "$b: NoDisplay, category advice does not apply"
+        continue
+      fi
       # Graded as a hint, not a blocker. It is a menu-placement choice, the tool
       # itself calls it a hint, and no user loses data over it. Grading it FAIL
       # put a cosmetic choice in the same column as a leaked credential.
