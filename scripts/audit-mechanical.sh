@@ -32,7 +32,25 @@ pass(){ printf 'PASS   %-9s %s\n' "$1" "$2"; PASS=$((PASS+1)); }
 fail(){ printf 'FAIL   %-9s %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
 hint(){ printf 'HINT   %-9s %s\n' "$1" "$2"; HINTS=$((HINTS+1)); }
 skip(){ printf 'SKIP   %-9s %s\n' "$1" "$2"; SKIPS=$((SKIPS+1)); }
-judge(){ printf 'JUDGE  %-9s %s\n' "$1" "$2"; }
+# A JUDGE id is not mechanical, but it is still a check, and a check nobody
+# answered must not pass by silence. The answer lives in a tracked file so it
+# ships with the source, can be diffed between releases, and cannot be an
+# opinion held in one session. ANSWERED counts the ones with a recorded answer
+# at THIS version; OPEN counts the ones without.
+LEDGER="audit/ANSWERS.md"
+ANSWERED=0; OPEN=0
+declare -a OPEN_IDS=()
+judge(){
+  local id="$1" q="$2" line=""
+  [[ -f "$LEDGER" ]] && line="$(grep -m1 -E "^$id @ $VER " "$LEDGER" 2>/dev/null)"
+  if [[ -n "$line" ]]; then
+    printf 'ANSWERED %-7s %s\n' "$id" "${line#* — }"
+    ANSWERED=$((ANSWERED+1))
+  else
+    printf 'OPEN   %-9s %s\n' "$id" "$q"
+    OPEN=$((OPEN+1)); OPEN_IDS+=("$id")
+  fi
+}
 have(){ command -v "$1" >/dev/null 2>&1; }
 
 echo "=== Wayfinder mechanical release audit"
@@ -302,6 +320,12 @@ judge W6    "kadaken.com: update manifest, /get/wayfinder, rendered news, warnin
 
 echo
 echo "=== $PASS pass, $FAIL fail, $HINTS hint, $SKIPS skip"
-echo "JUDGE lines are not results. They are the work this script cannot do."
+echo "=== $ANSWERED judged and recorded, $OPEN still open"
+if (( OPEN )); then
+  echo "  unanswered at $VER in $LEDGER: ${OPEN_IDS[*]}"
+  echo "They are checks, not notes. Answer each one in $LEDGER, one line:"
+  echo "    <id> @ $VER — <what was done and what it showed> (<date>)"
+fi
 (( FAIL == 0 )) || echo "RELEASE BLOCKED by the FAIL lines above."
-exit $(( FAIL > 0 ? 1 : 0 ))
+(( OPEN == 0 )) || echo "RELEASE BLOCKED: $OPEN of $((ANSWERED+OPEN)) judged checks unanswered."
+exit $(( (FAIL > 0 || OPEN > 0) ? 1 : 0 ))

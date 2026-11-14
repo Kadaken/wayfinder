@@ -152,6 +152,32 @@ case_expect_fail W5.2 "the installer lost its --dry-run flag" \
 case_expect_fail W5.3 "the flatpak manifest carries a stale tag" \
   bash -c 'sed -i "s/tag: v[0-9.]*/tag: v0.0.1/" flatpak/com.kadaken.wayfinder.yml'
 
+# ---------------------------------------------------------------- the judged half
+echo
+echo "-- the judged half: an unanswered check must block, an answered one must clear"
+reset_clone
+out="$(run_audit)"; rc_open=0; grep -qE "^OPEN   S1 " <<<"$out" && rc_open=1
+run_audit >/dev/null 2>&1; exit_with_open=$?
+if (( rc_open == 1 && exit_with_open != 0 )); then
+  printf 'FIRED  %-9s an unanswered judged check prints OPEN and exits non-zero\n' "ledger"
+  OK=$((OK+1))
+else
+  printf 'MISS   %-9s unanswered judged check did not block (OPEN=%s exit=%s)\n' "ledger" "$rc_open" "$exit_with_open"
+  BAD=$((BAD+1)); FAILED_CASES+=("ledger unanswered did not block")
+fi
+
+reset_clone
+mkdir -p audit
+printf 'S1 @ %s — selftest answer (1970-01-01)\n' "$VER" >> audit/ANSWERS.md
+out="$(run_audit)"
+if grep -qE "^ANSWERED S1 " <<<"$out" && ! grep -qE "^OPEN   S1 " <<<"$out"; then
+  printf 'FIRED  %-9s a recorded answer clears the check\n' "ledger"
+  OK=$((OK+1))
+else
+  printf 'MISS   %-9s a recorded answer did NOT clear the check\n' "ledger"
+  BAD=$((BAD+1)); FAILED_CASES+=("ledger answer did not clear")
+fi
+
 reset_clone
 echo
 echo "-- not covered by this self-test, and why"
