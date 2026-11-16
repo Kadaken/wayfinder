@@ -3102,6 +3102,62 @@ fn trash_dir() -> Result<PathBuf, String> {
     Ok(Path::new(&home).join(".local/share/Trash"))
 }
 
+/// D-271: Trash is per filesystem, not per user. GIO moves an item on another
+/// volume into that volume's own `.Trash-1000`, never into the home Trash, so
+/// listing the home Trash before and after the move saw no new entry and the
+/// delete was reported as failed although the item had moved (16 November 2026,
+/// Zito: "am not able to delete from the g drive on way finder" — the files
+/// were in `GoogleDrive/.Trash-1000` the whole time). This resolves the Trash
+/// that will actually receive `path`.
+fn trash_dir_for(path: &str) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let home_trash = trash_dir()?;
+    #[cfg(test)]
+    if fixture_trash::dir().is_some() {
+        return Ok(home_trash);
+    }
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let Some(mount) = mount_root_of(Path::new(path)) else {
+        return Ok(home_trash);
+    };
+    let home_mount = mount_root_of(Path::new(&home));
+    if home_mount.as_deref() == Some(mount.as_path()) {
+        return Ok(home_trash);
+    }
+    let uid = fs::metadata(&home).map(|m| m.uid()).unwrap_or(0);
+    let top = mount.join(format!(".Trash-{uid}"));
+    if top.is_dir() {
+        return Ok(top);
+    }
+    let shared = mount.join(".Trash").join(uid.to_string());
+    if shared.is_dir() {
+        return Ok(shared);
+    }
+    // Neither exists yet; GIO creates the top-level one on the first move.
+    Ok(top)
+}
+
+/// The directory where `path`'s filesystem is mounted: the highest ancestor
+/// still on the same device. `None` if nothing about `path` can be read.
+fn mount_root_of(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let mut current = path;
+    let dev = loop {
+        match fs::symlink_metadata(current) {
+            Ok(meta) => break meta.dev(),
+            Err(_) => current = current.parent()?,
+        }
+    };
+    let mut root = current.to_path_buf();
+    while let Some(parent) = root.parent() {
+        match fs::symlink_metadata(parent) {
+            Ok(meta) if meta.dev() == dev => root = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    Some(root)
+}
+
 /// The one call that moves an item to Trash. The reason comes back bare.
 fn trash_move(path: &str) -> Result<(), String> {
     #[cfg(test)]
@@ -3172,7 +3228,7 @@ fn trash_one_exact(path: &str) -> Result<TrashedItem, TrashStop> {
     let not_moved = |reason: String| TrashStop::NotMoved { path: path.to_string(), reason };
     let unidentified = |reason: String| TrashStop::MovedUnidentified { path: path.to_string(), reason };
     let unlisted = |err: std::io::Error| format!("cannot read the Trash folder: {err}");
-    let files_dir = trash_dir().map_err(not_moved)?.join("files");
+    let files_dir = trash_dir_for(path).map_err(not_moved)?.join("files");
     let fingerprint = fingerprint(path)
         .map_err(|err| not_moved(err.strip_prefix(&format!("{path}: ")).unwrap_or(&err).to_string()))?;
     let before = match files_dir_stems(&files_dir) {
@@ -3196,9 +3252,17 @@ fn trash_one_exact(path: &str) -> Result<TrashedItem, TrashStop> {
 /// already restored in this call is put back in Trash under the same
 /// selector before returning the error.
 pub fn restore_from_trash_exact(receipts: &[TrashReceipt]) -> Result<(), String> {
-    let trash = trash_dir()?;
+    let home_trash = trash_dir()?;
     let mut restored = Vec::new();
     for receipt in receipts {
+        // D-271: the receipt's selector is `<trash>/files/<stem>`, so it names
+        // the Trash the item actually went to — which is the volume's own when
+        // the item was not on the home filesystem.
+        let trash = Path::new(&receipt.selector)
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home_trash.clone());
         match restore_from_trash_in(&trash, &receipt.selector) {
             Ok(()) => restored.push(receipt),
             Err(err) => {
@@ -6523,6 +6587,48 @@ mod tests {
         );
         assert!(lines[1].ends_with("x.jpg"));
         assert!(!out.contains('\n') || out.contains("\r\n"), "no bare LF");
+    }
+
+    /// D-271: the Trash that receives an item is the one on the item's own
+    /// filesystem. Before this, every item was looked for in the home Trash, so
+    /// deleting from a mounted drive moved the file and then reported a failure.
+    #[test]
+    fn trash_dir_follows_the_item_s_own_filesystem_d271() {
+        use std::os::unix::fs::MetadataExt;
+        let home = std::env::var("HOME").expect("HOME");
+        let home_trash = Path::new(&home).join(".local/share/Trash");
+
+        // Something on the home filesystem still uses the home Trash.
+        let on_home = format!("{home}/.wf-d271-probe");
+        assert_eq!(trash_dir_for(&on_home).unwrap(), home_trash);
+
+        // mount_root_of climbs to the top of the device the path sits on, and
+        // never past it.
+        let root = mount_root_of(Path::new(&on_home)).expect("a mount root");
+        assert!(
+            Path::new(&home).starts_with(&root),
+            "{root:?} must contain the home folder"
+        );
+        assert_eq!(
+            mount_root_of(Path::new("/proc/self")),
+            Some(PathBuf::from("/proc")),
+            "/proc is its own filesystem"
+        );
+
+        // An item on a different filesystem resolves to that volume's Trash,
+        // named for this user, not to the home one.
+        let elsewhere = trash_dir_for("/proc/self/cmdline").unwrap();
+        assert_ne!(elsewhere, home_trash);
+        assert!(
+            elsewhere.starts_with("/proc"),
+            "must be the volume's own Trash: {elsewhere:?}"
+        );
+        let uid = fs::metadata(&home).unwrap().uid();
+        assert!(
+            elsewhere.ends_with(format!(".Trash-{uid}"))
+                || elsewhere.ends_with(Path::new(".Trash").join(uid.to_string())),
+            "must be this user's Trash on that volume: {elsewhere:?}"
+        );
     }
 
     #[test]
