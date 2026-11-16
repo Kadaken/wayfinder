@@ -159,6 +159,13 @@ pub fn fetch_manifest() -> Result<Manifest, String> {
             // and all it is told.
             "--user-agent",
             concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
+            // D-278: ask for the manifest itself, not a copy of it. The file
+            // is served with `max-age=0, must-revalidate`, but a content
+            // delivery network still held the previous release's manifest for
+            // about a minute after 0.9.26 went up, so a check in that minute
+            // was told there was nothing new.
+            "--header",
+            "Cache-Control: no-cache",
             MANIFEST_URL,
         ])
         .output()
