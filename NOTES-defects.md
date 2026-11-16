@@ -36,24 +36,63 @@ checks it on every run before a single test starts, and refuses to run if that
 bus can reach the portal. The proof is the test
 `the_test_bus_cannot_start_the_desktop_portal`.
 
-## D-274 — the headless GTK suite fails on a sidebar geometry assertion
+## D-274 — sidebar rows swell when the sidebar has room (FIXED)
 
-16 November 2026. `scripts/run232.sh full` fails at `src-tauri/src/native.rs`
-line 28042, `protected sidebar and row geometry moved`: the Home row measures
-107 px before the first drive scan lands and 38 px after it, so the "geometry
-did not move" assertion breaks.
+16 November 2026. `scripts/run232.sh full` failed at `src-tauri/src/native.rs`,
+`protected sidebar and row geometry moved`: the Home row measured 107 px
+before the first drive scan landed and 38 px after it.
 
     left  (after the scan):  (216, 38, 188, 680, 680)
     right (before the scan): (216, 107, 188, 680, 680)
 
 Not caused by 0.9.24. Proven by building the previous release commit (1cf820a,
-0.9.23) in a throwaway worktree and running the same suite: it fails there
-too, with the same two tuples, at that commit's line 27526. So 0.9.23 shipped
-with this suite already red.
+0.9.23) in a throwaway worktree and running the same suite: it failed there
+too, with the same two tuples, at that commit's line 27526.
 
-Most likely a fixture artefact rather than an app fault: with only the places
-rows present the sidebar's height is shared between few rows, so each is tall,
-and each shrinks once the drive rows arrive. The assertion captures `before`
-at a moment when the row count is different, not when the layout is wrong.
-Needs deciding: either the assertion captures after the row set is final, or
-the sidebar rows must not stretch at all.
+Not a fixture artefact either, and not row stretching -- `row.set_vexpand(false)`
+changed nothing. Measuring the Home row's whole widget tree named the cause:
+
+    GtkListBoxRow  alloc=188x107  nat_h=81
+      GtkBox       alloc=168x99   nat_h=87   hexpand
+        GtkBox     alloc=99x99    nat_w=256  nat_h=99   <- the icon slot
+          GtkPicture alloc=99x99  nat_w=256  nat_h=99
+        GtkBox     alloc=37x99    nat_h=18              <- the words
+
+The packaged icon was 256 px (D-275). A GtkPicture is height-for-width, so it
+took every pixel of width the words left over -- 99 here -- and reported 99 px
+of height to match. Short names left more width, so the rows differed: Root
+119 px, Home 107, "Connect to Server..." 97. Once the drive rows arrived the
+sidebar overflowed, every row fell back to its minimum, and all of them became
+38 px.
+
+Fixed by D-275: with a 30 px icon the picture cannot ask for more. The suite
+also now asserts a places row is at most 48 px tall before the scan.
+
+## D-275 — the sidebar icons have been soft since 0.9.22 (FIXED)
+
+16 November 2026. `static/icons/sidebar/*.png` are the copies compiled into
+the binary, and D-258 (7 November, "they need to look crisp") shrank them to
+the 30 px the sidebar draws, with Lanczos and a light sharpen, because letting
+the graphics card shrink a big picture rounds every edge.
+
+0.9.22 put the 256 px originals in that folder instead. Every release since --
+0.9.22, 0.9.23 and the 0.9.24 now on kadaken.com -- has drawn sidebar icons
+shrunk by the graphics card, soft again, and tall enough to stretch the rows
+(D-274).
+
+    commit 30553a0 "Wayfinder 0.9.22"   sidebar/home.png  256x256
+    commit 0033677 (the one before)     sidebar/home.png   18x18
+
+Fixed three ways: the icons regenerated at 30 px; `scripts/make-sidebar-icons.sh`
+now reads `SIDEBAR_ICON_SLOT` out of `native.rs` rather than carrying its own
+number, so the two cannot drift again; and the test
+`every_packaged_sidebar_icon_is_already_slot_sized` fails if any packaged icon
+is ever over the slot.
+
+## D-276 — the undo-race check at native.rs:33243 is flaky
+
+16 November 2026. One run of `scripts/run232.sh full` failed there with
+`status was "3 items shown"` where it wanted `Undo refused:`. The identical
+run straight afterwards passed the whole suite. The status label is being read
+after something else has already overwritten it, so the check is timing
+dependent rather than wrong. Not yet fixed; it has been seen once.

@@ -2785,6 +2785,27 @@ mod guide_descriptor_tests {
         desc
     }
 
+    /// D-275: every packaged sidebar icon is already the size the sidebar
+    /// draws it at. 0.9.22 put the 256px originals in `static/icons/sidebar`
+    /// instead of the shrunk copies, so the graphics card did the shrinking
+    /// -- soft edges again, the very thing D-258 fixed -- and a GtkPicture
+    /// that asks for 256 pixels stretched the sidebar rows to 107 pixels
+    /// whenever there was room for it (D-274). Run
+    /// `scripts/make-sidebar-icons.sh` if this fails.
+    #[test]
+    fn every_packaged_sidebar_icon_is_already_slot_sized() {
+        for (name, bytes) in SIDEBAR_ICON_BYTES {
+            assert_eq!(&bytes[1..4], b"PNG", "{name} is not a PNG");
+            let side = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as i32;
+            let (width, height) = (side(16), side(20));
+            assert!(
+                width <= SIDEBAR_ICON_SLOT && height <= SIDEBAR_ICON_SLOT,
+                "sidebar icon {name} is {width}x{height}, over the {SIDEBAR_ICON_SLOT} pixel slot; \
+                 run scripts/make-sidebar-icons.sh"
+            );
+        }
+    }
+
     #[test]
     fn claims_token_and_writes_a_live_ack() {
         let _guard = SERIAL.lock().unwrap();
@@ -28012,6 +28033,10 @@ Broken: Either state is wrong.\n";
         assert!(row_named(&ui, "SynA").is_none(), "no drive rows before the first scan lands");
         wait_for("laid out", || ui.list_scroll.width() > 0);
         let before = geometry(&ui);
+        // D-274: a sidebar row is its natural height even when the sidebar is
+        // short. Before the drives land there is plenty of spare height here,
+        // and a row that stretched into it measured 107 pixels instead of 38.
+        assert!(before.1 <= 48, "a places row stretched to fill a short sidebar: {}px", before.1);
 
         {
             let (open, cv) = &*gate;
