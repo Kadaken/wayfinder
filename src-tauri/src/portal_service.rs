@@ -1353,8 +1353,30 @@ mod tests {
             // NameTaken. These point at an empty folder instead.
             let empty_data = root.join("no-services");
             fs::create_dir_all(&empty_data).expect("create the empty data dir");
+            // D-273: the environment alone is not enough. `--session` reads
+            // /usr/share/dbus-1/session.conf, whose
+            // `<standard_session_servicedirs/>` always adds the built-in
+            // /usr/share/dbus-1/services on top of whatever XDG_DATA_DIRS
+            // says -- and that folder holds
+            // org.freedesktop.portal.Desktop.service. So a test asking for a
+            // file dialog still had this bus start a real xdg-desktop-portal
+            // carrying the throwaway HOME; it cannot read the user database
+            // from there, aborts inside the GNOME proxy resolver, and the
+            // desktop loses its own file dialogs with it. A config file of
+            // our own, naming one empty service folder and nothing else,
+            // leaves the portal unknown on this bus.
+            let config_path = root.join("session.conf");
+            fs::write(
+                &config_path,
+                format!(
+                    "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN\"\n \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n<busconfig>\n  <type>session</type>\n  <listen>unix:path={socket}</listen>\n  <servicedir>{services}</servicedir>\n  <policy context=\"default\">\n    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n    <allow eavesdrop=\"true\"/>\n    <allow own=\"*\"/>\n  </policy>\n</busconfig>\n",
+                    socket = socket_path.display(),
+                    services = empty_data.display(),
+                ),
+            )
+            .expect("write the private bus config");
             let mut daemon = Command::new("dbus-daemon")
-                .arg("--session")
+                .arg(format!("--config-file={}", config_path.display()))
                 .arg(format!("--address=unix:path={}", socket_path.display()))
                 .arg("--nofork")
                 .arg("--print-address")
@@ -1479,6 +1501,36 @@ mod tests {
         unmount_everything_under(&root);
         fs::remove_dir_all(&root).expect("remove the round-owned scratch root");
         bus.root_removed.set(true);
+        drop(bus);
+    }
+
+    /// D-273. The proof that a test bus cannot start anything on this
+    /// machine, and above all not the desktop portal. One started with a
+    /// test's throwaway HOME cannot read the user database, aborts inside the
+    /// GNOME proxy resolver, and the desktop loses its own file dialogs with
+    /// it. Asking this bus to start it by name must come back "unknown"
+    /// rather than leave a real portal process behind.
+    #[test]
+    fn the_test_bus_cannot_start_the_desktop_portal() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let client = bus.connect_client();
+        let answer = client.call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "StartServiceByName",
+            &("org.freedesktop.portal.Desktop", 0u32),
+        );
+        let error = match answer {
+            Ok(_) => panic!("the private bus started the desktop portal; it must not be able to"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("ServiceUnknown") || error.contains("not provided by any .service"),
+            "expected the portal to be unknown on the private bus, got: {error}"
+        );
+        drop(client);
         drop(bus);
     }
 
