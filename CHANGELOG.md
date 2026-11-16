@@ -4,6 +4,20 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.23 — 16 November 2026
+
+### Fixed
+
+- **Deleting from a mounted drive said it failed when it had worked.** Trash is
+  per filesystem: an item on another volume goes to that volume's own
+  `.Trash-1000`, never to the home Trash. Wayfinder listed only the home Trash
+  before and after the move, found no new entry, and reported the delete as
+  failed — so the same folder was moved to Trash more than once by anyone who
+  retried. The Trash is now resolved on the item's own filesystem, and Undo
+  reads the Trash from the receipt instead of assuming the home one. Affected
+  every external drive, every network mount and every FUSE mount, including
+  rclone-mounted cloud storage.
+
 ## 0.9.22 — 14 November 2026
 
 ### Added

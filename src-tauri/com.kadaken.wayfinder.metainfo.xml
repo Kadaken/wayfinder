@@ -46,6 +46,14 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.23" date="2026-11-16">
+      <description>
+        <p>Deleting an item on a mounted drive reported a failure although the
+        item had moved, because Trash is per filesystem and only the home Trash
+        was being read. The Trash on the item's own volume is used now, and Undo
+        follows it.</p>
+      </description>
+    </release>
     <release version="0.9.22" date="2026-11-14">
       <description>
         <p>Selecting a folder now lists its contents in the preview pane, each row
