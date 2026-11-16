@@ -85,4 +85,9 @@ if timeout 20 gdbus call --session --dest org.freedesktop.portal.Desktop \
   exit 97
 fi
 
-exec "$here/scripts/headless-gtk-test.sh" "${1:-full}"
+if [ "$#" -eq 0 ]; then
+  exec "$here/scripts/headless-gtk-test.sh" full
+fi
+# Every argument, not just the first: the `--` mode takes a whole command
+# after it, and dropping the rest left xvfb-run printing its own usage.
+exec "$here/scripts/headless-gtk-test.sh" "$@"

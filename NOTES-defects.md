@@ -111,3 +111,38 @@ is deleted -- from the repo, from the leftover release tree in
 `~/Projects/Scratch/wf-release-0dd0268`, and from
 `~/.local/share/wayfinder/icons`, which an August install had left behind and
 which `native.rs` already asserts the app must never read.
+
+## D-279 — an update leaves the old file picker running — FIXED 16 November 2026
+
+16 November 2026, the owner: "why is wayfinder greyed out now?" An install at 16:35
+replaced both binaries. The app came up on the new build, but the picker
+backend kept running from 14:03: `/proc/749707/exe` pointed at
+`/home/user/.local/bin/wayfinder-portal (deleted)`. Every file dialog on the
+machine was still being served by the replaced build, and the window greyed
+out waiting on it.
+
+Cause: `restart_portal()` in `packaging/install.sh` restarted
+`xdg-desktop-portal`, the front end, and nothing else. `wayfinder-portal` is
+started on demand by D-Bus and then stays up, so it survives that restart and
+serves the old code until the user logs out — which is exactly what the
+installer's closing message told people to do.
+
+This hit every user who updated without logging out, not just this machine.
+
+Fix: `restart_portal()` now runs `pkill -x wayfinder-portal` before the
+`try-restart`. D-Bus starts the new backend the next time any app asks for a
+dialog. Checked: killing the backend by hand at 16:43 brought a fresh one up
+at 16:43:48 on the current build, and `install.sh --dry-run` prints the new
+step in the right order.
+
+## D-278 — an update check could be answered from a cache (FIXED)
+
+16 November 2026. `wayfinder-update.json` is served with
+`max-age=0, must-revalidate`, but right after 0.9.26 went up the plain URL
+still answered 0.9.25 for about a minute while a request carrying
+`Cache-Control: no-cache` already got 0.9.26. A check landing in that window
+is told there is nothing new. `fetch_manifest` now sends that header.
+
+Found alongside it: `scripts/run232.sh` passed only its first argument on, so
+the `-- CMD` mode ran nothing and printed xvfb-run's usage instead. It passes
+all of them now.

@@ -138,8 +138,17 @@ refresh_caches() {
 
 restart_portal() {
   [ -n "$destdir" ] && return 0
-  if command -v systemctl >/dev/null 2>&1 && [ -z "${WAYFINDER_INSTALL_NO_RESTART:-}" ]; then
-    say "Restarting the desktop portal so the change takes effect now."
+  [ -n "${WAYFINDER_INSTALL_NO_RESTART:-}" ] && return 0
+  say "Restarting the desktop portal so the change takes effect now."
+  # The backend first. D-Bus started it on demand and keeps it running, so
+  # after an upgrade it is still serving file dialogs from the binary this
+  # installer just replaced - the user gets the old build until they log out.
+  # Stopping it is safe: D-Bus starts the new one the next time an app asks
+  # for a dialog.
+  if command -v pkill >/dev/null 2>&1; then
+    run pkill -x wayfinder-portal || true
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
     run systemctl --user try-restart xdg-desktop-portal.service || true
   fi
 }
