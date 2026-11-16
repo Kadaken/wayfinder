@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder"
-version = "0.9.24"
+version = "0.9.25"
 dependencies = [
  "gdk-pixbuf",
  "gdk4-wayland",

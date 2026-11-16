@@ -96,3 +96,18 @@ is ever over the slot.
 run straight afterwards passed the whole suite. The status label is being read
 after something else has already overwritten it, so the check is timing
 dependent rather than wrong. Not yet fixed; it has been seen once.
+
+## D-277 — 0.9.25 shipped the old sidebar drawings (FIXED)
+
+16 November 2026. Fixing D-275 by shrinking `static/icons/*.png` was wrong:
+those were the first 96px drawings, and 0.9.22 had replaced the sidebar art
+with a new 256px set in `static/icons/sidebar` without touching them. So
+0.9.25 put the old drawings back, at the right size. Zito: "they are the old
+icons not the new ones."
+
+The 256px masters are now `static/icons/sidebar-src`, recovered from commit
+b5af50a, and `scripts/make-sidebar-icons.sh` shrinks from there. The 96px set
+is deleted -- from the repo, from the leftover release tree in
+`~/Projects/Scratch/wf-release-0dd0268`, and from
+`~/.local/share/wayfinder/icons`, which an August install had left behind and
+which `native.rs` already asserts the app must never read.
