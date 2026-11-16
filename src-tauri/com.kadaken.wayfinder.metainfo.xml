@@ -46,6 +46,14 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.24" date="2026-11-16">
+      <description>
+        <p>Wayfinder can now tell you when a new version is out and install it
+        for you. It asks the site once a day, and the update is checked against
+        its checksum before anything is unpacked. There is also a Check for
+        Updates item in the options menu.</p>
+      </description>
+    </release>
     <release version="0.9.23" date="2026-11-16">
       <description>
         <p>Deleting an item on a mounted drive reported a failure although the

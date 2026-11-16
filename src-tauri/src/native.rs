@@ -3,7 +3,9 @@
 
 mod crash;
 mod native_core;
+mod audio_preview;
 mod native_smb;
+mod update;
 #[cfg(feature = "guide")]
 mod guide_sitting;
 
@@ -1159,6 +1161,21 @@ struct AppConfig {
     /// config reads as off rather than refusing to load.
     #[serde(default)]
     details_thumbnails: bool,
+    /// Look for a new Wayfinder once a day and say so if there is one.
+    /// On by default: until this existed there was no way at all to learn a
+    /// release had happened, and people sat twelve versions behind. Defaulted
+    /// true, so an existing config opts in rather than silently staying blind.
+    #[serde(default = "default_true")]
+    update_check: bool,
+    /// Unix seconds of the last check, successful or not. Shared by every
+    /// window through the config file, so opening ten windows is still one
+    /// check a day rather than ten requests.
+    #[serde(default)]
+    update_last_check: u64,
+    /// A version the user said to stop asking about. Cleared by the next
+    /// release, because this holds the version and not a flag.
+    #[serde(default)]
+    update_skipped: String,
 }
 
 /// Serde needs a function for a default that is not the type's own.
@@ -1840,6 +1857,9 @@ impl Default for AppConfig {
             install_convention: true,
             recent_files: Vec::new(),
             details_thumbnails: false,
+            update_check: true,
+            update_last_check: 0,
+            update_skipped: String::new(),
         }
     }
 }
@@ -2383,6 +2403,27 @@ struct Ui {
     preview_picture: gtk::Picture,
     preview_media_picture: gtk::Picture,
     preview_media_controls: gtk::MediaControls,
+    /// The sound preview's own controls. Audio does not use
+    /// `preview_media_controls`, because that needs a `GtkMediaStream` and
+    /// the only one GTK offers for a file aborts the process on an MP3; see
+    /// `audio_preview`.
+    preview_audio_title: gtk::Label,
+    preview_audio_info: gtk::Label,
+    preview_audio_play: gtk::Button,
+    preview_audio_scale: gtk::Scale,
+    preview_audio_elapsed: gtk::Label,
+    preview_audio_total: gtk::Label,
+    /// The file currently loaded, if any. Dropping it is what stops the
+    /// sound, so every path that stops playing drops this and nothing else.
+    preview_audio: Rc<RefCell<Option<audio_preview::AudioPlayer>>>,
+    /// The timer moving the scrubber. Held so it can be cancelled: a tick
+    /// left running after the player is gone would keep asking a dropped
+    /// pipeline for its position.
+    preview_audio_tick: Rc<RefCell<Option<glib::SourceId>>>,
+    /// True while the tick is writing the scale's value, so the handler that
+    /// seeks on a user drag does not seek on our own update and fight the
+    /// playhead.
+    preview_audio_seeking: Rc<Cell<bool>>,
     preview: gtk::Label,
     status: gtk::Label,
     /// D-155: transfer-only controls beside the status text; hidden at rest.
@@ -4165,6 +4206,56 @@ fn build_ui_in(
     preview_media_box.set_size_request(0, 0);
     preview_media_box.append(&preview_media_picture);
     preview_media_box.append(&preview_media_controls);
+    // The sound page. A file you can hear is still a file you are looking at,
+    // so the name and the same summary line the text preview shows stay on
+    // screen above the transport.
+    let preview_audio_icon = gtk::Image::from_icon_name("audio-x-generic-symbolic");
+    preview_audio_icon.set_pixel_size(64);
+    preview_audio_icon.set_margin_bottom(4);
+    let preview_audio_title = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .justify(gtk::Justification::Center)
+        .build();
+    preview_audio_title.add_css_class("heading");
+    let preview_audio_info = gtk::Label::builder()
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
+    preview_audio_info.add_css_class("dim-label");
+    let preview_audio_play = gtk::Button::from_icon_name("media-playback-start-symbolic");
+    preview_audio_play.set_tooltip_text(Some("Play"));
+    preview_audio_play.add_css_class("circular");
+    preview_audio_play.set_widget_name("wf-audio-play");
+    let preview_audio_elapsed = gtk::Label::new(Some("0:00"));
+    preview_audio_elapsed.add_css_class("numeric");
+    let preview_audio_total = gtk::Label::new(Some("0:00"));
+    preview_audio_total.add_css_class("numeric");
+    // Draggable even before a duration is known: the adjustment is rewritten
+    // once the pipeline answers.
+    let preview_audio_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.1);
+    preview_audio_scale.set_draw_value(false);
+    preview_audio_scale.set_hexpand(true);
+    preview_audio_scale.set_widget_name("wf-audio-seek");
+    let preview_audio_transport = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    preview_audio_transport.append(&preview_audio_play);
+    preview_audio_transport.append(&preview_audio_elapsed);
+    preview_audio_transport.append(&preview_audio_scale);
+    preview_audio_transport.append(&preview_audio_total);
+    let preview_audio_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    preview_audio_box.set_valign(gtk::Align::Center);
+    preview_audio_box.set_hexpand(true);
+    preview_audio_box.set_vexpand(true);
+    preview_audio_box.set_size_request(0, 0);
+    preview_audio_box.set_margin_top(10);
+    preview_audio_box.set_margin_end(10);
+    preview_audio_box.set_margin_bottom(10);
+    preview_audio_box.set_margin_start(10);
+    preview_audio_box.append(&preview_audio_icon);
+    preview_audio_box.append(&preview_audio_title);
+    preview_audio_box.append(&preview_audio_info);
+    preview_audio_box.append(&preview_audio_transport);
+
     let preview_folder = gtk::Box::new(gtk::Orientation::Vertical, 2);
     preview_folder.set_hexpand(true);
     preview_folder.set_valign(gtk::Align::Start);
@@ -4174,6 +4265,7 @@ fn build_ui_in(
     preview_stack.add_named(&preview, Some("text"));
     preview_stack.add_named(&preview_picture, Some("image"));
     preview_stack.add_named(&preview_media_box, Some("media"));
+    preview_stack.add_named(&preview_audio_box, Some("audio"));
     preview_stack.set_visible_child_name("text");
     // Spacing lives in CSS padding so the status bar's background runs the full
     // width of the window. With margins it stopped short on both sides.
@@ -4637,6 +4729,15 @@ fn build_ui_in(
         preview_picture,
         preview_media_picture,
         preview_media_controls,
+        preview_audio_title,
+        preview_audio_info,
+        preview_audio_play,
+        preview_audio_scale,
+        preview_audio_elapsed,
+        preview_audio_total,
+        preview_audio: Rc::new(RefCell::new(None)),
+        preview_audio_tick: Rc::new(RefCell::new(None)),
+        preview_audio_seeking: Rc::new(Cell::new(false)),
         preview,
         status,
         transfer_bar: transfer_bar.clone(),
@@ -4660,6 +4761,9 @@ fn build_ui_in(
         split_slot: split_slot.clone(),
         split: Rc::new(RefCell::new(None)),
     };
+    // Connected once, here, rather than per file: a handler attached each time
+    // a song was selected would stack up one per song played.
+    connect_preview_audio_controls(&ui);
     // GtkApplication keeps an activation-created window alive automatically,
     // but an initial GApplication `open` request can otherwise return before
     // GTK has taken that hold. Pair an explicit hold with the window lifecycle
@@ -4932,6 +5036,13 @@ fn build_ui_in(
         glib::idle_add_local_once(move || {
             show_setup_dialog(state_for_setup, ui_for_setup, true);
         });
+    }
+
+    // Same gates as the first run, for the same reasons: a picker belongs to
+    // another program and a headless test must not have a dialog dropped on
+    // top of the window its pointer proofs are aimed at.
+    if state.borrow().picker.is_none() && !embedded && !headless_no_first_run {
+        maybe_check_for_update();
     }
 
     // A Save picker opens ready to type. The name was selected but nothing
@@ -7575,6 +7686,214 @@ fn set_details_thumbnails(state: &Rc<RefCell<AppState>>, value: bool) {
 /// until Done is pressed, and Skip writes only the "asked already" flag -- so
 /// Skip never silently changes a setting, and the setup never appears twice
 /// whichever button was pressed.
+/// The menu's "Check for Updates...". Unlike the daily check this ignores the
+/// throttle and the skipped version, and always says what it found: a check
+/// the user asked for that answers with silence reads as a broken button.
+fn check_for_update_now() {
+    let now = unix_now();
+    update_config(|config| config.update_last_check = now);
+    std::thread::spawn(move || {
+        let outcome = update::fetch_manifest();
+        glib::idle_add_once(move || match outcome {
+            Ok(manifest) if update::is_newer(&manifest.version, update::current_version()) => {
+                // Asking by hand clears an earlier skip: the user is asking
+                // about this version again.
+                update_config(|config| config.update_skipped = String::new());
+                show_update_dialog(manifest);
+            }
+            Ok(_) => show_update_note(
+                "Wayfinder is up to date",
+                &format!("You have {}, which is the newest there is.", update::current_version()),
+            ),
+            Err(message) => show_update_note(
+                "Could not check for updates",
+                &format!("{message}\n\nNothing was changed."),
+            ),
+        });
+    });
+}
+
+/// A one-button dialog on the window the user is in. Used only for answers to
+/// a check they asked for; the daily check never speaks unless it found
+/// something.
+fn show_update_note(heading: &str, body: &str) {
+    let Some(window) = gio::Application::default()
+        .and_downcast::<adw::Application>()
+        .and_then(|app| app.active_window())
+    else {
+        return;
+    };
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_responses(&[("ok", "OK")]);
+    dialog.set_close_response("ok");
+    dialog.present(Some(&window));
+}
+
+/// Unix seconds now, or 0 if the clock cannot be read.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Asks the website whether there is a newer Wayfinder, and if there is, says
+/// so once.
+///
+/// The request runs on its own thread and the answer comes back through an
+/// idle callback, because a file manager that waits on a web server is a file
+/// manager that looks broken. Nothing about a failed check is shown: being
+/// offline is not an error worth a dialog.
+///
+/// The day's throttle is written to the config BEFORE the request goes out,
+/// not after. Writing it afterwards meant every window opened in the same
+/// second saw an unwritten timestamp and fired its own request.
+fn maybe_check_for_update() {
+    // A build under test must never reach the network. The headless gate above
+    // already covers the GTK tests; this covers anything else that sets it.
+    if std::env::var("WAYFINDER_NO_UPDATE_CHECK").as_deref() == Ok("1") {
+        return;
+    }
+    let config = load_config();
+    if !config.update_check {
+        return;
+    }
+    let now = unix_now();
+    if now.saturating_sub(config.update_last_check) < update::CHECK_INTERVAL_SECS {
+        return;
+    }
+    update_config(|config| config.update_last_check = now);
+
+    std::thread::spawn(move || {
+        let Ok(manifest) = update::fetch_manifest() else {
+            return;
+        };
+        if !update::is_newer(&manifest.version, update::current_version()) {
+            return;
+        }
+        // Re-read rather than trusting the snapshot taken before the request:
+        // the user may have skipped this very version while it was in flight.
+        if load_config().update_skipped == manifest.version {
+            return;
+        }
+        glib::idle_add_once(move || show_update_dialog(manifest));
+    });
+}
+
+/// Offers the update. Three answers, and the quiet one is the default: an
+/// update replaces the file manager the user is in the middle of using, so it
+/// is never the button a stray Return press lands on.
+fn show_update_dialog(manifest: update::Manifest) {
+    let Some(window) = gio::Application::default()
+        .and_downcast::<adw::Application>()
+        .and_then(|app| app.active_window())
+    else {
+        return;
+    };
+    let body = {
+        let mut body = format!(
+            "You have {}. Wayfinder {} is out.",
+            update::current_version(),
+            manifest.version
+        );
+        if !manifest.notes.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(&manifest.notes);
+        }
+        body.push_str(
+            "\n\nUpdating downloads it, checks it against its checksum, and \
+             installs it into your home directory. Wayfinder closes and comes \
+             back on the new version. Nothing needs a password.",
+        );
+        body
+    };
+    let dialog = adw::AlertDialog::new(Some("A new Wayfinder is out"), Some(&body));
+    dialog.add_responses(&[
+        ("later", "Not now"),
+        ("skip", "Skip this version"),
+        ("update", "Update and restart"),
+    ]);
+    dialog.set_default_response(Some("later"));
+    dialog.set_close_response("later");
+    dialog.set_response_appearance("update", adw::ResponseAppearance::Suggested);
+    dialog.connect_response(None, move |dialog, response| {
+        match response {
+            "skip" => {
+                let version = manifest.version.clone();
+                update_config(|config| config.update_skipped = version);
+            }
+            "update" => start_update(manifest.clone(), &dialog.clone().upcast()),
+            _ => {}
+        }
+    });
+    dialog.present(Some(&window));
+}
+
+/// Downloads, verifies and stages the update, then hands the install to a
+/// helper that runs after this process has gone and quits the app.
+///
+/// The install cannot happen here. `packaging/install.sh` writes the binaries
+/// with `install`, which truncates its target, and Linux refuses that on the
+/// image of a running process -- so installing from inside Wayfinder fails
+/// with ETXTBSY on the one file the update is for.
+fn start_update(manifest: update::Manifest, parent: &gtk::Widget) {
+    let window = parent
+        .root()
+        .and_downcast::<adw::ApplicationWindow>()
+        .or_else(|| {
+            gio::Application::default()
+                .and_downcast::<adw::Application>()
+                .and_then(|app| app.active_window())
+                .and_downcast::<adw::ApplicationWindow>()
+        });
+    let working = adw::AlertDialog::new(
+        Some("Updating"),
+        Some("Downloading and checking the new version. Wayfinder will close and reopen."),
+    );
+    if let Some(window) = window.clone() {
+        working.present(Some(&window));
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
+    std::thread::spawn(move || {
+        let _ = sender.send(update::download_and_verify(&manifest));
+    });
+    // Polled from the main loop rather than joined: joining here would freeze
+    // the window for the whole download.
+    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let outcome = match receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("the download stopped without saying why".to_string())
+            }
+        };
+        working.close();
+        match outcome.and_then(|root| update::install_after_exit(&root)) {
+            Ok(()) => {
+                if let Some(app) = gio::Application::default().and_downcast::<adw::Application>() {
+                    app.quit();
+                }
+            }
+            Err(message) => {
+                if let Some(window) = window.clone() {
+                    let failed = adw::AlertDialog::new(
+                        Some("The update did not install"),
+                        Some(&format!(
+                            "{message}\n\nNothing was changed. You can download it yourself from \
+                             kadaken.com."
+                        )),
+                    );
+                    failed.add_responses(&[("ok", "OK")]);
+                    failed.set_close_response("ok");
+                    failed.present(Some(&window));
+                }
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 fn show_setup_dialog(state: Rc<RefCell<AppState>>, ui: Ui, first_run: bool) {
     let (drop_ask, show_hidden, search_in_files, details_thumbnails) = {
         let st = state.borrow();
@@ -7991,6 +8310,17 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             show_setup_dialog(state.clone(), ui.clone(), false)
         });
         row.set_widget_name("wf-setup-option");
+        menu.append(&row);
+    }
+    {
+        let row = context_item(
+            "software-update-available-symbolic",
+            "Check for Updates...",
+            "",
+            &popover,
+            check_for_update_now,
+        );
+        row.set_widget_name("wf-update-option");
         menu.append(&row);
     }
     {
@@ -15784,12 +16114,13 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
-    // Audio: do NOT load into GtkMediaFile. Selecting a song prerolls a GStreamer
-    // playback pipeline that aborts (SIGABRT, multiqueue assertion in
-    // libgstplayback while parsing MP3), which crashes the whole app. Show file
-    // info instead — safe, no GStreamer. (Open the song in a real player to play.)
+    // Audio still must NOT go through GtkMediaFile. Selecting a song prerolls
+    // GStreamer's decodebin3, which aborts the process on an assertion rather
+    // than failing -- re-tested on GTK 4.22 and still true -- and that takes
+    // the whole file manager down. It plays through `audio_preview`, which
+    // uses the old playbin instead and has its own controls.
     if native_core::is_audio_path(&path_str) {
-        set_preview_text(ui, &native_core::entry_summary(entry));
+        set_preview_audio(ui, entry, &path_str);
         return;
     }
 
@@ -15810,10 +16141,186 @@ fn preview_zoom_for(ui: &Ui) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Stops whatever is playing and forgets it.
+///
+/// Called by every other preview path, not just when a sound file is
+/// deselected: clicking from a song to a photo has to silence the song, and
+/// the only way to be sure of that is for every path that changes the preview
+/// to come through here.
+fn stop_preview_audio(ui: &Ui) {
+    if let Some(source) = ui.preview_audio_tick.borrow_mut().take() {
+        source.remove();
+    }
+    // Dropping the player is what stops the sound; see `AudioPlayer::drop`.
+    ui.preview_audio.borrow_mut().take();
+    ui.preview_audio_seeking.set(false);
+}
+
+/// Shows a sound file with controls to play it.
+///
+/// It loads paused. Selecting a file in a list is not a request to make a
+/// noise, and arrowing down a folder of music would otherwise play a burst of
+/// every track on the way past.
+fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
+    stop_preview_audio(ui);
+    ui.preview_media_controls
+        .set_media_stream(None::<&gtk::MediaStream>);
+    ui.preview_media_picture
+        .set_paintable(None::<&gdk::Paintable>);
+    ui.preview_audio_title.set_text(&entry.name);
+    ui.preview_audio_info
+        .set_text(&native_core::entry_summary(entry));
+
+    let player = match audio_preview::AudioPlayer::open(path) {
+        Ok(player) => player,
+        Err(message) => {
+            // A file that will not decode says so where the controls would
+            // be, and shows no controls. Pretending to offer a Play button
+            // that cannot work is worse than saying nothing plays it.
+            ui.preview_audio_info.set_text(&format!(
+                "{}\n{message}",
+                native_core::entry_summary(entry)
+            ));
+            ui.preview_audio_play.set_sensitive(false);
+            ui.preview_audio_scale.set_sensitive(false);
+            ui.preview_audio_elapsed.set_text("0:00");
+            ui.preview_audio_total.set_text("0:00");
+            ui.preview_stack.set_visible_child_name("audio");
+            return;
+        }
+    };
+
+    ui.preview_audio_play.set_sensitive(true);
+    ui.preview_audio_scale.set_sensitive(true);
+    ui.preview_audio_play
+        .set_icon_name("media-playback-start-symbolic");
+    ui.preview_audio_play.set_tooltip_text(Some("Play"));
+    ui.preview_audio_elapsed.set_text("0:00");
+    // The duration is not always known the instant the pipeline is paused, so
+    // whatever it says now is shown and the tick corrects it.
+    let duration = player.duration_secs().unwrap_or(0.0);
+    ui.preview_audio_total
+        .set_text(&audio_preview::clock_text(duration));
+    ui.preview_audio_seeking.set(true);
+    ui.preview_audio_scale
+        .set_range(0.0, if duration > 0.0 { duration } else { 1.0 });
+    ui.preview_audio_scale.set_value(0.0);
+    ui.preview_audio_seeking.set(false);
+
+    *ui.preview_audio.borrow_mut() = Some(player);
+    ui.preview_stack.set_visible_child_name("audio");
+    start_preview_audio_tick(ui);
+}
+
+/// Moves the scrubber and the clock while something is playing.
+///
+/// Four times a second: enough that the numbers do not visibly jump, little
+/// enough that a file manager sitting with a song paused is not doing work.
+/// The tick also corrects the duration, because a VBR MP3 often cannot say
+/// how long it is until it has been playing for a moment.
+fn start_preview_audio_tick(ui: &Ui) {
+    let ui = ui.clone();
+    let source = glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let borrowed = ui.preview_audio.borrow();
+        let Some(player) = borrowed.as_ref() else {
+            // The player is gone, so this tick has nothing left to do and
+            // must not keep running.
+            return glib::ControlFlow::Break;
+        };
+        if let Some(message) = player.error() {
+            ui.preview_audio_info.set_text(&message);
+            ui.preview_audio_play.set_sensitive(false);
+            ui.preview_audio_scale.set_sensitive(false);
+            return glib::ControlFlow::Break;
+        }
+        let playing = player.is_playing();
+        let icon = if playing {
+            "media-playback-pause-symbolic"
+        } else {
+            "media-playback-start-symbolic"
+        };
+        if ui.preview_audio_play.icon_name().as_deref() != Some(icon) {
+            ui.preview_audio_play.set_icon_name(icon);
+            ui.preview_audio_play
+                .set_tooltip_text(Some(if playing { "Pause" } else { "Play" }));
+        }
+        if let Some(duration) = player.duration_secs() {
+            let total = audio_preview::clock_text(duration);
+            if ui.preview_audio_total.text() != total {
+                ui.preview_audio_total.set_text(&total);
+                ui.preview_audio_seeking.set(true);
+                ui.preview_audio_scale.set_range(0.0, duration);
+                ui.preview_audio_seeking.set(false);
+            }
+        }
+        let position = player.position_secs();
+        ui.preview_audio_elapsed
+            .set_text(&audio_preview::clock_text(position));
+        // Writing the value fires `value-changed`, which seeks. The flag is
+        // what stops the playhead from seeking to where it already is four
+        // times a second.
+        ui.preview_audio_seeking.set(true);
+        ui.preview_audio_scale.set_value(position);
+        ui.preview_audio_seeking.set(false);
+        glib::ControlFlow::Continue
+    });
+    *ui.preview_audio_tick.borrow_mut() = Some(source);
+}
+
+/// The Play button and the scrubber. Connected once, when the window is built,
+/// because a handler connected per file would stack up one per song played.
+fn connect_preview_audio_controls(ui: &Ui) {
+    {
+        let ui = ui.clone();
+        ui.preview_audio_play.clone().connect_clicked(move |_| {
+            let wants_play = {
+                let borrowed = ui.preview_audio.borrow();
+                let Some(player) = borrowed.as_ref() else {
+                    return;
+                };
+                let wants_play = !player.is_playing();
+                player.set_playing(wants_play);
+                wants_play
+            };
+            // The icon is set here as well as in the tick so the button
+            // answers the click immediately rather than up to 250ms later.
+            ui.preview_audio_play.set_icon_name(if wants_play {
+                "media-playback-pause-symbolic"
+            } else {
+                "media-playback-start-symbolic"
+            });
+            ui.preview_audio_play
+                .set_tooltip_text(Some(if wants_play { "Pause" } else { "Play" }));
+            if wants_play && ui.preview_audio_tick.borrow().is_none() {
+                start_preview_audio_tick(&ui);
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
+        ui.preview_audio_scale
+            .clone()
+            .connect_value_changed(move |scale| {
+                if ui.preview_audio_seeking.get() {
+                    return;
+                }
+                if let Some(player) = ui.preview_audio.borrow().as_ref() {
+                    player.seek_secs(scale.value());
+                }
+            });
+    }
+}
+
 fn set_preview_text(ui: &Ui, text: &str) {
     if !ui.preview_scroll.is_visible() {
         return;
     }
+    // Moving to any other kind of file silences a song; see
+    // `stop_preview_audio`.
+    stop_preview_audio(ui);
     ui.preview_media_controls
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
@@ -15878,6 +16385,9 @@ fn set_preview_folder(ui: &Ui, entry: &Entry, path: std::path::PathBuf, generati
     if !ui.preview_scroll.is_visible() {
         return;
     }
+    // Moving to any other kind of file silences a song; see
+    // `stop_preview_audio`.
+    stop_preview_audio(ui);
     ui.preview_media_controls
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
@@ -16008,6 +16518,9 @@ fn set_preview_image(ui: &Ui, path: &str) {
     if !ui.preview_scroll.is_visible() {
         return;
     }
+    // Moving to any other kind of file silences a song; see
+    // `stop_preview_audio`.
+    stop_preview_audio(ui);
     ui.preview_media_controls
         .set_media_stream(None::<&gtk::MediaStream>);
     ui.preview_media_picture
@@ -16145,6 +16658,9 @@ fn set_preview_media(ui: &Ui, path: &str) {
     if !ui.preview_scroll.is_visible() {
         return;
     }
+    // Moving to any other kind of file silences a song; see
+    // `stop_preview_audio`.
+    stop_preview_audio(ui);
     let file = gio::File::for_path(PathBuf::from(path));
     let media = gtk::MediaFile::for_file(&file);
     let zoom = preview_zoom_for(ui);

@@ -17,8 +17,34 @@ const IMG_EXT: [&str; 15] = [
     // D-251: these three were missing, so they were not even treated as images.
     "heif", "avifs", "jxl",
 ];
-const AUDIO_EXT: [&str; 13] = [
-    "mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma", "aiff", "aif", "alac", "oga", "spx",
+/// Every sound-file extension the preview offers to play.
+///
+/// It is long on purpose. The old list had 13 entries, and a file it did not
+/// name got the plain-text summary with no way to hear it -- which is the same
+/// dead end as having no audio preview at all, just for fewer files. These are
+/// the extensions GStreamer's own typefinder and demuxers cover, so a file
+/// named here either plays or says in the pane why it cannot; neither outcome
+/// can crash, because `audio_preview` never hands a file to GtkMediaFile.
+///
+/// Playlists (.m3u, .pls, .cue) are deliberately absent: they are text files
+/// listing other files, so the text preview is the right one for them.
+const AUDIO_EXT: [&str; 46] = [
+    // MPEG audio
+    "mp3", "mp2", "mp1", "mpga", "m4a", "m4b", "m4r", "aac", "adts", "aa3", "oma",
+    // Free and lossless
+    "flac", "alac", "ape", "wv", "tta", "shn", "tak",
+    // Uncompressed and Apple
+    "wav", "wave", "w64", "aiff", "aif", "aifc", "caf", "au", "snd", "voc",
+    // Ogg family
+    "ogg", "oga", "opus", "spx",
+    // Containers that normally hold only sound
+    "mka", "weba",
+    // Windows and broadcast
+    "wma", "ac3", "eac3", "dts",
+    // Telephony and handheld
+    "amr", "awb", "3ga", "gsm", "ra",
+    // DSD and Musepack
+    "dsf", "dff", "mpc",
 ];
 const VIDEO_EXT: [&str; 12] = [
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "ts", "3gp", "ogv", "mpeg",
@@ -7470,6 +7496,40 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
         assert!(is_video_path("/tmp/capture.MP4"));
         assert!(!is_audio_path("/tmp/readme.md"));
         assert!(!is_video_path("/tmp/photo.png"));
+    }
+
+    #[test]
+    fn every_sound_format_the_preview_claims_is_recognised() {
+        // The preview offers a Play button for exactly this list, so a format
+        // dropped from it silently loses the ability to be heard.
+        for extension in AUDIO_EXT {
+            let lower = format!("/tmp/track.{extension}");
+            let upper = format!("/tmp/track.{}", extension.to_uppercase());
+            assert!(is_audio_path(&lower), "{lower} was not treated as sound");
+            assert!(is_audio_path(&upper), "{upper} was not treated as sound");
+        }
+    }
+
+    #[test]
+    fn no_extension_is_both_sound_and_video() {
+        // Both branches return, so an extension in both lists would be
+        // decided by whichever check comes first -- a silent coin toss.
+        for extension in AUDIO_EXT {
+            assert!(
+                !VIDEO_EXT.contains(&extension),
+                "{extension} is claimed by both the sound and the video list"
+            );
+        }
+    }
+
+    #[test]
+    fn playlists_are_text_not_sound() {
+        // They list other files rather than containing any, so there is
+        // nothing for a Play button to play.
+        assert!(!is_audio_path("/tmp/party.m3u"));
+        assert!(!is_audio_path("/tmp/party.m3u8"));
+        assert!(!is_audio_path("/tmp/album.cue"));
+        assert!(!is_audio_path("/tmp/radio.pls"));
     }
 
     #[test]

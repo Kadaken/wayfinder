@@ -4,6 +4,39 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.24 — 16 November 2026
+
+### Added
+
+- Sound files play in the preview pane. Selecting a song now shows its name,
+  its details and a transport -- play and pause, a scrubber you can drag, and
+  elapsed and total time -- instead of a text summary with no way to hear it.
+  It loads paused, so arrowing down a folder of music does not play a burst of
+  every track on the way past, and moving to any other file silences it.
+- 46 sound formats are recognised, up from 13. Anything GStreamer can decode
+  is offered: the MPEG family, FLAC, ALAC, APE, WavPack, WAV and AIFF and CAF,
+  the Ogg family, DSD, Musepack, AC-3 and DTS, AMR and the handheld formats.
+  A file that will not decode says so in the pane instead of offering a Play
+  button that does nothing.
+- **Wayfinder can tell you a new version exists, and install it.** There was no
+  mechanism of any kind for this before. Wayfinder is handed out as a tarball
+  people unpack into their home directory, so `dnf` has never heard of it and
+  it cannot appear in a system update — which meant the download on the site
+  sat at 0.9.11 while 0.9.23 was current and nobody who had installed it could
+  find out. It now asks the site once a day, and if there is something newer it
+  says so once, with Not now, Skip this version and Update and restart. The
+  update is downloaded, checked against its size and its sha256, and only then
+  unpacked; the install runs from a helper after Wayfinder has closed, because
+  `install` cannot write a binary that is still running, and Wayfinder reopens
+  on the new version. The manifest may only name a download on kadaken.com, so
+  a tampered manifest cannot redirect the download somewhere else. Off switch:
+  `update_check` in `~/.config/wayfinder/native-config.json`. There is also
+  **Check for Updates...** in the options menu, which always answers, whether
+  or not there is anything new.
+
+  This only helps from 0.9.24 onward: an older copy has nothing in it to
+  check, so that one upgrade still has to be done by hand.
+
 ## 0.9.23 — 16 November 2026
 
 ### Fixed
