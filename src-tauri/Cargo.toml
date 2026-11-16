@@ -1,6 +1,6 @@
 [package]
 name = "wayfinder"
-version = "0.9.24"
+version = "0.9.25"
 description = "A fast, native file manager for Linux with a docked preview pane"
 authors = ["LegendofZito"]
 license = "GPL-3.0-or-later"
