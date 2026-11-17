@@ -24,7 +24,7 @@ confidence-threshold = 0.9
 # "unmaintained", not vulnerabilities, and all three are the same cause: the
 # zvariant family was folded into zbus 6. Wayfinder is on zbus 5.19 because the
 # portal backend's D-Bus code is written against it, so there is no upgrade to
-# take that does not rewrite that backend. Reviewed 16 November 2026 at 0.9.28;
+# take that does not rewrite that backend. Reviewed 16 November 2026;
 # re-decide when zbus 6 is adopted, and delete these lines then.
 ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; folded into zbus 6, no vulnerability" },
