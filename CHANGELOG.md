@@ -4,6 +4,43 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.28 — 16 November 2026
+
+### Fixed
+
+- The window no longer freezes while the sidebar reads a drive. The folders
+  behind a drive row, and the arrow that says whether a folder has children,
+  were read on the same thread that draws the window. On a local disk that is
+  invisible; on a mounted Google Drive each read is a network request, and the
+  window stopped answering until they all came back -- once for 21 minutes 59
+  seconds. Both reads now run on a worker and are remembered, so the window
+  stays usable and the rows fill in as the answers arrive.
+
+## 0.9.27 — 16 November 2026
+
+### Fixed
+
+- An update check asks for the version list itself instead of accepting a
+  cached copy. A check made in the minute after a release went out could be
+  told there was nothing new.
+
+## 0.9.26 — 16 November 2026
+
+### Fixed
+
+- The sidebar icons are the intended drawings again. 0.9.25 shrank the wrong
+  set of source images and shipped the older artwork.
+
+## 0.9.25 — 16 November 2026
+
+### Fixed
+
+- Sidebar rows are their natural height. A row stretched to fill the space
+  above the drive list, so the places at the top were taller than they should
+  have been, and every row collapsed once the drives appeared.
+- The sidebar icons are packaged at the size they are drawn at, so the
+  graphics card no longer shrinks them and softens every edge.
+
 ## 0.9.24 — 16 November 2026
 
 ### Added

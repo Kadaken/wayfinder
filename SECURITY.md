@@ -44,7 +44,7 @@ and say why rather than leave you waiting.
 
 The audit, and what in it is still unmeasured, is kept honest in
 [`CHANGELOG.md`](CHANGELOG.md) and in the repository's own notes. The short
-version as of 0.9.22: `cargo audit` reports no vulnerable dependency, the
+version as of 0.9.28: `cargo audit` reports no vulnerable dependency, the
 refusals above all have tests behind them, and **a deliberate hostile run at
 the file dialog has never been written.** If you want somewhere to start, start
 there.
