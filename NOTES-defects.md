@@ -1,5 +1,5 @@
 
-## D-272 — the window freezes on a cold network mount
+## D-272 — the window freezes on a cold network mount — FIXED 16 November 2026
 
 16 November 2026, Zito: "it freezes when i ry to select the new drive".
 Selecting a newly mounted rclone Google Drive folder locks the window.
@@ -9,6 +9,31 @@ is happening on the GTK main thread, so the whole window stops answering for
 as long as the network takes instead of showing progress and staying usable.
 Not a hang — it does come back. Reproduce by mounting any rclone remote and
 selecting it before anything has cached.
+
+**16 November 2026, second hit, far worse.** Zito: "wayfinders fucked ass is
+stuck again." This time it did not come back: the single GUI thread sat in
+`getdents64` on `/home/zito/GoogleDrive-cgzito` in uninterruptible disk sleep
+(`State: D`, wchan `request_wait_answer` — a FUSE request rclone never
+answered) for **21 minutes 59 seconds**, using 0.08 s of CPU the whole time.
+All three windows showed `unresponsive=true` to KWin. The same listing from a
+shell took 3 seconds once rclone was warm.
+
+The folder listing itself was already off the main thread
+(`gio::spawn_blocking` in `load_directory`). The sidebar tree was not, and the
+sidebar is rebuilt constantly:
+
+- `ensure_tree_children` ran `list_subdirs`, which is one `read_dir` for the
+  branch plus **one more `read_dir` per child** to decide whether to draw an
+  arrow — on a Drive mount that is a network round trip each.
+- `dir_has_subdirs` ran on every drive row on every single rebuild.
+
+FIXED: both now run on a worker through `gio::spawn_blocking`, the answer is
+cached in `AppState::tree_children` / `AppState::tree_openable`, and
+`AppState::tree_pending` stops the same path being asked twice while a worker
+is out. The first ask returns nothing and the sidebar is rebuilt once the
+answer lands, so a slow mount costs a beat, never the window. A drive is drawn
+as openable until the probe says otherwise, so the arrow is never missing while
+the answer is in flight.
 
 ## D-273 — a test run killed the desktop's file dialogs — FIXED 16 November 2026
 

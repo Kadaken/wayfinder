@@ -2238,6 +2238,13 @@ struct AppState {
     /// that starts collapsed hides the folders people click most.
     places_expanded: bool,
     tree_children: HashMap<String, Vec<(String, String, bool)>>,
+    /// D-272: paths whose children are being read on a worker right now, so
+    /// one slow mount is asked for once and not on every sidebar rebuild.
+    tree_pending: HashSet<String>,
+    /// D-272: does this drive have subfolders? Answered on a worker and
+    /// remembered, because asking costs a network round trip on an rclone or
+    /// SMB mount and the sidebar is rebuilt constantly.
+    tree_openable: HashMap<String, bool>,
     typeahead: String,
     typeahead_at: Instant,
     pending_offer: Option<PendingOffer>,
@@ -4065,6 +4072,8 @@ fn build_ui_in(
         tree_expanded: HashSet::new(),
         places_expanded: true,
         tree_children: HashMap::new(),
+        tree_pending: HashSet::new(),
+        tree_openable: HashMap::new(),
         typeahead: String::new(),
         typeahead_at: Instant::now(),
         pending_offer: None,
@@ -5982,7 +5991,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             connect_drive_context(&row, state.clone(), ui.clone(), drive);
             let show_hidden = state.borrow().show_hidden;
             let tree_open = !mount.is_empty() && state.borrow().tree_expanded.contains(&mount);
-            let can_open = !mount.is_empty() && dir_has_subdirs(&mount, show_hidden);
+            let can_open = tree_drive_openable(state, ui, &mount);
             if can_open {
                 let arrow = sidebar_expander(tree_open);
                 prepend_sidebar_arrow(&row, &arrow);
@@ -5997,7 +6006,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             }
             ui.sidebar.append(&row);
             if tree_open && can_open {
-                for (child_name, child_path, has_children) in ensure_tree_children(state, &mount) {
+                for (child_name, child_path, has_children) in ensure_tree_children(state, ui, &mount) {
                     append_tree_row(
                         state,
                         ui,
@@ -6825,17 +6834,85 @@ fn folder_tree_roots() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-fn ensure_tree_children(state: &Rc<RefCell<AppState>>, path: &str) -> Vec<(String, String, bool)> {
+/// D-272: the children of a sidebar branch, read on a worker thread.
+///
+/// Reading them here used to be a plain `read_dir` plus one more `read_dir`
+/// per child, on the GTK main thread. On a local disk that is microseconds.
+/// On an rclone Google Drive mount every one of those is a network round
+/// trip, and the whole window stopped answering until they all came back --
+/// measured at 21 minutes 59 seconds on 16 November 2026, with the main
+/// thread stuck in `getdents64` on `GoogleDrive-cgzito` in uninterruptible
+/// disk sleep. Nothing the window could do about it, because nothing in the
+/// window was running.
+///
+/// Now the first ask returns nothing and starts a worker; when it lands the
+/// answer is cached and the sidebar is rebuilt once. The branch opens a beat
+/// later on a slow mount instead of freezing the app.
+fn ensure_tree_children(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    path: &str,
+) -> Vec<(String, String, bool)> {
     if let Some(children) = state.borrow().tree_children.get(path).cloned() {
         return children;
     }
+    if state.borrow().tree_pending.contains(path) {
+        return Vec::new();
+    }
     let show_hidden = state.borrow().show_hidden;
-    let children = list_subdirs(path, show_hidden);
-    state
-        .borrow_mut()
-        .tree_children
-        .insert(path.to_string(), children.clone());
-    children
+    state.borrow_mut().tree_pending.insert(path.to_string());
+    let state_for_job = state.clone();
+    let ui_for_job = ui.clone();
+    let key = path.to_string();
+    let path_for_worker = path.to_string();
+    glib::spawn_future_local(async move {
+        let children = gio::spawn_blocking(move || list_subdirs(&path_for_worker, show_hidden))
+            .await
+            .unwrap_or_default();
+        {
+            let mut state_ref = state_for_job.borrow_mut();
+            state_ref.tree_pending.remove(&key);
+            state_ref.tree_children.insert(key.clone(), children);
+        }
+        rebuild_sidebar(&state_for_job, &ui_for_job);
+    });
+    Vec::new()
+}
+
+/// D-272: has this drive got subfolders to open into? Same story as
+/// `ensure_tree_children`: on a network mount the answer costs a round trip,
+/// and the sidebar asks on every rebuild. Until the worker answers the drive
+/// is treated as openable, so the arrow is there to click; if it turns out to
+/// have no subfolders the arrow goes on the next rebuild.
+fn tree_drive_openable(state: &Rc<RefCell<AppState>>, ui: &Ui, mount: &str) -> bool {
+    if mount.is_empty() {
+        return false;
+    }
+    if let Some(known) = state.borrow().tree_openable.get(mount).copied() {
+        return known;
+    }
+    let probe_key = format!("\u{1}openable:{mount}");
+    if state.borrow().tree_pending.contains(&probe_key) {
+        return true;
+    }
+    let show_hidden = state.borrow().show_hidden;
+    state.borrow_mut().tree_pending.insert(probe_key.clone());
+    let state_for_job = state.clone();
+    let ui_for_job = ui.clone();
+    let key = mount.to_string();
+    let mount_for_worker = mount.to_string();
+    glib::spawn_future_local(async move {
+        let openable = gio::spawn_blocking(move || dir_has_subdirs(&mount_for_worker, show_hidden))
+            .await
+            .unwrap_or(false);
+        {
+            let mut state_ref = state_for_job.borrow_mut();
+            state_ref.tree_pending.remove(&probe_key);
+            state_ref.tree_openable.insert(key, openable);
+        }
+        rebuild_sidebar(&state_for_job, &ui_for_job);
+    });
+    true
 }
 
 /// How deep the sidebar tree will open. A guard, not a preference: a symlink
@@ -6907,7 +6984,7 @@ fn append_tree_row(
     if !expanded || !openable {
         return;
     }
-    for (child_name, child_path, child_has_children) in ensure_tree_children(state, path) {
+    for (child_name, child_path, child_has_children) in ensure_tree_children(state, ui, path) {
         append_tree_row(
             state,
             ui,
