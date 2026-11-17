@@ -46,6 +46,31 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.28" date="2026-11-16">
+      <description>
+        <p>The sidebar no longer freezes the window. Reading the folders behind
+        a drive row now happens on a worker, so a slow or rate-limited network
+        mount can no longer stop the whole window while it answers.</p>
+      </description>
+    </release>
+    <release version="0.9.27" date="2026-11-16">
+      <description>
+        <p>An update check is no longer answered from a stale cached copy, so a
+        new version is seen the moment it is published.</p>
+      </description>
+    </release>
+    <release version="0.9.26" date="2026-11-16">
+      <description>
+        <p>The sidebar icons are the right drawings again, and crisp at every
+        size.</p>
+      </description>
+    </release>
+    <release version="0.9.25" date="2026-11-16">
+      <description>
+        <p>Sidebar rows are their proper height again instead of stretching to
+        fill the space above the drives.</p>
+      </description>
+    </release>
     <release version="0.9.24" date="2026-11-16">
       <description>
         <p>Wayfinder can now tell you when a new version is out and install it

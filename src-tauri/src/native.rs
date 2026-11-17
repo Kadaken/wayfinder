@@ -6841,7 +6841,7 @@ fn folder_tree_roots() -> Vec<(String, String)> {
 /// On an rclone Google Drive mount every one of those is a network round
 /// trip, and the whole window stopped answering until they all came back --
 /// measured at 21 minutes 59 seconds on 16 November 2026, with the main
-/// thread stuck in `getdents64` on `GoogleDrive-user` in uninterruptible
+/// thread stuck in `getdents64` on the Drive mount in uninterruptible
 /// disk sleep. Nothing the window could do about it, because nothing in the
 /// window was running.
 ///

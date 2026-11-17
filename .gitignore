@@ -13,3 +13,4 @@ vite.config.ts.timestamp-*
 flatpak-cargo-generator.py
 .crews/
 dist/
+.wrangler/

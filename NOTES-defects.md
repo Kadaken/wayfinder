@@ -3,7 +3,7 @@
 
 16 November 2026, the owner: "it freezes when i ry to select the new drive".
 Selecting a newly mounted rclone Google Drive folder locks the window.
-Measured on `/home/user/CloudDrive-user`: the first directory read took
+Measured on a mounted rclone Google Drive remote: the first directory read took
 **7.8 seconds**, the second 0.24 s once the FUSE dir cache was warm. The read
 is happening on the GTK main thread, so the whole window stops answering for
 as long as the network takes instead of showing progress and staying usable.
@@ -12,7 +12,7 @@ selecting it before anything has cached.
 
 **16 November 2026, second hit, far worse.** the owner: "wayfinders fucked ass is
 stuck again." This time it did not come back: the single GUI thread sat in
-`getdents64` on `/home/user/CloudDrive-user` in uninterruptible disk sleep
+`getdents64` on the Drive mount in uninterruptible disk sleep
 (`State: D`, wchan `request_wait_answer` — a FUSE request rclone never
 answered) for **21 minutes 59 seconds**, using 0.08 s of CPU the whole time.
 All three windows showed `unresponsive=true` to KWin. The same listing from a
@@ -142,7 +142,7 @@ which `native.rs` already asserts the app must never read.
 16 November 2026, the owner: "why is wayfinder greyed out now?" An install at 16:35
 replaced both binaries. The app came up on the new build, but the picker
 backend kept running from 14:03: `/proc/749707/exe` pointed at
-`/home/user/.local/bin/wayfinder-portal (deleted)`. Every file dialog on the
+`~/.local/bin/wayfinder-portal (deleted)`. Every file dialog on the
 machine was still being served by the replaced build, and the window greyed
 out waiting on it.
 
