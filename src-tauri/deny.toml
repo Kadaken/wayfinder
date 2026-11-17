@@ -1,0 +1,40 @@
+# cargo-deny configuration for Wayfinder.
+#
+# Without this file cargo-deny rejects every licence, because its default is to
+# allow nothing. That printed a 5-error "licenses FAILED" that said nothing
+# about the project. The allow list below is the set of licences the dependency
+# tree actually carries, read from `cargo metadata`, and Wayfinder itself is
+# GPL-3.0-or-later, which every one of them is compatible with.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unlicense",
+    "Unicode-3.0",
+    "Zlib",
+    "GPL-3.0-or-later",
+    "LGPL-2.1-or-later",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# The written acceptance the release audit's K8.1 asks for. All three are
+# "unmaintained", not vulnerabilities, and all three are the same cause: the
+# zvariant family was folded into zbus 6. Wayfinder is on zbus 5.19 because the
+# portal backend's D-Bus code is written against it, so there is no upgrade to
+# take that does not rewrite that backend. Reviewed 16 November 2026 at 0.9.28;
+# re-decide when zbus 6 is adopted, and delete these lines then.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; folded into zbus 6, no vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; folded into zbus 6, no vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; folded into zbus 6, no vulnerability" },
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
