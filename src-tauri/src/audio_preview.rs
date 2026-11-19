@@ -44,6 +44,9 @@ pub struct AudioPlayer {
     finished: std::rc::Rc<std::cell::Cell<bool>>,
     /// What the bus said went wrong, if anything. Shown instead of controls.
     failed: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    /// D-327: a length worked out from the file itself, for formats whose
+    /// decoder (MIDI through fluiddec) reports none.
+    computed_secs: Option<f64>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -117,6 +120,9 @@ impl AudioPlayer {
             path: path.to_string(),
             finished,
             failed,
+            computed_secs: crate::native_core::is_midi_path(path)
+                .then(|| crate::native_core::midi_duration_secs(path))
+                .flatten(),
             _bus_watch: bus_watch,
         })
     }
@@ -169,6 +175,16 @@ impl AudioPlayer {
             .query_duration::<gst::ClockTime>()
             .map(|t| t.nseconds() as f64 / 1_000_000_000.0)
             .filter(|secs| *secs > 0.0)
+            .or(self.computed_secs)
+    }
+
+    /// True when the length is our own estimate rather than the decoder's.
+    pub fn duration_is_computed(&self) -> bool {
+        self.computed_secs.is_some()
+            && self
+                .pipeline
+                .query_duration::<gst::ClockTime>()
+                .map_or(true, |t| t.nseconds() == 0)
     }
 
     /// Jumps to `secs`. Clamped to the file, because a scrubber dragged to its
@@ -417,6 +433,46 @@ mod tests {
                 "paused at {paused_at} seconds but it moved to {still}"
             );
             let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// D-327: a real MIDI stream (fluiddec) reports no length, so ours is used,
+    /// and a seek is honoured (position probe); gated on the owner's copy of the
+    /// song existing so the suite passes without it.
+    #[test]
+    fn midi_length_comes_from_the_file_and_seeking_works() {
+        let song = "/home/user/Music/song.mid";
+        if !std::path::Path::new(song).exists() || !gst_ready() {
+            return;
+        }
+        in_main_context(|| {
+            let Ok(player) = AudioPlayer::open(song) else { return };
+            let context = gst::glib::MainContext::thread_default()
+                .unwrap_or_else(gst::glib::MainContext::default);
+            let d = wait_for_duration(&player).expect("length must come from somewhere");
+            assert!(d > 60.0 && d < 80.0, "computed length {d}");
+            eprintln!("MIDI-PROBE decoder length reported: {:?}, computed flag {}",
+                player.pipeline.query_duration::<gst::ClockTime>(), player.duration_is_computed());
+            if !player.set_playing(true) {
+                eprintln!("MIDI-PROBE could not play (no device?)");
+                return;
+            }
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_millis(1500) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let before = player.position_secs();
+            player.seek_secs(30.0);
+            let t1 = std::time::Instant::now();
+            while t1.elapsed() < std::time::Duration::from_millis(1500) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let after = player.position_secs();
+            eprintln!("MIDI-PROBE position before seek {before:.2}, after seek to 30: {after:.2}");
+            assert!(before < 10.0, "before the seek it was at {before}");
+            assert!(after >= 29.5 && after < 40.0, "a seek to 30 s landed at {after}");
         });
     }
 

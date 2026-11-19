@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const IMG_EXT: [&str; 15] = [
+const IMG_EXT: [&str; 16] = [
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
     // D-251: these three were missing, so they were not even treated as images.
     "heif", "avifs", "jxl",
+    // D-322: a Canon camera's video thumbnail (MVI_0001.THM) is a plain JPEG.
+    "thm",
 ];
 /// Every sound-file extension the preview offers to play.
 ///
@@ -28,7 +30,7 @@ const IMG_EXT: [&str; 15] = [
 ///
 /// Playlists (.m3u, .pls, .cue) are deliberately absent: they are text files
 /// listing other files, so the text preview is the right one for them.
-const AUDIO_EXT: [&str; 46] = [
+const AUDIO_EXT: [&str; 50] = [
     // MPEG audio
     "mp3", "mp2", "mp1", "mpga", "m4a", "m4b", "m4r", "aac", "adts", "aa3", "oma",
     // Free and lossless
@@ -45,6 +47,8 @@ const AUDIO_EXT: [&str; 46] = [
     "amr", "awb", "3ga", "gsm", "ra",
     // DSD and Musepack
     "dsf", "dff", "mpc",
+    // MIDI (played through the fluidsynth GStreamer plugin, D-327)
+    "mid", "midi", "kar", "rmi",
 ];
 const VIDEO_EXT: [&str; 12] = [
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "ts", "3gp", "ogv", "mpeg",
@@ -1635,6 +1639,48 @@ pub fn launch_path_in_args(args: &[String]) -> Option<String> {
         }
     }
     positional
+}
+
+/// D-328: `--select` adds this as one extra file argument. It is not a
+/// real path; the window that receives the launch (this process or one
+/// already running) reads it as "show the first path in its parent".
+pub const SELECT_MARKER_SCHEME: &str = "x-wayfinder-select";
+pub const SELECT_MARKER_URI: &str = "x-wayfinder-select://marker";
+
+/// Where a `--select` launch goes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SelectLaunch {
+    /// The folder whose window opens. Always an existing folder.
+    pub folder: String,
+    /// The item to highlight in it, when it exists.
+    pub select: Option<String>,
+}
+
+/// D-328: the folder to open and the item to highlight for `--select path`.
+/// An existing file or folder opens its parent with it highlighted. A path
+/// that does not exist opens the nearest ancestor that does, highlighting
+/// nothing. The filesystem root has no parent and opens itself.
+pub fn select_launch_target(path: &str) -> SelectLaunch {
+    let target = Path::new(path);
+    if target.symlink_metadata().is_ok() {
+        return match target.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() && parent.is_dir() => SelectLaunch {
+                folder: parent.to_string_lossy().to_string(),
+                select: Some(target.to_string_lossy().to_string()),
+            },
+            _ => SelectLaunch {
+                folder: if target.is_dir() { path.to_string() } else { "/".to_string() },
+                select: None,
+            },
+        };
+    }
+    let folder = target
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.is_dir())
+        .map(|ancestor| ancestor.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    SelectLaunch { folder, select: None }
 }
 
 fn launch_path_from_env() -> Option<String> {
@@ -3620,6 +3666,7 @@ fn hash_file_bytes(
     path: &Path,
     len: u64,
     cancel: &AtomicBool,
+    tick: &dyn Fn(u64),
 ) -> Result<(), String> {
     use std::hash::Hasher;
     use std::io::Read;
@@ -3634,6 +3681,7 @@ fn hash_file_bytes(
         }
         hasher.write(&buf[..got]);
         seen += got as u64;
+        tick(got as u64);
     }
     if seen != len {
         return Err(format!("{}: read {seen} of {len} bytes", path.display()));
@@ -3646,6 +3694,7 @@ fn hash_tree(
     dir: &Path,
     entries: &mut u64,
     cancel: &AtomicBool,
+    tick: &dyn Fn(u64),
 ) -> Result<(), String> {
     use std::hash::Hasher;
     let mut names = fs::read_dir(dir)
@@ -3666,12 +3715,12 @@ fn hash_tree(
             hasher.write(target.to_string_lossy().as_bytes());
         } else if meta.is_dir() {
             hasher.write_u8(b'D');
-            hash_tree(hasher, &path, entries, cancel)?;
+            hash_tree(hasher, &path, entries, cancel, tick)?;
             hasher.write_u8(b'/');
         } else {
             hasher.write_u8(b'F');
             hasher.write_u64(meta.len());
-            hash_file_bytes(hasher, &path, meta.len(), cancel)?;
+            hash_file_bytes(hasher, &path, meta.len(), cancel, tick)?;
         }
     }
     Ok(())
@@ -3682,6 +3731,12 @@ pub fn fingerprint(path: &str) -> Result<Fingerprint, String> {
 }
 
 fn fingerprint_c(path: &str, cancel: &AtomicBool) -> Result<Fingerprint, String> {
+    fingerprint_tick(path, cancel, &|_| {})
+}
+
+/// `fingerprint_c`, reporting every chunk of file bytes it reads, so a long
+/// read of a slow drive can show progress instead of a silent wait.
+fn fingerprint_tick(path: &str, cancel: &AtomicBool, tick: &dyn Fn(u64)) -> Result<Fingerprint, String> {
     use std::hash::Hasher;
     let p = Path::new(path);
     let meta = fs::symlink_metadata(p).map_err(|e| format!("{path}: {e}"))?;
@@ -3691,10 +3746,10 @@ fn fingerprint_c(path: &str, cancel: &AtomicBool) -> Result<Fingerprint, String>
         Ok(Fingerprint::Link(target.to_string_lossy().to_string()))
     } else if meta.is_dir() {
         let mut entries = 0;
-        hash_tree(&mut hasher, p, &mut entries, cancel)?;
+        hash_tree(&mut hasher, p, &mut entries, cancel, tick)?;
         Ok(Fingerprint::Tree { entries, digest: hasher.finish() })
     } else {
-        hash_file_bytes(&mut hasher, p, meta.len(), cancel)?;
+        hash_file_bytes(&mut hasher, p, meta.len(), cancel, tick)?;
         Ok(Fingerprint::File { len: meta.len(), digest: hasher.finish() })
     }
 }
@@ -3706,11 +3761,15 @@ pub fn snapshot_sources(srcs: &[String]) -> Result<Vec<SourceSnapshot>, String> 
 }
 
 fn snapshot_sources_c(srcs: &[String], cancel: &AtomicBool) -> Result<Vec<SourceSnapshot>, String> {
+    snapshot_sources_tick(srcs, cancel, &|_| {})
+}
+
+fn snapshot_sources_tick(srcs: &[String], cancel: &AtomicBool, tick: &dyn Fn(u64)) -> Result<Vec<SourceSnapshot>, String> {
     use std::os::unix::fs::MetadataExt;
     srcs.iter()
         .map(|p| {
             let meta = fs::symlink_metadata(p).map_err(|e| format!("cannot read {p}: {e}"))?;
-            Ok(SourceSnapshot { path: p.clone(), ino: meta.ino(), fp: fingerprint_c(p, cancel)? })
+            Ok(SourceSnapshot { path: p.clone(), ino: meta.ino(), fp: fingerprint_tick(p, cancel, tick)? })
         })
         .collect()
 }
@@ -3733,12 +3792,89 @@ fn verify_transfer_c(
     is_copy: bool,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
+    verify_transfer_tick(before, items, is_copy, cancel, &|_| {}).map(|_| ())
+}
+
+/// D-320: one verified top-level item of a transfer, kept so the person can
+/// see exactly what was checked. `files` lists up to `REPORT_FILE_CAP` files
+/// of a folder with their sizes; `files_total` is the true count.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportRow {
+    pub from: String,
+    pub to: String,
+    /// "file", "folder" or "link".
+    pub kind: &'static str,
+    pub bytes: u64,
+    pub files_total: u64,
+    pub files: Vec<(String, u64)>,
+    pub digest: String,
+}
+
+pub const REPORT_FILE_CAP: usize = 2000;
+
+fn walk_report(dir: &Path, rel: &Path, rows: &mut Vec<(String, u64)>, total: &mut u64, bytes: &mut u64) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut names: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        let rel_path = rel.join(&name);
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            walk_report(&path, &rel_path, rows, total, bytes);
+        } else {
+            *total += 1;
+            *bytes += meta.len();
+            if rows.len() < REPORT_FILE_CAP {
+                rows.push((rel_path.to_string_lossy().to_string(), meta.len()));
+            }
+        }
+    }
+}
+
+fn report_row(item: &ResolvedItem, fp: &Fingerprint) -> ReportRow {
+    let mut row = ReportRow {
+        from: item.from.clone(),
+        to: item.to.clone(),
+        kind: "file",
+        bytes: 0,
+        files_total: 1,
+        files: Vec::new(),
+        digest: String::new(),
+    };
+    match fp {
+        Fingerprint::File { len, digest } => {
+            row.bytes = *len;
+            row.digest = format!("{digest:016x}");
+        }
+        Fingerprint::Link(t) => {
+            row.kind = "link";
+            row.digest = t.clone();
+        }
+        Fingerprint::Tree { digest, .. } => {
+            row.kind = "folder";
+            row.digest = format!("{digest:016x}");
+            row.files_total = 0;
+            walk_report(Path::new(&item.to), Path::new(""), &mut row.files, &mut row.files_total, &mut row.bytes);
+        }
+    }
+    row
+}
+
+fn verify_transfer_tick(
+    before: &[SourceSnapshot],
+    items: &[ResolvedItem],
+    is_copy: bool,
+    cancel: &AtomicBool,
+    tick: &dyn Fn(u64),
+) -> Result<Vec<ReportRow>, String> {
     use std::os::unix::fs::MetadataExt;
+    let mut report = Vec::with_capacity(items.len());
     for item in items {
         let Some(src) = before.iter().find(|s| s.path == item.from) else {
             return Err(format!("transfer check: no record of {}", item.from));
         };
-        let dest = fingerprint_c(&item.to, cancel).map_err(|e| {
+        let dest = fingerprint_tick(&item.to, cancel, tick).map_err(|e| {
             if e == CANCELLED_MSG {
                 e
             } else {
@@ -3752,14 +3888,15 @@ fn verify_transfer_c(
         if is_copy {
             let now = now
                 .map_err(|_| format!("transfer check: copy removed the source {}", item.from))?;
-            if now.ino() != src.ino || fingerprint_c(&item.from, cancel)? != src.fp {
+            if now.ino() != src.ino || fingerprint_tick(&item.from, cancel, tick)? != src.fp {
                 return Err(format!("transfer check: copy changed the source {}", item.from));
             }
         } else if now.is_ok() {
             return Err(format!("transfer check: move left the source {}", item.from));
         }
+        report.push(report_row(item, &dest));
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Result of a committed transfer. `warnings` are cleanup problems after a valid,
@@ -3768,6 +3905,8 @@ fn verify_transfer_c(
 pub struct TransferResult {
     pub items: Vec<ResolvedItem>,
     pub warnings: Vec<String>,
+    /// D-320: what the final check verified, one row per top-level item.
+    pub report: Vec<ReportRow>,
 }
 
 /// One live change that can be reversed, in commit order.
@@ -3877,8 +4016,17 @@ fn roll_back(journal: &[JournalOp], stages: &[PathBuf]) -> Vec<String> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TransferEvent {
     Preparing,
+    /// Reading the sources once to record what they hold, before any copy
+    /// starts. On a slow drive this is the long wait; `done <= total`.
+    Reading { done: u64, total: u64 },
     Bytes { done: u64, total: u64 },
+    /// An item (by position in the request) is about to be staged: its byte
+    /// size, so a window can show which item is copying and how far along.
+    Item { index: usize, bytes: u64 },
     Verifying,
+    /// Hashing the copy and the result to prove they match: how many bytes of
+    /// the bytes to hash are done. `done <= total`.
+    Checking { done: u64, total: u64 },
     /// The verified commit point: Cancel no longer applies.
     Committing,
 }
@@ -4166,7 +4314,26 @@ pub fn transfer_batch_ctl(
     let dest_dev = fs::metadata(dest_dir)
         .map_err(|e| TransferFail::Failed(e.to_string()))?
         .dev();
-    let before = snapshot_sources_c(srcs, cancel).map_err(|e| fail_of(e.into()))?;
+    let mut read_total = 0u64;
+    for src in srcs {
+        read_total = add_bytes(read_total, count_bytes(Path::new(src), cancel).map_err(|e| fail_of(e.into()))?)
+            .map_err(TransferFail::Failed)?;
+    }
+    let read_done = std::cell::Cell::new(0u64);
+    let read_sent = std::cell::Cell::new(0u64);
+    let read_tick = |bytes: u64| {
+        let done = read_done.get() + bytes;
+        read_done.set(done);
+        // About every 4 MiB, so a fast drive is not flooded with events.
+        if done >= read_sent.get() + 4 * 1024 * 1024 || done == read_total {
+            read_sent.set(done);
+            (ctl.on_event)(TransferEvent::Reading { done, total: read_total });
+        }
+    };
+    if read_total > 0 {
+        (ctl.on_event)(TransferEvent::Reading { done: 0, total: read_total });
+    }
+    let before = snapshot_sources_tick(srcs, cancel, &read_tick).map_err(|e| fail_of(e.into()))?;
     let mut plan = plan_transfer_items(srcs, dest_dir, is_copy, on_conflict)
         .map_err(TransferFail::Failed)?;
 
@@ -4187,6 +4354,20 @@ pub fn transfer_batch_ctl(
         }
         sizes.push(bytes);
     }
+    // Bytes hashed to prove the result: the staged copy (when there is one),
+    // then the result itself, and for a copy the source again.
+    let verify_total = add_bytes(total, read_total.saturating_mul(if is_copy { 2 } else { 1 }))
+        .map_err(TransferFail::Failed)?;
+    let verify_done = std::cell::Cell::new(0u64);
+    let verify_sent = std::cell::Cell::new(0u64);
+    let verify_tick = |bytes: u64| {
+        let done = (verify_done.get() + bytes).min(verify_total);
+        verify_done.set(done);
+        if done >= verify_sent.get() + 4 * 1024 * 1024 || done == verify_total {
+            verify_sent.set(done);
+            (ctl.on_event)(TransferEvent::Checking { done, total: verify_total });
+        }
+    };
     let mut progress = Progress { total, last: None, on_event: ctl.on_event };
     if staging {
         progress.advance(0);
@@ -4209,6 +4390,7 @@ pub fn transfer_batch_ctl(
         check_cancel(cancel)?;
         Ok(())
     };
+    let report_cell: std::cell::RefCell<Vec<ReportRow>> = std::cell::RefCell::new(Vec::new());
     let mut run = || -> Result<(), Stop> {
         // Prepare every incoming object beside its destination.
         let mut base = 0u64;
@@ -4225,10 +4407,11 @@ pub fn transfer_batch_ctl(
                 stages.push(stage.clone());
                 let stage_str = stage.to_string_lossy().to_string();
                 let item_bytes = sizes[index];
+                (ctl.on_event)(TransferEvent::Item { index, bytes: item_bytes });
                 copy_item(ctl, &item.src, &stage, base, item_bytes, &mut progress)?;
                 base += item_bytes;
                 (ctl.on_event)(TransferEvent::Verifying);
-                if fingerprint_c(&stage_str, cancel)? != *src_fp {
+                if fingerprint_tick(&stage_str, cancel, &verify_tick)? != *src_fp {
                     return Err(Stop::Failed("the prepared copy does not match its source".to_string()));
                 }
                 item.stage = Some(stage);
@@ -4283,7 +4466,8 @@ pub fn transfer_batch_ctl(
             .iter()
             .map(|i| ResolvedItem { from: i.src.clone(), to: i.dest.to_string_lossy().to_string() })
             .collect();
-        verify_transfer_c(&before, &items, is_copy, cancel)?;
+        let rows = verify_transfer_tick(&before, &items, is_copy, cancel, &verify_tick)?;
+        *report_cell.borrow_mut() = rows;
         Ok(())
     };
     if let Err(stop) = run() {
@@ -4317,7 +4501,8 @@ pub fn transfer_batch_ctl(
         .iter()
         .map(|i| ResolvedItem { from: i.src.clone(), to: i.dest.to_string_lossy().to_string() })
         .collect();
-    Ok(TransferResult { items, warnings })
+    let report = report_cell.into_inner();
+    Ok(TransferResult { items, warnings, report })
 }
 
 /// D-187: moves each item from `item.to` back to `item.from`, refusing the
@@ -4421,8 +4606,13 @@ fn decode_archive(
         run("tar", &["-xf", path, "-C", &dir]).map(|()| dir)
     } else if lower.ends_with(".zip") {
         let dir = out()?;
-        match run("unzip", &["-o", path, "-d", &dir]) {
+        // D-323: Wayfinder's own reader first (exact progress, instant Cancel,
+        // no dependency); it refuses anything it cannot do safely, and 7z does
+        // that. Info-ZIP unzip is gone: it failed on a 70 GB zip and 7z is a
+        // declared dependency anyway.
+        match run(BUILTIN_ZIP, &[path, &dir]) {
             Ok(()) => Ok(dir),
+            Err(first) if first == CANCELLED_MSG => Err(first),
             Err(_) => {
                 let dir = out()?;
                 run("7z", &["x", "-y", &format!("-o{dir}"), path]).map(|()| dir)
@@ -4763,6 +4953,226 @@ fn extract_here_with(
     run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
     publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<ExtractHereOutcome, String> {
+    extract_here_dir(path, dest_dir, run, publish, &|_| Ok(()))
+}
+
+/// The name `decode_archive` uses for Wayfinder's own zip reader, so it sits in
+/// the same try-this-then-that chain as the outside tools.
+const BUILTIN_ZIP: &str = "wayfinder-zip";
+
+fn zip_stamp(dt: zip::DateTime) -> Option<std::time::SystemTime> {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = dt.year() as i32 - 1900;
+    tm.tm_mon = dt.month() as i32 - 1;
+    tm.tm_mday = dt.day() as i32;
+    tm.tm_hour = dt.hour() as i32;
+    tm.tm_min = dt.minute() as i32;
+    tm.tm_sec = dt.second() as i32;
+    tm.tm_isdst = -1;
+    let secs = unsafe { libc::mktime(&mut tm) };
+    (secs >= 0).then(|| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+/// Extracts every entry of a zip into the empty folder `dir`. Refuses (so 7z
+/// takes over) on anything it will not do safely: an unsafe name, a link, a
+/// method the build lacks, a name already written, a bad checksum.
+fn extract_zip_builtin(path: &Path, dir: &Path, cancel: &AtomicBool, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    // Open every entry first: a zip this reader cannot fully read is refused
+    // before a single byte is written, not after tens of gigabytes.
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        if entry.enclosed_name().is_none() {
+            return Err("unsafe name in zip".to_string());
+        }
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            return Err("zip holds a link".to_string());
+        }
+    }
+    let mut written: u64 = 0;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut dir_stamps: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for i in 0..archive.len() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED_MSG.to_string());
+        }
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let rel = entry.enclosed_name().ok_or_else(|| "unsafe name in zip".to_string())?;
+        let target = dir.join(&rel);
+        let mode = entry.unix_mode().unwrap_or(0o644);
+        if mode & 0o170000 == 0o120000 {
+            return Err("zip holds a link".to_string());
+        }
+        if entry.is_dir() {
+            fs::create_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            if let Some(t) = entry.last_modified().and_then(zip_stamp) {
+                dir_stamps.push((target, t));
+            }
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| format!("{}: {e}", target.display()))?;
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(CANCELLED_MSG.to_string());
+            }
+            let n = entry.read(&mut buf).map_err(|e| format!("{}: {e}", rel.display()))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| format!("{}: {e}", target.display()))?;
+            written += n as u64;
+            on_bytes(written);
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = out.set_permissions(fs::Permissions::from_mode(mode & 0o777));
+        }
+        if let Some(t) = entry.last_modified().and_then(zip_stamp) {
+            let _ = out.set_modified(t);
+        }
+    }
+    for (d, t) in dir_stamps.into_iter().rev() {
+        if let Ok(f) = fs::File::open(&d) {
+            let _ = f.set_modified(t);
+        }
+    }
+    Ok(())
+}
+
+/// What a running Extract Here reports and obeys (D-321).
+pub struct ExtractCtl<'a> {
+    pub cancel: &'a AtomicBool,
+    /// Bytes written so far into the temporary folder, about twice a second.
+    pub on_bytes: &'a (dyn Fn(u64) + Sync),
+    /// Total uncompressed bytes when the archive can say (a zip's directory).
+    pub on_total: &'a (dyn Fn(u64) + Sync),
+}
+
+fn dir_apparent_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    for entry in rd.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
+        if meta.is_dir() {
+            total += dir_apparent_bytes(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Runs one tool, and kills it the moment `cancel` is set. A cancelled run
+/// returns `CANCELLED_MSG`, which the caller never retries with another tool.
+fn run_cmd_cancellable(cmd: &str, args: &[&str], cancel: &AtomicBool) -> Result<(), String> {
+    run_cmd_cancellable_with(cmd, args, cancel, &|_| {})
+}
+
+fn run_cmd_cancellable_with(cmd: &str, args: &[&str], cancel: &AtomicBool, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
+    if cmd == BUILTIN_ZIP {
+        return extract_zip_builtin(Path::new(args[0]), Path::new(args[1]), cancel, on_bytes);
+    }
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(s) = stderr.as_mut() {
+            let mut bytes = Vec::new();
+            let _ = s.read_to_end(&mut bytes);
+            text = String::from_utf8_lossy(&bytes).trim().to_string();
+        }
+        text
+    });
+    let status = loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(CANCELLED_MSG.to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let text = reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else if text.is_empty() {
+        Err(format!("{cmd} failed"))
+    } else {
+        Err(text)
+    }
+}
+
+/// Extract Here with a visible progress and a working Cancel (D-321). A
+/// cancelled extraction removes its temporary folder and publishes nothing.
+pub fn extract_archive_here_ctl(path: &str, dest_dir: &str, ctl: &ExtractCtl) -> Result<ExtractHereOutcome, String> {
+    if path.to_lowercase().ends_with(".zip") {
+        if let Ok(file) = fs::File::open(path) {
+            if let Ok(entries) = index_zip(file, &DEFAULT_ZIP_LIMITS, ctl.cancel) {
+                (ctl.on_total)(entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum());
+            }
+        }
+    }
+    let current: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !finished.load(Ordering::SeqCst) {
+                let dir = current.lock().ok().and_then(|d| d.clone());
+                if let Some(dir) = dir {
+                    (ctl.on_bytes)(dir_apparent_bytes(&dir));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        let result = extract_here_dir(
+            path,
+            dest_dir,
+            &|cmd, args| run_cmd_cancellable_with(cmd, args, ctl.cancel, ctl.on_bytes),
+            &rename_no_replace_io,
+            &|dir| {
+                if ctl.cancel.load(Ordering::SeqCst) {
+                    return Err(CANCELLED_MSG.to_string());
+                }
+                if let Ok(mut cur) = current.lock() {
+                    *cur = Some(dir.to_path_buf());
+                }
+                Ok(())
+            },
+        );
+        finished.store(true, Ordering::SeqCst);
+        result
+    })
+}
+
+fn extract_here_dir(
+    path: &str,
+    dest_dir: &str,
+    run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
+    publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    on_dir: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<ExtractHereOutcome, String> {
     let dest = Path::new(dest_dir);
     let mut stage: Option<ExtractStage> = None;
     let mut attempts = 0u32;
@@ -4776,6 +5186,7 @@ fn extract_here_with(
         attempts += 1;
         let out = stage.path.join(format!("attempt-{attempts}"));
         fs::create_dir(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        on_dir(&out)?;
         Ok(out.to_string_lossy().into_owned())
     });
     let listed = decoded.and_then(|out| {
@@ -4976,8 +5387,306 @@ pub fn is_audio_path(path: &str) -> bool {
     has_extension(path, &AUDIO_EXT)
 }
 
+/// D-324: what a file's first bytes say it is, as (label, extensions that
+/// name that format). `None` when no known signature matches.
+pub fn sniff_real_type(head: &[u8]) -> Option<(&'static str, &'static [&'static str])> {
+    let starts = |prefix: &[u8]| head.starts_with(prefix);
+    if starts(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0 && head[1] & 0x06 != 0) {
+        return Some(("MP3 audio", &["mp3", "mp2", "mpga"]));
+    }
+    if starts(b"RIFF") && head.len() >= 12 {
+        return match &head[8..12] {
+            b"WAVE" => Some(("WAV audio", &["wav", "wave"])),
+            b"AVI " => Some(("AVI video", &["avi"])),
+            b"WEBP" => Some(("WebP image", &["webp"])),
+            b"RMID" => Some(("MIDI music", &["rmi", "mid", "midi"])),
+            _ => None,
+        };
+    }
+    if starts(b"GIF87a") || starts(b"GIF89a") {
+        return Some(("a GIF image", &["gif"]));
+    }
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        return Some(("a PNG image", &["png"]));
+    }
+    if starts(&[0xFF, 0xD8, 0xFF]) {
+        return Some(("a JPEG image", &["jpg", "jpeg", "jpe", "thm"]));
+    }
+    if starts(b"BM") && head.len() >= 14 {
+        return Some(("a BMP image", &["bmp"]));
+    }
+    if starts(b"%PDF") {
+        return Some(("a PDF document", &["pdf"]));
+    }
+    if starts(b"PK\x03\x04") {
+        return Some(("a ZIP archive", &["zip", "docx", "xlsx", "pptx", "odt", "jar", "apk"]));
+    }
+    if starts(b"OggS") {
+        return Some(("Ogg audio", &["ogg", "oga", "ogv", "opus"]));
+    }
+    if starts(b"fLaC") {
+        return Some(("FLAC audio", &["flac"]));
+    }
+    if starts(b"MThd") {
+        return Some(("MIDI music", &["mid", "midi", "kar"]));
+    }
+    if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        return Some(("MP4 or QuickTime media", &["mp4", "m4a", "m4v", "mov", "3gp", "heic", "avif"]));
+    }
+    if starts(&[0x30, 0x26, 0xB2, 0x75]) {
+        return Some(("Windows Media (ASF)", &["wma", "wmv", "asf"]));
+    }
+    if starts(b"MZ") {
+        return Some(("a Windows program", &["exe", "dll"]));
+    }
+    None
+}
+
+/// D-324: one line saying why a file cannot be previewed, naming what it
+/// really is. `wanted` is the word for what its name promised ("audio",
+/// "picture"). Reads at most 16 bytes.
+pub fn damaged_file_reason(path: &str, wanted: &str) -> String {
+    use std::io::Read;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let mut head = [0u8; 16];
+    let read = match fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
+        Ok(n) => n,
+        Err(err) => return format!("Cannot read this file: {err}."),
+    };
+    if read == 0 {
+        return format!("Empty file: 0 bytes, so there is no {wanted} to show.");
+    }
+    match sniff_real_type(&head[..read]) {
+        Some((label, exts)) if !exts.contains(&ext.as_str()) => {
+            if ext.is_empty() {
+                format!("This file is actually {label}, not {wanted}.")
+            } else {
+                format!("This file is actually {label}, not a .{ext} {wanted}.")
+            }
+        }
+        Some((label, _)) => format!(
+            "Unreadable data: the start of the file says {label}, but it is damaged and cannot be decoded."
+        ),
+        None => format!("Unreadable data: this file has no known {wanted} format signature, so it is damaged or not {wanted} at all."),
+    }
+}
+
+/// D-324: a sound file that is plainly not sound (empty, or carrying another
+/// kind of data such as a GIF). `None` when the player should try it. Costs
+/// one 16-byte read.
+pub fn not_audio_reason(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    let read = fs::File::open(path).and_then(|mut f| f.read(&mut head)).ok()?;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let plainly_wrong = match sniff_real_type(&head[..read]) {
+        _ if read == 0 => true,
+        Some((_, exts)) => {
+            !exts.contains(&ext.as_str()) && !exts.iter().any(|e| AUDIO_EXT.contains(e))
+        }
+        None => false,
+    };
+    plainly_wrong.then(|| damaged_file_reason(path, "audio file"))
+}
+
 pub fn is_video_path(path: &str) -> bool {
     has_extension(path, &VIDEO_EXT)
+}
+
+/// D-327: how long a MIDI file plays, in seconds, worked out from its own
+/// bytes because GStreamer's MIDI decoder reports no length.
+///
+/// Accepts a plain Standard MIDI File (`MThd`) or one wrapped in RIFF `RMID`
+/// (`.rmi`). Honours every tempo change (meta FF 51 03) across all tracks,
+/// default 500000 microseconds per quarter note. Format 0 and 1 with a
+/// ticks-per-quarter division; SMPTE division is read too. The result is the
+/// time of the last event of any track. `None` for anything malformed;
+/// never panics. Reads at most 16 MiB.
+pub fn midi_duration_secs(path: &str) -> Option<f64> {
+    use std::io::Read;
+    const CAP: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(CAP)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    midi_duration_from_bytes(&bytes)
+}
+
+/// The byte-level half of [`midi_duration_secs`], split out so tests need no files.
+pub fn midi_duration_from_bytes(bytes: &[u8]) -> Option<f64> {
+    let smf = midi_unwrap_rmid(bytes)?;
+    if smf.len() < 14 || &smf[0..4] != b"MThd" {
+        return None;
+    }
+    let header_len = u32::from_be_bytes(smf[4..8].try_into().ok()?) as usize;
+    if header_len < 6 || 8 + header_len > smf.len() {
+        return None;
+    }
+    let format = u16::from_be_bytes([smf[8], smf[9]]);
+    let track_count = u16::from_be_bytes([smf[10], smf[11]]) as usize;
+    let division = u16::from_be_bytes([smf[12], smf[13]]);
+    if format > 2 || track_count == 0 {
+        return None;
+    }
+    // Ticks per quarter note, or (SMPTE) a fixed ticks-per-second rate.
+    let smpte_ticks_per_sec = if division & 0x8000 != 0 {
+        let fps = 256 - u32::from(division >> 8); // negative byte, e.g. -25
+        let per_frame = u32::from(division & 0xff);
+        let rate = f64::from(fps) * f64::from(per_frame);
+        if rate <= 0.0 {
+            return None;
+        }
+        Some(rate)
+    } else if division == 0 {
+        return None;
+    } else {
+        None
+    };
+    let tpq = f64::from(division);
+
+    // (absolute tick, microseconds per quarter) for every tempo change.
+    let mut tempos: Vec<(u64, u32)> = Vec::new();
+    let mut last_tick: u64 = 0;
+    let mut pos = 8 + header_len;
+    let mut tracks_read = 0usize;
+    while tracks_read < track_count && pos + 8 <= smf.len() {
+        let id = &smf[pos..pos + 4];
+        let len = u32::from_be_bytes(smf[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let start = pos + 8;
+        // A last track whose length runs past the end is read as far as it goes.
+        let end = start.saturating_add(len).min(smf.len());
+        pos = start.saturating_add(len);
+        if id != b"MTrk" {
+            continue;
+        }
+        tracks_read += 1;
+        let track = &smf[start..end];
+        let mut i = 0usize;
+        let mut tick: u64 = 0;
+        let mut running: Option<u8> = None;
+        while i < track.len() {
+            let (delta, used) = midi_varlen(&track[i..])?;
+            i += used;
+            tick = tick.checked_add(u64::from(delta))?;
+            let first = *track.get(i)?;
+            let status = if first & 0x80 != 0 {
+                i += 1;
+                first
+            } else {
+                running?
+            };
+            match status {
+                0xFF => {
+                    let kind = *track.get(i)?;
+                    i += 1;
+                    let (mlen, used) = midi_varlen(track.get(i..)?)?;
+                    i += used;
+                    let mlen = mlen as usize;
+                    let body = track.get(i..i.checked_add(mlen)?)?;
+                    if kind == 0x51 && mlen == 3 {
+                        let us = (u32::from(body[0]) << 16)
+                            | (u32::from(body[1]) << 8)
+                            | u32::from(body[2]);
+                        if us > 0 {
+                            tempos.push((tick, us));
+                        }
+                    }
+                    i += mlen;
+                    running = None;
+                    if kind == 0x2F {
+                        last_tick = last_tick.max(tick);
+                        break;
+                    }
+                }
+                0xF0 | 0xF7 => {
+                    let (slen, used) = midi_varlen(track.get(i..)?)?;
+                    i += used;
+                    i = i.checked_add(slen as usize)?;
+                    if i > track.len() {
+                        return None;
+                    }
+                    running = None;
+                }
+                0x80..=0xEF => {
+                    running = Some(status);
+                    i += if matches!(status & 0xF0, 0xC0 | 0xD0) { 1 } else { 2 };
+                    if i > track.len() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            last_tick = last_tick.max(tick);
+        }
+    }
+    if tracks_read == 0 {
+        return None;
+    }
+    if let Some(rate) = smpte_ticks_per_sec {
+        return Some(last_tick as f64 / rate);
+    }
+    tempos.sort_by_key(|t| t.0);
+    let mut secs = 0.0f64;
+    let mut at = 0u64;
+    let mut us = 500_000u32;
+    for (tick, new_us) in tempos {
+        if tick >= last_tick {
+            break;
+        }
+        secs += (tick - at) as f64 * f64::from(us) / 1_000_000.0 / tpq;
+        at = tick;
+        us = new_us;
+    }
+    secs += (last_tick - at) as f64 * f64::from(us) / 1_000_000.0 / tpq;
+    Some(secs)
+}
+
+/// The Standard MIDI File inside `bytes`: the data itself, or the payload of
+/// the `data` chunk of a RIFF `RMID` wrapper.
+fn midi_unwrap_rmid(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"RMID" {
+        return Some(bytes);
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let start = pos + 8;
+        let end = start.saturating_add(len).min(bytes.len());
+        if id == b"data" {
+            return Some(&bytes[start..end]);
+        }
+        // RIFF chunks are padded to an even length.
+        pos = start.saturating_add(len).saturating_add(len & 1);
+    }
+    None
+}
+
+/// A MIDI variable-length number: up to four bytes, seven bits each.
+fn midi_varlen(bytes: &[u8]) -> Option<(u32, usize)> {
+    let mut value: u32 = 0;
+    for (n, byte) in bytes.iter().take(4).enumerate() {
+        value = (value << 7) | u32::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            return Some((value, n + 1));
+        }
+    }
+    None
+}
+
+/// MIDI file extensions, case-insensitive.
+pub fn is_midi_path(path: &str) -> bool {
+    has_extension(path, &["mid", "midi", "kar", "rmi"])
 }
 
 pub fn properties(path: &str) -> Result<FileProperties, String> {
@@ -5121,6 +5830,26 @@ fn fmt_modified_with_now(seconds: i64, now: Option<glib::DateTime>) -> String {
     }
 
     absolute()
+}
+
+/// The exact local date and time behind the friendly text.
+///
+/// "Just now" and "27 min ago" cannot tell two files apart, and the relative
+/// label is all the column has room for, so the full stamp lives in the row's
+/// tooltip (D-303). Seconds are included on purpose: that is the part that
+/// settles which of two files in the same minute came last.
+pub fn fmt_modified_exact(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "Modified: unknown".to_string();
+    }
+    let Ok(dt) = glib::DateTime::from_unix_local(seconds) else {
+        return format!("Modified: {seconds}");
+    };
+    let stamp = dt
+        .format("%A, %B %d, %Y at %l:%M:%S %p")
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|_| seconds.to_string());
+    format!("Modified: {stamp}")
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
@@ -5271,6 +6000,9 @@ fn whole_disk_of(device: &str) -> String {
 }
 
 fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<(), String> {
+    if cmd == BUILTIN_ZIP {
+        return extract_zip_builtin(Path::new(args[0]), Path::new(args[1]), &AtomicBool::new(false), &|_| {});
+    }
     let output = Command::new(cmd)
         .args(args)
         .output()
@@ -5424,6 +6156,90 @@ impl<S, U: Clone, H> WindowRegistry<S, U, H> {
 /// lets a writer finish before a scan reads its size.
 pub const REFRESH_MIN_GAP_MS: u64 = 500;
 pub const REFRESH_SETTLE_MS: u64 = 500;
+
+/// D-295: the sidebar tree's answers (child folders of an expanded branch,
+/// and whether a drive has any), remembered so a slow mount is asked once.
+/// Bounded, so a window that browses a deep tree all day cannot grow without
+/// limit, and every answer can be dropped: when a branch is closed, when its
+/// folder changed, or when the hidden-files choice changed what it holds.
+pub const TREE_CACHE_CAP: usize = 400;
+
+pub type TreeChild = (String, String, bool);
+
+#[derive(Default, Clone)]
+pub struct TreeCache {
+    children: std::collections::HashMap<String, Vec<TreeChild>>,
+    openable: std::collections::HashMap<String, bool>,
+    /// Insertion order of `children` keys, oldest first, for the cap.
+    order: std::collections::VecDeque<String>,
+}
+
+impl TreeCache {
+    pub fn children(&self, path: &str) -> Option<&Vec<TreeChild>> {
+        self.children.get(path)
+    }
+
+    pub fn openable(&self, mount: &str) -> Option<bool> {
+        self.openable.get(mount).copied()
+    }
+
+    pub fn insert_children(&mut self, path: String, children: Vec<TreeChild>) {
+        if self.children.insert(path.clone(), children).is_none() {
+            self.order.push_back(path);
+        }
+        while self.children.len() > TREE_CACHE_CAP {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.children.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub fn insert_openable(&mut self, mount: String, openable: bool) {
+        // One bool per drive: bounded by the number of mounts, but never
+        // let a pathological mount list grow it past the same cap.
+        if self.openable.len() >= TREE_CACHE_CAP && !self.openable.contains_key(&mount) {
+            self.openable.clear();
+        }
+        self.openable.insert(mount, openable);
+    }
+
+    /// Drop the answer for `path` and for everything below it.
+    pub fn forget_under(&mut self, path: &str) {
+        let below = format!("{}/", path.trim_end_matches('/'));
+        let gone = |key: &String| key == path || key.starts_with(&below);
+        self.children.retain(|key, _| !gone(key));
+        self.order.retain(|key| !gone(key));
+        self.openable.retain(|key, _| !gone(key));
+    }
+
+    /// A folder changed: its own answer and its parent's (which carries the
+    /// "has subfolders" flag for it) are both stale. Children below stay.
+    pub fn forget_folder_and_parent(&mut self, path: &str) {
+        let trimmed = path.trim_end_matches('/');
+        let mut stale = vec![trimmed.to_string()];
+        if let Some(index) = trimmed.rfind('/') {
+            stale.push(if index == 0 { "/".to_string() } else { trimmed[..index].to_string() });
+        }
+        for key in &stale {
+            self.children.remove(key);
+            self.order.retain(|k| k != key);
+            self.openable.remove(key);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.children.clear();
+        self.order.clear();
+        self.openable.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.children.len() + self.openable.len()
+    }
+}
 
 /// Coalesces directory-monitor events into scans. Pure: the caller passes the
 /// clock in milliseconds, so the rules are testable without a main loop.
@@ -5778,6 +6594,218 @@ mod tests {
         let bytes = bytes_of(&events);
         assert_eq!(bytes.first(), Some(&(0, 30)));
         assert_eq!(bytes.last(), Some(&(30, 30)));
+    }
+
+    /// D-313: the read of the sources before a copy reports its progress, so a
+    /// slow drive shows a moving bar instead of a silent "Preparing".
+    #[test]
+    fn reading_the_sources_reports_progress_before_any_copy_d313() {
+        let root = scratch_case("wf-d313-reading");
+        let (srcs, dest) = big_file_fixture(&root);
+        let program = slow_copy_program(&root);
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        let result = run_ctl(&srcs, &dest, true, PasteConflict::KeepBoth, &|_| Ok(()), false, &never, &program, &events, &|_| {});
+        assert!(result.is_ok(), "{result:?}");
+        let all: Vec<TransferEvent> = events.borrow().iter().map(|(_, e)| *e).collect();
+        let total = 6 * 1024 * 1024;
+        let reads: Vec<(u64, u64)> = all
+            .iter()
+            .filter_map(|e| if let TransferEvent::Reading { done, total } = e { Some((*done, *total)) } else { None })
+            .collect();
+        assert!(reads.len() >= 3, "start, a middle step and the end: {reads:?}");
+        assert_eq!(reads.first(), Some(&(0, total)));
+        assert_eq!(reads.last(), Some(&(total, total)));
+        assert!(reads.windows(2).all(|w| w[1].0 > w[0].0), "strictly advancing: {reads:?}");
+        let last_read = all.iter().rposition(|e| matches!(e, TransferEvent::Reading { .. })).unwrap();
+        let first_bytes = all.iter().position(|e| matches!(e, TransferEvent::Bytes { .. })).unwrap();
+        assert!(last_read < first_bytes, "all reading happens before the first copied byte");
+    }
+
+    /// D-316: proving the copy matches reports progress, so "Verifying" on a
+    /// slow drive shows a moving bar and a number instead of standing still.
+    #[test]
+    fn verifying_reports_progress_d316() {
+        let root = scratch_case("wf-d316-verifying");
+        let (srcs, dest) = big_file_fixture(&root);
+        let program = slow_copy_program(&root);
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        let result = run_ctl(&srcs, &dest, true, PasteConflict::KeepBoth, &|_| Ok(()), false, &never, &program, &events, &|_| {});
+        assert!(result.is_ok(), "{result:?}");
+        let all: Vec<TransferEvent> = events.borrow().iter().map(|(_, e)| *e).collect();
+        let checks: Vec<(u64, u64)> = all
+            .iter()
+            .filter_map(|e| if let TransferEvent::Checking { done, total } = e { Some((*done, *total)) } else { None })
+            .collect();
+        // A 6 MiB copy hashes the staged copy, the result and the source: 18 MiB.
+        let total = 18 * 1024 * 1024;
+        assert!(checks.len() >= 4, "several steps: {checks:?}");
+        assert_eq!(checks.last(), Some(&(total, total)));
+        assert!(checks.iter().all(|(d, t)| *t == total && d <= t));
+        assert!(checks.windows(2).all(|w| w[1].0 > w[0].0), "strictly advancing: {checks:?}");
+        let first_check = all.iter().position(|e| matches!(e, TransferEvent::Checking { .. })).unwrap();
+        let last_bytes = all.iter().rposition(|e| matches!(e, TransferEvent::Bytes { .. })).unwrap();
+        assert!(first_check > last_bytes - 1, "checking follows copying");
+    }
+
+    /// D-320: a finished transfer hands back what the final check verified.
+    /// D-321: Extract Here reports its total and its bytes written, and a
+    /// Cancel set before it starts stops it and leaves nothing behind.
+    #[test]
+    fn extract_reports_progress_and_cancels_d321() {
+        let root = scratch_case("wf-d321-extract");
+        let dest = root.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        let archive = root.join("pack.zip");
+        let big = vec![b'x'; 3 * 1024 * 1024];
+        {
+            let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+            let options: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("a.bin", options).unwrap();
+            std::io::Write::write_all(&mut writer, &big).unwrap();
+            writer.start_file("b.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+        let total = std::sync::atomic::AtomicU64::new(0);
+        let never = AtomicBool::new(false);
+        let ctl = ExtractCtl { cancel: &never, on_bytes: &|_| {}, on_total: &|t| total.store(t, Ordering::SeqCst) };
+        let done = extract_archive_here_ctl(archive.to_str().unwrap(), dest.to_str().unwrap(), &ctl).expect("extract");
+        assert_eq!(total.load(Ordering::SeqCst), 3 * 1024 * 1024 + 5, "the zip's own total");
+        assert_eq!(done.published.len(), 2, "{:?}", done.published);
+        assert_eq!(fs::read(dest.join("b.txt")).unwrap(), b"hello");
+
+        let dest2 = root.join("out2");
+        fs::create_dir_all(&dest2).unwrap();
+        let cancelled = AtomicBool::new(true);
+        let ctl = ExtractCtl { cancel: &cancelled, on_bytes: &|_| {}, on_total: &|_| {} };
+        let err = extract_archive_here_ctl(archive.to_str().unwrap(), dest2.to_str().unwrap(), &ctl).unwrap_err();
+        assert_eq!(err, CANCELLED_MSG);
+        assert_eq!(fs::read_dir(&dest2).unwrap().count(), 0, "a cancelled extraction leaves nothing");
+    }
+
+    /// D-323: the built-in reader keeps contents and modes, reports exact bytes,
+    /// refuses an unsafe name or a link (so 7z takes over), and stops when cancelled.
+    #[test]
+    fn builtin_zip_reader_d323() {
+        use std::io::Write as _;
+        let root = scratch_case("wf-d323-zip");
+        let mk = |name: &str, file: &str, mode: u32, body: &[u8], method: zip::CompressionMethod| -> PathBuf {
+            let at = root.join(name);
+            let mut w = zip::ZipWriter::new(fs::File::create(&at).unwrap());
+            let o: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default().compression_method(method).unix_permissions(mode);
+            w.start_file(file, o).unwrap();
+            w.write_all(body).unwrap();
+            w.finish().unwrap();
+            at
+        };
+        let archive = mk("a.zip", "Movies/a.txt", 0o640, &vec![b'q'; 2_500_000], zip::CompressionMethod::Deflated);
+        let out = root.join("out");
+        fs::create_dir(&out).unwrap();
+        let seen = std::sync::atomic::AtomicU64::new(0);
+        extract_zip_builtin(&archive, &out, &AtomicBool::new(false), &|b| seen.store(b, Ordering::SeqCst)).unwrap();
+        assert_eq!(fs::metadata(out.join("Movies/a.txt")).unwrap().len(), 2_500_000);
+        assert_eq!(seen.load(Ordering::SeqCst), 2_500_000, "exact bytes written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(out.join("Movies/a.txt")).unwrap().permissions().mode() & 0o777, 0o640);
+        }
+
+        let evil = mk("evil.zip", "../escape.txt", 0o644, b"x", zip::CompressionMethod::Stored);
+        let out2 = root.join("out2");
+        fs::create_dir(&out2).unwrap();
+        assert!(extract_zip_builtin(&evil, &out2, &AtomicBool::new(false), &|_| {}).is_err());
+        assert!(!root.join("escape.txt").exists());
+
+        let link = root.join("link.zip");
+        {
+            let mut w = zip::ZipWriter::new(fs::File::create(&link).unwrap());
+            let o: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            w.add_symlink("l", "/etc/passwd", o).unwrap();
+            w.finish().unwrap();
+        }
+        let out3 = root.join("out3");
+        fs::create_dir(&out3).unwrap();
+        assert!(extract_zip_builtin(&link, &out3, &AtomicBool::new(false), &|_| {}).is_err());
+
+        let out4 = root.join("out4");
+        fs::create_dir(&out4).unwrap();
+        assert_eq!(extract_zip_builtin(&archive, &out4, &AtomicBool::new(true), &|_| {}), Err(CANCELLED_MSG.to_string()));
+    }
+
+    /// Manual: `WF_REAL_ZIP=<path> cargo test ... real_zip_d323 -- --ignored`. Opens
+    /// every entry (so every method is supported) and reads the 20 smallest in
+    /// full (so their checksums are checked).
+    #[test]
+    #[ignore]
+    fn real_zip_d323() {
+        let path = std::env::var("WF_REAL_ZIP").expect("WF_REAL_ZIP");
+        let mut a = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        let mut sizes: Vec<(u64, usize)> = Vec::new();
+        let total = a.len();
+        for i in 0..total {
+            let e = match a.by_index(i) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("entry {i} of {total} refused: {err}");
+                    return;
+                }
+            };
+            assert!(e.enclosed_name().is_some(), "unsafe name {i}");
+            assert!(e.unix_mode().map_or(true, |m| m & 0o170000 != 0o120000), "link {i}");
+            sizes.push((e.size(), i));
+        }
+        sizes.sort();
+        for (_, i) in sizes.iter().filter(|(sz, _)| *sz > 0).take(20) {
+            let mut e = a.by_index(*i).unwrap();
+            std::io::copy(&mut e, &mut std::io::sink()).unwrap();
+        }
+        eprintln!("entries {} ok", a.len());
+    }
+
+    #[test]
+    fn camera_thumbnail_files_are_images_d322() {
+        assert!(is_image(Path::new("/card/DCIM/100CANON/MVI_3935.THM")));
+        assert!(is_image(Path::new("clip.thm")));
+        assert!(!is_image(Path::new("clip.MOV")));
+    }
+
+    #[test]
+    fn transfer_returns_a_verified_report_d320() {
+        let root = scratch_case("wf-d320-report");
+        let src = root.join("src");
+        let dest = root.join("dest");
+        fs::create_dir_all(src.join("album/sub")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("album/one.txt"), b"hello").unwrap();
+        fs::write(src.join("album/sub/two.txt"), b"world!!").unwrap();
+        fs::write(src.join("solo.bin"), vec![7u8; 1000]).unwrap();
+        let srcs = vec![src.join("album").to_string_lossy().to_string(), src.join("solo.bin").to_string_lossy().to_string()];
+        let result = transfer_batch_ctl(
+            &srcs,
+            &dest.to_string_lossy(),
+            false,
+            PasteConflict::KeepBoth,
+            &|_| Ok(()),
+            false,
+            &TransferCtl { cancel: &AtomicBool::new(false), on_event: &|_| {}, copy_program: "cp" },
+        )
+        .expect("move succeeds");
+        assert_eq!(result.report.len(), 2, "one row per item: {:?}", result.report);
+        let album = result.report.iter().find(|r| r.kind == "folder").expect("folder row");
+        assert_eq!(album.files_total, 2);
+        assert_eq!(album.bytes, 12);
+        let mut names: Vec<&str> = album.files.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["one.txt", "sub/two.txt"]);
+        let solo = result.report.iter().find(|r| r.kind == "file").expect("file row");
+        assert_eq!((solo.files_total, solo.bytes), (1, 1000));
+        assert_eq!(solo.digest.len(), 16);
+        assert!(!src.join("solo.bin").exists(), "a move leaves no source");
     }
 
     #[test]
@@ -6669,7 +7697,7 @@ mod tests {
         // a before/after diff itself, but trashing into the shared real Trash
         // concurrently with a test that does (trash_paths_exact) would corrupt
         // that other test's diff.
-        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("HOME");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6721,7 +7749,7 @@ mod tests {
         // each restore to their own exact payload, never "newest by original
         // path" (that heuristic is what `restore_from_trash` uses and is exactly
         // the bug this gate exists to prove fixed for Redo).
-        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("HOME");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6824,6 +7852,23 @@ mod tests {
     #[test]
     fn fmt_modified_says_just_now_for_fresh_files() {
         assert_eq!(fmt_modified(now_unix() - 30), "Just now");
+    }
+
+    // D-303: the column is relative text, so two files a few seconds apart read
+    // the same. The tooltip is the only place the order is legible.
+    #[test]
+    fn fmt_modified_exact_carries_the_date_and_the_seconds() {
+        let stamp = fmt_modified_exact(1_763_000_000);
+        assert!(stamp.starts_with("Modified: "), "{stamp}");
+        assert_eq!(stamp.matches(':').count(), 3, "needs h:m:s, got {stamp}");
+        assert!(stamp.contains("2025") || stamp.contains("2026"), "{stamp}");
+        assert!(!stamp.contains("  "), "padding not collapsed: {stamp}");
+    }
+
+    #[test]
+    fn fmt_modified_exact_says_unknown_rather_than_a_fake_date() {
+        assert_eq!(fmt_modified_exact(0), "Modified: unknown");
+        assert_eq!(fmt_modified_exact(-1), "Modified: unknown");
     }
 
     #[test]
@@ -9260,6 +10305,7 @@ mod extract_here_seam_tests_d230 {
         let dir = match cmd {
             "tar" => after("-C"),
             "unzip" => after("-d"),
+            "wayfinder-zip" => args.get(1).copied(),
             "unar" => after("-output-directory"),
             "7z" => args.iter().find_map(|arg| arg.strip_prefix("-o")),
             _ => None,
@@ -9302,10 +10348,10 @@ mod extract_here_seam_tests_d230 {
         let run = |cmd: &str, args: &[&str]| -> Result<(), String> {
             let out = out_dir(cmd, args);
             used.borrow_mut().push((cmd.to_string(), out.clone()));
-            if cmd == "unzip" {
+            if cmd == "wayfinder-zip" {
                 fs::write(out.join("JUNK.txt"), "left by the failed tool").unwrap();
                 fs::write(out.join("fresh.txt"), "HALF").unwrap();
-                return Err("unzip failed on purpose".to_string());
+                return Err("wayfinder-zip failed on purpose".to_string());
             }
             run_cmd_capture(cmd, args)
         };
@@ -9327,7 +10373,7 @@ mod extract_here_seam_tests_d230 {
         );
         // Each tool wrote into a folder of its own inside the temporary folder, never the destination.
         let used = used.into_inner();
-        assert_eq!(used.iter().map(|(cmd, _)| cmd.as_str()).collect::<Vec<_>>(), ["unzip", "7z"]);
+        assert_eq!(used.iter().map(|(cmd, _)| cmd.as_str()).collect::<Vec<_>>(), ["wayfinder-zip", "7z"]);
         assert_ne!(used[0].1, used[1].1, "each attempt gets its own folder");
         for (cmd, out) in &used {
             let stage = out.parent().unwrap();
@@ -9437,7 +10483,7 @@ mod extract_here_seam_tests_d230 {
         let cut_tar = dest.join("cut.tar");
         pack("tar", &src, &["note.txt", "z-big.bin"], &cut_tar);
         cut(&cut_tar, 4096);
-        // Cut the same way: unzip refuses it, and the 7z that follows writes what it can, then fails.
+        // Cut the same way: Wayfinder's own reader refuses it, and the 7z that follows writes what it can, then fails.
         let cut_zip = dest.join("cut.zip");
         pack("zip", &src, &["note.txt", "z-big.bin"], &cut_zip);
         cut(&cut_zip, 3000);
@@ -9448,7 +10494,7 @@ mod extract_here_seam_tests_d230 {
 
         let cases: [(&Path, &[(&str, Option<&str>)]); 3] = [
             (&cut_tar, &[("tar", Some("NEW note"))]),
-            (&cut_zip, &[("unzip", None), ("7z", Some("NEW note"))]),
+            (&cut_zip, &[("wayfinder-zip", None), ("7z", Some("NEW note"))]),
             (&junk, &[("7z", None), ("unar", None)]),
         ];
         for (archive, expected) in cases {
@@ -11013,5 +12059,338 @@ mod launch_arg_tests_d265 {
         assert_eq!(launch_path_in_args(&args(&["--pick"])), None);
         assert_eq!(launch_path_in_args(&args(&["--select"])), None);
         assert_eq!(launch_path_in_args(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod tree_cache_tests {
+    use super::*;
+
+    fn kid(name: &str) -> Vec<TreeChild> {
+        vec![(name.to_string(), format!("/x/{name}"), false)]
+    }
+
+    #[test]
+    fn tree_cache_never_grows_past_its_cap_d295() {
+        let mut cache = TreeCache::default();
+        for n in 0..(TREE_CACHE_CAP + 250) {
+            cache.insert_children(format!("/p/{n}"), kid("a"));
+            cache.insert_openable(format!("/m/{n}"), true);
+        }
+        assert!(cache.children.len() <= TREE_CACHE_CAP);
+        assert!(cache.openable.len() <= TREE_CACHE_CAP);
+        // Oldest went first, newest stayed.
+        assert!(cache.children("/p/0").is_none());
+        assert!(cache.children(&format!("/p/{}", TREE_CACHE_CAP + 249)).is_some());
+    }
+
+    #[test]
+    fn replacing_an_answer_does_not_age_it_twice_d295() {
+        let mut cache = TreeCache::default();
+        cache.insert_children("/a".into(), kid("1"));
+        cache.insert_children("/a".into(), kid("2"));
+        assert_eq!(cache.order.len(), 1, "one key, one slot in the order");
+        assert_eq!(cache.children("/a").unwrap()[0].0, "2");
+    }
+
+    #[test]
+    fn forget_under_drops_the_branch_and_nothing_beside_it_d295() {
+        let mut cache = TreeCache::default();
+        for path in ["/a", "/a/b", "/a/b/c", "/ab", "/z"] {
+            cache.insert_children(path.into(), kid("k"));
+        }
+        cache.insert_openable("/a".into(), true);
+        cache.forget_under("/a");
+        assert!(cache.children("/a").is_none());
+        assert!(cache.children("/a/b").is_none());
+        assert!(cache.children("/a/b/c").is_none());
+        assert!(cache.openable("/a").is_none());
+        assert!(cache.children("/ab").is_some(), "a sibling that shares a prefix stays");
+        assert!(cache.children("/z").is_some());
+        assert_eq!(cache.order.len(), cache.children.len(), "the order never keeps a ghost");
+    }
+
+    #[test]
+    fn a_changed_folder_forgets_itself_and_its_parent_only_d295() {
+        let mut cache = TreeCache::default();
+        for path in ["/", "/a", "/a/b", "/a/b/c"] {
+            cache.insert_children(path.into(), kid("k"));
+        }
+        cache.forget_folder_and_parent("/a/b");
+        assert!(cache.children("/a/b").is_none());
+        assert!(cache.children("/a").is_none());
+        assert!(cache.children("/a/b/c").is_some(), "grandchildren are untouched");
+        assert!(cache.children("/").is_some());
+        cache.forget_folder_and_parent("/a");
+        assert!(cache.children("/").is_none(), "the parent of a top-level folder is the root");
+    }
+
+    #[test]
+    fn clear_empties_everything_d295() {
+        let mut cache = TreeCache::default();
+        cache.insert_children("/a".into(), kid("k"));
+        cache.insert_openable("/a".into(), false);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.order.is_empty());
+    }
+
+    #[test]
+    fn sniff_names_the_real_type_d324() {
+        assert_eq!(sniff_real_type(b"GIF89a....").unwrap().0, "a GIF image");
+        assert_eq!(sniff_real_type(b"ID3\x03\0\0").unwrap().0, "MP3 audio");
+        assert_eq!(sniff_real_type(&[0xFF, 0xFB, 0x90, 0x00]).unwrap().0, "MP3 audio");
+        assert_eq!(sniff_real_type(b"RIFF\x00\x00\x00\x00WAVEfmt ").unwrap().0, "WAV audio");
+        assert!(sniff_real_type(&[0, 1, 2, 3, 4, 5]).is_none());
+        // A WAV whose payload is MPEG layer 3 is still a WAV on disk.
+        assert!(sniff_real_type(b"RIFF\x00\x00\x00\x00WAVEfmt ").unwrap().1.contains(&"wav"));
+    }
+
+    #[test]
+    fn damaged_reason_is_one_line_naming_the_real_type_d324() {
+        let dir = scratch_root().join(format!("wf-d324c-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mp3_as_gif = dir.join("a.gif");
+        fs::write(&mp3_as_gif, b"ID3\x03\0\0\0\0\0\0").unwrap();
+        let reason = damaged_file_reason(mp3_as_gif.to_str().unwrap(), "picture");
+        assert_eq!(reason, "This file is actually MP3 audio, not a .gif picture.");
+        let gif_as_mp3 = dir.join("b.mp3");
+        fs::write(&gif_as_mp3, b"GIF89a\0\0\0\0\0\0\0\0").unwrap();
+        assert!(not_audio_reason(gif_as_mp3.to_str().unwrap()).unwrap().contains("actually a GIF image"));
+        // Real audio, and a WAV named .mp3, are left for the player to try.
+        let wav_as_mp3 = dir.join("c.mp3");
+        fs::write(&wav_as_mp3, b"RIFF\0\0\0\0WAVEfmt ").unwrap();
+        assert!(not_audio_reason(wav_as_mp3.to_str().unwrap()).is_none());
+        let real = dir.join("d.mp3");
+        fs::write(&real, b"ID3\x03\0\0\0\0\0\0").unwrap();
+        assert!(not_audio_reason(real.to_str().unwrap()).is_none());
+        let empty = dir.join("e.mp3");
+        fs::write(&empty, b"").unwrap();
+        assert!(damaged_file_reason(empty.to_str().unwrap(), "audio file").starts_with("Empty file"));
+        assert!(!reason.contains('\n'));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod midi_duration_tests {
+    use super::*;
+
+    fn vl(mut n: u32) -> Vec<u8> {
+        let mut out = vec![(n & 0x7f) as u8];
+        n >>= 7;
+        while n > 0 {
+            out.insert(0, ((n & 0x7f) as u8) | 0x80);
+            n >>= 7;
+        }
+        out
+    }
+    fn track(events: &[u8]) -> Vec<u8> {
+        let mut t = b"MTrk".to_vec();
+        t.extend((events.len() as u32).to_be_bytes());
+        t.extend(events);
+        t
+    }
+    fn smf(format: u16, tpq: u16, tracks: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = b"MThd".to_vec();
+        f.extend(6u32.to_be_bytes());
+        f.extend(format.to_be_bytes());
+        f.extend((tracks.len() as u16).to_be_bytes());
+        f.extend(tpq.to_be_bytes());
+        for t in tracks {
+            f.extend(t);
+        }
+        f
+    }
+    const EOT: [u8; 3] = [0xFF, 0x2F, 0x00];
+
+    /// 480 ticks per quarter, default tempo: 480 ticks = 0.5 s.
+    fn one_second_track() -> Vec<u8> {
+        let mut e = vec![0x00, 0x90, 60, 100];
+        e.extend(vl(960));
+        e.extend([0x80, 60, 0]);
+        e.extend([0x00]);
+        e.extend(EOT);
+        track(&e)
+    }
+
+    #[test]
+    fn plain_smf_length_uses_the_default_tempo() {
+        let f = smf(0, 480, &[one_second_track()]);
+        let d = midi_duration_from_bytes(&f).unwrap();
+        assert!((d - 1.0).abs() < 1e-9, "{d}");
+    }
+
+    #[test]
+    fn rmid_wrapped_file_reads_the_same_as_the_bare_one() {
+        let inner = smf(0, 480, &[one_second_track()]);
+        let mut riff = b"RIFF".to_vec();
+        riff.extend((4 + 8 + inner.len() as u32).to_le_bytes());
+        riff.extend(b"RMID");
+        riff.extend(b"data");
+        riff.extend((inner.len() as u32).to_le_bytes());
+        riff.extend(&inner);
+        let d = midi_duration_from_bytes(&riff).unwrap();
+        assert!((d - 1.0).abs() < 1e-9, "{d}");
+    }
+
+    #[test]
+    fn a_tempo_change_splits_the_arithmetic() {
+        // Tempo track: 500000 until tick 480, then 1000000 (60 bpm).
+        let mut t0 = vec![0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20];
+        t0.extend(vl(480));
+        t0.extend([0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]);
+        t0.extend([0x00]);
+        t0.extend(EOT);
+        // Note track ends at tick 960: 0.5 s + 1.0 s.
+        let mut t1 = vec![0x00, 0x90, 60, 100];
+        t1.extend(vl(960));
+        t1.extend([0x80, 60, 0, 0x00]);
+        t1.extend(EOT);
+        let f = smf(1, 480, &[track(&t0), track(&t1)]);
+        let d = midi_duration_from_bytes(&f).unwrap();
+        assert!((d - 1.5).abs() < 1e-9, "{d}");
+    }
+
+    #[test]
+    fn running_status_and_sysex_are_walked_correctly() {
+        let mut e = vec![0x00, 0x90, 60, 100];
+        e.extend([0x00, 62, 100]); // running status note-on
+        e.extend([0x00, 0xF0, 0x03, 1, 2, 0xF7]); // sysex
+        e.extend(vl(480));
+        e.extend([64, 100]); // running status after sysex is cancelled -> must be rejected
+        let f = smf(0, 480, &[track(&e)]);
+        assert_eq!(midi_duration_from_bytes(&f), None);
+
+        let mut e = vec![0x00, 0x90, 60, 100];
+        e.extend([0x00, 62, 100]);
+        e.extend([0x00, 0xF0, 0x03, 1, 2, 0xF7]);
+        e.extend(vl(480));
+        e.extend([0x90, 64, 100]);
+        e.extend(vl(480));
+        e.extend([65, 100]); // running status, 960 ticks total = 1 s
+        e.extend([0x00]);
+        e.extend(EOT);
+        let f = smf(0, 480, &[track(&e)]);
+        let d = midi_duration_from_bytes(&f).unwrap();
+        assert!((d - 1.0).abs() < 1e-9, "{d}");
+    }
+
+    #[test]
+    fn truncated_and_garbage_input_is_none_and_never_panics() {
+        assert_eq!(midi_duration_from_bytes(b""), None);
+        assert_eq!(midi_duration_from_bytes(b"MThd"), None);
+        assert_eq!(midi_duration_from_bytes(b"not a midi file at all, really"), None);
+        let good = smf(0, 480, &[one_second_track()]);
+        for cut in 0..good.len() {
+            let _ = midi_duration_from_bytes(&good[..cut]);
+        }
+        // Every single-byte corruption must also be survivable.
+        for at in 0..good.len() {
+            let mut bad = good.clone();
+            bad[at] = 0xFF;
+            let _ = midi_duration_from_bytes(&bad);
+        }
+        let junk: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let _ = midi_duration_from_bytes(&junk);
+        assert_eq!(midi_duration_secs("/nonexistent/none.mid"), None);
+    }
+
+    #[test]
+    fn midi_extension_check_ignores_case() {
+        for name in ["a.mid", "a.MID", "a.Midi", "a.kar", "a.RMI"] {
+            assert!(is_midi_path(name), "{name}");
+        }
+        assert!(!is_midi_path("a.mp3"));
+    }
+
+    /// Seconds of audio in a canonical PCM WAV, from its fmt and data chunks.
+    fn wav_secs(path: &str) -> Option<f64> {
+        let b = fs::read(path).ok()?;
+        let (mut rate, mut pos) = (0u32, 12usize);
+        while pos + 8 <= b.len() {
+            let len = u32::from_le_bytes(b[pos + 4..pos + 8].try_into().ok()?) as usize;
+            match &b[pos..pos + 4] {
+                b"fmt " => rate = u32::from_le_bytes(b[pos + 16..pos + 20].try_into().ok()?),
+                b"data" if rate > 0 => return Some(len.min(b.len() - pos - 8) as f64 / rate as f64),
+                _ => {}
+            }
+            pos += 8 + len + (len & 1);
+        }
+        None
+    }
+
+    #[test]
+    fn real_songs_match_their_wav_renders_when_present() {
+        let dir = "/home/user/Music/For Suno";
+        for song in ["song1", "Song2", "song3", "song4", "song7", "song8", "song9", "song10", "song11", "lara2"] {
+            let mid = format!("{dir}/{song}.mid");
+            let wav = format!("{dir}/{song}.wav");
+            let (Some(w), true) = (wav_secs(&wav), std::path::Path::new(&mid).exists()) else {
+                continue;
+            };
+            let m = midi_duration_secs(&mid);
+            eprintln!("MIDI-VS-WAV {song}: midi {m:?}s, wav {w:.2}s");
+            let m = m.expect("a real song must parse");
+            // The render adds a release tail of a few seconds, never shortens.
+            assert!(w - m > -1.0 && w - m < 6.0, "{song}: midi {m} wav {w}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod select_launch_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = scratch_root().join(format!("wf-d328-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Images/Animals")).unwrap();
+        fs::write(dir.join("Images/a.txt"), "x").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_folder_opens_its_parent_with_the_folder_highlighted_d328() {
+        let dir = scratch("folder");
+        let target = dir.join("Images");
+        let got = select_launch_target(target.to_str().unwrap());
+        assert_eq!(got.folder, dir.to_string_lossy());
+        assert_eq!(got.select.as_deref(), target.to_str());
+        // A trailing slash is the same folder.
+        let slash = select_launch_target(&format!("{}/", target.display()));
+        assert_eq!(slash.folder, dir.to_string_lossy());
+        assert!(slash.select.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_opens_its_folder_with_the_file_highlighted_d328() {
+        let dir = scratch("file");
+        let target = dir.join("Images/a.txt");
+        let got = select_launch_target(target.to_str().unwrap());
+        assert_eq!(got.folder, dir.join("Images").to_string_lossy());
+        assert_eq!(got.select.as_deref(), target.to_str());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_path_opens_the_nearest_folder_that_exists_d328() {
+        let dir = scratch("missing");
+        let target = dir.join("Images/Gone/deeper/file.png");
+        let got = select_launch_target(target.to_str().unwrap());
+        assert_eq!(got.folder, dir.join("Images").to_string_lossy());
+        assert_eq!(got.select, None);
+        // Nothing of it exists at all: the root, still a window.
+        let got = select_launch_target("/definitely-not-here-d328/x/y");
+        assert_eq!((got.folder.as_str(), got.select), ("/", None));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_root_has_no_parent_and_opens_itself_d328() {
+        let got = select_launch_target("/");
+        assert_eq!((got.folder.as_str(), got.select), ("/", None));
     }
 }

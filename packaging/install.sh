@@ -145,8 +145,19 @@ restart_portal() {
   # installer just replaced - the user gets the old build until they log out.
   # Stopping it is safe: D-Bus starts the new one the next time an app asks
   # for a dialog.
+  # D-288: never match on the process name. Linux truncates comm to 15
+  # characters and "wayfinder-portal" is 16, so `pkill -x wayfinder-portal`
+  # can never match anything and the old backend kept running. Match the
+  # full path of the binary this installer owns, and say what happened.
+  portal_bin="$prefix/bin/wayfinder-portal"
   if command -v pkill >/dev/null 2>&1; then
-    run pkill -x wayfinder-portal || true
+    if [ "$dry" = 1 ]; then
+      printf '  would: stop any running %s\n' "$portal_bin"
+    elif pkill -f -- "^${portal_bin}( |$)"; then
+      say "  stopped the running portal backend; D-Bus will start the new one."
+    else
+      say "  no portal backend was running."
+    fi
   fi
   if command -v systemctl >/dev/null 2>&1; then
     run systemctl --user try-restart xdg-desktop-portal.service || true

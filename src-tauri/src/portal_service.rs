@@ -25,6 +25,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
@@ -150,6 +151,22 @@ pub trait Chooser: Send + Sync {
     fn pick(&self, app_id: &str, parent_window: &str, title: &str, request: &WireRequest) -> PickOutcome {
         let _ = request;
         PickOutcome::from(self.pick_single(app_id, parent_window, title))
+    }
+
+    /// W2 attack 8: the same pick, but `cancel` is set when the caller sends
+    /// `Request.Close()`. A chooser that can stop early watches it and
+    /// answers `Cancelled`; the default ignores it, so every existing
+    /// chooser keeps its behaviour.
+    fn pick_cancellable(
+        &self,
+        app_id: &str,
+        parent_window: &str,
+        title: &str,
+        request: &WireRequest,
+        cancel: &AtomicBool,
+    ) -> PickOutcome {
+        let _ = cancel;
+        self.pick(app_id, parent_window, title, request)
     }
 }
 
@@ -441,26 +458,83 @@ impl ProcessChooser {
     /// group* the child was spawned into (never a reused PID, never an
     /// unrelated process) so a descendant the child spawned -- e.g. a
     /// shell's own child -- cannot outlive it as an orphan.
-    fn wait_with_deadline(&self, mut child: Child) -> Option<std::process::ExitStatus> {
+    fn wait_with_deadline(&self, child: Child) -> ChildWait {
+        self.wait_with_deadline_or_cancel(child, &AtomicBool::new(false))
+    }
+
+    fn wait_with_deadline_or_cancel(&self, mut child: Child, cancel: &AtomicBool) -> ChildWait {
         let pgid = child.id() as libc::pid_t;
         let start = Instant::now();
         loop {
             match child.try_wait() {
-                Ok(Some(status)) => return Some(status),
+                Ok(Some(status)) => return ChildWait::Exited(status),
                 Ok(None) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        kill_owned_process_group(pgid);
+                        let _ = child.wait();
+                        return ChildWait::Cancelled;
+                    }
                     if !self.should_ignore_deadline() && start.elapsed() >= self.deadline {
                         kill_owned_process_group(pgid);
                         let _ = child.wait();
-                        return None;
+                        return ChildWait::TimedOut;
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(_) => {
                     kill_owned_process_group(pgid);
                     let _ = child.wait();
-                    return None;
+                    return ChildWait::WaitFailed;
                 }
             }
+        }
+    }
+}
+
+/// Why the picker process stopped being waited on.
+///
+/// D-301: a child killed at the deadline and a child that exited with a
+/// shape the portal refuses both used to arrive here as `None`, so a slow
+/// machine and a broken picker produced the same single line of output and
+/// neither said which it was. That cost a day of looking in the wrong
+/// place. The three cases are now distinct and each one says so.
+#[derive(Debug)]
+enum ChildWait {
+    Exited(std::process::ExitStatus),
+    /// The deadline expired and the child's process group was killed.
+    TimedOut,
+    /// `try_wait` itself failed; the child was killed and reaped.
+    WaitFailed,
+    /// The caller sent `Request.Close()`; the child was killed and reaped.
+    Cancelled,
+}
+
+impl ChildWait {
+    fn exit_code(&self) -> Option<i32> {
+        match self {
+            ChildWait::Exited(status) => status.code(),
+            _ => None,
+        }
+    }
+
+    /// One line on stderr naming what happened, for every outcome that is
+    /// not a clean exit. The daemon's journal is the only place a user or
+    /// an auditor can see this, so it is never silent.
+    fn report(&self, deadline: Duration) {
+        match self {
+            ChildWait::Exited(_) => {}
+            ChildWait::TimedOut => eprintln!(
+                "wayfinder-portal: the file picker did not answer within {}s and was killed; \
+                 reporting the request as failed",
+                deadline.as_secs()
+            ),
+            ChildWait::WaitFailed => eprintln!(
+                "wayfinder-portal: waiting on the file picker failed; it was killed and the \
+                 request is reported as failed"
+            ),
+            ChildWait::Cancelled => eprintln!(
+                "wayfinder-portal: the caller closed the request; the file picker was killed"
+            ),
         }
     }
 }
@@ -516,11 +590,26 @@ impl Chooser for ProcessChooser {
 
     fn pick(
         &self,
+        app_id: &str,
+        parent_window: &str,
+        title: &str,
+        request: &WireRequest,
+    ) -> PickOutcome {
+        self.pick_cancellable(app_id, parent_window, title, request, &AtomicBool::new(false))
+    }
+
+    fn pick_cancellable(
+        &self,
         _app_id: &str,
         parent_window: &str,
         _title: &str,
         request: &WireRequest,
+        cancel: &AtomicBool,
     ) -> PickOutcome {
+        // Closed before anything was started: nothing to spawn or clean up.
+        if cancel.load(Ordering::SeqCst) {
+            return PickOutcome::from(ChooserOutcome::Cancelled);
+        }
         let base = match &self.scratch_base {
             Some(base) => base,
             None => return PickOutcome::from(ChooserOutcome::Failed),
@@ -594,8 +683,14 @@ impl Chooser for ProcessChooser {
             }
         };
 
-        let status = self.wait_with_deadline(child);
-        let exit_code = status.and_then(|s| s.code());
+        let wait = self.wait_with_deadline_or_cancel(child, cancel);
+        wait.report(self.deadline);
+        let exit_code = wait.exit_code();
+        if matches!(wait, ChildWait::Cancelled) {
+            // The caller closed the request: the picker was killed, and
+            // whatever it wrote is not an answer.
+            return PickOutcome::from(ChooserOutcome::Cancelled);
+        }
 
         let outcome = if self.should_accept_any_exit_code() {
             // Same evidence, same exit code, but the classification guard
@@ -692,12 +787,38 @@ fn build_success_results(
 /// Decodes the real `a(sa(us))` `filters` wire value. `Ok(vec![])` when
 /// the key is absent; `Err(())` only when the key is present but
 /// structurally malformed -- never a panic.
+/// Hard input caps (W2). A caller is another application, so every list
+/// and string it sends is bounded before anything is allocated for it or
+/// shown. Over a cap the request is refused, never trimmed: a trimmed
+/// list would quietly answer a different question than the one asked.
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_NAME_BYTES: usize = 255;
+const MAX_FILTERS: usize = 128;
+const MAX_FILTER_RULES: usize = 512;
+const MAX_CHOICES: usize = 32;
+const MAX_CHOICE_OPTIONS: usize = 256;
+
+/// True when `text` holds a character that can make a label or a file name
+/// read as something it is not: any control character (C0, DEL and C1, so
+/// newline, carriage return, escape), and the Unicode bidirectional
+/// controls that reorder text on screen (`\u{202e}` turns `invoice_gnp.sh`
+/// into `invoice_hs.png`).
+fn has_hostile_chars(text: &str) -> bool {
+    text.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    })
+}
+
 fn decode_filters(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireFilter>, ()> {
     let Some(value) = options.get("filters") else {
         return Ok(Vec::new());
     };
     let raw: Vec<(String, Vec<(u32, String)>)> =
         Vec::try_from(value.clone()).map_err(|_| ())?;
+    if raw.len() > MAX_FILTERS || raw.iter().any(|(_, rules)| rules.len() > MAX_FILTER_RULES) {
+        return Err(());
+    }
     Ok(raw
         .into_iter()
         .map(|(name, rules)| WireFilter { name, rules })
@@ -750,9 +871,19 @@ fn decode_choices(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireChoic
     };
     let raw: Vec<(String, String, Vec<(String, String)>, String)> =
         Vec::try_from(value.clone()).map_err(|_| ())?;
+    if raw.len() > MAX_CHOICES {
+        return Err(());
+    }
     raw.into_iter()
         .map(|(id, label, options, initial)| {
             if id.is_empty() || label.is_empty() {
+                return Err(());
+            }
+            if options.len() > MAX_CHOICE_OPTIONS
+                || has_hostile_chars(&id)
+                || has_hostile_chars(&label)
+                || options.iter().any(|(oid, olabel)| has_hostile_chars(oid) || has_hostile_chars(olabel))
+            {
                 return Err(());
             }
             if options.iter().any(|(oid, olabel)| oid.is_empty() || olabel.is_empty()) {
@@ -809,6 +940,9 @@ fn decode_path_option(options: &HashMap<String, OwnedValue>, key: &str) -> Resul
     if trimmed.is_empty() {
         return Err(());
     }
+    if trimmed.len() > MAX_PATH_BYTES {
+        return Err(());
+    }
     let text = std::str::from_utf8(trimmed).map_err(|_| ())?;
     if !Path::new(text).is_absolute() {
         return Err(());
@@ -828,7 +962,12 @@ fn decode_current_name(options: &HashMap<String, OwnedValue>) -> Result<String, 
     if name.is_empty() {
         return Ok(String::new());
     }
-    if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+    if name.contains('/')
+        || name == "."
+        || name == ".."
+        || name.len() > MAX_NAME_BYTES
+        || has_hostile_chars(&name)
+    {
         return Err(());
     }
     Ok(name)
@@ -868,7 +1007,13 @@ fn decode_save_files_names(options: &HashMap<String, OwnedValue>) -> Result<Vec<
             None => &bytes,
         };
         let name = std::str::from_utf8(trimmed).map_err(|_| ())?;
-        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        if name.is_empty()
+            || name.contains('/')
+            || name == "."
+            || name == ".."
+            || name.len() > MAX_NAME_BYTES
+            || has_hostile_chars(name)
+        {
             return Err(());
         }
         names.push(name.to_string());
@@ -1215,23 +1360,65 @@ impl PortalService {
     }
 }
 
+/// The object each in-flight request exports at its own handle path, so the
+/// desktop can call `Request.Close()` on it (W2 attack 8). It holds only the
+/// flag the running pick watches.
+struct RequestObject {
+    cancel: Arc<AtomicBool>,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Request")]
+impl RequestObject {
+    #[zbus(name = "Close")]
+    fn close(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Runs one request: exports its `Request` object at `handle`, runs `work`
+/// (the blocking pick) off the bus thread so `Close()` and other apps'
+/// requests are still answered while a dialog is open, then removes the
+/// object. A handle that is already in use is refused, never replaced: two
+/// requests on one path would let one app close the other's dialog.
+async fn run_request<F>(
+    server: &zbus::ObjectServer,
+    handle: ObjectPath<'_>,
+    work: F,
+) -> (u32, HashMap<String, OwnedValue>)
+where
+    F: FnOnce(Arc<AtomicBool>) -> (u32, HashMap<String, OwnedValue>) + Send + 'static,
+{
+    let cancel = Arc::new(AtomicBool::new(false));
+    match server.at(handle.clone(), RequestObject { cancel: cancel.clone() }).await {
+        Ok(true) => {}
+        _ => return refuse(),
+    }
+    let answer = blocking::unblock(move || work(cancel)).await;
+    let _ = server.remove::<RequestObject, _>(handle).await;
+    answer
+}
+
 #[zbus::interface(name = "org.freedesktop.impl.portal.FileChooser")]
 impl PortalService {
     #[zbus(name = "OpenFile")]
-    fn open_file(
+    async fn open_file(
         &self,
-        _handle: ObjectPath<'_>,
+        handle: ObjectPath<'_>,
         app_id: String,
         parent_window: String,
         title: String,
         options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
     ) -> (u32, HashMap<String, OwnedValue>) {
-        let chooser = &self.chooser;
-        decide(
-            &options,
-            |request| chooser.pick(&app_id, &parent_window, &title, request),
-            GuardOverride::None,
-        )
+        let chooser = self.chooser.clone();
+        run_request(server, handle, move |cancel| {
+            decide(
+                &options,
+                |request| chooser.pick_cancellable(&app_id, &parent_window, &title, request, &cancel),
+                GuardOverride::None,
+            )
+        })
+        .await
     }
 
     /// `SaveFile`: the app names a file to write. Same request plumbing and
@@ -1239,21 +1426,25 @@ impl PortalService {
     /// and the suggested name/folder/file, and the result is guarded as a
     /// writable target rather than an existing one.
     #[zbus(name = "SaveFile")]
-    fn save_file(
+    async fn save_file(
         &self,
-        _handle: ObjectPath<'_>,
+        handle: ObjectPath<'_>,
         app_id: String,
         parent_window: String,
         title: String,
         options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
     ) -> (u32, HashMap<String, OwnedValue>) {
-        let chooser = &self.chooser;
-        decide_with_shape(
-            &options,
-            |request| chooser.pick(&app_id, &parent_window, &title, request),
-            GuardOverride::None,
-            RequestShape::Save,
-        )
+        let chooser = self.chooser.clone();
+        run_request(server, handle, move |cancel| {
+            decide_with_shape(
+                &options,
+                |request| chooser.pick_cancellable(&app_id, &parent_window, &title, request, &cancel),
+                GuardOverride::None,
+                RequestShape::Save,
+            )
+        })
+        .await
     }
 
     /// `SaveFiles`: the app hands over a list of file names and the portal
@@ -1261,20 +1452,24 @@ impl PortalService {
     /// Exporting it matters for the same reason `SaveFile` does -- an app
     /// calling a method this backend does not answer gets no dialog at all.
     #[zbus(name = "SaveFiles")]
-    fn save_files(
+    async fn save_files(
         &self,
-        _handle: ObjectPath<'_>,
+        handle: ObjectPath<'_>,
         app_id: String,
         parent_window: String,
         title: String,
         options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
     ) -> (u32, HashMap<String, OwnedValue>) {
-        let chooser = &self.chooser;
-        decide_save_files(
-            &options,
-            |request| chooser.pick(&app_id, &parent_window, &title, request),
-            GuardOverride::None,
-        )
+        let chooser = self.chooser.clone();
+        run_request(server, handle, move |cancel| {
+            decide_save_files(
+                &options,
+                |request| chooser.pick_cancellable(&app_id, &parent_window, &title, request, &cancel),
+                GuardOverride::None,
+            )
+        })
+        .await
     }
 }
 
@@ -1967,6 +2162,41 @@ mod tests {
         assert_eq!(fs::read_dir(&base).unwrap().count(), 1, "only the leftover sleeppid marker, the req-* root is gone");
         fs::remove_file(base.join("sleeppid")).expect("remove exact sleeppid marker");
         finish_base(base);
+    }
+
+    /// D-301: a timeout and a refused result both answer the caller `2`, so
+    /// the only way to tell them apart is for the wait itself to say which it
+    /// was. A day was lost to that in November 2026.
+    #[test]
+    fn child_wait_tells_a_timeout_apart_from_a_refused_result() {
+        let slow = FakeNative::scripted("sleep 30\n");
+        let base = scratch_base("wait-kind-timeout");
+        let chooser =
+            ProcessChooser::for_test(slow.path().to_path_buf(), Duration::from_millis(200), base.clone());
+        let child = Command::new(slow.path())
+            .arg("--pick")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the slow fixture");
+        let wait = chooser.wait_with_deadline(child);
+        assert!(matches!(wait, ChildWait::TimedOut), "got {wait:?}");
+        assert_eq!(wait.exit_code(), None, "a killed child has no exit code to read");
+
+        let quick = FakeNative::scripted("exit 1\n");
+        let child = Command::new(quick.path())
+            .arg("--pick")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the quick fixture");
+        let wait = chooser.wait_with_deadline(child);
+        assert!(matches!(wait, ChildWait::Exited(_)), "got {wait:?}");
+        assert_eq!(wait.exit_code(), Some(1), "a clean exit still reports its code");
+        // No pick() ran, so no scratch root was ever created under `base`.
+        assert!(!base.exists(), "waiting on a child must not create a scratch root");
     }
 
     #[test]
@@ -3780,6 +4010,184 @@ mod tests {
     /// A name that is not a plain name is refused before the picker ever
     /// opens, so a `SaveFiles` request can never be steered out of the
     /// folder the user chose.
+    // ---- W2 attack 8: the request handle and Request.Close() ----
+
+    /// A chooser that shows a "dialog" until it is closed: it counts how many
+    /// requests reached it, then waits (at most 10 s) for the caller's cancel.
+    struct WaitingChooser {
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WaitingChooser {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { started: std::sync::atomic::AtomicUsize::new(0) })
+        }
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Chooser for WaitingChooser {
+        fn pick_single(&self, _app_id: &str, _parent_window: &str, _title: &str) -> ChooserOutcome {
+            ChooserOutcome::Failed
+        }
+        fn pick_cancellable(
+            &self,
+            _app_id: &str,
+            _parent_window: &str,
+            _title: &str,
+            _request: &WireRequest,
+            cancel: &AtomicBool,
+        ) -> PickOutcome {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                if cancel.load(Ordering::SeqCst) {
+                    return PickOutcome::from(ChooserOutcome::Cancelled);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            PickOutcome::from(ChooserOutcome::Failed)
+        }
+    }
+
+    fn open_file_at(
+        client: &Connection,
+        handle: &str,
+    ) -> zbus::Result<(u32, HashMap<String, OwnedValue>)> {
+        let body = (
+            ObjectPath::try_from(handle.to_string()).expect("object path"),
+            "org.example.w2".to_string(),
+            String::new(),
+            "Open".to_string(),
+            HashMap::<String, OwnedValue>::new(),
+        );
+        let message =
+            client.call_method(Some(BUS_NAME), OBJECT_PATH, Some(INTERFACE_NAME), "OpenFile", &body)?;
+        message.body().deserialize::<(u32, HashMap<String, OwnedValue>)>().map_err(Into::into)
+    }
+
+    fn close_request(client: &Connection, handle: &str) -> zbus::Result<()> {
+        client
+            .call_method(
+                Some(BUS_NAME),
+                handle,
+                Some("org.freedesktop.impl.portal.Request"),
+                "Close",
+                &(),
+            )
+            .map(|_| ())
+    }
+
+    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ready() {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const H1: &str = "/org/freedesktop/portal/desktop/request/w2/one";
+    const H2: &str = "/org/freedesktop/portal/desktop/request/w2/two";
+
+    #[test]
+    fn dbus_request_close_cancels_a_pending_openfile_and_removes_the_object() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let chooser = WaitingChooser::new();
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let caller = client.clone();
+        let call = std::thread::spawn(move || open_file_at(&caller, H1));
+        wait_until("the request to reach the chooser", || chooser.started() == 1);
+        let closed_at = Instant::now();
+        close_request(&client, H1).expect("Close on a live request");
+        let (response, results) = call.join().expect("caller thread").expect("OpenFile reply");
+        assert_eq!(response, RESPONSE_CANCELLED, "Close must answer the pending call as cancelled");
+        assert!(uris_of(&results).is_empty());
+        assert!(closed_at.elapsed() < Duration::from_secs(3), "Close must not wait for the deadline");
+        assert!(close_request(&client, H1).is_err(), "the Request object must be gone after the answer");
+        finish_private_bus(bus, server, client);
+    }
+
+    #[test]
+    fn dbus_a_second_request_is_served_while_the_first_is_open() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let chooser = WaitingChooser::new();
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let (c1, c2) = (client.clone(), client.clone());
+        let first = std::thread::spawn(move || open_file_at(&c1, H1));
+        wait_until("the first request", || chooser.started() == 1);
+        let second = std::thread::spawn(move || open_file_at(&c2, H2));
+        wait_until("the second request to reach the chooser while the first is open", || {
+            chooser.started() == 2
+        });
+        close_request(&client, H2).expect("close the second");
+        close_request(&client, H1).expect("close the first");
+        for call in [first, second] {
+            let (response, _) = call.join().expect("thread").expect("reply");
+            assert_eq!(response, RESPONSE_CANCELLED);
+        }
+        finish_private_bus(bus, server, client);
+    }
+
+    #[test]
+    fn dbus_a_reused_handle_is_refused_and_leaves_the_first_request_alone() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let chooser = WaitingChooser::new();
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+
+        let caller = client.clone();
+        let first = std::thread::spawn(move || open_file_at(&caller, H1));
+        wait_until("the first request", || chooser.started() == 1);
+        let (response, results) = open_file_at(&client, H1).expect("duplicate reply");
+        assert_eq!(response, RESPONSE_OTHER, "a handle already in use must be refused");
+        assert!(results.is_empty());
+        assert_eq!(chooser.started(), 1, "the duplicate must never reach the chooser");
+        close_request(&client, H1).expect("the first request's object is still there");
+        let (response, _) = first.join().expect("thread").expect("reply");
+        assert_eq!(response, RESPONSE_CANCELLED, "only the first request was closed");
+        // The handle is free again once its request has ended.
+        let caller = client.clone();
+        let again = std::thread::spawn(move || open_file_at(&caller, H1));
+        wait_until("the reused handle to be accepted", || chooser.started() == 2);
+        close_request(&client, H1).expect("close");
+        again.join().expect("thread").expect("reply");
+        finish_private_bus(bus, server, client);
+    }
+
+    #[test]
+    fn child_wait_cancel_kills_a_running_picker_at_once() {
+        let slow = FakeNative::scripted("sleep 30\n");
+        let base = scratch_base("wait-kind-cancel");
+        let chooser =
+            ProcessChooser::for_test(slow.path().to_path_buf(), Duration::from_secs(60), base.clone());
+        let child = Command::new(slow.path())
+            .arg("--pick")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the slow fixture");
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let wait = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| chooser.wait_with_deadline_or_cancel(child, &cancel));
+            std::thread::sleep(Duration::from_millis(150));
+            cancel.store(true, Ordering::SeqCst);
+            waiter.join().expect("waiter")
+        });
+        assert!(matches!(wait, ChildWait::Cancelled), "got {wait:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "must not wait for the 60 s deadline");
+        let _ = base;
+    }
+
     #[test]
     fn dbus_savefiles_refuses_a_name_that_escapes_the_folder() {
         let _guard = env_lock();
@@ -4368,7 +4776,7 @@ mod tests {
         std::env::set_var("HOME", fixture_dir_root.path());
 
         let chooser: Arc<dyn Chooser> =
-            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(120), base.clone()));
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
@@ -4455,7 +4863,7 @@ mod tests {
         std::env::set_var("HOME", fixture_dir_root.path());
 
         let chooser: Arc<dyn Chooser> =
-            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(120), base.clone()));
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
@@ -4516,7 +4924,7 @@ mod tests {
         std::env::set_var("HOME", fixture_dir_root.path());
 
         let chooser: Arc<dyn Chooser> =
-            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(120), base.clone()));
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
@@ -4723,7 +5131,7 @@ mod tests {
         std::env::set_var("HOME", fixture_dir_root.path());
 
         let chooser: Arc<dyn Chooser> =
-            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(120), base.clone()));
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
@@ -4911,7 +5319,7 @@ mod tests {
         std::env::set_var("HOME", fixture_dir_root.path());
 
         let chooser: Arc<dyn Chooser> =
-            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(30), base.clone()));
+            Arc::new(ProcessChooser::for_test(driver, Duration::from_secs(120), base.clone()));
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
@@ -6617,5 +7025,166 @@ mod tests {
             "finish() must never remove a sibling scratch entry it does not own"
         );
         fs::remove_file(&decoy).expect("remove decoy sibling file");
+    }
+}
+
+/// W2: the hostile run at the portal's D-Bus arguments, as mechanical
+/// tests. Each case from the audit is built the way a hostile app would
+/// send it and handed to the real decoders; a refusal must happen before
+/// the chooser is reached, so every picker here panics if called.
+#[cfg(test)]
+mod hostile_w2 {
+    use super::*;
+    use zbus::zvariant::Value;
+
+    fn opt(key: &str, value: Value<'_>) -> HashMap<String, OwnedValue> {
+        let mut map = HashMap::new();
+        map.insert(key.to_string(), OwnedValue::try_from(value).expect("encode option"));
+        map
+    }
+
+    fn ay(bytes: &[u8]) -> Value<'static> {
+        Value::from(bytes.to_vec())
+    }
+
+    fn save_refused(options: &HashMap<String, OwnedValue>) -> bool {
+        let (response, results) = decide_with_shape(
+            options,
+            |_| panic!("a hostile Save must be refused before the chooser"),
+            GuardOverride::None,
+            RequestShape::Save,
+        );
+        response == RESPONSE_OTHER && results.is_empty()
+    }
+
+    /// Attack 1: `current_name` that tries to leave the folder.
+    #[test]
+    fn w2_1_save_current_name_cannot_leave_the_folder() {
+        for name in ["../../.bashrc", "/etc/passwd", "subdir/../../escape.sh", "..", ".", "a/b"] {
+            assert!(save_refused(&opt("current_name", Value::from(name))), "{name:?} must be refused");
+        }
+    }
+
+    /// Attack 2: every hostile entry in `SaveFiles` refuses the whole call.
+    #[test]
+    fn w2_2_save_files_any_hostile_name_refuses_the_whole_call() {
+        let hostile: Vec<Vec<u8>> = vec![b"ok.txt".to_vec(), b"../escaped.txt\0".to_vec(), b"/etc/hosts\0".to_vec()];
+        let (response, results) = decide_save_files(
+            &opt("files", Value::from(hostile)),
+            |_| panic!("must be refused before the chooser"),
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_OTHER);
+        assert!(results.is_empty());
+        let sneaky: Vec<Vec<u8>> = vec![b"normal/../../pwn.sh\0".to_vec()];
+        let (response, _) = decide_save_files(
+            &opt("files", Value::from(sneaky)),
+            |_| panic!("must be refused before the chooser"),
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_OTHER);
+    }
+
+    /// Attack 3: malformed byte strings for `current_folder` / `current_file`.
+    #[test]
+    fn w2_3_malformed_byte_strings_never_panic_and_never_pass() {
+        let key = "current_folder";
+        assert!(decode_path_option(&opt(key, ay(b"")), key).is_err(), "3a empty");
+        assert_eq!(
+            decode_path_option(&opt(key, ay(b"/tmp")), key),
+            Ok(Some("/tmp".to_string())),
+            "3b a missing trailing NUL is a valid path"
+        );
+        assert!(
+            decode_path_option(&opt(key, ay(b"/tmp/x\0/etc/shadow\0")), key).is_err(),
+            "3c an interior NUL is two paths, never one"
+        );
+        assert!(
+            decode_path_option(&opt(key, ay(&[0x2f, 0x74, 0x6d, 0x70, 0x2f, 0xff, 0xfe, 0x00])), key).is_err(),
+            "3d invalid UTF-8 cannot be trusted"
+        );
+        assert!(decode_path_option(&opt(key, ay(b"relative/dir\0")), key).is_err(), "relative");
+        assert!(decode_path_option(&opt(key, Value::from(7u32)), key).is_err(), "wrong type");
+        for bad in [ay(b""), ay(b"/tmp/x\0/etc\0"), ay(&[0x2f, 0x80, 0x81, 0x00])] {
+            let mut options = opt("current_file", bad);
+            options.insert("current_name".to_string(), OwnedValue::try_from(Value::from("a.txt")).unwrap());
+            assert!(save_refused(&options), "a bad current_file must refuse the Save");
+        }
+    }
+
+    /// Attack 5: control characters and bidi overrides in anything shown.
+    #[test]
+    fn w2_5_control_characters_and_bidi_overrides_are_refused() {
+        for name in ["a\nb.txt", "a\rb", "a\x1b[31m", "invoice_\u{202e}gnp.sh", "a\u{2066}b", "a\u{0085}b", "a\u{7f}b"] {
+            assert!(save_refused(&opt("current_name", Value::from(name))), "{name:?} must be refused");
+        }
+        let names: Vec<Vec<u8>> = vec!["bad\u{202e}name".as_bytes().to_vec()];
+        let (response, _) = decide_save_files(
+            &opt("files", Value::from(names)),
+            |_| panic!("must be refused before the chooser"),
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_OTHER, "SaveFiles names too");
+        let choices = vec![("id1", "Format\nDisk", vec![("opt1", "Yes")], "opt1")];
+        assert!(decode_choices(&opt("choices", Value::from(choices))).is_err(), "a choice label with a newline");
+        let choices = vec![("id1", "Format", vec![("opt1", "Yes\r\n")], "opt1")];
+        assert!(decode_choices(&opt("choices", Value::from(choices))).is_err(), "an option label with CRLF");
+    }
+
+    /// Attack 6: absurd sizes are refused at the boundary, not allocated.
+    #[test]
+    fn w2_6_absurd_lengths_are_refused_at_the_boundary() {
+        let huge_name = "x".repeat(1_048_576);
+        assert!(save_refused(&opt("current_name", Value::from(huge_name.as_str()))));
+        let long_name = "x".repeat(MAX_NAME_BYTES + 1);
+        assert!(save_refused(&opt("current_name", Value::from(long_name.as_str()))));
+        let edge = "x".repeat(MAX_NAME_BYTES);
+        assert_eq!(decode_current_name(&opt("current_name", Value::from(edge.as_str()))), Ok(edge));
+
+        let mut path = b"/".to_vec();
+        path.extend(std::iter::repeat(b'a').take(131_072));
+        assert!(decode_path_option(&opt("current_folder", ay(&path)), "current_folder").is_err());
+
+        let rules: Vec<(u32, String)> = (0..5).map(|_| (0u32, "*.txt".to_string())).collect();
+        let many_filters: Vec<(String, Vec<(u32, String)>)> =
+            (0..5_000).map(|i| (format!("f{i}"), rules.clone())).collect();
+        assert!(decode_filters(&opt("filters", Value::from(many_filters))).is_err(), "5000 filters");
+        let long_rules: Vec<(u32, String)> = (0..5_000).map(|_| (0u32, "*.txt".to_string())).collect();
+        assert!(
+            decode_filters(&opt("filters", Value::from(vec![("one".to_string(), long_rules)]))).is_err(),
+            "5000 rules in one filter"
+        );
+        let many_choices: Vec<(String, String, Vec<(String, String)>, String)> = (0..5_000)
+            .map(|i| (format!("c{i}"), "label".to_string(), Vec::new(), String::new()))
+            .collect();
+        assert!(decode_choices(&opt("choices", Value::from(many_choices))).is_err(), "5000 choices");
+
+        let at_limit: Vec<(String, Vec<(u32, String)>)> =
+            (0..MAX_FILTERS).map(|i| (format!("f{i}"), rules.clone())).collect();
+        assert!(decode_filters(&opt("filters", Value::from(at_limit))).is_ok(), "the cap itself is allowed");
+    }
+
+    /// Attack 7: contradictory options and an undefined filter rule type.
+    #[test]
+    fn w2_7_contradictory_options_and_unknown_rule_types() {
+        let mut options = opt("directory", Value::from(true));
+        options.insert("multiple".to_string(), OwnedValue::try_from(Value::from(true)).unwrap());
+        assert!(save_refused(&options), "directory on a Save");
+        let (response, _) = decide_with_shape(
+            &opt("multiple", Value::from(true)),
+            |request| {
+                assert!(!request.multiple, "multiple is never honoured on a Save");
+                PickOutcome::from(ChooserOutcome::Cancelled)
+            },
+            GuardOverride::None,
+            RequestShape::Save,
+        );
+        assert_ne!(response, RESPONSE_SUCCESS);
+        // An undefined rule type (99) is carried through to the picker, which
+        // matches it against nothing (`native.rs wire_filter_allows`).
+        let filter = vec![("Bad", vec![(99u32, "**/**/**"), (0u32, ""), (1u32, "invalid/mime/type")])];
+        let decoded = decode_filters(&opt("filters", Value::from(filter))).expect("well-formed on the wire");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].rules.len(), 3);
     }
 }

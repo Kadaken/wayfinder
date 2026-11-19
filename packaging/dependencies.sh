@@ -24,7 +24,7 @@
 #
 # `wf_dep_check_<key>` returns 0 when the thing works.
 
-WF_DEPS="ffmpeg gstreamer gstav pixbuf gvfs portal"
+WF_DEPS="ffmpeg gstreamer gstav pixbuf gvfs portal sevenzip"
 
 wf_dep_title() {
   case "$1" in
@@ -34,6 +34,7 @@ wf_dep_title() {
     pixbuf)    echo "PNG, JPEG, WebP and GIF previews" ;;
     gvfs)      echo "Windows and Samba network shares" ;;
     portal)    echo "Wayfinder as every program's Open and Save box" ;;
+    sevenzip)  echo "Extract Here for zip, 7z, rar and other archives" ;;
   esac
 }
 
@@ -45,7 +46,27 @@ wf_dep_cost() {
     pixbuf)    echo "no picture previews at all" ;;
     gvfs)      echo "Connect to Server cannot reach a share" ;;
     portal)    echo "other programs keep their own file dialog" ;;
+    sevenzip)  echo "Extract Here fails on every archive that is not a tarball" ;;
   esac
+}
+
+# D-280: gst-inspect-1.0 builds GStreamer's plugin registry as a side effect,
+# so probing for codecs wrote ~/.cache/gstreamer-1.0 into a home directory the
+# caller was only reading. Probe against a throwaway registry instead, so
+# --check and --dry-run leave nothing behind.
+wf_gst_inspect() {
+  _probe_cache="${TMPDIR:-/tmp}/wayfinder-probe-cache.$$"
+  mkdir -p "$_probe_cache" 2>/dev/null || true
+  # XDG_CACHE_HOME covers every cache a loaded plugin writes, not only
+  # GStreamer's registry: a hardware video plugin pulls in the GPU driver,
+  # which writes its own shader caches.
+  XDG_CACHE_HOME="$_probe_cache" \
+  GST_REGISTRY="$_probe_cache/gst-registry.bin" \
+  MESA_SHADER_CACHE_DISABLE=true \
+    gst-inspect-1.0 "$1" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$_probe_cache"
+  return $rc
 }
 
 wf_dep_ok() {
@@ -55,11 +76,11 @@ wf_dep_ok() {
       ;;
     gstreamer)
       command -v gst-inspect-1.0 >/dev/null 2>&1 \
-        && gst-inspect-1.0 playbin >/dev/null 2>&1
+        && wf_gst_inspect playbin
       ;;
     gstav)
       command -v gst-inspect-1.0 >/dev/null 2>&1 \
-        && gst-inspect-1.0 libav >/dev/null 2>&1
+        && wf_gst_inspect libav
       ;;
     pixbuf)
       # gdk-pixbuf is a hard requirement of the binary itself, so if the app
@@ -74,6 +95,9 @@ wf_dep_ok() {
       ;;
     portal)
       [ -n "$(ls -A /usr/share/xdg-desktop-portal/portals 2>/dev/null)" ]
+      ;;
+    sevenzip)
+      command -v 7z >/dev/null 2>&1
       ;;
   esac
 }
@@ -101,10 +125,11 @@ wf_dep_packages() {
   case "$distro:$key" in
     fedora:ffmpeg)    echo "ffmpeg-free libavif libheif" ;;
     fedora:gstreamer) echo "gstreamer1-plugins-base gstreamer1-plugins-good" ;;
-    fedora:gstav)     echo "gstreamer1-plugins-bad-free gstreamer1-plugin-libav" ;;
+    fedora:gstav)     echo "gstreamer1-plugins-bad-free gstreamer1-plugins-bad-free-fluidsynth gstreamer1-plugin-libav" ;;
     fedora:pixbuf)    echo "gdk-pixbuf2 glycin-loaders" ;;
     fedora:gvfs)      echo "gvfs-smb" ;;
     fedora:portal)    echo "xdg-desktop-portal" ;;
+    fedora:sevenzip)    echo "7zip" ;;
 
     debian:ffmpeg)    echo "ffmpeg libavif-bin libheif1" ;;
     debian:gstreamer) echo "gstreamer1.0-plugins-base gstreamer1.0-plugins-good" ;;
@@ -112,6 +137,7 @@ wf_dep_packages() {
     debian:pixbuf)    echo "libgdk-pixbuf-2.0-0 glycin-loaders" ;;
     debian:gvfs)      echo "gvfs-backends" ;;
     debian:portal)    echo "xdg-desktop-portal" ;;
+    debian:sevenzip)    echo "p7zip-full" ;;
 
     arch:ffmpeg)      echo "ffmpeg libavif libheif" ;;
     arch:gstreamer)   echo "gst-plugins-base gst-plugins-good" ;;
@@ -119,6 +145,7 @@ wf_dep_packages() {
     arch:pixbuf)      echo "gdk-pixbuf2 glycin" ;;
     arch:gvfs)        echo "gvfs-smb" ;;
     arch:portal)      echo "xdg-desktop-portal" ;;
+    arch:sevenzip)    echo "7zip" ;;
 
     suse:ffmpeg)      echo "ffmpeg libavif16 libheif1" ;;
     suse:gstreamer)   echo "gstreamer-plugins-base gstreamer-plugins-good" ;;
@@ -126,6 +153,7 @@ wf_dep_packages() {
     suse:pixbuf)      echo "gdk-pixbuf glycin-loaders" ;;
     suse:gvfs)        echo "gvfs-backend-samba" ;;
     suse:portal)      echo "xdg-desktop-portal" ;;
+    suse:sevenzip)    echo "7zip" ;;
 
     *) echo "" ;;
   esac

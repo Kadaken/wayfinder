@@ -160,6 +160,9 @@ dialog. Checked: killing the backend by hand at 16:43 brought a fresh one up
 at 16:43:48 on the current build, and `install.sh --dry-run` prints the new
 step in the right order.
 
+That fix was itself dead code: see D-288. `pkill -x` cannot match a
+16-character process name, so the step never fired until 16 November 2026.
+
 ## D-278 — an update check could be answered from a cache (FIXED)
 
 16 November 2026. `wayfinder-update.json` is served with
@@ -171,3 +174,610 @@ is told there is nothing new. `fetch_manifest` now sends that header.
 Found alongside it: `scripts/run232.sh` passed only its first argument on, so
 the `-- CMD` mode ran nothing and printed xvfb-run's usage instead. It passes
 all of them now.
+
+## D-288 — the portal restart added for D-279 can never fire
+
+Found 16 November 2026, auditing W5.4 at 0.9.28. **FIXED the same day** — the
+pattern now matches the installed path and the installer says whether anything
+was stopped. Proven: the new pattern finds the live portal, pid 7258; the old
+one finds nothing.
+
+`packaging/install.sh:149` runs `pkill -x wayfinder-portal`. The name is 16
+characters; Linux truncates a process's `comm` to 15, so `-x` compares against
+`wayfinder-porta` and never matches. Proven on this machine: the running portal
+is pid 7258 with `comm=wayfinder-porta`, and `pgrep -x wayfinder-portal` exits
+1. pkill itself prints the warning and the installer swallows it with `|| true`.
+
+Effect: installing or upgrading leaves the OLD portal binary serving every
+application's file dialog until the user logs out. That is why INSTALL.txt has
+to tell people to log out.
+
+Fix: match the installed path, `pkill -f -- "$prefix/bin/wayfinder-portal"`,
+and report whether anything was signalled instead of discarding the result.
+
+## D-280 — --dry-run writes into the home directory
+
+Found 16 November 2026, auditing W5.4 at 0.9.28. **FIXED the same day** — the
+codec probe runs with XDG_CACHE_HOME pointed at a throwaway directory that is
+removed afterwards. Proven: --dry-run against an empty home now leaves 0 files.
+
+`install.sh --dry-run` says "print every step, change nothing". Run against an
+empty HOME it created `.cache/gstreamer-1.0/registry.x86_64.bin`,
+`.cache/mesa_shader_cache/` and `.cache/radv_builtin_shaders/`, because
+`packaging/dependencies.sh:57` runs `gst-inspect-1.0 playbin` to probe for
+codecs and GStreamer builds its registry as a side effect.
+
+Harmless caches, but the claim is false. Either skip the probe under --dry-run
+and say the feature check was skipped, or point `GST_REGISTRY` at a temporary
+file for the probe.
+
+## D-281 — the 0.9.28 GitHub release was never published
+
+Found 16 November 2026, auditing W5 and S9 at 0.9.28. **FIXED the same day** —
+assets replaced and the release published as latest.
+
+`gh release list` shows `Wayfinder 0.9.28  Draft  v0.9.28`. The newest public
+release is still 0.9.23. kadaken.com serves 0.9.28 and the in-app updater offers
+it, so anyone who goes to GitHub instead — which SECURITY.md and the download
+card both point at — sees a version five releases old. 0.9.24 to 0.9.27 have no
+release at all.
+
+## D-282 — the draft release's tarball is a different build from the served one
+
+Found 16 November 2026, auditing W5 at 0.9.28. **FIXED the same day** — both
+assets re-uploaded from dist/, 3,106,357 bytes, sha256 80ca5082…
+
+The asset attached to the draft is 3,105,966 bytes. The file served from
+kadaken.com, listed in `wayfinder-update.json` and in `download/SHA256SUMS`, is
+3,106,357 bytes — the rebuild made after the tag moved to `67b7ea1`. The
+release's `SHA256SUMS.txt` therefore states a checksum that no published file
+has. Fix: replace both assets from the artifact that was actually shipped.
+
+## D-283 — the download page carries no warning that it moves and deletes files (FIXED in source)
+
+Found 16 November 2026, auditing W6 at 0.9.28. Fixed in the site source the same
+day, not yet published.
+
+The rendered kadaken.com card says "Beta", "Nowhere near finished" and lists
+five things it cannot do yet. Searched the whole rendered page for delete,
+trash, overwrite, permanent, "your files": zero matches. A file manager in beta
+that moves, overwrites and deletes the user's files should say so above the
+download button, not only in the app. The release audit asks for an
+alpha warning AND a destructive-scope warning; only the first is there.
+
+Fixed: `index.html` now carries a "Read this before you download it" box
+directly above the download button -- that it moves, copies, renames and
+deletes real files and is beta; that Ctrl+Z undoes most of it and Delete goes
+to the desktop Trash while Shift+Delete erases with nothing to bring it back;
+to have a backup of anything irreplaceable first; and that it installs under
+~/.local for one user and never asks for root.
+
+## D-284 — 20 dead-code items ship in wayfinder-native, one whole feature among them
+Status: Open (found by K1.3 at 0.9.28, 16 Nov 2026)
+
+`cargo clippy --release --bins --all-features -- -D warnings` reports 20
+never-used items in the native binary. Most are small, but six of them are the
+complete helper set for D-242's hand-installed-software convention —
+`install_dir`, `looks_like_an_app_tree`, `is_executable_file`,
+`appimage_desktop_entry`, `config_install_convention` and the `AppTree`
+variant. They are defined in native_core.rs, they have tests, and native.rs
+calls none of them. The code and its tests ship; the user cannot reach the
+feature.
+
+Why it matters: a passing test on unreachable code reads as coverage and is
+not. Either the feature gets wired into the user interface or the helpers and
+their tests come out. It is not a crash and it is not a security fault, so it
+does not block 0.9.28, but it must not survive another release unanswered.
+
+## D-285 — a config that will not parse is replaced by defaults, silently
+Status: FIXED 17 Nov 2026 with D-297 (damaged file moved to .corrupt, read falls back to .bak)
+
+`load_config` (native.rs:1876) ends in `.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()`.
+Any parse failure — one bad field, a truncated write, a config written by a
+version that did not yet have `favorites`, `recents`, `show_hidden`,
+`view_mode`, `search_in_files`, `sort_key` or `sort_ascending`, none of which
+carry `#[serde(default)]` — throws the whole file away and starts from
+defaults. Favourites, recents, remembered networks and every view setting go
+with it, and nothing is said. The next write then overwrites the file that
+could have been repaired.
+
+The fix is two parts and neither is large: `#[serde(default)]` on every field
+so a partial config keeps what it has, and on a genuine parse failure move the
+bad file aside (native-config.json.unreadable) and say so in the status line
+instead of overwriting it.
+
+## D-286 — uninstall leaves Wayfinder named as the folder handler
+Status: Open (found by S14 at 0.9.28, 16 Nov 2026)
+
+install.sh runs `xdg-mime default com.kadaken.wayfinder.desktop inode/directory`
+(packaging/install.sh:338) and `--uninstall` never undoes it. After an
+uninstall the user's mimeapps.list still names a .desktop file that no longer
+exists as the handler for folders. The uninstall already does the equivalent
+repair for portals.conf, keeping a .bak, so the pattern to follow is in the
+same script.
+
+## D-287 — the app is dark on every desktop, including a light one
+Status: Open (found by S18.4 at 0.9.28, 16 Nov 2026)
+
+`connect_startup` sets `adw::ColorScheme::PreferDark` unconditionally
+(src-tauri/src/native.rs:3800). The system light/dark preference is never read,
+so a user on a light desktop gets a dark file manager with no way to change it,
+and "light and dark without a restart" cannot be answered yes. ColorScheme::
+Default would follow the desktop. Whether Wayfinder should follow the desktop
+or stay dark on purpose is a decision, not a bug — but it must be a decision
+somebody made, not a line nobody revisited.
+
+## D-289 — the fix this release exists for has no test
+Status: FIXED 17 Nov 2026 -- TESTED. `sidebar_tree_reads_never_block_the_window_d289` in the GTK suite: a read held shut on a channel does not stop the main loop, is asked once, lands in the cache when released; same for the drive probe. Mutation-checked (removing the pending guard fails it). Not covered: a real hung Drive mount; the D-278 Cache-Control header test is still not written.
+
+D-272 is the only entry in the 0.9.28 changelog and nothing in the suite
+covers it. The id appears in four comments (native.rs:2241, 2244, 6837, 6882)
+and in no test; no test function touches `tree_children`, `tree_openable` or
+`tree_pending`. The next person to make the sidebar synchronous again brings
+the 21-minute freeze back and every one of the 475 tests still passes.
+
+The test that would cover it, inside `gtk_headless_suite` where a real
+AppState and a real main loop already exist: call `ensure_tree_children` on a
+real directory, assert the first call returns nothing and leaves the path in
+`tree_pending`, iterate the main loop until the worker lands, then assert the
+second call answers from `tree_children` and dispatches no second worker. The
+same shape proves `dir_has_subdirs_async` for `tree_openable`, including that
+a drive is drawn as openable while the probe is in flight.
+
+Second, smaller: D-278's `Cache-Control: no-cache` header (update.rs:168) is
+asserted by nothing. Extracting `fetch_manifest`'s curl argument list into a
+function that returns it makes that a one-line assertion.
+
+## D-290 — the config ignores XDG_CONFIG_HOME
+Status: FIXED 17 Nov 2026 -- TESTED. `config_path_from` honours an absolute, non-empty XDG_CONFIG_HOME; `adopt_legacy_config` copies the old $HOME/.config file across once, never over newer settings. 2 tests, mutation-checked. Not covered: a real upgrade from 0.9.27 with XDG_CONFIG_HOME set.
+
+`config_path()` (src-tauri/src/native.rs:1867) builds
+`$HOME/.config/wayfinder/native-config.json` from `HOME` alone. The XDG base
+directory spec says use `XDG_CONFIG_HOME` when it is set and non-empty, and
+fall back to `$HOME/.config` only when it is not. Proven: a run with
+`XDG_CONFIG_HOME` pointing at a prepared directory ignored the config sitting
+there, created a fresh default one under `$HOME/.config`, and wrote to that.
+
+Anyone who sets `XDG_CONFIG_HOME` -- which is the usual way to keep a home
+directory tidy, and what a container or a sandboxed launcher does -- has their
+settings written outside it and silently starts from defaults.
+
+Fix: honour the variable when set and non-empty, keeping `$HOME/.config` as
+the fallback. One function; `read_config_at` and `update_config_at` already
+take a path, so nothing else changes.
+
+## D-291 — keyboard focus is invisible
+Status: FIXED 17 Nov 2026 -- TESTED. `:focus-visible` draws a 2px @wf_accent_hover ring (3.6:1 or better on every surface; the first colour tried was 2.91:1 and failed). Test reads the colours from the stylesheet; mutation-checked. Not covered: a look at it in the live window, and focus inside popovers and dialogs.
+
+The stylesheet's only focus rule removes the indicator:
+
+    button:focus, button:focus-visible,
+    row:focus,    row:focus-visible { outline: none; box-shadow: none; }
+
+Nothing adds one back, so a keyboard user tabbing through the toolbar cannot
+see where they are. WCAG 2.1 2.4.7. The rule was almost certainly written to
+kill GTK's dotted ring on a mouse click, which is what `:focus-visible`
+already handles on its own: dropping `:focus` from the selector and styling
+`:focus-visible` with a 2px accent outline gives a ring for the keyboard and
+none for the mouse.
+
+## D-292 — every context menu is pointer-only
+Status: Open (found by S12 at 0.9.28, 16 Nov 2026)
+
+Context menus are opened by `GestureClick` on button 3 / BUTTON_SECONDARY
+(native.rs:6370, 6556, 8224 and the sidebar). No handler exists for the Menu
+key or Shift+F10 -- `Key::Menu` appears nowhere -- so an action that lives
+only in a context menu is unreachable without a mouse. The operations that
+also have a shortcut (copy, cut, paste, rename, delete) are fine; the rest are
+not.
+
+## D-293 — five text roles are below the contrast minimum
+Status: Open (found by S12 at 0.9.28, 16 Nov 2026)
+
+`@wf_text_muted` (#6b7079) gives 3.39:1 on the listing background and 3.04:1
+on a raised pane, against the 4.5:1 WCAG 2.1 1.4.3 asks for normal-size text.
+It is used at 11 to 14px for the sidebar headings, the sidebar detail line,
+the empty-folder placeholder, the empty-preview text and the menu accelerator
+labels, so the large-text exemption does not apply. Disabled buttons also use
+it, and those are exempt.
+
+Lifting it to about #8b909a, which is already defined as `@wf_text_dim` and
+measures 5.26:1 on the same background, clears all five. The pane hairline
+(#3a3f49 on #1b1d22, 1.60:1) is a separate, weaker case: 1.4.11 wants 3:1 for
+a boundary that carries meaning, and this one is draggable.
+
+## D-294 — nothing sets an accessible name
+Status: Open (found by S12 at 0.9.28, 16 Nov 2026)
+
+No call to `update_property`, `AccessibleProperty` or `set_accessible` exists
+in the binary -- zero, searched by name -- while 12 buttons are icon-only.
+A screen reader is left with 18 tooltips and the icon names. Each icon-only
+button needs one `update_property(&[gtk::accessible::Property::Label("...")])`
+beside the tooltip it already has.
+
+## D-296 — the site terms contradict the licence Wayfinder ships under (FIXED in source)
+Status: fixed in the site source 16 Nov 2026, not yet published
+
+`terms.html` on kadaken.com is headed "For Crews and other Kadaken software"
+and forbids, without written permission: redistributing the software "in whole
+or in part, original or modified ... including mirrors, re-uploads, bundles,
+app stores, package repositories and forks"; modifying, adapting, translating
+or creating derivative works; and reverse engineering.
+
+Wayfinder ships under GPL-3.0-or-later -- declared in `src-tauri/Cargo.toml`,
+in the metainfo's `<project_license>`, and as the full GPLv3 text in `LICENSE`
+inside the tarball. The GPL grants every one of those rights to everyone, and
+section 10 forbids adding further restrictions to them. A reader who takes the
+terms page at its word believes they may not do what the licence in the
+download explicitly permits.
+
+Fix: one paragraph on that page naming Wayfinder, stating that it is released
+under GPL-3.0-or-later and that its own licence governs it, as the page
+already does for the engine ports. Changing Wayfinder's licence is not an
+option for versions already published -- a GPL grant cannot be withdrawn after
+the fact.
+
+Fixed: `terms.html` now carries a third notice, beside the one for the engine
+ports -- "Wayfinder is open source", naming GPL-3.0-or-later, stating that its
+own licence governs it and that the restrictions on that page do not apply to
+it, linking the source. The page's opening line now reads "For Crews and other
+Kadaken software that is not released under an open-source licence" and is
+dated 16 November 2026. the owner changed his position on 16 November 2026: his
+software can be open source. Not published yet.
+
+## D-295 — two caches added in 0.9.28 never let go
+Status: FIXED 17 Nov 2026 -- TESTED. `TreeCache` (native_core.rs) caps at 400, forgets a branch when closed, forgets a folder and its parent on refresh or monitor scan, clears on the hidden-files toggle. 5 unit tests, cap and forget mutation-checked. Not covered: an outside change to a folder that is not the open one (needs the file monitors deferred to 0.9.29).
+
+`AppState::tree_children` and `AppState::tree_openable` (native.rs:2240, 2247)
+are the D-272 fix: the sidebar's directory reads are answered once and
+remembered. Nothing ever removes an entry. No `.remove`, no `.clear`, no size
+cap -- searched by name. A window that browses a deep tree all day keeps a
+path String and a Vec of child tuples for every branch it ever expanded, for
+as long as the window lives.
+
+Every other growing collection in `AppState` is bounded: `recents` and
+`recent_files` truncate to 12 (native.rs:2005, 2019), `undo_stack` and
+`redo_stack` drain down to 100 (13648, 13658), grid thumbnails stop at 60 with
+2 decodes at a time. These two are the exception.
+
+It is small per entry and it is not a leak in the C sense -- it is freed when
+the window closes -- but it is the only unbounded cache in the program and it
+is one line of eviction away from not being one. It also goes stale: a folder
+whose children changed outside the app keeps its old answer until the entry is
+replaced.
+
+## D-297 — the config is replaced without fsync, on btrfs, and a bad read resets it
+Status: FIXED 17 Nov 2026 -- TESTED. fsync of file and parent, per-process temp name, .bak of the last good file, damaged file moved to .corrupt, read falls back to .bak. Not covered: a real power cut or disk-full (needs root).
+
+`update_config_at` (native.rs:1899) writes `native-config.json.tmp` and renames
+it over the real file. There is no `sync_all` or `sync_data` anywhere in the
+product -- zero hits across `native.rs` and `native_core.rs`. the owner's `/home` is
+btrfs.
+
+Write-then-rename is only atomic once the data is on disk. ext4 has flushed
+delayed allocations before a rename since 2.6.30; btrfs makes no such promise
+without an fsync of the file, and the directory entry needs its own. So a power
+cut or a hard reset shortly after a settings change can leave a zero-length or
+truncated `native-config.json`.
+
+What makes that worse than a lost setting: `load_config` (native.rs:1876) ends
+`.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()`, which is
+D-285. A truncated config does not report anything -- it silently becomes the
+default, so every favourite, bookmark and view choice is gone with no message.
+
+Unproven: the btrfs ordering claim has not been tested here, and no crash was
+staged. Aragon's review argues the write path matters less than the read path,
+and that is right: whatever the filesystem guarantees, the next setting change
+after a damaged read calls `update_config_at`, which has already replaced the
+config in memory with the defaults, and writes those defaults over the damaged
+file. A recoverable hiccup, or a hand-edited JSON typo, becomes permanent.
+
+Fix, all four parts: `sync_all()` on the tmp file and on the parent directory
+before the rename, so the guarantee does not depend on which filesystem this
+is; keep the previous good file as `native-config.json.bak`; on a parse
+failure move the damaged file to `native-config.json.corrupt` and read the
+`.bak` instead of returning defaults; and say so in the window rather than
+starting empty in silence.
+
+## D-298 — two GTK tests can never share one process, and the cause is measured
+Status: Open (proven 16 Nov 2026, after Aragon's review)
+
+`cargo test --release --features guide --bins -- --test-threads=1` reports
+`gtk_headless_suite` (native.rs:21617) panicking "Attempted to initialize GTK
+from two different threads". It was assumed to be an ordering limit with no
+fix but running the suite alone.
+
+Measured instead: Rust's own test harness spawns a fresh OS thread for every
+`#[test]` even at `--test-threads=1`. A three-test probe crate printing
+`thread::current().id()` under `--test-threads=1 --nocapture` printed
+ThreadId(2), ThreadId(3), ThreadId(4) -- one per test. `gtk4-rs` records the
+thread that first called `gtk::init()` and panics for any other thread, and 40
+test functions call it, so the 41st always loses.
+
+So `cargo test --bins`, the command the release audit prescribes, cannot pass
+by construction, and W4 needs two invocations.
+
+The fix, and it is not a split binary: one process-wide GTK thread created
+once through a `OnceLock`, calling `gtk::init()` and owning the main context
+for the life of the test binary, plus a `with_gtk(|| ...)` helper that
+dispatches a closure to it over a channel, catches the panic with
+`catch_unwind` and rethrows it on the harness's thread. Cost is honest: about
+40 lines of harness and 40 mechanical test edits, not 25 lines.
+
+## D-299 — two processes write the config through one fixed temp file
+Status: FIXED 17 Nov 2026 -- TESTED. Per-process temp name plus an exclusive lock on native-config.json.lock around the whole read-change-write; the eight-thread test fails 3 of 3 runs with the lock removed. Not covered: two real processes (the test uses threads, which take the same kind of lock).
+
+`update_config_at` (native.rs:1899) writes `path.with_extension("json.tmp")`
+-- a single fixed name, no PID, no nonce, no `flock`. There are 24 write sites.
+
+The main window is single-instance, but `--pick` is deliberately NON_UNIQUE,
+so a picker process runs beside it, and `push_recent_file` (native.rs:7163) is
+one of the 24. Two processes writing at once interleave into the same
+`native-config.json.tmp`, and whichever renames last puts whatever that file
+then holds over the live config. The loser's `rename` can also fail with
+ENOENT, which is discarded: the line is `let _ = fs::rename(&tmp, path)`.
+
+Interleaved JSON reaches the live config, and `load_config` (native.rs:1876)
+turns an unparseable config into `Default::default()` with no message -- D-285
+and D-297. So this is a data-loss path that needs no power cut.
+
+Fix: write to `native-config.json.<pid>.tmp` and keep the rename, which is
+already atomic, and take D-297's `.bak` plus quarantine so a damaged file is
+never silently replaced by defaults.
+
+## D-300 — every background read shares one bounded thread pool
+Status: Open (code confirmed 16 Nov 2026, behaviour unproven)
+
+D-272 was fixed by moving the sidebar's blocking reads off the GTK thread with
+`gio::spawn_blocking`. There are 10 `gio::spawn_blocking` sites in native.rs
+and they all hand work to the same pool GLib keeps for `GTask`, which is
+capped -- 10 threads by default:
+
+    6743  SMB lookup
+    6869  list_subdirs, the sidebar branch
+    6905  dir_has_subdirs, the drive arrow probe
+    9061  drop receive
+    10772, 10925, 16655, 16728  thumbnails and previews
+    16546  the folder listing
+
+A mount in uninterruptible kernel sleep cannot be cancelled or killed until
+its driver times out, and D-272's own report was 22 minutes. Enough wedged
+probes occupy the whole pool, and then the folder listing and the thumbnails
+have nowhere to run: the window answers, but nothing loads. The freeze this
+release exists to fix comes back by a different route.
+
+Unproven: no wedged mount was staged. What is certain from the code is the
+shared pool and the absence of any per-mount limit or circuit breaker.
+
+Fix: a probe pool of its own, separate from listing and thumbnails, plus one
+in-flight probe per mount and a remembered failure so a dead mount is not
+retried on every sidebar rebuild.
+
+## D-301 — a real Cancel through the real portal reports error, not cancelled
+Status: FIXED 17 Nov 2026 -- the Cancel path was never at fault; the timeout
+now names itself and the test deadline matches production (120s)
+
+What was measured on 17 Nov, after the first failure:
+
+* The cancel driver run by hand under its own Xvfb exits `1` and leaves a
+  zero-byte result file -- exactly what `read_result_strict` reads as
+  `EmptyCancel`.
+* The test run alone passes, and a probe inside the portal printed
+  `exit_code=Some(1) status_none=false result=Ok("")` -- 1 passed, 61.67s.
+* All three `native_picker_real` tests run together pass, probe printing a
+  real exit code and result for each -- 3 passed, 173.75s.
+
+So the picker, the exit code, the result file and the parser are all clear.
+The only remaining way to reach the reported `2` is `wait_with_deadline`
+returning `None`: the child outlived the 30 seconds the test gives it and was
+killed. The failing run was the whole suite under load; the production
+deadline is 120 seconds (portal_service.rs:362), the test's is 30
+(portal_service.rs:4529 area).
+
+The real defect underneath: a timeout and a malformed result are reported
+identically, as `ChooserOutcome::Failed`, so a slow machine and a broken
+picker are the same line of output and neither says which it was.
+
+`portal_service::tests::native_picker_real_cancel_through_exported_open_file`
+fails in the shipped feature configuration -- no `--features guide` -- with
+
+    assertion `left == right` failed: real Cancel must report cancelled
+      left: 2   right: 1
+
+Response 2 is RESPONSE_OTHER, the catch-all failure. The run was
+`scripts/run232.sh -- cargo test --release --bin wayfinder-portal --
+--test-threads=1 native_picker_real`: 2 passed, 1 failed, 188.56s.
+
+The same run proves the save path is fine without `guide`:
+`native_picker_real_save_through_exported_save_file` passed here and failed
+only in the earlier `--features guide` run. `guide` is not in the shipped
+binary (`default = []` in src-tauri/Cargo.toml), so that one is a feature-only
+fault; this one is not.
+
+Cancel is reported only when both halves hold (portal_service.rs:626):
+
+    Some(1) => match read_result_strict(&result_path) {
+        Some(ParsedResult::EmptyCancel) => ChooserOutcome::Cancelled,
+        _ => ChooserOutcome::Failed,
+    },
+
+so either the picker child did not exit 1, or its result file is not the
+empty-cancel shape. The driver clicks the real Cancel button once the window
+is mapped (native.rs:5136) and breaks out of its poll immediately after:
+
+    if cfg!(feature = "picker-test-driver-cancel") {
+        if let Some(cancel) = ui.picker_cancel.clone() { cancel.emit_clicked(); }
+        return glib::ControlFlow::Break;
+    }
+
+If `ui.picker_cancel` is None the poll breaks having clicked nothing, and the
+30-second deadline then produces exactly this failure. Unproven either way: the
+child's exit code and its result file have not been read.
+
+Whether this is a defect in the Cancel path itself or in the test driver is
+undecided, and it decides whether 0.9.28 can ship.
+
+## D-302 — an open window keeps showing a folder that has been renamed
+Status: Open (seen live 17 Nov 2026, cause read from the code, unproven)
+
+`/home/user/Downloads/Aragon Exchange` was renamed to `Argon Exchange` while a
+window had it open. The window went on listing the old names, the breadcrumb
+went on reading `Aragon Exchange`, and opening the subfolder it was showing
+failed with "Cannot open /home/user/Downloads/Aragon Exchange/Aragon Replies:
+No such file or directory (os error 2)". The listing was stale and the window
+never said so.
+
+The monitor watches the inode, so it is still alive after its own folder is
+renamed, but the handler at native.rs:9124 compares `state.cwd` with the path
+it was installed on:
+
+    if state.borrow().monitor_generation != monitor_generation
+        || state.borrow().cwd != watched { return; }
+
+Both are the old path string, so they match, and the rescan that follows reads
+that old path, which no longer exists. A failed rescan leaves the previous
+listing on screen.
+
+Two things are wrong, not one: the window does not learn its own folder has
+moved, and a rescan that fails with ENOENT shows nothing at all -- the user
+has to find out by clicking a row and reading an error.
+
+Fix: watch for the folder's own move. `monitor_directory` is installed with
+`FileMonitorFlags::NONE` (native.rs:9095) while the other monitor in the
+program uses `WATCH_MOVES` (native.rs:3687). With moves watched, follow the
+new path and update `cwd` and the breadcrumb; and when a rescan fails with
+ENOENT, say so in the window instead of keeping a listing that is a lie.
+
+## D-303 — the Modified column is written once and never ticks
+Status: FIXED 17 Nov 2026 (ticker + tooltip; the two-minute "Just now" bucket kept on his call)
+
+`fmt_modified` runs when a row is built (native.rs:9847) and nothing re-runs
+it. A window left open shows the ages it had at load: "Just now" stays "Just
+now" for an hour, and nothing on screen moves until the user presses refresh.
+
+Two smaller faults in the same column:
+
+* `JUST_NOW_MINUTES = 2` (native_core.rs:5059), so "Just now" covers anything
+  under two minutes and the next label is "2 min ago" -- "1 min ago" can never
+  appear. The label is accurate and the bucket is simply wider than the words
+  suggest.
+* Rows that share a label cannot be told apart. The sort is on the real
+  timestamp, so the order on screen is already exact, but seven rows all
+  reading "27 min ago" give the eye nothing, and there is no tooltip carrying
+  the real time.
+
+Fix: re-render the Modified column on a 30-second timer (the text only, not
+the listing), narrow "Just now" to under 60 seconds so "1 min ago" exists, and
+put the full local date and time in the row's tooltip.
+
+## D-304 — a hostile filter pattern hung the file picker (found by W2, attack 7)
+FIXED, TESTED. `glob_match` tried every way to split the name for each `*`, so
+40 `*a` segments against a 200-character miss never finished (killed at 560 s).
+It now remembers failed states: cost is pattern length times name length.
+Test: `glob_match_with_many_stars_finishes_fast_on_a_miss` (0.00 s).
+Not covered: `mime_match`, which does no pattern search.
+
+## W2 — hostile run at the portal's D-Bus arguments
+TESTED for attacks 1, 2, 3, 5, 6, 7 (`hostile_w2` module, `portal_service.rs`);
+mutation-checked (two guards disabled, two tests failed). Added: control and
+bidi characters refused in `current_name`, `SaveFiles` names and choice labels;
+caps of 255 bytes per name, 4096 per path, 128 filters, 512 rules per filter,
+32 choices, 256 options per choice. `title` and `accept_label` are never read
+by the portal, so they never reach the screen.
+NOT covered: attack 4 (symlink / dotfile pre-selection is picker behaviour, not
+decoder behaviour) and attack 8 (the portal ignores the request handle and
+exports no `Request` object, so `Close()` and a reused handle are untested).
+
+## D-305 — the portal served one request at a time and had no Request.Close() (W2 attack 8)
+FIXED, TESTED. The three methods were blocking, so while one app's dialog was
+open every other app's request waited behind it, and a `Close()` could not be
+heard. They are now async: the pick runs on its own thread (`blocking::unblock`),
+each request exports `org.freedesktop.impl.portal.Request` at its handle, and
+`Close()` kills the picker and answers the call as cancelled (response 1). A
+handle already in use is refused (response 2), never replaced. Added the
+`blocking = "1"` dependency (already in the lock file via zbus).
+Tests: `dbus_request_close_cancels_a_pending_openfile_and_removes_the_object`,
+`dbus_a_second_request_is_served_while_the_first_is_open`,
+`dbus_a_reused_handle_is_refused_and_leaves_the_first_request_alone`,
+`child_wait_cancel_kills_a_running_picker_at_once`; mutation-checked (Close made
+a no-op: two tests failed). Not covered: a Close sent by the real
+xdg-desktop-portal frontend (tests send it from a plain bus client), and
+attack 4 (symlink / dotfile pre-selection).
+
+## D-306 — a Save onto a symbolic link hid where the file would really go (W2 attack 4)
+FIXED, TESTED. The picker asked "Replace?" only when `exists()` was true, and
+`exists()` follows links: a link to another folder's file showed only the link's
+name, and a dangling link got no question at all. `picker_save_confirmation`
+now asks for any link and names where it leads. A Save already needs an
+explicit Save click or Enter, and an existing file already needed Replace.
+Test: `save_onto_a_link_names_where_it_leads_d305`; mutation-checked (link
+branch disabled: the test failed). Not covered: the picker does not refuse to
+open in a hidden folder such as `.ssh`; the Replace question is the control.
+
+## D-324 — a damaged "mp3" or "gif" gave no reason; blank preview pane on Storage (cause UNPROVEN)
+PART FIXED, TESTED; blank pane UNPROVEN. Reported twice: `Storage/Old Hard Drive/Audio/SFX/f33058132.mp3`
+(via `--select`) and `.../songs/TRACK02.wav` (click) showed a completely blank right pane.
+Headless (xvfb) with the real folders, the real config and a 1700-file folder could NOT
+reproduce it: the target is highlighted and the audio box shows (stack "audio", title set).
+Live process (/proc): main thread idle, a WAV playbin loaded, so the player opened; the
+failure looks visual or state in the live Wayland window, not decoding. Not fixed.
+Fixed: files whose bytes are not what the name says now show one line naming the real
+type ("This file is actually a GIF image, not a .mp3 audio file.", "Empty file ...",
+"Unreadable data ..."). `native_core::sniff_real_type`, `damaged_file_reason`,
+`not_audio_reason`; used by `set_preview_audio` and the `set_preview_image` failure branch.
+Tests: `sniff_names_the_real_type_d324`, `damaged_reason_is_one_line_naming_the_real_type_d324`,
+`damaged_files_say_what_they_really_are_d324`, `select_big_folder_audio_preview_d324`.
+Not covered: live Wayland rendering; the --select highlighting of the wrong row seen live.
+Follow-up (same day, coordinator live reports A: wrong row selected, B: black video pane): NOT reproduced.
+- Warm live launches on the d324 build (`--select` VideoCompressor/20221015_205310.mp4, Audio/.../Basil and Binkies.mp3) selected the right row; the video pane showed a frame (duration 0:24) a few seconds in.
+- Headless, real files: the `--select` target is selected; the video stream is prepared in about 2.2 s, paintable 1080x1920, no error. Ignored probes: `d324_probe_video_select` (WF_PROBE_FILE), `d324_sweep_real_audio` (WF_SWEEP_DIRS).
+- Sweep of Old Hard Drive/Audio, SFX, songs (headless, read-only): every audio file shows its title and either a working Play bar or the damaged-file line; 0 blank panes.
+- Only live-only clue: journal lines `pixman_region32_init_rect: Invalid rectangle passed` (10 at a time) at 18:30, 20:07 and 20:21 in wayfinder processes; 20:21:52 is when TRACK02.wav showed blank. Some widget gets an invalid size; not located. Needs a live capture while the pane is blank.
+
+## D-325 — Wayfinder froze (main thread 100%) on a list-row click; focus left in the preview pane
+FIXED, TESTED (headless); the exact live trigger is UNPROVEN. Core `wf-freeze.596993`: `gtk_gesture_click_begin -> gtk_list_item_widget_grab_focus -> gtk_window_root_set_focus -> synthesize_focus_change_events -> gtk_widget_get_parent -> g_log`, looping (gtk4 4.22.5). The old focus widget was stale. `update_preview` swapped pages and rebuilt or emptied children (folder rows, audio and video controls, `set_preview_folder` removes its focusable buttons) with focus still inside the pane. Fix: `release_preview_focus` (native.rs, before `update_preview` dispatches) moves focus to the file view first. Test `preview_focus_survives_selecting_another_row_d325` failed before the fix (focus stayed in the pane) and passes after; it also fails on any GTK warning or critical. Not covered: the live freeze was never reproduced, so which widget held the focus is not known; focus moved by other code paths (popovers, inline rename editors) is untouched.
+
+## D-326 - preview pane stuck blank in one window while another window works
+- Cause: `PREVIEW_GENERATION` (native.rs, thread_local) was one counter for every window in the process. Any preview update in window B (folder refresh, selection) bumped it, so window A's still-decoding picture was dropped by the D-253/D-268 guard and A stayed on "Opening preview" / blank.
+- Fix: per-window `Ui.preview_generation`; `next_preview_generation(ui)`; all async guards compare the window's own counter.
+- Test: `a_preview_in_one_window_does_not_cancel_another_windows_d326` (failed before, passes after).
+- Not proven: that this was the live trigger (cut pending path not involved; no early return found that explains it alone).
+
+## D-327 — MIDI files had no Play button (18 Nov 2026)
+- Symptom: the owner's own songs (`song1.mid`...`lara2.mid`) showed no player in the preview.
+- Cause: `mid/midi/kar/rmi` were not in `AUDIO_EXT`, and the GStreamer MIDI decoder (fluiddec) was not installed.
+- Fix: added the four extensions to `AUDIO_EXT`, RIFF `RMID` to `sniff_real_type`, and `gstreamer1-plugins-bad-free-fluidsynth` to the Fedora deps.
+- Verified: GtkMediaFile plays lara2.mid, song9.mid, lara2.rmi (timestamp advances, no error); the live preview shows the player and counts up.
+- Length fix (second part): GStreamer reports no MIDI length. `native_core::midi_duration_secs` (native_core.rs, after `is_video_path`) reads the file (16 MiB cap), unwraps RIFF RMID, parses the SMF header and every track with tempo changes, running status, sysex and meta events, formats 0/1/2, SMPTE division; None on malformed input. `AudioPlayer::open` stores it (`computed_secs`) and `duration_secs()` falls back to it (audio_preview.rs), so the label and seek bar use it with no UI change.
+- Seeking: probed, it WORKS (position 1.31 s, after seek to 30 s it read 31.33 s). So the bar is real, not hidden.
+- Tests: `midi_duration_tests` (7: plain, RMID, tempo change, running status+sysex, truncated/garbage, extension case, 10 real songs against their wavs), `midi_length_comes_from_the_file_and_seeking_works` (audio_preview.rs), `midi_preview_shows_its_length_and_seeks_d327` (native.rs).
+- Real songs: MIDI length is consistently 2.7-2.9 s shorter than the fluidsynth wav render (the wav has a tail), e.g. lara2 68.32 vs 71.08.
+- Not covered: type 2 files with real multi-song use; the live Wayfinder window was not driven.
+- Baseline fix made on the way: `a_drive_row_accepts_a_drop_d318` failed before any change here (the sidebar rebuilt under the test); the test now waits for the first scan, overrides the scan and settles before acting. It also stopped the Trash and `gtk_headless_suite` failures that followed it.
+
+## D-328 — `--select <folder>` sometimes shows no window in front (18 Nov 2026)
+- 4 tries: `--select Storage/Images` and `--select Storage` showed nothing in front and logged no wf-event; `--select Images/Animals` and a repeat `--select Images` worked.
+- Plain `wayfinder <folder>` worked first time. Not reproduced or diagnosed yet.
+- Cause found: `gtk_launch_args` turned `--select X` into plain `X`, so a folder opened INSIDE itself and was never highlighted (`select_path_from_files` keeps files only). A missing path opened nothing useful.
+- Cause NOT reproduced: the missing window. `present()` is always called in `build_ui_in`; 5 forwarded launches under a private bus all produced a window. Unproven hypothesis: on Wayland a forwarded launch carries no activation token, so the compositor refuses to raise the window (it exists but is behind).
+- Fix: `gtk_launch_args` appends the marker `x-wayfinder-select://marker` when `--select` had a value; `launch_from_files` (native.rs, before `connect_open`) sees it and uses `native_core::select_launch_target`: existing path opens its parent with it selected; missing path opens the nearest existing ancestor; root opens itself.
+- Tests: `select_launch_tests` (native_core.rs, 4), `select_adds_the_marker_and_a_plain_launch_does_not_d328`, `launch_from_files_reads_the_marker_d328`, `select_launches_always_open_a_window_d328` (native.rs), and `scripts/test-select-forwarded.sh` (running instance plus 5 forwarded launches on a private bus and Xvfb; each must add a window).
+- Not covered: Wayland raise/focus (Xvfb has no focus stealing prevention), so the actual "behind other windows" case is unproven.
+
+## D-329 - .MOV preview and poster (18 Nov 2026)
+- Checked, no defect found: `101_0823.MOV` and `MISC/.../IMG_0022.MOV` show the "media" stack, the stream prepares with no error, and the grid poster paints a frame.
+- Tests: `real_mov_files_preview_and_get_a_poster_d329` (skips if the drive is absent), `mov_extension_is_case_insensitive_d329`.
+- Not covered: other codecs; the live window; playback to the end.
+
+## Builder status (18 Nov 2026)
+- D-327 length gap: DONE (midi_duration_secs, seek works). Files: src-tauri/src/native_core.rs, audio_preview.rs, native.rs (test, plus d318 test fix). Left: nothing known.
+- D-328: PARTIAL. Window-count and nearest-parent fixes DONE and tested; the missing window itself was never reproduced (Wayland focus hypothesis unproven). Files: native.rs, native_core.rs, scripts/test-select-forwarded.sh. Left: a test on a real Wayland session.
+- D-329 .MOV: DONE as a check, no defect found; two tests pass. Files: native.rs. Left: nothing.
+- Final full-suite run was started and not confirmed; clippy not run; release build done before the .MOV test (binary passes the forwarded-launch script).
+
+## Session stop 18 Nov 2026 (usage limit)
+- Final full suite was ~382/442 when stopped; log: /tmp/claude-1000/-home-user/2750af87-99c8-4b99-968a-17702775fa0d/scratchpad/final.log (may be cleared on reboot).
+- Failing so far, both also failing at baseline: tests::gtk_headless_suite, tests::pasted_copy_reciprocal_round_trip_and_fail_closed. Not diagnosed.
+- TODO next session: re-run full suite; then run the dbus-update-activation-environment reset (project_wayfinder_sandbox_poisons_portal); diagnose the 2 failures; install target/release/wayfinder-native to ~/.local/bin/wayfinder via .new + mv; commit.
+- FINAL: suite 436 passed / 3 failed / 3 ignored (baseline 416/5/3). Failing, all pre-existing: gtk_headless_suite, pasted_copy_reciprocal_round_trip_and_fail_closed (native.rs:18909), restore_each_puts_a_really_trashed_file_back_where_it_came_from (native.rs:18426). D-Bus env reset done after the suite. Release binary predates the .MOV test; rebuild before install.
+- 19 Nov 2026: fixed the 3 failures. gtk_headless_suite must run via scripts/run232.sh; its helpers now dismiss the D-320 transfer-report dialog (close() and question()). REAL_TRASH_TEST_LOCK users recover a poisoned lock. Main tests 438 pass / 0 fail / 3 ignored; gtk_headless_suite passes. portal_service routing_bypass_* and d236 time out at random (3-5 per run, different set each run, also on HEAD) — pre-existing, open. Clippy 0 errors, 60 warnings. Installed to ~/.local/bin/wayfinder; previous binary at wayfinder.pre-d328. Not committed.

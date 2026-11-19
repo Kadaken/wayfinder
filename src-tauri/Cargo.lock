@@ -1564,6 +1564,7 @@ dependencies = [
 name = "wayfinder"
 version = "0.9.28"
 dependencies = [
+ "blocking",
  "gdk-pixbuf",
  "gdk4-wayland",
  "gstreamer",

@@ -96,12 +96,22 @@ window.wayfinder-window {
     font-size: 13px;
 }
 
+/* D-291: the old rule removed the indicator everywhere, so a keyboard user
+   could not see where they were. `:focus-visible` is set by GTK only for
+   keyboard focus, so the mouse still gets no ring and the keyboard gets a
+   2px accent one. Inset (negative offset) so a row's ring is not clipped by
+   the list edge. */
 button:focus,
-button:focus-visible,
-row:focus,
-row:focus-visible {
+row:focus {
     outline: none;
     box-shadow: none;
+}
+button:focus-visible,
+row:focus-visible,
+entry:focus-visible,
+.wf-list row:focus-visible {
+    outline: 2px solid @wf_accent_hover;
+    outline-offset: -2px;
 }
 
 .wf-titlebar {
@@ -583,6 +593,12 @@ scrollbar slider:active {
     color: #ffffff;
 }
 
+/* The line between the folder section and the file section. It is a border on
+   the first row of the second section, never a row of its own. */
+.wf-list .wf-group-boundary {
+    border-top: 1px solid alpha(@wf_text_dim, 0.35);
+}
+
 .wf-list.wf-list-compact .wf-file-row {
     min-height: 18px;
     padding: 0 12px;
@@ -750,6 +766,26 @@ scrollbar slider:active {
     min-height: 4px;
 }
 
+.wf-transfer-banner {
+    background: @wf_raised;
+    border-bottom: 1px solid @wf_line;
+    padding: 8px 12px;
+    font-weight: bold;
+}
+
+.wf-transfer-banner progressbar {
+    min-width: 200px;
+}
+
+.wf-ghost {
+    opacity: 0.6;
+    padding: 4px 12px;
+}
+
+.wf-ghost progressbar {
+    min-height: 3px;
+}
+
 .wf-transfer-cancel {
     min-height: 0;
     padding: 0 8px;
@@ -787,9 +823,19 @@ popover contents {
 
 /* Explorer highlights a menu row with a soft neutral, not a saturated accent.
    A full-strength blue on every hover made the menu feel noisy. */
-.wf-menu-item:hover {
+.wf-menu-item:hover,
+.wf-menu-item:focus-visible {
     background: @wf_control_hover;
     color: #ffffff;
+}
+
+/* D-315: Explorer marks the keyboard-selected menu row with the one soft
+   highlight, never a ring inside it. The accent outline drawn on a focused
+   button made the first row of every right-click menu look double-bordered. */
+.wf-menu-item:focus-visible,
+.wf-menu-tool:focus-visible {
+    outline: none;
+    box-shadow: none;
 }
 
 /* Explorer's top strip: icon-only buttons for the actions you reach for
@@ -810,7 +856,8 @@ popover contents {
     margin: 0;
 }
 
-.wf-menu-tool:hover {
+.wf-menu-tool:hover,
+.wf-menu-tool:focus-visible {
     background: @wf_control_hover;
     color: #ffffff;
 }
@@ -820,7 +867,8 @@ popover contents {
     -gtk-icon-size: 16px;
 }
 
-.wf-menu-item:hover .wf-menu-icon {
+.wf-menu-item:hover .wf-menu-icon,
+.wf-menu-item:focus-visible .wf-menu-icon {
     color: #ffffff;
 }
 
@@ -829,7 +877,8 @@ popover contents {
     font-size: 11px;
 }
 
-.wf-menu-item:hover .wf-menu-accel {
+.wf-menu-item:hover .wf-menu-accel,
+.wf-menu-item:focus-visible .wf-menu-accel {
     color: rgba(255, 255, 255, 0.85);
 }
 
@@ -1043,6 +1092,84 @@ enum SortKey {
     Modified,
 }
 
+/// Where folders sit relative to files. `Top` is what the app has always done,
+/// so it is the default, and an unknown value in a config file reads as `Top`
+/// rather than as an error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+enum FolderPlacement {
+    #[default]
+    Top,
+    Mixed,
+    Bottom,
+}
+
+impl<'de> Deserialize<'de> for FolderPlacement {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Anything not recognised is the default, never an error: one odd
+        // value must not make the whole config file unreadable.
+        let text = String::deserialize(deserializer)?;
+        Ok(match text.as_str() {
+            "Mixed" => FolderPlacement::Mixed,
+            "Bottom" => FolderPlacement::Bottom,
+            _ => FolderPlacement::Top,
+        })
+    }
+}
+
+/// Per-folder placements kept in the config. Capped so the file cannot grow
+/// without bound; the oldest choice is the one dropped.
+const PLACEMENT_OVERRIDE_CAP: usize = 200;
+
+/// A folder's own placement if it has one, otherwise the universal default.
+fn resolve_placement(
+    default: FolderPlacement,
+    overrides: &[(String, FolderPlacement)],
+    folder: &str,
+) -> FolderPlacement {
+    overrides
+        .iter()
+        .find(|(path, _)| path == folder)
+        .map_or(default, |(_, placement)| *placement)
+}
+
+/// Sets (`Some`) or clears (`None`) one folder's own placement. A set moves the
+/// folder to the newest end, so the cap always drops the least recently chosen.
+fn set_placement_override(
+    overrides: &mut Vec<(String, FolderPlacement)>,
+    folder: &str,
+    placement: Option<FolderPlacement>,
+) {
+    overrides.retain(|(path, _)| path != folder);
+    if let Some(placement) = placement {
+        overrides.push((folder.to_string(), placement));
+    }
+    if overrides.len() > PLACEMENT_OVERRIDE_CAP {
+        let excess = overrides.len() - PLACEMENT_OVERRIDE_CAP;
+        overrides.drain(..excess);
+    }
+}
+
+/// Index of the first row of the second section, when folders and files are
+/// grouped and both groups are present.
+fn group_boundary_index(
+    entries: &[Entry],
+    placement: FolderPlacement,
+) -> Option<usize> {
+    if placement == FolderPlacement::Mixed {
+        return None;
+    }
+    let mut previous: Option<bool> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(was_dir) = previous {
+            if was_dir != entry.is_dir {
+                return Some(index);
+            }
+        }
+        previous = Some(entry.is_dir);
+    }
+    None
+}
+
 fn column_shown_by_default() -> bool {
     true
 }
@@ -1125,6 +1252,12 @@ struct AppConfig {
     search_in_files: bool,
     sort_key: SortKey,
     sort_ascending: bool,
+    /// Where folders sit among files: the default for every folder.
+    #[serde(default)]
+    folder_placement: FolderPlacement,
+    /// Folders that keep their own placement instead of the default.
+    #[serde(default)]
+    folder_placement_overrides: Vec<(String, FolderPlacement)>,
     /// Days an item may sit in the Trash before it is deleted for good.
     /// 0 is "never delete automatically", and is the default, so an upgrade
     /// never starts deleting anybody's Trash without being asked.
@@ -1713,25 +1846,47 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         hit != negated
     }
 
-    fn inner(p: &[char], t: &[char]) -> bool {
-        match p.first() {
+    // A state is (what is left of the pattern, what is left of the text).
+    // Every state that has failed once is remembered, so a pattern full of
+    // `*` costs at most pattern-length times text-length steps instead of
+    // trying every way to split the text (W2: a hostile filter must not
+    // hang the picker).
+    fn inner(
+        p: &[char],
+        t: &[char],
+        sizes: (usize, usize),
+        failed: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        let key = (sizes.0 - p.len(), sizes.1 - t.len());
+        if failed.contains(&key) {
+            return false;
+        }
+        let hit = match p.first() {
             None => t.is_empty(),
-            Some('*') => inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..])),
-            Some('?') => !t.is_empty() && inner(&p[1..], &t[1..]),
+            Some('*') => {
+                inner(&p[1..], t, sizes, failed)
+                    || (!t.is_empty() && inner(p, &t[1..], sizes, failed))
+            }
+            Some('?') => !t.is_empty() && inner(&p[1..], &t[1..], sizes, failed),
             Some('[') => match parse_class(&p[1..]) {
                 Some((ranges, negated, rest)) => {
                     !t.is_empty()
                         && class_matches(&ranges, negated, t[0])
-                        && inner(rest, &t[1..])
+                        && inner(rest, &t[1..], sizes, failed)
                 }
-                None => t.first() == Some(&'[') && inner(&p[1..], &t[1..]),
+                None => t.first() == Some(&'[') && inner(&p[1..], &t[1..], sizes, failed),
             },
-            Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..], sizes, failed),
+        };
+        if !hit {
+            failed.insert(key);
         }
+        hit
     }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    inner(&p, &t)
+    let mut failed = std::collections::HashSet::new();
+    inner(&p, &t, (p.len(), t.len()), &mut failed)
 }
 
 /// `Entry` carries no MIME type, only a name; this resolves one via the
@@ -1849,6 +2004,8 @@ impl Default for AppConfig {
             search_in_files: false,
             sort_key: SortKey::Name,
             sort_ascending: true,
+            folder_placement: FolderPlacement::Top,
+            folder_placement_overrides: Vec::new(),
             columns: ColumnVisibility::default(),
             remembered_networks: Vec::new(),
             trash_keep_days: 0,
@@ -1864,27 +2021,88 @@ impl Default for AppConfig {
     }
 }
 
+/// D-290: where the settings live. `XDG_CONFIG_HOME` when it is set, not empty
+/// and an absolute path (the spec says to ignore a relative one), otherwise
+/// `$HOME/.config`. Pure: the environment is read by the caller.
+fn config_path_from(xdg: Option<&std::ffi::OsStr>, home: Option<&str>) -> Option<PathBuf> {
+    let base = match xdg.map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => PathBuf::from(home?).join(".config"),
+    };
+    Some(base.join("wayfinder").join("native-config.json"))
+}
+
+/// D-290: 0.9.27 and earlier wrote to `$HOME/.config` whatever `XDG_CONFIG_HOME`
+/// said. Someone who sets it has their real settings there, so the first run
+/// that honours the variable copies them across once, and only when the new
+/// place has no settings yet. The old file is left where it was.
+fn adopt_legacy_config(new_path: &Path, legacy_path: &Path) {
+    if new_path == legacy_path || new_path.exists() || !legacy_path.is_file() {
+        return;
+    }
+    if let Some(parent) = new_path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = fs::copy(legacy_path, new_path);
+}
+
 fn config_path() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("wayfinder")
-            .join("native-config.json")
-    })
+    let home = std::env::var("HOME").ok();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let path = config_path_from(xdg.as_deref(), home.as_deref())?;
+    if let Some(home) = home.as_deref() {
+        let legacy = config_path_from(None, Some(home))?;
+        adopt_legacy_config(&path, &legacy);
+    }
+    Some(path)
 }
 
 fn load_config() -> AppConfig {
-    config_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    config_path().map(|path| read_config_at(&path)).unwrap_or_default()
+}
+
+/// What is on disk at a config path. A file that exists but will not parse is
+/// its own case: it must never be treated as "no settings", because the next
+/// write would then replace it with defaults and the user's settings would be
+/// gone for good (D-297, D-285).
+enum ConfigFile {
+    Missing,
+    Parsed(AppConfig),
+    Unparseable,
+}
+
+fn config_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn config_quarantine_path(path: &Path) -> PathBuf {
+    path.with_extension("json.corrupt")
+}
+
+fn inspect_config_file(path: &Path) -> ConfigFile {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<AppConfig>(&raw) {
+            Ok(config) => ConfigFile::Parsed(config),
+            Err(_) => ConfigFile::Unparseable,
+        },
+        // Unreadable bytes (not UTF-8) are damage, not absence.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigFile::Missing,
+        Err(_) => ConfigFile::Unparseable,
+    }
 }
 
 fn read_config_at(path: &Path) -> AppConfig {
-    let mut config: AppConfig = fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let mut config = match inspect_config_file(path) {
+        ConfigFile::Parsed(config) => config,
+        ConfigFile::Missing => AppConfig::default(),
+        // The live file is damaged: the last good write is the best answer.
+        ConfigFile::Unparseable => match inspect_config_file(&config_backup_path(path)) {
+            ConfigFile::Parsed(config) => config,
+            _ => AppConfig::default(),
+        },
+    };
     // D-247: a config written before the vault rule existed can already hold
     // vault paths. Dropping them on every read means the next write removes
     // them from the file as well, so nothing has to be cleaned up by hand.
@@ -1893,21 +2111,70 @@ fn read_config_at(path: &Path) -> AppConfig {
     config
 }
 
+/// Writes `raw` to `path` so that a crash or power cut leaves either the old
+/// file or the new one, never a hole. rename() alone only orders the names;
+/// the bytes must reach disk first, and the directory entry after (D-297).
+/// The temp name carries the process id so two Wayfinder processes can never
+/// write through the same temp file (D-299).
+fn write_config_durably(path: &Path, raw: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(raw.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Reads the config as it is on disk NOW, applies one change, writes it back.
 /// Every window shares the file, so a window may only change the fields it
 /// owns; rewriting a stale full snapshot would undo another window's changes.
+///
+/// The whole read-change-write runs under an exclusive lock on a sidecar file,
+/// so two processes cannot both read the same old state and have the second
+/// write erase the first (D-299). A damaged file is moved aside, never
+/// overwritten, and the last good copy is kept as `.bak` (D-297).
 fn update_config_at(path: &Path, change: impl FnOnce(&mut AppConfig)) -> AppConfig {
-    let mut config = read_config_at(path);
-    change(&mut config);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(raw) = serde_json::to_string_pretty(&config) {
-        let tmp = path.with_extension("json.tmp");
-        if fs::write(&tmp, raw).is_ok() {
-            let _ = fs::rename(&tmp, path);
-        }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("json.lock"))
+        .ok();
+    if let Some(lock) = &lock {
+        let _ = lock.lock();
     }
+
+    let on_disk = inspect_config_file(path);
+    let damaged = matches!(on_disk, ConfigFile::Unparseable);
+    let mut config = read_config_at(path);
+    change(&mut config);
+
+    if let Ok(raw) = serde_json::to_string_pretty(&config) {
+        if damaged {
+            // Keep the evidence: a typo in a hand-edited file is recoverable
+            // only if the file is still there.
+            let _ = fs::rename(path, config_quarantine_path(path));
+        } else if matches!(on_disk, ConfigFile::Parsed(_)) {
+            let _ = fs::copy(path, config_backup_path(path));
+        }
+        let _ = write_config_durably(path, &raw);
+    }
+    // The lock is released when `lock` is dropped.
+    drop(lock);
     config
 }
 
@@ -2217,6 +2484,10 @@ struct AppState {
     preview_zoom: f64,
     sort_key: SortKey,
     sort_ascending: bool,
+    folder_placement: FolderPlacement,
+    folder_overrides: Vec<(String, FolderPlacement)>,
+    /// The first row of the second section, so its row can carry the divider.
+    group_boundary: Option<native_core::EntrySource>,
     columns_visible: ColumnVisibility,
     sidebar_active_key: Option<String>,
     /// Mirror of `AppConfig::trash_keep_days`, so the Trash menu can show
@@ -2237,14 +2508,13 @@ struct AppState {
     /// Places list, the way Explorer shows them. Open to begin with: a list
     /// that starts collapsed hides the folders people click most.
     places_expanded: bool,
-    tree_children: HashMap<String, Vec<(String, String, bool)>>,
+    tree_cache: native_core::TreeCache,
     /// D-272: paths whose children are being read on a worker right now, so
     /// one slow mount is asked for once and not on every sidebar rebuild.
     tree_pending: HashSet<String>,
     /// D-272: does this drive have subfolders? Answered on a worker and
     /// remembered, because asking costs a network round trip on an rclone or
     /// SMB mount and the sidebar is rebuilt constantly.
-    tree_openable: HashMap<String, bool>,
     typeahead: String,
     typeahead_at: Instant,
     pending_offer: Option<PendingOffer>,
@@ -2407,6 +2677,8 @@ struct Ui {
     preview_toggle: gtk::ToggleButton,
     /// Divider position remembered while the preview pane is hidden.
     preview_saved_position: Rc<std::cell::Cell<i32>>,
+    /// D-326: this window's preview generation (was one counter shared by every window).
+    preview_generation: Rc<std::cell::Cell<u64>>,
     preview_picture: gtk::Picture,
     preview_media_picture: gtk::Picture,
     preview_media_controls: gtk::MediaControls,
@@ -2423,6 +2695,9 @@ struct Ui {
     /// The file currently loaded, if any. Dropping it is what stops the
     /// sound, so every path that stops playing drops this and nothing else.
     preview_audio: Rc<RefCell<Option<audio_preview::AudioPlayer>>>,
+    /// Path of the song in `preview_audio`, so a refresh that re-selects the
+    /// same song does not reload it paused (D-314).
+    preview_audio_path: Rc<RefCell<Option<String>>>,
     /// The timer moving the scrubber. Held so it can be cancelled: a tick
     /// left running after the player is gone would keep asking a dropped
     /// pipeline for its position.
@@ -2436,6 +2711,12 @@ struct Ui {
     /// D-155: transfer-only controls beside the status text; hidden at rest.
     transfer_bar: gtk::ProgressBar,
     transfer_cancel: gtk::Button,
+    /// A banner above the listing, shown in EVERY window while any transfer runs.
+    transfer_banner: gtk::Box,
+    /// Greyed placeholders for what is arriving, shown in the destination folder.
+    ghost_box: gtk::Box,
+    transfer_banner_label: gtk::Label,
+    transfer_banner_bar: gtk::ProgressBar,
     picker_open: Option<gtk::Button>,
     /// The Save file-name box. Present only for a Save request.
     picker_name: Option<gtk::Entry>,
@@ -2469,6 +2750,12 @@ struct Ui {
     /// Some only while split. The second pane owns its own AppState and Ui;
     /// closing the split unregisters it and drops its widgets.
     split: Rc<RefCell<Option<SplitPane>>>,
+    /// While split: true when the right pane was used last. The one Places
+    /// list sends its clicks to that pane, as Dolphin's does (D-311).
+    split_right_active: Rc<Cell<bool>>,
+    /// The left pane's Places list, so focus inside it never changes which
+    /// pane is the active one.
+    sidebar_scroll: gtk::ScrolledWindow,
 }
 
 /// The live second pane: the Paned holding both bodies, and the pane's own
@@ -2477,6 +2764,22 @@ struct Ui {
 struct SplitPane {
     paned: gtk::Paned,
     state: Rc<RefCell<AppState>>,
+    /// The window's focus watcher that tracks the active pane; removed when
+    /// the split closes.
+    focus_handler: Rc<RefCell<Option<glib::SignalHandlerId>>>,
+}
+
+/// The pane a Places click should navigate: the right pane while split and
+/// last used, otherwise the pane the list belongs to (D-311).
+fn split_target(state: &Rc<RefCell<AppState>>, ui: &Ui) -> (Rc<RefCell<AppState>>, Ui) {
+    if ui.split_right_active.get() {
+        if let Some(pane) = ui.split.borrow().as_ref() {
+            if let Some(pane_ui) = ui_for_state(&pane.state) {
+                return (pane.state.clone(), pane_ui);
+            }
+        }
+    }
+    (state.clone(), ui.clone())
 }
 
 /// Where a second pane puts itself: the window it shares and the Paned whose
@@ -3832,8 +4135,7 @@ A path may be a plain path or a file:// address."#
         // "show in folder", a desktop launcher with %U -- always gets a new
         // window. Routing it into the window already on screen moved that
         // window to another folder, losing the place the user was in.
-        let initial_path = initial_path_from_files(files);
-        let select_path = select_path_from_files(files);
+        let (initial_path, select_path) = launch_from_files(files);
         build_ui(app, initial_path, select_path);
     });
     // GApplication turns positional file and folder arguments into `open`
@@ -3898,22 +4200,63 @@ fn gtk_launch_args(raw_args: &[String]) -> Vec<String> {
     // D-265: GTK itself reads this list, and a flag it does not know makes it
     // print "Unknown option" and quit before a window ever opens. --select is
     // ours, so it is turned back into a plain path before GTK sees it.
+    //
+    // D-328: once it is a plain path, "open this folder" and "show this
+    // folder in its parent" look the same to the window that receives it,
+    // possibly another process. `--select` therefore adds one marker argument
+    // after the paths; see `launch_from_files`.
     let mut out = vec![program];
+    let mut selected = false;
     let mut rest = raw_args.iter().skip(1);
     while let Some(arg) = rest.next() {
         if let Some(value) = arg.strip_prefix("--select=") {
             if !value.is_empty() {
                 out.push(value.to_string());
+                selected = true;
             }
         } else if arg == "--select" {
             if let Some(value) = rest.next() {
-                out.push(value.to_string());
+                if !value.is_empty() {
+                    out.push(value.to_string());
+                    selected = true;
+                }
             }
         } else {
             out.push(arg.clone());
         }
     }
+    if selected {
+        out.push(native_core::SELECT_MARKER_URI.to_string());
+    }
     out
+}
+
+/// D-328: what a launch asks for, as (folder to open, item to highlight).
+///
+/// Without the `--select` marker this is the old rule: a folder opens inside
+/// itself, a file opens its folder with the file highlighted. With the marker
+/// the first path is always shown inside its parent with the path itself
+/// highlighted, file or folder alike. A path that is gone opens the nearest
+/// folder that still exists, with nothing highlighted, so a window always
+/// opens.
+fn launch_from_files(files: &[gio::File]) -> (Option<String>, Option<String>) {
+    let select_mode = files
+        .iter()
+        .any(|file| file.uri_scheme().as_deref() == Some(native_core::SELECT_MARKER_SCHEME));
+    if !select_mode {
+        return (initial_path_from_files(files), select_path_from_files(files));
+    }
+    let target = files
+        .iter()
+        .find(|file| file.uri_scheme().as_deref() != Some(native_core::SELECT_MARKER_SCHEME))
+        .and_then(|file| file.path());
+    match target {
+        Some(path) => {
+            let launch = native_core::select_launch_target(&path.to_string_lossy());
+            (Some(launch.folder), launch.select)
+        }
+        None => (None, None),
+    }
 }
 
 fn initial_path_from_files(files: &[gio::File]) -> Option<String> {
@@ -4059,6 +4402,9 @@ fn build_ui_in(
         preview_zoom: 1.0,
         sort_key: visible_sort(config.sort_key, config.sort_ascending, config.columns).0,
         sort_ascending: visible_sort(config.sort_key, config.sort_ascending, config.columns).1,
+        folder_placement: config.folder_placement,
+        folder_overrides: config.folder_placement_overrides.clone(),
+        group_boundary: None,
         columns_visible: config.columns,
         sidebar_active_key: None,
         trash_keep_days: config.trash_keep_days,
@@ -4071,9 +4417,8 @@ fn build_ui_in(
         smb_dialog: None,
         tree_expanded: HashSet::new(),
         places_expanded: true,
-        tree_children: HashMap::new(),
+        tree_cache: native_core::TreeCache::default(),
         tree_pending: HashSet::new(),
-        tree_openable: HashMap::new(),
         typeahead: String::new(),
         typeahead_at: Instant::now(),
         pending_offer: None,
@@ -4303,16 +4648,24 @@ fn build_ui_in(
     // The row carries the status background so the bar and Cancel sit inside it.
     let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     status_row.add_css_class("wf-status");
-    let transfer_bar = gtk::ProgressBar::builder().valign(gtk::Align::Center).visible(false).build();
-    transfer_bar.add_css_class("wf-transfer-bar");
-    transfer_bar.set_size_request(160, -1);
     let transfer_cancel = gtk::Button::with_label("Cancel");
     transfer_cancel.add_css_class("flat");
     transfer_cancel.add_css_class("wf-transfer-cancel");
     transfer_cancel.set_visible(false);
+    let transfer_banner = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    transfer_banner.add_css_class("wf-transfer-banner");
+    transfer_banner.set_visible(false);
+    let transfer_banner_label = gtk::Label::builder().xalign(0.0).build();
+    transfer_banner_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let transfer_banner_bar = gtk::ProgressBar::builder().valign(gtk::Align::Center).hexpand(true).build();
+    transfer_banner.append(&transfer_banner_label);
+    // One progress bar and one Cancel, in the banner above the files; the
+    // bottom status line is text only.
+    transfer_banner_bar.add_css_class("wf-transfer-bar");
+    let transfer_bar = transfer_banner_bar.clone();
+    transfer_banner.append(&transfer_banner_bar);
+    transfer_banner.append(&transfer_cancel);
     status_row.append(&status);
-    status_row.append(&transfer_bar);
-    status_row.append(&transfer_cancel);
 
     let back = icon_button("go-previous-symbolic", "Back");
     let forward = icon_button("go-next-symbolic", "Forward");
@@ -4511,6 +4864,10 @@ fn build_ui_in(
     files_pane.set_hexpand(true);
     files_pane.set_vexpand(true);
     files_pane.set_size_request(-1, 0);
+    let ghost_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    ghost_box.set_visible(false);
+    files_pane.append(&transfer_banner);
+    files_pane.append(&ghost_box);
     files_pane.append(&quick_access);
     files_pane.append(&recent_files_strip);
     files_pane.append(&column_header);
@@ -4756,6 +5113,7 @@ fn build_ui_in(
         file_preview: file_preview.clone(),
         preview_toggle: preview_toggle.clone(),
         preview_saved_position: Rc::new(std::cell::Cell::new(0)),
+        preview_generation: Rc::new(std::cell::Cell::new(0)),
         preview_picture,
         preview_media_picture,
         preview_media_controls,
@@ -4766,12 +5124,17 @@ fn build_ui_in(
         preview_audio_elapsed,
         preview_audio_total,
         preview_audio: Rc::new(RefCell::new(None)),
+        preview_audio_path: Rc::new(RefCell::new(None)),
         preview_audio_tick: Rc::new(RefCell::new(None)),
         preview_audio_seeking: Rc::new(Cell::new(false)),
         preview,
         status,
         transfer_bar: transfer_bar.clone(),
         transfer_cancel: transfer_cancel.clone(),
+        transfer_banner: transfer_banner.clone(),
+        ghost_box: ghost_box.clone(),
+        transfer_banner_label: transfer_banner_label.clone(),
+        transfer_banner_bar: transfer_banner_bar.clone(),
         picker_open: picker_open.clone(),
         picker_name: picker_name.clone(),
         picker_name_syncing: Rc::new(std::cell::Cell::new(false)),
@@ -4790,6 +5153,8 @@ fn build_ui_in(
         body: body.clone(),
         split_slot: split_slot.clone(),
         split: Rc::new(RefCell::new(None)),
+        split_right_active: Rc::new(Cell::new(false)),
+        sidebar_scroll: sidebar_scroll.clone(),
     };
     // Connected once, here, rather than per file: a handler attached each time
     // a song was selected would stack up one per song played.
@@ -4825,6 +5190,7 @@ fn build_ui_in(
     }
     if !embedded {
         start_drive_refresh(&state);
+        start_modified_retick(&state);
     }
     #[cfg(feature = "guide")]
     start_guide_watch(&state);
@@ -5989,6 +6355,12 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             // drives do in Explorer and in Dolphin.
             let mount = drive.mountpoint.clone();
             connect_drive_context(&row, state.clone(), ui.clone(), drive);
+            // D-318: a drive is a folder to drop into. Without this the drive
+            // row had no drop target at all, so dragging onto Storage showed
+            // the red "not allowed" circle (18 Nov 2026).
+            if !mount.is_empty() {
+                connect_sidebar_drop(&row, state, ui, &mount);
+            }
             let show_hidden = state.borrow().show_hidden;
             let tree_open = !mount.is_empty() && state.borrow().tree_expanded.contains(&mount);
             let can_open = tree_drive_openable(state, ui, &mount);
@@ -6089,6 +6461,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 fn activate_sidebar_row(state: &Rc<RefCell<AppState>>, ui: &Ui, row: &gtk::ListBoxRow) {
+    let (state, ui) = &split_target(state, ui);
     let Some(path) = row.tooltip_text().map(|s| s.to_string()) else {
         return;
     };
@@ -6853,7 +7226,18 @@ fn ensure_tree_children(
     ui: &Ui,
     path: &str,
 ) -> Vec<(String, String, bool)> {
-    if let Some(children) = state.borrow().tree_children.get(path).cloned() {
+    ensure_tree_children_with(state, ui, path, list_subdirs)
+}
+
+/// The reader is a parameter so a test can hand it one that blocks on purpose
+/// (D-289). Production always passes `list_subdirs`.
+fn ensure_tree_children_with(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    path: &str,
+    reader: impl FnOnce(&str, bool) -> Vec<(String, String, bool)> + Send + 'static,
+) -> Vec<(String, String, bool)> {
+    if let Some(children) = state.borrow().tree_cache.children(path).cloned() {
         return children;
     }
     if state.borrow().tree_pending.contains(path) {
@@ -6866,17 +7250,26 @@ fn ensure_tree_children(
     let key = path.to_string();
     let path_for_worker = path.to_string();
     glib::spawn_future_local(async move {
-        let children = gio::spawn_blocking(move || list_subdirs(&path_for_worker, show_hidden))
+        let children = gio::spawn_blocking(move || reader(&path_for_worker, show_hidden))
             .await
             .unwrap_or_default();
         {
             let mut state_ref = state_for_job.borrow_mut();
             state_ref.tree_pending.remove(&key);
-            state_ref.tree_children.insert(key.clone(), children);
+            state_ref.tree_cache.insert_children(key.clone(), children);
         }
         rebuild_sidebar(&state_for_job, &ui_for_job);
     });
     Vec::new()
+}
+
+/// D-295: a folder changed (refresh, a file operation, the folder monitor), so
+/// the sidebar's remembered answer for it and for its parent is stale. The
+/// sidebar is rebuilt by the caller's own reload; nothing is read here.
+fn forget_tree_answers_for(state: &Rc<RefCell<AppState>>, location: &native_core::Location) {
+    if let Some(path) = location.real_path_string() {
+        state.borrow_mut().tree_cache.forget_folder_and_parent(&path);
+    }
 }
 
 /// D-272: has this drive got subfolders to open into? Same story as
@@ -6885,10 +7278,20 @@ fn ensure_tree_children(
 /// is treated as openable, so the arrow is there to click; if it turns out to
 /// have no subfolders the arrow goes on the next rebuild.
 fn tree_drive_openable(state: &Rc<RefCell<AppState>>, ui: &Ui, mount: &str) -> bool {
+    tree_drive_openable_with(state, ui, mount, dir_has_subdirs)
+}
+
+/// Injectable reader, for the same reason as `ensure_tree_children_with`.
+fn tree_drive_openable_with(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    mount: &str,
+    reader: impl FnOnce(&str, bool) -> bool + Send + 'static,
+) -> bool {
     if mount.is_empty() {
         return false;
     }
-    if let Some(known) = state.borrow().tree_openable.get(mount).copied() {
+    if let Some(known) = state.borrow().tree_cache.openable(mount) {
         return known;
     }
     let probe_key = format!("\u{1}openable:{mount}");
@@ -6902,13 +7305,13 @@ fn tree_drive_openable(state: &Rc<RefCell<AppState>>, ui: &Ui, mount: &str) -> b
     let key = mount.to_string();
     let mount_for_worker = mount.to_string();
     glib::spawn_future_local(async move {
-        let openable = gio::spawn_blocking(move || dir_has_subdirs(&mount_for_worker, show_hidden))
+        let openable = gio::spawn_blocking(move || reader(&mount_for_worker, show_hidden))
             .await
             .unwrap_or(false);
         {
             let mut state_ref = state_for_job.borrow_mut();
             state_ref.tree_pending.remove(&probe_key);
-            state_ref.tree_openable.insert(key, openable);
+            state_ref.tree_cache.insert_openable(key, openable);
         }
         rebuild_sidebar(&state_for_job, &ui_for_job);
     });
@@ -7007,6 +7410,9 @@ fn toggle_tree_only(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
         let mut state_ref = state.borrow_mut();
         if state_ref.tree_expanded.contains(path) {
             state_ref.tree_expanded.remove(path);
+            // D-295: a closed branch is read again when it is opened again,
+            // so what it holds is never older than the last time it was shown.
+            state_ref.tree_cache.forget_under(path);
         } else {
             state_ref.tree_expanded.insert(path.to_string());
         }
@@ -7208,6 +7614,8 @@ fn clear_tiles(tiles: &gtk::FlowBox) {
 /// them. Called wherever the listing, the favourites or the recent list change,
 /// so neither strip can show yesterday's contents.
 fn rebuild_quick_access(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    // Runs whenever a listing lands, so a folder opened mid-transfer shows the ghosts.
+    refresh_ghosts();
     clear_tiles(&ui.quick_access_tiles);
     clear_tiles(&ui.recent_files_tiles);
     let home = std::env::var("HOME").unwrap_or_default();
@@ -7264,7 +7672,37 @@ fn rebuild_quick_access(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 status.set_label(&format!("Opened {name}"));
             }
         });
-        ui.recent_files_tiles.insert(&tile, -1);
+        // The tile can be dragged out like a row, and a button beside it
+        // opens the folder it lives in with the file selected, so a recent
+        // file can be placed anywhere and its origin is never a mystery.
+        let drag_path = file.path.clone();
+        connect_file_drag_with(
+            &tile,
+            Rc::new({
+                let drag_path = drag_path.clone();
+                move || vec![drag_path.clone()]
+            }),
+            drag_path,
+            None,
+        );
+        let reveal = gtk::Button::from_icon_name("folder-open-symbolic");
+        reveal.add_css_class("flat");
+        reveal.set_valign(gtk::Align::Center);
+        reveal.set_tooltip_text(Some("Show in folder"));
+        {
+            let state = state.clone();
+            let path = file.path.clone();
+            reveal.connect_clicked(move |_| {
+                let folder = native_core::parent_dir(&path);
+                state.borrow_mut().pinned_top = Some(path.clone());
+                navigate(&state, native_core::Location::real(&folder));
+            });
+        }
+        tile.set_hexpand(true);
+        let cell = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        cell.append(&tile);
+        cell.append(&reveal);
+        ui.recent_files_tiles.insert(&cell, -1);
     }
     ui.recent_files_strip.set_visible(true);
 }
@@ -7751,6 +8189,50 @@ fn set_preview_visible(state: &Rc<RefCell<AppState>>, ui: &Ui, visible: bool) {
 /// a no-op.
 /// The one drop-menu path. Writes the single field it changed, so a window
 /// holding stale values never writes them over another window's change.
+fn effective_placement(st: &AppState) -> FolderPlacement {
+    resolve_placement(st.folder_placement, &st.folder_overrides, &st.cwd.display_string())
+}
+
+/// Takes the shared config's placement fields into this window, so what the
+/// menu shows is what the file holds after another window's change.
+fn adopt_placement(state: &Rc<RefCell<AppState>>, config: Option<AppConfig>) {
+    if let Some(config) = config {
+        let mut st = state.borrow_mut();
+        st.folder_placement = config.folder_placement;
+        st.folder_overrides = config.folder_placement_overrides;
+    }
+}
+
+/// Picks a placement. It goes to this folder's own setting when the folder has
+/// one, otherwise to the universal default.
+fn set_folder_placement(state: &Rc<RefCell<AppState>>, ui: &Ui, placement: FolderPlacement) {
+    let folder = state.borrow().cwd.display_string();
+    let has_own = state.borrow().folder_overrides.iter().any(|(path, _)| *path == folder);
+    let config = update_config(|config| {
+        if has_own {
+            set_placement_override(&mut config.folder_placement_overrides, &folder, Some(placement));
+        } else {
+            config.folder_placement = placement;
+        }
+    });
+    adopt_placement(state, config);
+    repopulate_rows(state, ui);
+}
+
+/// Gives this folder its own placement (starting from what it shows now), or
+/// hands it back to the universal default.
+fn set_placement_this_folder_only(state: &Rc<RefCell<AppState>>, ui: &Ui, own: bool) {
+    let (folder, current) = {
+        let st = state.borrow();
+        (st.cwd.display_string(), effective_placement(&st))
+    };
+    let config = update_config(|config| {
+        set_placement_override(&mut config.folder_placement_overrides, &folder, own.then_some(current));
+    });
+    adopt_placement(state, config);
+    repopulate_rows(state, ui);
+}
+
 fn set_drop_ask(state: &Rc<RefCell<AppState>>, value: bool) {
     if state.borrow().drop_ask == value {
         return;
@@ -8087,6 +8569,8 @@ fn set_show_hidden(state: &Rc<RefCell<AppState>>, value: bool) {
         return;
     }
     state.borrow_mut().show_hidden = value;
+    // D-295: the cached answers were read under the old choice.
+    state.borrow_mut().tree_cache.clear();
     update_config(|config| config_show_hidden(config, value));
     if let Some(ui) = ui_for_state(state) {
         if ui.hidden.is_active() != value {
@@ -8402,6 +8886,48 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         menu.append(&row);
     }
     {
+        let (current, own) = {
+            let st = state.borrow();
+            let folder = st.cwd.display_string();
+            (effective_placement(&st), st.folder_overrides.iter().any(|(path, _)| *path == folder))
+        };
+        for (placement, label, name) in [
+            (FolderPlacement::Top, "Folders on Top", "wf-folders-top-option"),
+            (FolderPlacement::Mixed, "Folders Mixed with Files", "wf-folders-mixed-option"),
+            (FolderPlacement::Bottom, "Folders on Bottom", "wf-folders-bottom-option"),
+        ] {
+            let checked = current == placement;
+            let state = state.clone();
+            let ui = ui.clone();
+            let row = context_item(
+                if checked { "object-select-symbolic" } else { "" },
+                label,
+                "",
+                &popover,
+                move || set_folder_placement(&state, &ui, placement),
+            );
+            row.set_widget_name(name);
+            if checked {
+                row.add_css_class("wf-checked");
+            }
+            menu.append(&row);
+        }
+        let state = state.clone();
+        let ui = ui.clone();
+        let row = context_item(
+            if own { "object-select-symbolic" } else { "" },
+            "Use This Setting for This Folder Only",
+            "",
+            &popover,
+            move || set_placement_this_folder_only(&state, &ui, !own),
+        );
+        row.set_widget_name("wf-folders-this-folder-option");
+        if own {
+            row.add_css_class("wf-checked");
+        }
+        menu.append(&row);
+    }
+    {
         let state = state.clone();
         let ui = ui.clone();
         let row = context_item("emblem-system-symbolic", "Setup...", "", &popover, move || {
@@ -8563,6 +9089,10 @@ fn toggle_split(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         ui.split_slot.remove(&pane.paned);
         ui.split_slot.append(&ui.body);
         unregister_window(&pane.state);
+        if let Some(id) = pane.focus_handler.borrow_mut().take() {
+            ui.window.disconnect(id);
+        }
+        ui.split_right_active.set(false);
         // Reparenting the body drops the keyboard focus. Put it back in this
         // pane's list, or the next keypress goes nowhere.
         ui.list.grab_focus();
@@ -8609,7 +9139,31 @@ fn toggle_split(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     if let Some(pane_ui) = ui_for_state(&pane_state) {
         pane_ui.list.grab_focus();
     }
-    *ui.split.borrow_mut() = Some(SplitPane { paned, state: pane_state });
+    ui.split_right_active.set(true);
+    let focus_handler = match ui_for_state(&pane_state) {
+        Some(pane_ui) => {
+            let (flag, left_body, right_body, sidebar) =
+                (ui.split_right_active.clone(), ui.body.clone(), pane_ui.body.clone(), ui.sidebar_scroll.clone());
+            Some(ui.window.connect_focus_widget_notify(move |window| {
+                let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else { return };
+                // Focus in the Places list keeps whichever pane was active.
+                if focus == *sidebar.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&sidebar) {
+                    return;
+                }
+                if focus == *right_body.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&right_body) {
+                    flag.set(true);
+                } else if focus.is_ancestor(&left_body) {
+                    flag.set(false);
+                }
+            }))
+        }
+        None => None,
+    };
+    *ui.split.borrow_mut() = Some(SplitPane {
+        paned,
+        state: pane_state,
+        focus_handler: Rc::new(RefCell::new(focus_handler)),
+    });
     eprintln!("wf-event: split on");
 }
 
@@ -8890,6 +9444,9 @@ fn navigate_to_with_message(
     // Refreshing the SAME folder (e.g. after a delete) should keep the scroll
     // position; only real navigation to a different folder resets to the top.
     let same_folder = state.borrow().cwd == path;
+    if same_folder {
+        forget_tree_answers_for(state, &path);
+    }
     // A pending reveal (e.g. the just-renamed row) owns the scroll position for
     // this reload via `apply_pending_reveal`; restoring the pre-reload scroll
     // 16ms later would silently drag the view back off the revealed row.
@@ -9007,7 +9564,14 @@ fn navigate_to_with_message(
                 update_command_bar_zip_state(&state, ui);
                 update_sidebar_active_rows(&state, ui);
                 install_directory_monitor(&state, ui, &path);
-                if let Some(target) = state.borrow().pinned_top.clone() {
+                // The borrow must end before selecting: selecting scrolls the
+                // row into view, which binds rows, and a bind takes
+                // `borrow_mut` (a `state.borrow()` in the `if let` header would
+                // stay alive for the whole body and panic there).
+                // One time only: selecting it again on every refresh would take
+                // the selection away from whatever the user picked since.
+                let opened_on = state.borrow_mut().pinned_top.take();
+                if let Some(target) = opened_on {
                     select_entry_by_source(&state, ui, &native_core::EntrySource::real(&target));
                 }
                 ui.status.set_label(&listing_status(
@@ -9182,6 +9746,7 @@ fn start_monitor_scan(
     path: native_core::Location,
 ) {
     let show_hidden = state.borrow().show_hidden;
+    forget_tree_answers_for(state, &path);
     #[cfg(any(test))]
     SCAN_LOG.with(|log| log.borrow_mut().push((monotonic_ms(), 0)));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -9273,6 +9838,7 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
                 }
                 if let Some(modified) = modified.upgrade() {
                     modified.set_label(&row_modified_text(&entry));
+                    modified.set_tooltip_text(Some(&row_modified_tooltip(&entry)));
                 }
             }
         }
@@ -9847,6 +10413,58 @@ fn row_modified_text(entry: &Entry) -> String {
         .unwrap_or_else(|| native_core::fmt_modified(entry.modified))
 }
 
+/// What the row's Modified cell says when the pointer rests on it.
+///
+/// The cell itself is relative text; this is the stamp that settles which of
+/// two files sharing a label came last (D-303).
+fn row_modified_tooltip(entry: &Entry) -> String {
+    entry.metadata_error.as_ref().map_or_else(
+        || native_core::fmt_modified_exact(entry.modified),
+        |error| format!("Metadata unavailable: {error}"),
+    )
+}
+
+/// The Modified column is written once when a row is built and would otherwise
+/// keep the ages it had at load: "Just now" an hour later, and nothing on
+/// screen moving until the user presses refresh (D-303). This re-renders the
+/// text only -- no listing, no disk read.
+const MODIFIED_RETICK_SECS: u32 = 30;
+
+fn retick_modified_labels(state: &Rc<RefCell<AppState>>) {
+    let (labels, entries) = {
+        let st = state.borrow();
+        (st.meta_labels.clone(), st.visible_entries.clone())
+    };
+    for entry in entries {
+        let Some((_, modified)) = labels.get(&entry.source) else {
+            continue;
+        };
+        let Some(label) = modified.upgrade() else {
+            continue;
+        };
+        let text = row_modified_text(&entry);
+        if label.label() != text {
+            label.set_label(&text);
+        }
+        label.set_tooltip_text(Some(&row_modified_tooltip(&entry)));
+    }
+}
+
+/// One re-render every 30 seconds until the window is gone.
+fn start_modified_retick(state: &Rc<RefCell<AppState>>) {
+    let weak = Rc::downgrade(state);
+    glib::timeout_add_seconds_local(MODIFIED_RETICK_SECS, move || {
+        let Some(state) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if ui_for_state(&state).is_none() {
+            return glib::ControlFlow::Break;
+        }
+        retick_modified_labels(&state);
+        glib::ControlFlow::Continue
+    });
+}
+
 fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.clone();
     let state_for_unbind = state.clone();
@@ -9865,6 +10483,9 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         line.add_css_class("wf-file-row");
+        if state.borrow().group_boundary.as_ref() == Some(&entry.source) {
+            line.add_css_class("wf-group-boundary");
+        }
         let entry_display_path = entry.source.display_string();
         line.set_tooltip_text(Some(&entry.metadata_error.as_ref().map_or_else(
             || entry_display_path.clone(),
@@ -9910,6 +10531,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         name.add_css_class("wf-file-name");
+        name.set_attributes(Some(&name_zoom_attrs(icon_zoom)));
         let editing = state
             .borrow()
             .inline_rename
@@ -9953,6 +10575,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         modified.add_css_class("wf-file-meta");
+        modified.set_tooltip_text(Some(&row_modified_tooltip(&entry)));
         ui.columns.modified.add_widget(&modified);
         let columns_visible = state.borrow().columns_visible;
         size.set_visible(columns_visible.size);
@@ -10161,16 +10784,16 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             .filter(|entry| entry.name.to_lowercase().contains(&filter_text))
             .collect()
     };
-    sort_entries(&mut visible_entries, sort_key, sort_ascending);
+    let placement = effective_placement(&state.borrow());
+    sort_entries(&mut visible_entries, sort_key, sort_ascending, placement);
 
-    // Force the pinned path (a just-downloaded, just-opened file) to the very top,
-    // ahead of folders and every sort key.
-    let pinned = state.borrow().pinned_top.clone();
-    if let Some(pin) = pinned {
-        if let Some(pos) = visible_entries.iter().position(|entry| entry.source.real_path_string() == Some(pin.clone())) {
-            let entry = visible_entries.remove(pos);
-            visible_entries.insert(0, entry);
-        }
+    // No row is forced out of its sorted place. A file the window was opened
+    // on is selected (see navigation), not moved: it sits where the chosen sort
+    // and the folder placement put it, like every other file.
+    {
+        let boundary = group_boundary_index(&visible_entries, placement)
+            .map(|index| visible_entries[index].source.clone());
+        state.borrow_mut().group_boundary = boundary;
     }
 
     let (thumbnail_queue, video_poster_queue) = {
@@ -10296,6 +10919,8 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 .wrap(true)
                 .build();
             name.add_css_class("wf-grid-name");
+            name.set_attributes(Some(&name_zoom_attrs(icon_zoom)));
+            name.set_lines(((2.0 * name_text_scale(icon_zoom)).ceil() as i32).clamp(2, 4));
             name.set_size_request(tile_px, -1);
             grid_item.set_size_request(tile_px, -1);
             grid_item.append(&icon);
@@ -10414,15 +11039,20 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     update_selection(state, ui);
 }
 
-fn sort_entries(entries: &mut [Entry], key: SortKey, ascending: bool) {
+fn sort_entries(entries: &mut [Entry], key: SortKey, ascending: bool, placement: FolderPlacement) {
     // D-82: the natural-name key is built once per entry, not re-derived on
     // each of the O(n log n) comparisons.
     let keys: Vec<Vec<NameToken>> = entries.iter().map(|e| natural_name_key(&e.name)).collect();
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by(|&i, &j| {
         let (a, b) = (&entries[i], &entries[j]);
-        // Explorer parity: folders always sort ABOVE files, in every sort order.
-        let dir_order = b.is_dir.cmp(&a.is_dir);
+        // Folders are grouped above or below files unless the user mixed them;
+        // the sort key then orders each group (or, mixed, the whole list).
+        let dir_order = match placement {
+            FolderPlacement::Top => b.is_dir.cmp(&a.is_dir),
+            FolderPlacement::Bottom => a.is_dir.cmp(&b.is_dir),
+            FolderPlacement::Mixed => std::cmp::Ordering::Equal,
+        };
         if dir_order != std::cmp::Ordering::Equal {
             return dir_order;
         }
@@ -10583,6 +11213,18 @@ fn file_icon(
 
 /// D-267: one place that says how large a grid tile's picture is, so the tile,
 /// its name label and the thumbnail decoded for it can never drift apart.
+/// Ctrl+scroll sizes the names with the pictures (D-312), so a name that ends
+/// in "..." can be read by zooming in. Text never goes below 85% or above 180%.
+fn name_text_scale(zoom: f64) -> f64 {
+    zoom.clamp(0.85, 1.8)
+}
+
+fn name_zoom_attrs(zoom: f64) -> gtk::pango::AttrList {
+    let attrs = gtk::pango::AttrList::new();
+    attrs.insert(gtk::pango::AttrFloat::new_scale(name_text_scale(zoom)));
+    attrs
+}
+
 fn grid_tile_px(zoom: f64) -> i32 {
     ((GRID_TILE_SIZE * zoom).round() as i32).max(1)
 }
@@ -11383,6 +12025,22 @@ fn entry_for_grid_child(state: &Rc<RefCell<AppState>>, child: &gtk::FlowBoxChild
 fn update_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let entries = selected_entries(state, ui);
     update_picker_open_button(state, ui, &entries);
+    // D-314: a song that is loaded keeps playing through a refresh. Saving a
+    // file in the same folder rebuilds the listing, which clears and restores
+    // the selection; that is not a request to stop or reload the song.
+    if ui.preview_audio_path.borrow().is_some() {
+        match entries.as_slice() {
+            [] => return,
+            [entry] => {
+                if let native_core::EntrySource::Real(path) = &entry.source {
+                    if ui.preview_audio_path.borrow().as_deref() == Some(&*path.to_string_lossy()) {
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     match entries.as_slice() {
         [] => set_preview_text(ui, "Select a file"),
         [entry] => update_preview(ui, entry),
@@ -11523,6 +12181,36 @@ fn picker_save_typed_name(ui: &Ui) -> String {
     text
 }
 
+/// W2 attack 4: what a Save must ask before it answers, or `None` when the
+/// name is free. A file that exists is confirmed. A symbolic link is
+/// confirmed too, and the question names where the link leads: writing to a
+/// link replaces whatever it points at, which can be a file in another
+/// folder (or, for a dangling link, one that does not exist yet), and the
+/// name on screen alone would hide that. `exists()` follows links, so a
+/// dangling one used to be answered with no question at all.
+fn picker_save_confirmation(target: &Path, name: &str) -> Option<(String, String)> {
+    let title = format!("Replace \"{name}\"?");
+    if let Ok(link) = std::fs::read_link(target) {
+        let leads_to = match target.parent() {
+            Some(parent) => parent.join(&link),
+            None => link,
+        };
+        let leads_to = std::fs::canonicalize(&leads_to).unwrap_or(leads_to);
+        let body = format!(
+            "\"{name}\" is a link to {}. Saving replaces that file, not the link.",
+            leads_to.display()
+        );
+        return Some((title, body));
+    }
+    if target.exists() {
+        return Some((
+            title,
+            "A file with that name is already in this folder. Saving replaces it.".to_string(),
+        ));
+    }
+    None
+}
+
 /// Answers a Save request: the typed name joined to the folder on screen.
 /// An existing file is confirmed first -- the caller is about to overwrite
 /// it and nothing else in the flow asks.
@@ -11542,16 +12230,12 @@ fn picker_save_submit(state: &Rc<RefCell<AppState>>, ui: &Ui, picker: &PickerSta
         return;
     }
     let paths = vec![target.to_string_lossy().into_owned()];
-    if target.exists() {
+    if let Some((title, body)) = picker_save_confirmation(&target, &name) {
         let picker = picker.clone();
         let paths_for_confirm = paths.clone();
-        show_confirm_dialog(
-            ui,
-            &format!("Replace \"{name}\"?"),
-            "A file with that name is already in this folder. Saving replaces it.",
-            "Replace",
-            move || picker_write_and_exit(&picker, paths_for_confirm.clone(), 0),
-        );
+        show_confirm_dialog(ui, &title, &body, "Replace", move || {
+            picker_write_and_exit(&picker, paths_for_confirm.clone(), 0)
+        });
         return;
     }
     picker_write_and_exit(picker, paths, 0);
@@ -12349,8 +13033,8 @@ fn paste_clipboard(state: Rc<RefCell<AppState>>, ui: Ui) {
             return;
         }
     };
-    if state.borrow().active_transfer.is_some() {
-        ui.status.set_label("A transfer is already running");
+    if transfer_running_anywhere() {
+        refuse_second_transfer(&state, &ui);
         return;
     }
     let request = {
@@ -12482,8 +13166,8 @@ struct Transfer {
 /// No clash runs straight away; a clash asks Replace / Duplicate / Cancel once
 /// for the whole operation, and Cancel starts nothing.
 fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Transfer) {
-    if state.borrow().active_transfer.is_some() {
-        ui.status.set_label("A transfer is already running");
+    if transfer_running_anywhere() {
+        refuse_second_transfer(&state, &ui);
         return;
     }
     match plan_transfer(&transfer) {
@@ -12701,7 +13385,7 @@ fn transfer_outcome(
     is_copy: bool,
     result: Result<native_core::TransferResult, String>,
 ) -> Result<JobOutcome, String> {
-    let native_core::TransferResult { items, warnings } = result?;
+    let native_core::TransferResult { items, warnings, report: _ } = result?;
     let mut message = format!("{ed} {} item{}", items.len(), plural(items.len()));
     if !warnings.is_empty() {
         message.push_str(&format!(" (warning: {})", warnings.join("; ")));
@@ -12775,8 +13459,31 @@ fn transfer_strip(is_copy: bool, event: native_core::TransferEvent) -> StripView
             fraction: Some(0.0),
             cancel_enabled: true,
         },
+        E::Reading { done, total } if total > 0 => StripView {
+            text: format!(
+                "Checking files before the {noun} {}% ({} of {})",
+                (done as u128 * 100 / total as u128) as u64,
+                native_core::fmt_size(done),
+                native_core::fmt_size(total)
+            ),
+            fraction: Some(done as f64 / total as f64),
+            cancel_enabled: true,
+        },
+        E::Reading { .. } => StripView { text: format!("Preparing {noun}"), fraction: None, cancel_enabled: true },
+        E::Checking { done, total } if total > 0 => StripView {
+            text: format!(
+                "Verifying {noun} {}% ({} of {})",
+                (done as u128 * 100 / total as u128) as u64,
+                native_core::fmt_size(done),
+                native_core::fmt_size(total)
+            ),
+            fraction: Some(done as f64 / total as f64),
+            cancel_enabled: true,
+        },
+        E::Checking { .. } => StripView { text: format!("Verifying {noun}"), fraction: None, cancel_enabled: true },
         E::Verifying => StripView { text: format!("Verifying {noun}"), fraction: None, cancel_enabled: true },
         E::Committing => StripView { text: format!("Verifying {noun}"), fraction: None, cancel_enabled: false },
+        E::Item { .. } => StripView { text: format!("Preparing {noun}"), fraction: None, cancel_enabled: true },
     }
 }
 
@@ -12785,16 +13492,51 @@ fn show_transfer_strip(ui: &Ui, view: &StripView) {
     if let Some(fraction) = view.fraction {
         ui.transfer_bar.set_fraction(fraction.clamp(0.0, 1.0));
     }
-    ui.transfer_bar.set_visible(true);
     ui.transfer_cancel.set_visible(true);
     ui.transfer_cancel.set_sensitive(view.cancel_enabled);
+    // The banner goes on every open window, so a transfer started in one is
+    // seen from all of them, not only from a small bar in the window it began in.
+    let windows = WINDOWS.with(|w| w.borrow().windows());
+    for (_, other) in windows {
+        let route = TRANSFER_VIEW.with(|v| v.borrow().as_ref().map(|t| t.route.clone())).unwrap_or_default();
+        let banner = if route.is_empty() { view.text.clone() } else { format!("{}  \u{b7}  {route}", view.text) };
+        other.transfer_banner_label.set_label(&banner);
+        match view.fraction {
+            Some(fraction) => other.transfer_banner_bar.set_fraction(fraction.clamp(0.0, 1.0)),
+            None => other.transfer_banner_bar.pulse(),
+        }
+        other.transfer_banner.set_visible(true);
+    }
 }
 
 fn hide_transfer_strip(ui: &Ui) {
-    ui.transfer_bar.set_visible(false);
     ui.transfer_cancel.set_visible(false);
     ui.transfer_cancel.set_sensitive(true);
     ui.transfer_bar.set_fraction(0.0);
+    let windows = WINDOWS.with(|w| w.borrow().windows());
+    for (_, other) in windows {
+        other.transfer_banner.set_visible(false);
+        other.transfer_banner_bar.set_fraction(0.0);
+    }
+}
+
+/// True when a transfer is running in ANY window. One transfer at a time,
+/// app-wide: the one that started first is never touched, a later one is refused.
+fn transfer_running_anywhere() -> bool {
+    WINDOWS
+        .with(|w| w.borrow().windows())
+        .iter()
+        .any(|(state, _)| state.try_borrow().is_ok_and(|st| st.active_transfer.is_some()))
+}
+
+/// The refusal for a second transfer, said where the person is looking.
+fn refuse_second_transfer(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let own = state.try_borrow().is_ok_and(|st| st.active_transfer.is_some());
+    ui.status.set_label(if own {
+        "A transfer is already running"
+    } else {
+        "A transfer is already running in another window"
+    });
 }
 
 /// Cancel targets only the live transfer and only before its commit point.
@@ -12818,6 +13560,14 @@ fn request_transfer_cancel(state: &Rc<RefCell<AppState>>, ui: &Ui) -> bool {
 fn wire_transfer_cancel(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let (state, ui_for_click) = (state.clone(), ui.clone());
     ui.transfer_cancel.connect_clicked(move |_| {
+        // D-321: an extraction shares the banner and its Cancel.
+        let extracting = EXTRACT_CANCEL.with(|c| c.borrow().clone());
+        if let Some(flag) = extracting {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            ui_for_click.transfer_cancel.set_sensitive(false);
+            ui_for_click.status.set_label("Cancelling extraction");
+            return;
+        }
         request_transfer_cancel(&state, &ui_for_click);
     });
 }
@@ -12842,7 +13592,202 @@ fn apply_transfer_event(
     if cancelling {
         return;
     }
-    show_transfer_strip(ui, &transfer_strip(is_copy, event));
+    let suffix = note_transfer_event(event);
+    refresh_ghosts();
+    if matches!(event, native_core::TransferEvent::Item { .. }) {
+        return;
+    }
+    let mut view = transfer_strip(is_copy, event);
+    view.text.push_str(&suffix);
+    show_transfer_strip(ui, &view);
+}
+
+/// One item of a running transfer, as a ghost in the destination folder.
+struct GhostItem {
+    name: String,
+    is_dir: bool,
+    bytes: u64,
+    base: Option<u64>,
+}
+
+/// What the windows need to draw a running transfer: where it lands, what is
+/// arriving, and the speed so far.
+struct TransferView {
+    dest: PathBuf,
+    /// "from Untitled to Storage": which folders, so a banner seen in another
+    /// window says where the transfer is happening.
+    route: String,
+    items: Vec<GhostItem>,
+    done: u64,
+    total: u64,
+    last_sample: Option<(Instant, u64)>,
+    speed: f64,
+}
+
+thread_local! {
+    static TRANSFER_VIEW: RefCell<Option<TransferView>> = const { RefCell::new(None) };
+}
+
+/// "from Untitled to Storage": the folder the items are in and the folder they
+/// are going to, by name.
+fn transfer_route(srcs: &[PathBuf], dest: &Path) -> String {
+    let name = |p: &Path| {
+        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string_lossy().into_owned())
+    };
+    match srcs.first().and_then(|src| src.parent()) {
+        Some(from) => format!("from {} to {}", name(from), name(dest)),
+        None => format!("to {}", name(dest)),
+    }
+}
+
+fn start_transfer_view(dest: &Path, srcs: &[PathBuf]) {
+    let items = srcs
+        .iter()
+        .map(|src| GhostItem {
+            name: src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            is_dir: src.is_dir(),
+            bytes: 0,
+            base: None,
+        })
+        .collect();
+    TRANSFER_VIEW.with(|view| {
+        *view.borrow_mut() = Some(TransferView {
+            dest: dest.to_path_buf(),
+            route: transfer_route(srcs, dest),
+            items,
+            done: 0,
+            total: 0,
+            last_sample: None,
+            speed: 0.0,
+        });
+    });
+    refresh_ghosts();
+}
+
+fn end_transfer_view() {
+    TRANSFER_VIEW.with(|view| *view.borrow_mut() = None);
+    refresh_ghosts();
+}
+
+/// "42 s left", "3 min left", "1 h 5 min left".
+fn eta_text(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{} s left", seconds.max(1)),
+        60..=3599 => format!("{} min left", seconds.div_ceil(60)),
+        _ => format!("{} h {} min left", seconds / 3600, (seconds % 3600).div_ceil(60)),
+    }
+}
+
+/// Records one event and returns the " - 38 MB/s - 2 min left" text for it.
+fn note_transfer_event(event: native_core::TransferEvent) -> String {
+    use native_core::TransferEvent as E;
+    TRANSFER_VIEW.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(view) = guard.as_mut() else {
+            return String::new();
+        };
+        match event {
+            E::Item { index, bytes } => {
+                let base: u64 = view.items.iter().take(index).map(|item| item.bytes).sum();
+                if let Some(item) = view.items.get_mut(index) {
+                    item.bytes = bytes;
+                    item.base = Some(base);
+                }
+                String::new()
+            }
+            E::Bytes { done, total } => {
+                view.done = done;
+                view.total = total;
+                let now = Instant::now();
+                match view.last_sample {
+                    None => view.last_sample = Some((now, done)),
+                    Some((then, before)) => {
+                        let seconds = now.duration_since(then).as_secs_f64();
+                        // Sampled at most every half second so the speed and the
+                        // time left do not jump about with every small event.
+                        if seconds >= 0.5 {
+                            let instant = done.saturating_sub(before) as f64 / seconds;
+                            view.speed = if view.speed > 0.0 { 0.7 * view.speed + 0.3 * instant } else { instant };
+                            view.last_sample = Some((now, done));
+                        }
+                    }
+                }
+                if view.speed < 1.0 || total <= done {
+                    return String::new();
+                }
+                let left = ((total - done) as f64 / view.speed).ceil() as u64;
+                format!("  \u{b7}  {}/s  \u{b7}  {}", native_core::fmt_size(view.speed as u64), eta_text(left))
+            }
+            _ => String::new(),
+        }
+    })
+}
+
+/// Greyed ghost rows for what is arriving, in every window that is showing
+/// the destination folder; every other window shows none.
+fn refresh_ghosts() {
+    let snapshot = TRANSFER_VIEW.with(|cell| {
+        cell.borrow().as_ref().map(|view| {
+            let rows: Vec<(String, bool, f64)> = view
+                .items
+                .iter()
+                .map(|item| {
+                    let fraction = match item.base {
+                        Some(base) if item.bytes > 0 => {
+                            (view.done.saturating_sub(base) as f64 / item.bytes as f64).clamp(0.0, 1.0)
+                        }
+                        Some(_) => 1.0,
+                        None => 0.0,
+                    };
+                    (item.name.clone(), item.is_dir, fraction)
+                })
+                .collect();
+            (view.dest.clone(), rows)
+        })
+    });
+    let windows = WINDOWS.with(|w| w.borrow().windows());
+    for (state, ui) in windows {
+        let here = match (&snapshot, state.try_borrow()) {
+            (Some((dest, _)), Ok(st)) => st.cwd.real_path().is_some_and(|cwd| cwd == dest.as_path()),
+            _ => false,
+        };
+        while let Some(child) = ui.ghost_box.first_child() {
+            ui.ghost_box.remove(&child);
+        }
+        let (true, Some((_, rows))) = (here, &snapshot) else {
+            ui.ghost_box.set_visible(false);
+            continue;
+        };
+        const SHOWN: usize = 8;
+        for (name, is_dir, fraction) in rows.iter().take(SHOWN) {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            row.add_css_class("wf-ghost");
+            let icon = gtk::Image::from_icon_name(if *is_dir { "folder" } else { "text-x-generic" });
+            icon.set_pixel_size(20);
+            let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            words.set_hexpand(true);
+            let label = gtk::Label::builder().label(name).xalign(0.0).build();
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            let bar = gtk::ProgressBar::new();
+            bar.set_fraction(*fraction);
+            words.append(&label);
+            words.append(&bar);
+            let percent = gtk::Label::new(Some(&format!("{}%", (fraction * 100.0).round() as u64)));
+            row.append(&icon);
+            row.append(&words);
+            row.append(&percent);
+            ui.ghost_box.append(&row);
+        }
+        if rows.len() > SHOWN {
+            let more = gtk::Label::builder()
+                .label(format!("and {} more arriving", rows.len() - SHOWN))
+                .xalign(0.0)
+                .build();
+            more.add_css_class("wf-ghost");
+            ui.ghost_box.append(&more);
+        }
+        ui.ghost_box.set_visible(true);
+    }
 }
 
 /// Clears the active identity only for its own terminal event.
@@ -12851,6 +13796,7 @@ fn end_transfer(state: &Rc<RefCell<AppState>>, ui: &Ui, id: u64) -> bool {
     if st.active_transfer.as_ref().is_some_and(|a| a.id == id) {
         st.active_transfer = None;
         drop(st);
+        end_transfer_view();
         hide_transfer_strip(ui);
         true
     } else {
@@ -12910,8 +13856,8 @@ fn run_transfer(
     transfer: Transfer,
     on_conflict: native_core::PasteConflict,
 ) {
-    if state.borrow().active_transfer.is_some() {
-        ui.status.set_label("A transfer is already running");
+    if transfer_running_anywhere() {
+        refuse_second_transfer(&state, &ui);
         return;
     }
     let Transfer { srcs, dest, is_copy, cut_offer, style } = transfer;
@@ -12947,6 +13893,7 @@ fn run_transfer(
     let refresh_path = state.borrow().cwd.clone();
     ui.status.set_label(&label);
     show_transfer_strip(&ui, &transfer_strip(is_copy, native_core::TransferEvent::Preparing));
+    start_transfer_view(&dest, &srcs);
 
     let program = transfer_copy_program();
     let force_cross_device = transfer_force_cross_device();
@@ -12984,6 +13931,7 @@ fn run_transfer(
                     end_transfer(&state, &ui, id);
                     match result {
                         Ok(result) => {
+                            let report = result.report.clone();
                             if let Ok(outcome) = transfer_outcome(ed, is_copy, Ok(result)) {
                                 // A cut offer is taken off the clipboard only on
                                 // success, and only if it is still the one there.
@@ -12994,6 +13942,7 @@ fn run_transfer(
                                     }
                                 }
                                 complete_job(&state, &ui, outcome, &refresh_path, &|_, _, _| {});
+                                show_transfer_report(&ui, is_copy, &report);
                             }
                         }
                         Err(native_core::TransferFail::Cancelled) => {
@@ -13004,6 +13953,7 @@ fn run_transfer(
                         }
                         Err(native_core::TransferFail::Failed(err)) => {
                             ui.status.set_label(&format!("Operation failed: {err}"));
+                            show_transfer_failure(&ui, is_copy, &err);
                         }
                     }
                     return glib::ControlFlow::Break;
@@ -13578,23 +14528,101 @@ fn extract_archive_to_folder_action(state: Rc<RefCell<AppState>>, ui: Ui, path: 
     );
 }
 
+thread_local! {
+    /// D-321: the cancel flag of the extraction running now, if any.
+    static EXTRACT_CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// What the banner says while an archive is extracting.
+fn extract_strip(name: &str, written: u64, total: Option<u64>) -> StripView {
+    match total.filter(|t| *t > 0) {
+        Some(total) => {
+            let written = written.min(total);
+            StripView {
+                text: format!(
+                    "Extracting {name} {}% ({} of {})",
+                    (written as u128 * 100 / total as u128) as u64,
+                    native_core::fmt_size(written),
+                    native_core::fmt_size(total)
+                ),
+                fraction: Some(written as f64 / total as f64),
+                cancel_enabled: true,
+            }
+        }
+        None => StripView {
+            text: format!("Extracting {name} \u{2014} {} written", native_core::fmt_size(written)),
+            fraction: None,
+            cancel_enabled: true,
+        },
+    }
+}
+
 fn extract_archive_action(state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
     if state.borrow().cwd.is_zip() {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
+    if EXTRACT_CANCEL.with(|c| c.borrow().is_some()) || transfer_running_anywhere() {
+        ui.status.set_label("Something is already running; wait for it to finish");
+        return;
+    }
     let cwd = state.borrow().cwd.real_path_string().expect("checked is_zip above");
-    run_job(
-        state,
-        ui,
-        "Extracting archive".to_string(),
-        move || {
-            // D-230: never the plain "Extracted archive" when a name was skipped or failed.
-            let outcome = native_core::extract_archive_here(&path, &cwd)?;
-            Ok(JobOutcome::message(outcome.summary()))
-        },
-        |_, _, _| {},
-    );
+    let refresh_path = state.borrow().cwd.clone();
+    let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let cancel = Arc::new(AtomicBool::new(false));
+    EXTRACT_CANCEL.with(|c| *c.borrow_mut() = Some(cancel.clone()));
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    show_transfer_strip(&ui, &extract_strip(&name, 0, None));
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (cancel, written, total) = (cancel.clone(), written.clone(), total.clone());
+        std::thread::spawn(move || {
+            let on_bytes = |b: u64| written.store(b, std::sync::atomic::Ordering::SeqCst);
+            let on_total = |t: u64| total.store(t, std::sync::atomic::Ordering::SeqCst);
+            let ctl = native_core::ExtractCtl { cancel: &cancel, on_bytes: &on_bytes, on_total: &on_total };
+            let _ = tx.send(native_core::extract_archive_here_ctl(&path, &cwd, &ctl));
+        });
+    }
+    glib::timeout_add_local(JOB_POLL_INTERVAL, move || {
+        match rx.try_recv() {
+            Ok(result) => {
+                EXTRACT_CANCEL.with(|c| *c.borrow_mut() = None);
+                hide_transfer_strip(&ui);
+                match result {
+                    Ok(outcome) => {
+                        // D-230: never the plain "Extracted archive" when a name was skipped or failed.
+                        complete_job(&state, &ui, JobOutcome::message(outcome.summary()), &refresh_path, &|_, _, _| {});
+                    }
+                    Err(e) if e == "transfer cancelled" => {
+                        complete_job(&state, &ui, JobOutcome::message("Extraction cancelled"), &refresh_path, &|_, _, _| {});
+                    }
+                    Err(e) => {
+                        ui.status.set_label(&format!("Operation failed: {e}"));
+                        let dialog = adw::AlertDialog::new(Some("Extraction did NOT complete"), Some(&e));
+                        dialog.add_responses(&[("ok", "OK")]);
+                        dialog.set_close_response("ok");
+                        dialog.present(Some(&ui.window));
+                    }
+                }
+                glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => {
+                let t = total.load(std::sync::atomic::Ordering::SeqCst);
+                show_transfer_strip(
+                    &ui,
+                    &extract_strip(&name, written.load(std::sync::atomic::Ordering::SeqCst), (t > 0).then_some(t)),
+                );
+                glib::ControlFlow::Continue
+            }
+            Err(TryRecvError::Disconnected) => {
+                EXTRACT_CANCEL.with(|c| *c.borrow_mut() = None);
+                hide_transfer_strip(&ui);
+                ui.status.set_label("Operation failed");
+                glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn empty_trash_action(state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -14826,6 +15854,15 @@ fn show_drive_context_menu(
         #[cfg(feature = "guide")]
         guide_name_drive(&button, if drive.mountpoint.is_empty() { "remount" } else { "open" }, &drive);
         menu.append(&button);
+    }
+
+    // A mounted drive can open in a window of its own, like any folder.
+    if !drive.mountpoint.is_empty() {
+        let ui = ui.clone();
+        let path = drive.mountpoint.clone();
+        menu.append(&context_item("window-new-symbolic", "Open in New Window", "", &popover, move || {
+            open_new_window(&ui, path.clone());
+        }));
     }
 
     if drive.kind == "drive" && !drive.mountpoint.is_empty() {
@@ -16117,10 +17154,156 @@ fn build_drop_target(
             show_drop_action_dialog(state.clone(), ui.clone(), txn);
             return true;
         }
-        transfer_with_preflight(state.clone(), ui.clone(), txn.into_transfer());
+        // D-317: a drag is easy to release by accident (a refused drop once
+        // ran anyway and moved 66 GB into the wrong folder), so every drop
+        // asks first, naming the destination, before anything moves.
+        show_drop_confirm_dialog(state.clone(), ui.clone(), txn);
         true
     });
     drop
+}
+
+/// The words for the drop confirmation: what moves, from where, to where.
+fn drop_confirm_text(txn: &DropTxn) -> (String, String, &'static str) {
+    let name_of = |p: &Path| {
+        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string_lossy().into_owned())
+    };
+    let verb = if txn.is_copy { "Copy" } else { "Move" };
+    let what = if txn.srcs.len() == 1 {
+        format!("\"{}\"", name_of(&txn.srcs[0]))
+    } else {
+        format!("{} items", txn.srcs.len())
+    };
+    let heading = format!("{verb} {what} to \"{}\"?", name_of(&txn.dest));
+    let from = txn.srcs.first().and_then(|s| s.parent()).map(|p| p.display().to_string()).unwrap_or_default();
+    let detail = format!("From: {from}\nTo: {}", txn.dest.display());
+    (heading, detail, verb)
+}
+
+/// Asks before a dropped transfer starts. The tuple was consumed on the drop,
+/// so answering cannot start it twice.
+/// D-320: what the final check verified, as Markdown the person can keep.
+fn transfer_report_markdown(is_copy: bool, report: &[native_core::ReportRow]) -> String {
+    let verb = if is_copy { "Copy" } else { "Move" };
+    let total_files: u64 = report.iter().map(|r| r.files_total).sum();
+    let total_bytes: u64 = report.iter().map(|r| r.bytes).sum();
+    let mut md = format!(
+        "# {verb} verified: {} item{}, {} file{}, {}\n\n",
+        report.len(),
+        plural(report.len()),
+        total_files,
+        plural(total_files as usize),
+        native_core::fmt_size(total_bytes)
+    );
+    md.push_str(if is_copy {
+        "Each item was read back from the destination and its content matched the source; the source was re-read and is unchanged.\n\n"
+    } else {
+        "Each item was read back from the destination and its content matched the source as it was before the move; the source is gone.\n\n"
+    });
+    md.push_str("Check used: a 64-bit content fingerprint of every byte (folders: every name, size and byte). It is not a cryptographic hash.\n\n");
+    md.push_str("| Item | From | To | Type | Files | Size | Fingerprint |\n|---|---|---|---|---|---|---|\n");
+    for r in report {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            Path::new(&r.to).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            r.from,
+            r.to,
+            r.kind,
+            r.files_total,
+            native_core::fmt_size(r.bytes),
+            r.digest
+        ));
+    }
+    for r in report.iter().filter(|r| r.kind == "folder") {
+        md.push_str(&format!("\n## {}\n\n", r.to));
+        for (name, size) in &r.files {
+            md.push_str(&format!("- {name} ({})\n", native_core::fmt_size(*size)));
+        }
+        if r.files_total as usize > r.files.len() {
+            md.push_str(&format!("- ... and {} more files, all covered by the folder fingerprint\n", r.files_total as usize - r.files.len()));
+        }
+    }
+    md
+}
+
+fn write_transfer_report(is_copy: bool, report: &[native_core::ReportRow]) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let dir = home.join("Documents").join("Wayfinder Transfer Reports");
+    std::fs::create_dir_all(&dir).ok()?;
+    let stamp = glib::DateTime::now_local().ok()?.format("%Y-%m-%d %H.%M.%S").ok()?;
+    let dest_name = report
+        .first()
+        .and_then(|r| Path::new(&r.to).parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let verb = if is_copy { "Copy" } else { "Move" };
+    let path = dir.join(format!("{stamp} - {verb} to {dest_name}.md"));
+    std::fs::write(&path, transfer_report_markdown(is_copy, report)).ok()?;
+    Some(path)
+}
+
+/// D-320: after a verified transfer, a saved list AND a window naming every
+/// item that was checked. Both exist so the person can say which they prefer.
+fn show_transfer_report(ui: &Ui, is_copy: bool, report: &[native_core::ReportRow]) {
+    if report.is_empty() {
+        return;
+    }
+    let saved = write_transfer_report(is_copy, report);
+    let verb = if is_copy { "Copy" } else { "Move" };
+    let total_files: u64 = report.iter().map(|r| r.files_total).sum();
+    let total_bytes: u64 = report.iter().map(|r| r.bytes).sum();
+    let heading = format!(
+        "{verb} verified: {} file{}, {}",
+        total_files,
+        plural(total_files as usize),
+        native_core::fmt_size(total_bytes)
+    );
+    let mut body = String::new();
+    for r in report.iter().take(12) {
+        let name = Path::new(&r.to).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        body.push_str(&format!("\u{2713} {name}  \u{2014}  {}, {} file{}\n", native_core::fmt_size(r.bytes), r.files_total, plural(r.files_total as usize)));
+    }
+    if report.len() > 12 {
+        body.push_str(&format!("... and {} more items\n", report.len() - 12));
+    }
+    match &saved {
+        Some(path) => body.push_str(&format!("\nFull list saved to:\n{}", path.display())),
+        None => body.push_str("\nThe full list could not be saved."),
+    }
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+    dialog.add_responses(&[("ok", "OK")]);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("ok");
+    eprintln!("wf-event: transfer_report shown items={} files={}", report.len(), total_files);
+    dialog.present(Some(&ui.window));
+}
+
+/// D-320: a transfer that fails its check is never only a line in the status
+/// bar.
+fn show_transfer_failure(ui: &Ui, is_copy: bool, err: &str) {
+    let verb = if is_copy { "Copy" } else { "Move" };
+    let dialog = adw::AlertDialog::new(Some(&format!("{verb} did NOT complete")), Some(err));
+    dialog.add_responses(&[("ok", "OK")]);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("ok");
+    eprintln!("wf-event: transfer_failure shown");
+    dialog.present(Some(&ui.window));
+}
+
+fn show_drop_confirm_dialog(state: Rc<RefCell<AppState>>, ui: Ui, txn: DropTxn) {
+    let (heading, detail, verb) = drop_confirm_text(&txn);
+    let parent = ui.window.clone();
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&detail));
+    dialog.add_responses(&[("cancel", "Cancel"), ("go", verb)]);
+    dialog.set_response_appearance("go", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        eprintln!("wf-event: drop_confirm response={response}");
+        if response == "go" {
+            transfer_with_preflight(state.clone(), ui.clone(), txn.clone().into_transfer());
+        }
+    });
+    dialog.present(Some(&parent));
 }
 
 fn connect_file_drop<W: IsA<gtk::Widget>>(widget: &W, state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -16179,6 +17362,26 @@ fn connect_zoom_controller<W: IsA<gtk::Widget>>(
     widget.add_controller(scroll);
 }
 
+/// D-325: if keyboard focus sits anywhere inside the preview pane, move it to
+/// the file view (the grid in Icons view, the list otherwise). Focus elsewhere
+/// is left alone, so arrowing through rows never jumps.
+fn release_preview_focus(ui: &Ui) {
+    if !focus_within(&ui.window, &ui.preview_scroll) {
+        return;
+    }
+    let grid_shown = ui.grid.is_visible() && ui.grid.is_mapped();
+    if grid_shown {
+        ui.grid.grab_focus();
+    } else {
+        ui.list.grab_focus();
+    }
+    // A view with nothing to focus refuses; then clear it outright so no
+    // pointer to a preview widget survives.
+    if focus_within(&ui.window, &ui.preview_scroll) {
+        GtkWindowExt::set_focus(&ui.window, gtk::Widget::NONE);
+    }
+}
+
 fn update_preview(ui: &Ui, entry: &Entry) {
     if !ui.preview_scroll.is_visible() {
         return;
@@ -16186,7 +17389,16 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     // D-268: every preview takes the next generation, so a folder listing that
     // comes back from its worker after the user has selected something else is
     // dropped instead of painting over the newer preview.
-    let generation = next_preview_generation();
+    let generation = next_preview_generation(ui);
+
+    // D-325: the pane is about to swap pages and rebuild or empty children
+    // (the folder rows, the audio and video controls). Focus left inside it
+    // is left pointing at a widget that is hidden, made insensitive or
+    // removed, and the next click on a list row, which grabs focus, made
+    // GTK walk that stale widget's parents forever (owner's window frozen,
+    // main thread at 100%, 18 Nov 2026). Hand the focus to the file list
+    // first, the same hand-over `keep_focus_on_empty_view` does.
+    release_preview_focus(ui);
 
     if entry.is_dir {
         match &entry.source {
@@ -16251,6 +17463,7 @@ fn stop_preview_audio(ui: &Ui) {
     }
     // Dropping the player is what stops the sound; see `AudioPlayer::drop`.
     ui.preview_audio.borrow_mut().take();
+    ui.preview_audio_path.borrow_mut().take();
     ui.preview_audio_seeking.set(false);
 }
 
@@ -16272,12 +17485,20 @@ fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
     ui.preview_audio_info
         .set_text(&native_core::entry_summary(entry));
 
-    let player = match audio_preview::AudioPlayer::open(path) {
+    // D-324: an "mp3" that is really a GIF never reaches the player; the pane
+    // says what it is and shows no controls.
+    let opened = match native_core::not_audio_reason(path) {
+        Some(reason) => Err(reason),
+        None => audio_preview::AudioPlayer::open(path)
+            .map_err(|m| format!("{}\n{m}", native_core::damaged_file_reason(path, "audio file"))),
+    };
+    let player = match opened {
         Ok(player) => player,
         Err(message) => {
             // A file that will not decode says so where the controls would
             // be, and shows no controls. Pretending to offer a Play button
             // that cannot work is worse than saying nothing plays it.
+            // D-324: say what the file really is, not only that playbin failed.
             ui.preview_audio_info.set_text(&format!(
                 "{}\n{message}",
                 native_core::entry_summary(entry)
@@ -16309,6 +17530,7 @@ fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
     ui.preview_audio_seeking.set(false);
 
     *ui.preview_audio.borrow_mut() = Some(player);
+    *ui.preview_audio_path.borrow_mut() = Some(path.to_string());
     ui.preview_stack.set_visible_child_name("audio");
     start_preview_audio_tick(ui);
 }
@@ -16320,18 +17542,28 @@ fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
 /// The tick also corrects the duration, because a VBR MP3 often cannot say
 /// how long it is until it has been playing for a moment.
 fn start_preview_audio_tick(ui: &Ui) {
+    let tick_slot = ui.preview_audio_tick.clone();
+    let closure_slot = tick_slot.clone();
     let ui = ui.clone();
     let source = glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
         let borrowed = ui.preview_audio.borrow();
         let Some(player) = borrowed.as_ref() else {
             // The player is gone, so this tick has nothing left to do and
-            // must not keep running.
+            // must not keep running. Forget the id too: returning Break
+            // removes the source, and a later `stop_preview_audio` removing
+            // it again is a GLib critical (D-310).
+            closure_slot.borrow_mut().take();
             return glib::ControlFlow::Break;
         };
         if let Some(message) = player.error() {
-            ui.preview_audio_info.set_text(&message);
+            // D-324: the decoder's own error says little; name the real type.
+            ui.preview_audio_info.set_text(&format!(
+                "{}\n{message}",
+                native_core::damaged_file_reason(player.path(), "audio file")
+            ));
             ui.preview_audio_play.set_sensitive(false);
             ui.preview_audio_scale.set_sensitive(false);
+            closure_slot.borrow_mut().take();
             return glib::ControlFlow::Break;
         }
         let playing = player.is_playing();
@@ -16365,7 +17597,7 @@ fn start_preview_audio_tick(ui: &Ui) {
         ui.preview_audio_seeking.set(false);
         glib::ControlFlow::Continue
     });
-    *ui.preview_audio_tick.borrow_mut() = Some(source);
+    *tick_slot.borrow_mut() = Some(source);
 }
 
 /// The Play button and the scrubber. Connected once, when the window is built,
@@ -16450,24 +17682,14 @@ fn set_preview_text(ui: &Ui, text: &str) {
     ui.preview_stack.set_visible_child_name("text");
 }
 
-thread_local! {
-    /// D-253: which selection the preview pane is currently showing. An AVIF
-    /// has to be decoded by an outside program, which takes a moment, and in
-    /// that moment the user can select something else. The decode result is
-    /// only painted when this number is still the one it started with, so a
-    /// slow picture can never land on top of a newer selection.
-    static PREVIEW_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
 
 /// D-268: one place that moves the preview generation on. Any preview that
 /// finishes work off the main thread captures this and paints only if it is
 /// still the current one.
-fn next_preview_generation() -> u64 {
-    PREVIEW_GENERATION.with(|gen| {
-        let next = gen.get().wrapping_add(1);
-        gen.set(next);
-        next
-    })
+fn next_preview_generation(ui: &Ui) -> u64 {
+    let next = ui.preview_generation.get().wrapping_add(1);
+    ui.preview_generation.set(next);
+    next
 }
 
 /// D-268: how many children the folder preview lists. The pane is a glance at
@@ -16542,13 +17764,14 @@ fn set_preview_folder(ui: &Ui, entry: &Entry, path: std::path::PathBuf, generati
         .map(|state| state.borrow().show_hidden)
         .unwrap_or(false);
     let ui_for_result = ui.clone();
+    let live_generation = ui.preview_generation.clone();
     glib::spawn_future_local(async move {
         let listed = gio::spawn_blocking(move || {
             let cancelled = std::sync::atomic::AtomicBool::new(false);
             native_core::list_dir_cancellable(&path, show_hidden, &cancelled)
         })
         .await;
-        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+        if live_generation.get() != generation {
             return;
         }
         let ui = ui_for_result;
@@ -16630,11 +17853,8 @@ fn set_preview_image(ui: &Ui, path: &str) {
         (420.0 * zoom).round() as i32
     };
     ui.preview_picture.set_size_request(size, size);
-    let generation = PREVIEW_GENERATION.with(|gen| {
-        let next = gen.get().wrapping_add(1);
-        gen.set(next);
-        next
-    });
+    let generation = next_preview_generation(ui);
+    let live_generation = ui.preview_generation.clone();
 
     // D-253: the preview pane paints through GdkTexture, which has no AVIF,
     // HEIC or JPEG-XL decoder, so selecting one of those left the pane blank
@@ -16654,7 +17874,7 @@ fn set_preview_image(ui: &Ui, path: &str) {
             let decoded =
                 gio::spawn_blocking(move || transcoded_thumbnail_file(&source, PREVIEW_DECODE_WIDTH))
                     .await;
-            if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+            if live_generation.get() != generation {
                 return;
             }
             match decoded {
@@ -16697,7 +17917,7 @@ fn set_preview_image(ui: &Ui, path: &str) {
         // blow a 16px icon up to the pane and show a blurred smear, and -1
         // means "leave this dimension alone".
         let header = Pixbuf::file_info_future(source.clone()).await;
-        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+        if live_generation.get() != generation {
             return;
         }
         let too_big = matches!(
@@ -16712,7 +17932,7 @@ fn set_preview_image(ui: &Ui, path: &str) {
                 .ok(),
             Err(_) => None,
         };
-        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+        if live_generation.get() != generation {
             return;
         }
         if let Some(pixbuf) = decoded {
@@ -16729,7 +17949,7 @@ fn set_preview_image(ui: &Ui, path: &str) {
             transcoded_thumbnail_file(&fallback_source, PREVIEW_DECODE_WIDTH)
         })
         .await;
-        if PREVIEW_GENERATION.with(|gen| gen.get()) != generation {
+        if live_generation.get() != generation {
             return;
         }
         match cached {
@@ -16743,9 +17963,10 @@ fn set_preview_image(ui: &Ui, path: &str) {
                     "preview: nothing on this machine could decode it",
                     "gdk-pixbuf and the outside decoder both refused it",
                 );
-                words.set_label(
-                    "No preview for this picture.\nNothing on this machine can decode it.",
-                );
+                words.set_label(&format!(
+                    "No preview for this picture.\n{}",
+                    native_core::damaged_file_reason(&source, "picture")
+                ));
                 stack.set_visible_child_name("text");
             }
         }
@@ -17113,6 +18334,55 @@ mod tests {
     /// D-224: committed `75ca650`'s `glob_match` treated `[`/`]` literally,
     /// so the installed contract's bracket-class form never worked. Calls
     /// the real `glob_match` directly, not a copy.
+    /// W2 attack 4: a Save onto a link must say where the link leads, and a
+    /// dangling link must still ask.
+    #[test]
+    fn save_onto_a_link_names_where_it_leads_d305() {
+        let root = crate::native_core::scratch_root().join(format!("wf-w2-a4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let benign = root.join("benign");
+        let secret = root.join("secret");
+        std::fs::create_dir_all(&benign).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("id_key"), "private").unwrap();
+        std::fs::write(benign.join("plain.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(secret.join("id_key"), benign.join("innocent.txt")).unwrap();
+        std::os::unix::fs::symlink("../secret/not-yet", benign.join("dangling.txt")).unwrap();
+
+        assert!(picker_save_confirmation(&benign.join("free.txt"), "free.txt").is_none());
+
+        let (_, plain) = picker_save_confirmation(&benign.join("plain.txt"), "plain.txt").expect("existing file");
+        assert!(plain.contains("already in this folder"), "{plain}");
+
+        let (title, body) =
+            picker_save_confirmation(&benign.join("innocent.txt"), "innocent.txt").expect("link to a file");
+        assert_eq!(title, "Replace \"innocent.txt\"?");
+        let real = std::fs::canonicalize(secret.join("id_key")).unwrap();
+        assert!(body.contains(&real.display().to_string()), "must name the real file: {body}");
+
+        let (_, body) =
+            picker_save_confirmation(&benign.join("dangling.txt"), "dangling.txt").expect("dangling link must ask");
+        assert!(body.contains("not-yet"), "must name where the dangling link leads: {body}");
+    }
+
+    /// W2 attack 7: a hostile filter pattern full of `*` must not make the
+    /// picker hang. Many stars against a long name that never matches is the
+    /// worst case for a backtracking matcher.
+    #[test]
+    fn glob_match_with_many_stars_finishes_fast_on_a_miss() {
+        let pattern = format!("{}b", "*a".repeat(40));
+        let name = "a".repeat(200);
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pattern, &name));
+        assert!(!glob_match("**/**/**/**/**", &name));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "glob matching took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn glob_match_bracket_class_admits_case_variants_and_excludes_wrong_suffix() {
         assert!(super::glob_match("*.[iI][cC][oO]", "favicon.ico"));
@@ -17153,7 +18423,7 @@ mod tests {
     /// and asserts the file is back at its original path with its bytes.
     #[test]
     fn restore_each_puts_a_really_trashed_file_back_where_it_came_from() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = owned_scratch_dir_225("trash-restore-roundtrip");
         let original = dir.join("restore-me.txt");
         fs::write(&original, b"restore me unchanged").unwrap();
@@ -17451,7 +18721,9 @@ mod tests {
     /// `build_ui` calls), never a copy of its logic, and walks the real
     /// `gtk::Box` children it populates.
     #[test]
-    fn enumerated_choice_label_lands_in_the_real_widget_tree() {
+    fn enumerated_choice_label_lands_in_the_real_widget_tree() { gtk_thread::run(enumerated_choice_label_lands_in_the_real_widget_tree_on_gtk_thread); }
+
+    fn enumerated_choice_label_lands_in_the_real_widget_tree_on_gtk_thread() {
         if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
             return;
         }
@@ -17545,7 +18817,7 @@ mod tests {
     /// process's real user data dir and is not redirected by a test's fake HOME.
     #[test]
     fn created_trashed_reciprocal_round_trip_and_fail_closed() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("HOME");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -17634,7 +18906,7 @@ mod tests {
     /// restores it exactly.
     #[test]
     fn pasted_copy_reciprocal_round_trip_and_fail_closed() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("HOME");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -18051,7 +19323,7 @@ mod tests {
             entry("zfolder", true, 0),
             entry("afile.txt", false, 0),
         ];
-        sort_entries(&mut v, SortKey::Name, true);
+        sort_entries(&mut v, SortKey::Name, true, FolderPlacement::Top);
         let dirs: Vec<bool> = v.iter().map(|e| e.is_dir).collect();
         // Explorer parity: all folders first, no file above any folder.
         assert_eq!(
@@ -18071,7 +19343,7 @@ mod tests {
             entry("folder", true, 0),
             entry("b.txt", false, 0),
         ];
-        sort_entries(&mut v, SortKey::Name, false);
+        sort_entries(&mut v, SortKey::Name, false, FolderPlacement::Top);
         assert!(v[0].is_dir, "folder first even descending");
         assert!(!v[1].is_dir && !v[2].is_dir, "files after folders");
     }
@@ -18182,7 +19454,9 @@ mod tests {
     /// Fresh-install proof entry: runs alone, on a virtual display, in an empty HOME
     /// and working folder where no Wayfinder icon directory exists.
     #[test]
-    fn packaged_icons_fresh_install_d80() {
+    fn packaged_icons_fresh_install_d80() { gtk_thread::run(packaged_icons_fresh_install_d80_on_gtk_thread); }
+
+    fn packaged_icons_fresh_install_d80_on_gtk_thread() {
         if std::env::var("WAYFINDER_D80_FRESH").as_deref() != Ok("1") {
             return;
         }
@@ -19355,7 +20629,10 @@ Broken: Either state is wrong.\n";
     /// Runs the D-154 sitting proof alone on a virtual display.
     #[cfg(feature = "guide")]
     #[test]
-    fn guide_sitting_attached_card_d154_alone() {
+    fn guide_sitting_attached_card_d154_alone() { gtk_thread::run(guide_sitting_attached_card_d154_alone_on_gtk_thread); }
+
+    #[cfg(feature = "guide")]
+    fn guide_sitting_attached_card_d154_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D154_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -19372,7 +20649,10 @@ Broken: Either state is wrong.\n";
     /// the corrected exact-XID binding rebinds focus and clicks exactly once.
     #[cfg(feature = "guide")]
     #[test]
-    fn d53_keyboard_focus_binds_to_intended_surface_alone() {
+    fn d53_keyboard_focus_binds_to_intended_surface_alone() { gtk_thread::run(d53_keyboard_focus_binds_to_intended_surface_alone_on_gtk_thread); }
+
+    #[cfg(feature = "guide")]
+    fn d53_keyboard_focus_binds_to_intended_surface_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D53_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -19488,7 +20768,7 @@ Broken: Either state is wrong.\n";
         // this one cannot be redirected to a private per-test `$HOME` the way
         // `undo_redo_gate_trash_d187` already established: lock out other
         // real-trash tests and use the ambient `$HOME` instead.
-        let _trash_guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _trash_guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let _xdg_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
         // Installs no override (limits stay at the shipped defaults for this
         // test) but holds the ZIP-limits serialization lock for the test's
@@ -20770,7 +22050,9 @@ Broken: Either state is wrong.\n";
     /// D-188 ledger #61: a boundary refusal that takes real wall-clock time
     /// to reach settles within a named bound while GTK keeps ticking.
     #[test]
-    fn zip_size_limit_boundaries_d188() {
+    fn zip_size_limit_boundaries_d188() { gtk_thread::run(zip_size_limit_boundaries_d188_on_gtk_thread); }
+
+    fn zip_size_limit_boundaries_d188_on_gtk_thread() {
         if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -21344,7 +22626,9 @@ Broken: Either state is wrong.\n";
     /// archive, and two tabs keep independent real/ZIP locations and
     /// histories across switching and closure.
     #[test]
-    fn zip_navigation_history_tabs_d188() {
+    fn zip_navigation_history_tabs_d188() { gtk_thread::run(zip_navigation_history_tabs_d188_on_gtk_thread); }
+
+    fn zip_navigation_history_tabs_d188_on_gtk_thread() {
         if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -21486,7 +22770,9 @@ Broken: Either state is wrong.\n";
     /// navigation generation and never land stale rows or a stale status,
     /// inside a ZIP the same way the real-folder case already requires.
     #[test]
-    fn zip_stale_listing_generation_race_d188() {
+    fn zip_stale_listing_generation_race_d188() { gtk_thread::run(zip_stale_listing_generation_race_d188_on_gtk_thread); }
+
+    fn zip_stale_listing_generation_race_d188_on_gtk_thread() {
         if std::env::var("WAYFINDER_D188_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -21590,7 +22876,9 @@ Broken: Either state is wrong.\n";
     /// D-187 carried: the accepted round-187 Undo/Redo set, run on its own
     /// for a regression-only re-check (not reopening round 187).
     #[test]
-    fn undo_redo_d187_regression_alone() {
+    fn undo_redo_d187_regression_alone() { gtk_thread::run(undo_redo_d187_regression_alone_on_gtk_thread); }
+
+    fn undo_redo_d187_regression_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D187_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -21614,13 +22902,19 @@ Broken: Either state is wrong.\n";
     /// All GTK tests share one thread (GTK initializes once) and run only under
     /// a virtual display, so they can never open a window on the owner's screen.
     #[test]
-    fn gtk_headless_suite() {
+    fn gtk_headless_suite() { gtk_thread::run(gtk_headless_suite_on_gtk_thread); }
+
+    fn gtk_headless_suite_on_gtk_thread() {
         if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
             return;
         }
         // D-232: the suite uses the display's clipboard, so it runs only in a
         // private session. Checked before GTK and GIO read HOME or the display.
         let d232_session = private_session_guard_d232();
+        // D-290: the app now honours XDG_CONFIG_HOME. The guard above has
+        // checked it; the tests below each give themselves a HOME of their own
+        // and expect their settings under it, so the variable is dropped here.
+        std::env::remove_var("XDG_CONFIG_HOME");
         gtk::init().expect("gtk init on the virtual display");
         gst::init().expect("gstreamer init");
         let display = gdk::Display::default().expect("display");
@@ -21648,6 +22942,9 @@ Broken: Either state is wrong.\n";
         #[cfg(feature = "guide")]
         guide_zip_targets_d194c();
         split_view_opens_a_second_real_pane_d241();
+        split_places_navigate_the_active_pane_d311();
+        ctrl_scroll_zoom_scales_the_names_d312();
+        sidebar_tree_reads_never_block_the_window_d289();
         name_dialog_ok_and_enter_invoke_callback_once_cancel_never();
         {
             let root = crate::native_core::scratch_root().join(format!("wf-d80-{}", std::process::id()));
@@ -21679,6 +22976,9 @@ Broken: Either state is wrong.\n";
         job_result_survives_its_own_refresh_d32();
         folder_activation_waits_for_gtk_to_finish_d33();
         navigation_hands_focus_to_the_view_root_d34();
+        recent_tile_shows_its_folder_d307();
+        transfer_banner_and_one_transfer_app_wide_d308();
+        transfer_ghosts_show_in_the_destination_only_d309();
         clear_recents_is_durable_and_live_d35();
         settings_survive_the_application_id_d65();
         item_right_click_menu_opens_bounded_and_stays_d41();
@@ -24259,7 +25559,7 @@ Broken: Either state is wrong.\n";
 
         // transfer-progress / transfer-cancel: unmapped at rest, so no ring; only
         // paints once a real transfer makes the bar/Cancel visible, and clears when it ends.
-        assert!(!ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible(), "at rest before the transfer");
+        assert!(!ui.transfer_banner.is_visible() && !ui.transfer_cancel.is_visible(), "at rest before the transfer");
         put("transfer-progress", "copy progress");
         assert!(guide_marked(tree()).is_empty(), "no ring on an unmapped progress bar");
 
@@ -24270,7 +25570,7 @@ Broken: Either state is wrong.\n";
             Transfer { srcs: vec![src.join("big.bin")], dest: dest.clone(), is_copy: true, cut_offer: None, style: TransferStyle::Paste },
             native_core::PasteConflict::KeepBoth,
         );
-        wait_for("bar and Cancel become visible", || ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible());
+        wait_for("bar and Cancel become visible", || ui.transfer_banner.is_visible() && ui.transfer_cancel.is_visible());
         assert_eq!(by_name("transfer-progress").len(), 1, "exactly one transfer-progress target once live");
         let progress_bar = by_name("transfer-progress")[0].clone();
         assert!(progress_bar.clone().downcast::<gtk::ProgressBar>().is_ok(), "the real progress bar");
@@ -24292,7 +25592,7 @@ Broken: Either state is wrong.\n";
         // Clicking Cancel still routes to the real handler: the transfer actually cancels.
         cancel_button.emit_clicked();
         wait_for("transfer ends after the real Cancel click", || state.borrow().active_transfer.is_none());
-        wait_for("controls hide at rest again", || !ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible());
+        wait_for("controls hide at rest again", || !ui.transfer_banner.is_visible() && !ui.transfer_cancel.is_visible());
         wait_for("the ring clears once its target is unmapped again", || guide_marked(tree()).is_empty());
 
         TRANSFER_COPY_PROGRAM.with(|p| *p.borrow_mut() = None);
@@ -24311,6 +25611,224 @@ Broken: Either state is wrong.\n";
     /// D-241 split view: F3 builds a whole second pane in the same window --
     /// its own list, its own folder, its own tabs -- and F3 again takes it
     /// away and leaves the first pane's body intact and mapped.
+    /// D-289 (D-272's own test). A directory read that never comes back must
+    /// not stop the window, must be asked for once, and its answer must land
+    /// in the cache when the read finally returns. The reader here BLOCKS on a
+    /// channel the test holds, standing in for a hung Drive mount.
+    fn sidebar_tree_reads_never_block_the_window_d289() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d289-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d289test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(home.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        pump();
+
+        // ---- Children of a folder: the read is held shut.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_in_worker = reads.clone();
+        let path = "/wf-d289-hung-mount";
+        let started = Instant::now();
+        let first = ensure_tree_children_with(&state, &ui, path, move |_, _| {
+            reads_in_worker.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx.recv(); // hangs until the test lets go
+            vec![("child".to_string(), "/wf-d289-hung-mount/child".to_string(), false)]
+        });
+        assert!(first.is_empty(), "the first ask answers nothing and does not wait");
+        assert!(started.elapsed() < Duration::from_millis(500), "the first ask returned at once");
+        assert!(state.borrow().tree_pending.contains(path), "the read is recorded as in flight");
+
+        // The window keeps running while the read hangs: a timer on the main
+        // loop fires, which it could not if the read ran on the main thread.
+        let ticked = Rc::new(std::cell::Cell::new(false));
+        let ticked_in_timer = ticked.clone();
+        glib::timeout_add_local_once(Duration::from_millis(20), move || ticked_in_timer.set(true));
+        wait_for("the main loop to keep running while the read hangs", || ticked.get());
+
+        // Asked again while in flight: still nothing, and no second read.
+        let second = ensure_tree_children_with(&state, &ui, path, |_, _| {
+            panic!("a second read was started while the first is in flight")
+        });
+        assert!(second.is_empty());
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one read for any number of asks");
+
+        // Let the read finish: the answer lands in the cache, pending clears.
+        release_tx.send(()).unwrap();
+        wait_for("the released read to land in the cache", || {
+            state.borrow().tree_cache.children(path).is_some()
+        });
+        assert!(!state.borrow().tree_pending.contains(path));
+        let third = ensure_tree_children_with(&state, &ui, path, |_, _| {
+            panic!("the cached answer was read again")
+        });
+        assert_eq!(third.len(), 1, "now answered from the cache, with no read");
+
+        // ---- Drive probe: drawn as openable while it hangs, then settled.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<()>();
+        let mount = "/wf-d289-hung-drive";
+        let openable_now = tree_drive_openable_with(&state, &ui, mount, move |_, _| {
+            let _ = probe_rx.recv();
+            false
+        });
+        assert!(openable_now, "a drive is drawn openable while its probe is in flight");
+        assert!(
+            tree_drive_openable_with(&state, &ui, mount, |_, _| panic!("a second probe was started")),
+            "still openable, and no second probe"
+        );
+        probe_tx.send(()).unwrap();
+        wait_for("the released probe to land", || state.borrow().tree_cache.openable(mount).is_some());
+        assert_eq!(state.borrow().tree_cache.openable(mount), Some(false));
+        assert!(
+            !tree_drive_openable_with(&state, &ui, mount, |_, _| panic!("the answer was probed again")),
+            "the settled answer replaces the optimistic one"
+        );
+
+        // ---- D-295 live: closing a branch forgets it; a hidden-files change forgets all.
+        state.borrow_mut().tree_expanded.insert(path.to_string());
+        toggle_tree_only(&state, &ui, path);
+        assert!(state.borrow().tree_cache.children(path).is_none(), "a closed branch is forgotten");
+        state.borrow_mut().tree_cache.insert_children("/wf-d289-a".into(), Vec::new());
+        let was = state.borrow().show_hidden;
+        set_show_hidden(&state, !was);
+        assert!(state.borrow().tree_cache.children("/wf-d289-a").is_none(), "the hidden toggle clears the cache");
+        set_show_hidden(&state, was);
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-311: the one Places list in a split window navigates the pane that
+    /// was used last, as Dolphin's does, not always the left one.
+    /// D-312: Ctrl+scroll zoom scales the file names, not only the pictures.
+    fn ctrl_scroll_zoom_scales_the_names_d312() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d312-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a-rather-long-file-name-here.txt"), "1").unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d312test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        let scale_of = |class: &str| -> Option<f64> {
+            all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter(|w| w.has_css_class(class))
+                .find_map(|w| w.downcast::<gtk::Label>().ok())
+                .and_then(|l| l.attributes())
+                .and_then(|attrs| {
+                    attrs.attributes().into_iter().find_map(|a| {
+                        a.downcast_ref::<gtk::pango::AttrFloat>().map(|f| f.value())
+                    })
+                })
+        };
+        state.borrow_mut().icon_zoom = 1.0;
+        repopulate_rows(&state, &ui);
+        pump();
+        let at_one = scale_of("wf-file-name").expect("list name carries a scale");
+        state.borrow_mut().icon_zoom = 2.0;
+        repopulate_rows(&state, &ui);
+        pump();
+        let at_two = scale_of("wf-file-name").expect("list name carries a scale");
+        assert!(at_two > at_one, "names grow with the zoom: {at_one} -> {at_two}");
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        pump();
+        let grid = scale_of("wf-grid-name").expect("grid name carries a scale");
+        assert!(grid > 1.0, "grid names grow with the zoom: {grid}");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn split_places_navigate_the_active_pane_d311() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d311-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let left = root.join("left");
+        for d in ["Music", "Documents"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("one.txt"), "1").unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d311test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(left.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        toggle_split(&state, &ui);
+        pump();
+        let pane_state = ui.split.borrow().clone().expect("split").state;
+        let pane_ui = ui_for_state(&pane_state).expect("second pane ui");
+        wait_for("second pane listing", || pane_state.borrow().visible_entries.len() == 1);
+        let row_for = |name: &str| {
+            let wanted = home.join(name).to_string_lossy().to_string();
+            all_widgets(ui.sidebar.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+                .find(|r| r.tooltip_text().as_deref() == Some(wanted.as_str()))
+                .unwrap_or_else(|| panic!("a Places row for {name}"))
+        };
+        // The split opens with focus in the right pane.
+        assert!(ui.split_right_active.get(), "right pane is active after opening the split");
+        activate_sidebar_row(&state, &ui, &row_for("Music"));
+        wait_for("the right pane went to Music", || pane_state.borrow().cwd.display_string().ends_with("Music"));
+        assert!(state.borrow().cwd.display_string().ends_with("left"), "the left pane stayed put");
+        // Using the left pane makes it the active one.
+        ui.list.grab_focus();
+        pump();
+        assert!(!ui.split_right_active.get(), "left pane is active after focusing its list");
+        activate_sidebar_row(&state, &ui, &row_for("Documents"));
+        wait_for("the left pane went to Documents", || state.borrow().cwd.display_string().ends_with("Documents"));
+        assert!(pane_state.borrow().cwd.display_string().ends_with("Music"), "the right pane stayed put");
+        let _ = &pane_ui;
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn split_view_opens_a_second_real_pane_d241() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d241-{}", std::process::id()));
@@ -27798,6 +29316,194 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// A Recent file tile must say where the file lives: its Show in folder
+    /// button opens that folder with the file selected, and the tile drags.
+    fn recent_tile_shows_its_folder_d307() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d307-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let sub = home.join("projects-307");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("wanted-307.txt");
+        std::fs::write(&file, "W").unwrap();
+        std::fs::write(sub.join("other-307.txt"), "O").unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d307test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(home.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().windows())
+            .into_iter()
+            .find(|(_, u)| u.window.application().as_ref() == Some(app.upcast_ref()))
+            .expect("window");
+        wait_for("home listing", || state.borrow().visible_entries.len() == 1);
+        state.borrow_mut().recent_files = vec![bookmark_for_path(&file.to_string_lossy())];
+        rebuild_quick_access(&state, &ui);
+        pump();
+        let cell = ui.recent_files_tiles.first_child().and_then(|c| c.first_child()).expect("a recent tile");
+        let mut button = None;
+        let mut child = cell.first_child();
+        while let Some(w) = child {
+            child = w.next_sibling();
+            if w.tooltip_text().as_deref() == Some("Show in folder") {
+                button = w.downcast::<gtk::Button>().ok();
+            }
+        }
+        button.expect("Show in folder button beside the tile").emit_clicked();
+        wait_for("folder opened", || {
+            state.borrow().cwd.real_path_string().as_deref() == Some(&*sub.to_string_lossy())
+                && state.borrow().visible_entries.len() == 2
+        });
+        pump();
+        let picked: Vec<_> = selected_entries(&state, &ui)
+            .iter()
+            .filter_map(|e| e.source.real_path_string())
+            .collect();
+        assert_eq!(picked, vec![file.to_string_lossy().to_string()], "the file must be selected");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// A running transfer shows a banner in every window, and a second one
+    /// started in another window is refused while the first is left alone.
+    fn transfer_banner_and_one_transfer_app_wide_d308() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d308-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let (da, db) = (root.join("a-308"), root.join("b-308"));
+        for d in [&home, &da, &db] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d308test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(da.to_string_lossy().to_string()), None);
+        build_ui(&app, Some(db.to_string_lossy().to_string()), None);
+        let windows: Vec<_> = WINDOWS
+            .with(|w| w.borrow().windows())
+            .into_iter()
+            .filter(|(_, u)| u.window.application().as_ref() == Some(app.upcast_ref()))
+            .collect();
+        assert_eq!(windows.len(), 2);
+        let (sa, ua) = windows[0].clone();
+        let (sb, ub) = windows[1].clone();
+        assert!(!ua.transfer_banner.is_visible() && !ub.transfer_banner.is_visible());
+        assert!(!transfer_running_anywhere());
+        sa.borrow_mut().active_transfer = Some(ActiveTransfer {
+            id: 9_000_308,
+            is_copy: true,
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancelling: false,
+            committed: false,
+        });
+        show_transfer_strip(&ua, &transfer_strip(true, native_core::TransferEvent::Bytes { done: 50, total: 100 }));
+        pump();
+        for (name, u) in [("starting window", &ua), ("other window", &ub)] {
+            assert!(u.transfer_banner.is_visible(), "{name}: banner must show");
+            assert!(u.transfer_banner_label.label().contains("Copying 50%"), "{name}: {}", u.transfer_banner_label.label());
+            assert!((u.transfer_banner_bar.fraction() - 0.5).abs() < 0.001, "{name}: bar at half");
+        }
+        assert!(transfer_running_anywhere());
+        refuse_second_transfer(&sb, &ub);
+        assert_eq!(ub.status.label(), "A transfer is already running in another window");
+        refuse_second_transfer(&sa, &ua);
+        assert_eq!(ua.status.label(), "A transfer is already running");
+        assert!(sa.borrow().active_transfer.is_some(), "the first transfer is untouched");
+        sa.borrow_mut().active_transfer = None;
+        hide_transfer_strip(&ua);
+        pump();
+        assert!(!ua.transfer_banner.is_visible() && !ub.transfer_banner.is_visible(), "banner gone everywhere");
+        assert!(!transfer_running_anywhere());
+        ua.window.destroy();
+        ub.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// Ghost rows: greyed placeholders with progress appear in the window
+    /// showing the destination folder, and only there; they vanish at the end.
+    fn transfer_ghosts_show_in_the_destination_only_d309() {
+        use native_core::TransferEvent as E;
+        assert_eq!(eta_text(0), "1 s left");
+        assert_eq!(eta_text(42), "42 s left");
+        assert_eq!(eta_text(61), "2 min left");
+        assert_eq!(eta_text(3700), "1 h 2 min left");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d309-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let (dest, other, src) = (root.join("dest-309"), root.join("other-309"), root.join("src-309"));
+        for d in [&home, &dest, &other, &src] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(src.join("one.mp3"), "1").unwrap();
+        std::fs::write(src.join("two.mp3"), "2").unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d309test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dest.to_string_lossy().to_string()), None);
+        build_ui(&app, Some(other.to_string_lossy().to_string()), None);
+        let windows: Vec<_> = WINDOWS
+            .with(|w| w.borrow().windows())
+            .into_iter()
+            .filter(|(_, u)| u.window.application().as_ref() == Some(app.upcast_ref()))
+            .collect();
+        let at = |p: &Path| windows.iter().find(|(s, _)| s.borrow().cwd.real_path() == Some(p)).cloned().expect("window");
+        let (_, ud) = at(&dest);
+        let (_, uo) = at(&other);
+        start_transfer_view(&dest, &[src.join("one.mp3"), src.join("two.mp3")]);
+        note_transfer_event(E::Item { index: 0, bytes: 100 });
+        note_transfer_event(E::Bytes { done: 150, total: 200 });
+        note_transfer_event(E::Item { index: 1, bytes: 100 });
+        refresh_ghosts();
+        pump();
+        assert!(ud.ghost_box.is_visible(), "destination window shows ghosts");
+        assert!(!uo.ghost_box.is_visible(), "other window shows none");
+        let bars: Vec<f64> = {
+            let mut out = Vec::new();
+            let mut row = ud.ghost_box.first_child();
+            while let Some(r) = row {
+                let words = r.first_child().and_then(|icon| icon.next_sibling()).expect("words");
+                let bar = words.first_child().and_then(|l| l.next_sibling()).expect("bar").downcast::<gtk::ProgressBar>().unwrap();
+                out.push(bar.fraction());
+                row = r.next_sibling();
+            }
+            out
+        };
+        assert_eq!(bars, vec![1.0, 0.5], "first item done, second half way");
+        end_transfer_view();
+        pump();
+        assert!(!ud.ghost_box.is_visible() && !uo.ghost_box.is_visible(), "ghosts gone");
+        ud.window.destroy();
+        uo.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn clear_recents_is_durable_and_live_d35() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d35-{}", std::process::id()));
@@ -28238,7 +29944,9 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
-    fn drive_menus_survive_refresh_d229_alone() {
+    fn drive_menus_survive_refresh_d229_alone() { gtk_thread::run(drive_menus_survive_refresh_d229_alone_on_gtk_thread); }
+
+    fn drive_menus_survive_refresh_d229_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D229_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -29540,7 +31248,9 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
-    fn extract_here_keeps_existing_entries_d230_alone() {
+    fn extract_here_keeps_existing_entries_d230_alone() { gtk_thread::run(extract_here_keeps_existing_entries_d230_alone_on_gtk_thread); }
+
+    fn extract_here_keeps_existing_entries_d230_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D230_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -29682,7 +31392,9 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
-    fn partial_trash_keeps_undo_d231_alone() {
+    fn partial_trash_keeps_undo_d231_alone() { gtk_thread::run(partial_trash_keeps_undo_d231_alone_on_gtk_thread); }
+
+    fn partial_trash_keeps_undo_d231_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D231_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -30372,7 +32084,9 @@ Broken: Either state is wrong.\n";
     /// It owns and reads the private display's clipboard as a process of its
     /// own, on commands from the test. It does nothing unless a test started it.
     #[test]
-    fn shared_clipboard_peer_d232() {
+    fn shared_clipboard_peer_d232() { gtk_thread::run(shared_clipboard_peer_d232_on_gtk_thread); }
+
+    fn shared_clipboard_peer_d232_on_gtk_thread() {
         if std::env::var("WF_D232_PEER").as_deref() != Ok("1") {
             return;
         }
@@ -30931,8 +32645,17 @@ Broken: Either state is wrong.\n";
             self.shows();
         }
 
+        /// The question up in this window. A D-320 transfer report is not a
+        /// question: it is closed and skipped.
         fn question(&self) -> Option<adw::AlertDialog> {
-            self.ui.window.visible_dialog().and_then(|dialog| dialog.downcast::<adw::AlertDialog>().ok())
+            loop {
+                let alert = self.ui.window.visible_dialog().and_then(|dialog| dialog.downcast::<adw::AlertDialog>().ok())?;
+                if !alert.heading().map(|h| h.contains(" verified: ")).unwrap_or(false) {
+                    return Some(alert);
+                }
+                alert.force_close();
+                drain_d232();
+            }
         }
 
         /// Waits for the name-clash question to be up in this window.
@@ -30950,6 +32673,12 @@ Broken: Either state is wrong.\n";
         }
 
         fn close(&self) {
+            // D-320: a verified paste leaves its report dialog up; dismiss it
+            // so the window can close.
+            while let Some(dialog) = self.ui.window.visible_dialog() {
+                dialog.force_close();
+                drain_d232();
+            }
             self.ui.window.close();
             until_d232("the window to be gone", || ui_for_state(&self.state).is_none());
         }
@@ -32079,7 +33808,9 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
-    fn shared_clipboard_d232_alone() {
+    fn shared_clipboard_d232_alone() { gtk_thread::run(shared_clipboard_d232_alone_on_gtk_thread); }
+
+    fn shared_clipboard_d232_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D232_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -32157,7 +33888,9 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
-    fn shared_clipboard_seams_d232_alone() {
+    fn shared_clipboard_seams_d232_alone() { gtk_thread::run(shared_clipboard_seams_d232_alone_on_gtk_thread); }
+
+    fn shared_clipboard_seams_d232_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D232_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -32244,6 +33977,7 @@ Broken: Either state is wrong.\n";
         let committed = native_core::TransferResult {
             items: vec![item.clone()],
             warnings: vec!["could not remove a backup".into()],
+            report: Vec::new(),
         };
         let outcome = transfer_outcome("Pasted", true, Ok(committed)).unwrap();
         assert!(outcome.message.contains("warning"));
@@ -32480,7 +34214,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(selected_paths(&state, &ui), vec![new_path.clone()], "{tag}: exactly the renamed row is selected");
         let new_index = index_of(&state, &new_path).expect("renamed entry present after reload");
         let mut expected = state.borrow().visible_entries.clone();
-        sort_entries(&mut expected, state.borrow().sort_key, state.borrow().sort_ascending);
+        sort_entries(&mut expected, state.borrow().sort_key, state.borrow().sort_ascending, effective_placement(&state.borrow()));
         let names: Vec<&str> = expected.iter().map(|e| e.name.as_str()).collect();
         let sorted_index = names.iter().position(|&n| n == new_name).expect("renamed name in freshly-sorted order");
         assert_eq!(new_index, sorted_index, "{tag}: row sits at its natural sort position, not pinned or moved");
@@ -33343,7 +35077,7 @@ Broken: Either state is wrong.\n";
     /// trashed folder, and a destination reappearing between the fingerprint
     /// check and the no-replace restore.
     fn undo_redo_gate_trash_d187() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap();
+        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = std::env::var("HOME").expect("HOME");
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let stem = format!("wf-d187-gate-trash-{}-{nanos}", std::process::id());
@@ -33721,7 +35455,9 @@ Broken: Either state is wrong.\n";
 
     /// D-155 alone on a virtual display: the focused GTK gate for transfers.
     #[test]
-    fn transfer_progress_and_cancel_d155_alone() {
+    fn transfer_progress_and_cancel_d155_alone() { gtk_thread::run(transfer_progress_and_cancel_d155_alone_on_gtk_thread); }
+
+    fn transfer_progress_and_cancel_d155_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D155_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -33791,13 +35527,13 @@ Broken: Either state is wrong.\n";
                 pump();
             }
         };
-        let at_rest = || !ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible();
+        let at_rest = || !ui.transfer_banner.is_visible() && !ui.transfer_cancel.is_visible();
         assert!(at_rest(), "bar and Cancel are hidden at rest");
         assert!(!request_transfer_cancel(&state, &ui), "Cancel with nothing running does nothing");
 
         // 1. A successful copy: percent and byte text follow the worker.
         run_transfer(state.clone(), ui.clone(), transfer("big.bin", true, None), native_core::PasteConflict::KeepBoth);
-        assert!(ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
+        assert!(ui.transfer_banner.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
         until("copy done", &|| state.borrow().active_transfer.is_none());
         assert!(at_rest(), "controls hide when the transfer ends");
         assert!(ui.status.label().starts_with("Pasted 1 item"), "ordinary success status: {}", ui.status.label());
@@ -33898,7 +35634,9 @@ Broken: Either state is wrong.\n";
     /// D-185 alone on a virtual display: real GTK progress and Cancel for
     /// both a large local COPY and a forced-cross-device local MOVE.
     #[test]
-    fn transfer_progress_and_cancel_d185_alone() {
+    fn transfer_progress_and_cancel_d185_alone() { gtk_thread::run(transfer_progress_and_cancel_d185_alone_on_gtk_thread); }
+
+    fn transfer_progress_and_cancel_d185_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D185_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -34045,7 +35783,7 @@ Broken: Either state is wrong.\n";
             for l in &seen {
                 assert!(!l.contains("copy-src") && !l.contains(&*root.to_string_lossy()), "no source filename or path in: {l}");
             }
-            assert!(ui.transfer_bar.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
+            assert!(ui.transfer_banner.is_visible() && ui.transfer_cancel.is_visible() && ui.transfer_cancel.is_sensitive());
             let clicked = Instant::now();
             ui.transfer_cancel.emit_clicked();
             assert!(!ui.transfer_cancel.is_sensitive(), "Cancel is spent after one click");
@@ -34062,7 +35800,7 @@ Broken: Either state is wrong.\n";
             while ctx.iteration(false) {}
             println!("D185 MEASURE copy click-to-terminal-UI: {} ms", copy_latency.as_millis());
             assert!(copy_latency < Duration::from_millis(250), "copy terminal UI in {copy_latency:?}");
-            assert!(!ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible(), "controls hidden after cancel");
+            assert!(!ui.transfer_banner.is_visible() && !ui.transfer_cancel.is_visible(), "controls hidden after cancel");
             assert_eq!(sha256_of(&src.join(name)), before_sha, "source byte-identical after a cancelled copy");
             assert!(!dest.join(name).exists(), "destination absent after a cancelled copy");
             assert!(no_residue(), "no owned staging residue after a cancelled copy");
@@ -34126,7 +35864,7 @@ Broken: Either state is wrong.\n";
             while ctx.iteration(false) {}
             println!("D185 MEASURE move click-to-terminal-UI: {} ms", move_latency.as_millis());
             assert!(move_latency < Duration::from_millis(250), "move terminal UI in {move_latency:?}");
-            assert!(!ui.transfer_bar.is_visible() && !ui.transfer_cancel.is_visible(), "controls hidden after cancel");
+            assert!(!ui.transfer_banner.is_visible() && !ui.transfer_cancel.is_visible(), "controls hidden after cancel");
             assert_eq!(sha256_of(&src.join(name)), before_sha, "move source byte-identical after a cancelled move");
             assert!(!dest.join(name).exists(), "destination absent after a cancelled move");
             assert!(no_residue(), "no owned staging residue after a cancelled move");
@@ -34154,7 +35892,9 @@ Broken: Either state is wrong.\n";
     /// (own loopback only): real GIO/GVfs against a test-owned, throwaway
     /// `smbd` on `127.0.0.1:445`. Never runs outside that namespace.
     #[test]
-    fn smb_real_loopback_d186_alone() {
+    fn smb_real_loopback_d186_alone() { gtk_thread::run(smb_real_loopback_d186_alone_on_gtk_thread); }
+
+    fn smb_real_loopback_d186_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D186_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -34845,7 +36585,9 @@ Broken: Either state is wrong.\n";
     /// D-226 alone on a virtual display: the refresh a delete triggers must
     /// never show a frame at the top of the list.
     #[test]
-    fn scroll_flick_d226_alone() {
+    fn scroll_flick_d226_alone() { gtk_thread::run(scroll_flick_d226_alone_on_gtk_thread); }
+
+    fn scroll_flick_d226_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D226_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -34985,7 +36727,9 @@ Broken: Either state is wrong.\n";
     /// name was copied exactly once, that typing still drives the button,
     /// and that a name of spaces alone is refused.
     #[test]
-    fn save_picker_row_click_copies_the_name_without_recursing_d235_alone() {
+    fn save_picker_row_click_copies_the_name_without_recursing_d235_alone() { gtk_thread::run(save_picker_row_click_copies_the_name_without_recursing_d235_alone_on_gtk_thread); }
+
+    fn save_picker_row_click_copies_the_name_without_recursing_d235_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D235_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -35106,7 +36850,9 @@ Broken: Either state is wrong.\n";
     /// picker the panic landed in a GTK unbind callback, which cannot unwind,
     /// so the process aborted. Here it fails as a plain panic.
     #[test]
-    fn save_picker_opens_a_folder_instead_of_closing_d237_alone() {
+    fn save_picker_opens_a_folder_instead_of_closing_d237_alone() { gtk_thread::run(save_picker_opens_a_folder_instead_of_closing_d237_alone_on_gtk_thread); }
+
+    fn save_picker_opens_a_folder_instead_of_closing_d237_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D237_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -35210,7 +36956,10 @@ Broken: Either state is wrong.\n";
     /// read back off the live state and printed.
     #[cfg(feature = "guide")]
     #[test]
-    fn browsing_and_tabs_watched_d239_alone() {
+    fn browsing_and_tabs_watched_d239_alone() { gtk_thread::run(browsing_and_tabs_watched_d239_alone_on_gtk_thread); }
+
+    #[cfg(feature = "guide")]
+    fn browsing_and_tabs_watched_d239_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D239_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -35459,7 +37208,9 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
-    fn trash_button_in_trash_asks_first_d234_alone() {
+    fn trash_button_in_trash_asks_first_d234_alone() { gtk_thread::run(trash_button_in_trash_asks_first_d234_alone_on_gtk_thread); }
+
+    fn trash_button_in_trash_asks_first_d234_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D234_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -35627,7 +37378,9 @@ Broken: Either state is wrong.\n";
     /// D-233 alone on a virtual display: permanently deleting from the Trash
     /// (the confirm dialog included) must not move the list either.
     #[test]
-    fn scroll_flick_d233_alone() {
+    fn scroll_flick_d233_alone() { gtk_thread::run(scroll_flick_d233_alone_on_gtk_thread); }
+
+    fn scroll_flick_d233_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D233_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -35839,7 +37592,9 @@ Broken: Either state is wrong.\n";
 
     /// D-157 alone on a virtual display.
     #[test]
-    fn column_chooser_d157_alone() {
+    fn column_chooser_d157_alone() { gtk_thread::run(column_chooser_d157_alone_on_gtk_thread); }
+
+    fn column_chooser_d157_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D157_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -35865,7 +37620,9 @@ Broken: Either state is wrong.\n";
 
     /// D-156 connect: fake backend, real window, real modal, Scratch paths.
     #[test]
-    fn connect_gtk_d156_connect_alone() {
+    fn connect_gtk_d156_connect_alone() { gtk_thread::run(connect_gtk_d156_connect_alone_on_gtk_thread); }
+
+    fn connect_gtk_d156_connect_alone_on_gtk_thread() {
         if std::env::var("WAYFINDER_D156C_ONLY").as_deref() != Ok("1") {
             return;
         }
@@ -36372,6 +38129,980 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-298: Rust's test harness gives every `#[test]` a fresh OS thread, and
+    /// GTK may be initialised from one thread only, so a second GTK test used
+    /// to panic "Attempted to initialize GTK from two different threads".
+    /// Every GTK test now runs on this one thread, created once for the life
+    /// of the test binary. A panic on it is caught and rethrown on the
+    /// calling test's own thread, so the failure is reported against the
+    /// right test. A call made from the GTK thread itself runs in place (the
+    /// big suite calls other GTK tests as plain functions).
+    mod gtk_thread {
+        use std::sync::{mpsc, Mutex, OnceLock};
+        type Panic = Box<dyn std::any::Any + Send>;
+        type Job = (fn(), mpsc::Sender<Result<(), Panic>>);
+        static SENDER: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+        static GTK_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+        pub fn run(test: fn()) {
+            if GTK_THREAD.get() == Some(&std::thread::current().id()) {
+                return test();
+            }
+            let sender = SENDER.get_or_init(|| {
+                let (tx, rx) = mpsc::channel::<Job>();
+                std::thread::Builder::new()
+                    .name("gtk-test-thread".into())
+                    .spawn(move || {
+                        let _ = GTK_THREAD.set(std::thread::current().id());
+                        while let Ok((job, done)) = rx.recv() {
+                            let outcome = std::panic::catch_unwind(job);
+                            let _ = done.send(outcome);
+                        }
+                    })
+                    .expect("start the GTK test thread");
+                Mutex::new(tx)
+            });
+            let (done_tx, done_rx) = mpsc::channel();
+            sender.lock().unwrap_or_else(|p| p.into_inner()).send((test, done_tx)).expect("GTK test thread is alive");
+            if let Err(payload) = done_rx.recv().expect("GTK test thread answered") {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    /// D-316: a PNG preview must have real on-screen size, not only pixels.
+    #[test]
+    fn png_preview_has_a_visible_size_d316() { gtk_thread::run(png_preview_has_a_visible_size_d316_on_gtk_thread); }
+
+    fn png_preview_has_a_visible_size_d316_on_gtk_thread() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d316-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let pixbuf = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 1536, 1024).expect("pixbuf");
+        pixbuf.fill(0x3366_99ff);
+        pixbuf.savev(dir.join("pic.png"), "png", &[]).expect("write png");
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d316test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.set_default_size(1000, 700);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1);
+        ui.preview_toggle.set_active(true);
+        wait_for("preview pane", || ui.preview_scroll.is_mapped());
+        let path = dir.join("pic.png").to_string_lossy().to_string();
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&path));
+        wait_for("image page", || {
+            ui.preview_stack.visible_child_name().as_deref() == Some("image") && ui.preview_picture.paintable().is_some()
+        });
+        for _ in 0..10 {
+            pump();
+        }
+        eprintln!("D316 MEASURE picture {}x{} scroll {}x{} stack {}x{}", ui.preview_picture.width(), ui.preview_picture.height(), ui.preview_scroll.width(), ui.preview_scroll.height(), ui.preview_stack.width(), ui.preview_stack.height());
+        assert!(ui.preview_picture.width() > 50 && ui.preview_picture.height() > 50, "the picture is allocated real size");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-314: a loaded song survives the selection being cleared and restored
+    /// by a listing refresh, and still stops when another file is chosen.
+    /// D-315: a focused menu row is drawn as one highlight, with no outline.
+    #[test]
+    fn menu_rows_have_no_focus_ring_d315() {
+        let rule = APP_CSS.split(".wf-menu-item:focus-visible,\n.wf-menu-tool:focus-visible {").nth(1).expect("rule exists");
+        let body = rule.split('}').next().unwrap();
+        assert!(body.contains("outline: none;"), "{body}");
+        assert!(APP_CSS.contains(".wf-menu-item:hover,\n.wf-menu-item:focus-visible {"));
+    }
+
+    /// D-318: a drive in the Devices list accepts a drop, like every other
+    /// folder row. It had no drop target, so the pointer showed "not allowed".
+    #[test]
+    fn a_drive_row_accepts_a_drop_d318() { gtk_thread::run(a_drive_row_accepts_a_drop_d318_on_gtk_thread); }
+
+    fn a_drive_row_accepts_a_drop_d318_on_gtk_thread() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d318-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        let mount = root.join("mnt");
+        for d in [&home, &dir, &mount] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d318test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.present();
+        // The window starts its own drive scan (empty under test). Let it land
+        // first, or its result rebuilds the sidebar under the menu and the row
+        // this test holds is gone. That failed here and, because the failure
+        // left HOME changed on the shared GTK thread, took four other tests and
+        // the whole GTK suite down with it (baseline, 18 Nov 2026).
+        wait_for("the first scan to land", || !state.borrow().drive_refresh_in_flight);
+        let test_drives = vec![native_core::Drive {
+            name: "Storage".to_string(),
+            path: "/dev/test-storage".to_string(),
+            mountpoint: mount.to_string_lossy().to_string(),
+            size: 0,
+            fstype: "ntfs".to_string(),
+            kind: "part".to_string(),
+            removable: false,
+            space: None,
+        }];
+        // The window's own scan (empty under test) would land during a later
+        // pump, rebuild the sidebar and remove the row this test holds. Make
+        // every scan answer with the test's drive so nothing is rebuilt.
+        {
+            let scanned = test_drives.clone();
+            let mut st = state.borrow_mut();
+            st.drive_scan = Arc::new(move || scanned.clone());
+            st.drives = test_drives;
+        }
+        rebuild_sidebar(&state, &ui);
+        // Opening the folder files it under Recent, which rebuilds the sidebar
+        // once more. Let that happen before the row is taken.
+        for _ in 0..40 {
+            pump();
+        }
+        let has_drop_target = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::DropTarget>().ok()).is_some())
+        };
+        let want = mount.to_string_lossy().to_string();
+        let row = all_widgets(ui.sidebar.upcast_ref())
+            .into_iter()
+            .find(|w| w.is::<gtk::ListBoxRow>() && w.tooltip_text().as_deref() == Some(want.as_str()))
+            .expect("the drive row");
+        let line = row.downcast_ref::<gtk::ListBoxRow>().unwrap().child().expect("row line");
+        assert!(has_drop_target(&line), "the drive row carries a drop target");
+        // D-319: right-clicking a mounted drive offers Open in New Window.
+        let drive = state.borrow().drives[0].clone();
+        show_drive_context_menu(row.downcast_ref::<gtk::ListBoxRow>().unwrap(), state.clone(), ui.clone(), drive, 1.0, 1.0);
+        let offered = all_widgets(row.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .any(|l| l.label() == "Open in New Window");
+        assert!(offered, "the drive menu offers Open in New Window");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn drop_confirmation_names_the_destination_d317() {
+        let txn = DropTxn {
+            to_row: false,
+            dest: PathBuf::from("/run/media/user/Disk1"),
+            srcs: vec![PathBuf::from("/run/media/user/Untitled/Movies.zip")],
+            is_copy: false,
+            modified: false,
+        };
+        let (heading, detail, verb) = drop_confirm_text(&txn);
+        assert_eq!(heading, "Move \"Movies.zip\" to \"Storage\"?");
+        assert_eq!(detail, "From: /run/media/user/Untitled\nTo: /run/media/user/Disk1");
+        assert_eq!(verb, "Move");
+        let many = DropTxn { srcs: vec![PathBuf::from("/a/x"), PathBuf::from("/a/y")], is_copy: true, ..txn };
+        assert_eq!(drop_confirm_text(&many).0, "Copy 2 items to \"Storage\"?");
+    }
+
+    #[test]
+    fn transfer_report_lists_every_item_d320() {
+        let rows = vec![
+            native_core::ReportRow {
+                from: "/card/Movies.zip".into(),
+                to: "/store/iMac Backup/Movies.zip".into(),
+                kind: "file",
+                bytes: 70_903_620_645,
+                files_total: 1,
+                files: Vec::new(),
+                digest: "00112233445566ff".into(),
+            },
+            native_core::ReportRow {
+                from: "/card/Pics".into(),
+                to: "/store/iMac Backup/Pics".into(),
+                kind: "folder",
+                bytes: 30,
+                files_total: 2,
+                files: vec![("a.jpg".into(), 10), ("x/b.jpg".into(), 20)],
+                digest: "aabbccddeeff0011".into(),
+            },
+        ];
+        let md = transfer_report_markdown(false, &rows);
+        assert!(md.starts_with("# Move verified: 2 items, 3 files"), "{md}");
+        assert!(md.contains("Movies.zip") && md.contains("00112233445566ff"));
+        assert!(md.contains("- a.jpg (10 B)") && md.contains("- x/b.jpg (20 B)"), "{md}");
+        assert!(md.contains("the source is gone"));
+        assert!(transfer_report_markdown(true, &rows).contains("is unchanged"));
+    }
+
+    #[test]
+    fn transfer_route_names_both_folders_d317() {
+        let srcs = [PathBuf::from("/run/media/user/Untitled/DCIM/a.mp4")];
+        assert_eq!(transfer_route(&srcs, Path::new("/run/media/user/Disk1/Clips")), "from DCIM to Clips");
+        assert_eq!(transfer_route(&[], Path::new("/x/Clips")), "to Clips");
+    }
+
+    #[test]
+    fn loaded_song_survives_a_refresh_d314() { gtk_thread::run(loaded_song_survives_a_refresh_d314_on_gtk_thread); }
+
+    fn loaded_song_survives_a_refresh_d314_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let root = crate::native_core::scratch_root().join(format!("wf-d314-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mut wav = Vec::new();
+        let data = vec![0u8; 16000];
+        wav.extend(b"RIFF");
+        wav.extend((36 + data.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(8000u32.to_le_bytes());
+        wav.extend(16000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((data.len() as u32).to_le_bytes());
+        wav.extend(&data);
+        std::fs::write(dir.join("a-song.wav"), &wav).unwrap();
+        std::fs::write(dir.join("b-note.txt"), "hello").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d314test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 2);
+        pump();
+        let song = state.borrow().visible_entries.iter().position(|e| e.name == "a-song.wav").unwrap();
+        let note = state.borrow().visible_entries.iter().position(|e| e.name == "b-note.txt").unwrap();
+        ui.list_selection.select_item(song as u32, true);
+        update_selection(&state, &ui);
+        pump();
+        assert!(ui.preview_audio_path.borrow().is_some(), "the song is loaded");
+        std::fs::write(dir.join("b-note.txt"), "hello again").unwrap();
+        for _ in 0..4 {
+            pump();
+        }
+        ui.list_selection.unselect_all();
+        update_selection(&state, &ui);
+        assert!(ui.preview_audio_path.borrow().is_some(), "a cleared selection keeps the song");
+        ui.list_selection.select_item(song as u32, true);
+        update_selection(&state, &ui);
+        assert!(ui.preview_audio_path.borrow().is_some(), "re-selecting it keeps it");
+        ui.list_selection.select_item(note as u32, true);
+        update_selection(&state, &ui);
+        assert!(ui.preview_audio_path.borrow().is_none(), "choosing another file stops the song");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-324 read-only sweep over real folders (WF_SWEEP_DIRS, colon list).
+    /// Ignored by default: it needs the owner's drive.
+    #[test]
+    #[ignore]
+    fn d324_sweep_real_audio() { gtk_thread::run(d324_sweep_real_audio_on_gtk_thread); }
+
+    fn d324_sweep_real_audio_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let dirs = std::env::var("WF_SWEEP_DIRS").expect("WF_SWEEP_DIRS");
+        let root = crate::native_core::scratch_root().join(format!("wf-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.sweeptest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        let mut first = true;
+        for dir in dirs.split(':') {
+            build_ui(&app, Some(dir.to_string()), None);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("window");
+            if first { first = false; }
+            ui.window.set_default_size(1100, 700);
+            ui.window.present();
+            wait_for("listing", || !state.borrow().entries.is_empty());
+            for _ in 0..5 { pump(); }
+            let n = state.borrow().visible_entries.len();
+            let (mut ok, mut damaged, mut bad) = (0, 0, Vec::new());
+            let started = std::time::Instant::now();
+            for i in 0..n {
+                let (name, is_audio) = {
+                    let st = state.borrow();
+                    let e = &st.visible_entries[i];
+                    (e.name.clone(), !e.is_dir && native_core::is_audio_path(&e.name))
+                };
+                if !is_audio { continue; }
+                ui.list_selection.select_item(i as u32, true);
+                pump();
+                let t0 = std::time::Instant::now();
+                while ui.preview_audio_play.is_sensitive() == false && t0.elapsed().as_millis() < 400 { pump(); }
+                let stack = ui.preview_stack.visible_child_name().map(|s| s.to_string());
+                let title = ui.preview_audio_title.text().to_string();
+                let play = ui.preview_audio_play.is_sensitive();
+                let info = ui.preview_audio_info.text().to_string();
+                let vis = ui.preview_audio_title.is_mapped() && ui.preview_audio_play.is_mapped();
+                if stack.as_deref() != Some("audio") || title != name || !vis {
+                    bad.push(format!("BLANKISH {name}: stack={stack:?} title={title:?} mapped={vis}"));
+                } else if play { ok += 1; } else { damaged += 1; eprintln!("SWEEP damaged {name}: {}", info.replace('\n', " | ")); }
+            }
+            eprintln!("SWEEP dir={dir} entries={n} playable={ok} damaged={damaged} blankish={} took={}s", bad.len(), started.elapsed().as_secs());
+            for b in bad.iter().take(20) { eprintln!("SWEEP {b}"); }
+            ui.window.destroy();
+            pump();
+        }
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+    }
+
+    /// D-324 read-only probe: `--select` one real video, then time the
+    /// preview until the media stream is prepared. Needs WF_PROBE_FILE.
+    #[test]
+    #[ignore]
+    fn d324_probe_video_select() { gtk_thread::run(d324_probe_video_select_on_gtk_thread); }
+
+    fn d324_probe_video_select_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let file = std::env::var("WF_PROBE_FILE").expect("WF_PROBE_FILE");
+        let dir = std::path::Path::new(&file).parent().unwrap().to_string_lossy().to_string();
+        let root = crate::native_core::scratch_root().join(format!("wf-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.probetest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        build_ui(&app, Some(dir), Some(file.clone()));
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.set_default_size(1100, 700);
+        ui.window.present();
+        let t0 = std::time::Instant::now();
+        wait_for("listing", || !state.borrow().visible_entries.is_empty());
+        for _ in 0..5 { pump(); }
+        let selected: Vec<String> = (0..ui.list_selection.n_items())
+            .filter(|i| ui.list_selection.is_selected(*i))
+            .filter_map(|i| state.borrow().visible_entries.get(i as usize).and_then(|e| e.source.real_path_string()))
+            .collect();
+        eprintln!("PROBE selected={selected:?} wanted={file}");
+        let media = ui.preview_media_controls.media_stream();
+        for step in 0..40 {
+            pump();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if let Some(m) = &media {
+                eprintln!("PROBE t={}ms prepared={} dur={}us err={:?} stack={:?} pic={}x{} paintable={}x{}",
+                    t0.elapsed().as_millis(), m.is_prepared(), m.duration(), m.error().map(|e| e.to_string()),
+                    ui.preview_stack.visible_child_name(), ui.preview_media_picture.width(), ui.preview_media_picture.height(),
+                    ui.preview_media_picture.paintable().map(|p| p.intrinsic_width()).unwrap_or(-1),
+                    ui.preview_media_picture.paintable().map(|p| p.intrinsic_height()).unwrap_or(-1));
+                if m.is_prepared() && step > 4 { break; }
+            } else { eprintln!("PROBE no media stream, stack={:?}", ui.preview_stack.visible_child_name()); break; }
+        }
+        ui.window.destroy();
+        pump();
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+    }
+
+    /// D-329 check: `.MOV` extension is matched whatever its case.
+    #[test]
+    fn mov_extension_is_case_insensitive_d329() {
+        for name in ["/a/b/clip.MOV", "/a/b/clip.Mov", "/a/b/clip.mov", "/a/b/clip.mOv"] {
+            assert!(crate::native_core::is_video_path(name), "{name} must count as video");
+        }
+        assert!(!crate::native_core::is_video_path("/a/b/clip.mo"));
+    }
+
+    /// Real .MOV files from the owner's drive (read-only, skipped when the
+    /// drive is absent): selecting one shows the media stack and the stream
+    /// prepares without error, and the grid poster queue paints a frame.
+    #[test]
+    fn real_mov_files_preview_and_get_a_poster_d329() { gtk_thread::run(real_mov_files_preview_and_get_a_poster_on_gtk_thread); }
+
+    fn real_mov_files_preview_and_get_a_poster_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let base = "/run/media/user/Disk1/Old Hard Drives/Videos";
+        let mut files = vec![format!("{base}/Recovered - to sort/101_0823.MOV")];
+        let misc = format!("{base}/MISC/Wii SD card - saved stuff/2015-03-07");
+        if let Ok(rd) = std::fs::read_dir(&misc) {
+            let mut v: Vec<String> = rd.flatten().map(|e| e.path().to_string_lossy().to_string())
+                .filter(|p| p.to_lowercase().ends_with(".mov")).collect();
+            v.sort();
+            files.extend(v.into_iter().take(1));
+        }
+        files.retain(|f| std::path::Path::new(f).is_file());
+        if files.is_empty() { eprintln!("d329: drive absent, skipped"); return; }
+        let root = crate::native_core::scratch_root().join(format!("wf-d329-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d329test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        let mut failures: Vec<String> = Vec::new();
+        for file in &files {
+            let dir = std::path::Path::new(file).parent().unwrap().to_string_lossy().to_string();
+            build_ui(&app, Some(dir), Some(file.clone()));
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("window");
+            ui.window.set_default_size(1100, 700);
+            ui.window.present();
+            wait_for("listing", || !state.borrow().visible_entries.is_empty());
+            for _ in 0..5 { pump(); }
+            let mut prepared = false;
+            let mut err = None;
+            for _ in 0..60 {
+                pump();
+                std::thread::sleep(Duration::from_millis(250));
+                if let Some(m) = ui.preview_media_controls.media_stream() {
+                    err = m.error().map(|e| e.to_string());
+                    if m.is_prepared() || err.is_some() { prepared = m.is_prepared(); break; }
+                }
+            }
+            let stack = ui.preview_stack.visible_child_name().map(|s| s.to_string());
+            eprintln!("D329 {file}: stack={stack:?} prepared={prepared} err={err:?}");
+            if stack.as_deref() != Some("media") { failures.push(format!("{file}: stack {stack:?}")); }
+            if !prepared || err.is_some() { failures.push(format!("{file}: prepared={prepared} err={err:?}")); }
+            ui.window.destroy();
+            pump();
+
+            let picture = gtk::Picture::new();
+            let queue = Rc::new(RefCell::new(VideoPosterQueue {
+                cancelled: gio::Cancellable::new(),
+                pending: VecDeque::from([VideoPosterJob { path: file.clone(), picture: picture.clone() }]),
+                active: 0,
+                live: Vec::new(),
+            }));
+            start_video_poster_jobs(queue.clone());
+            let ctx = glib::MainContext::default();
+            for _ in 0..1200 {
+                while ctx.iteration(false) {}
+                if queue.borrow().active == 0 && queue.borrow().pending.is_empty() { break; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let poster = picture.paintable().is_some();
+            eprintln!("D329 {file}: poster={poster}");
+            if !poster { failures.push(format!("{file}: no grid poster")); }
+        }
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// D-327: a MIDI file's length comes from its own bytes (the decoder
+    /// reports none), so the preview shows it and the seek bar spans it, and
+    /// moving the bar really moves the stream. Hand-built 3 second file.
+    #[test]
+    fn midi_preview_shows_its_length_and_seeks_d327() { gtk_thread::run(midi_preview_shows_its_length_and_seeks_d327_on_gtk_thread); }
+
+    fn midi_preview_shows_its_length_and_seeks_d327_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let root = crate::native_core::scratch_root().join(format!("wf-d327-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("d");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let smf: Vec<u8> = [
+            &b"MThd"[..], &[0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0],
+            &b"MTrk"[..], &[0, 0, 0, 13, 0x00, 0x90, 0x3C, 0x64, 0x96, 0x40, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00],
+        ].concat();
+        let song = dir.join("three.mid");
+        std::fs::write(&song, &smf).unwrap();
+        assert_eq!(native_core::midi_duration_secs(song.to_str().unwrap()), Some(3.0));
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d327test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), Some(song.to_string_lossy().to_string()));
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.set_default_size(1100, 700);
+        ui.window.present();
+        wait_for("listing", || !state.borrow().visible_entries.is_empty());
+        wait_for("the audio page", || ui.preview_stack.visible_child_name().as_deref() == Some("audio"));
+        let decoder_error = ui.preview_audio.borrow().as_ref().and_then(|p| p.error());
+        if decoder_error.is_some() || ui.preview_audio.borrow().is_none() {
+            eprintln!("d327 SKIPPED the seek half: no MIDI decoder on this machine: {decoder_error:?}");
+        } else {
+            wait_for("the length shows", || ui.preview_audio_total.text() == "0:03");
+            assert_eq!(ui.preview_audio_scale.adjustment().upper(), 3.0, "the seek bar spans the file");
+            assert!(ui.preview_audio_scale.is_sensitive(), "the seek bar is usable");
+            // Drag the bar to 2 s: the stream must follow.
+            ui.preview_audio_scale.set_value(2.0);
+            let mut at = 0.0;
+            for _ in 0..40 {
+                pump();
+                at = ui.preview_audio.borrow().as_ref().map(|p| p.position_secs()).unwrap_or(0.0);
+                if at >= 1.9 { break; }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(at >= 1.9 && at <= 3.1, "the stream moved to 2 s, it is at {at}");
+        }
+        ui.window.destroy();
+        pump();
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+    }
+
+    /// D-325: focus sitting inside the preview pane, then another row is
+    /// chosen. GTK must not log a critical and must not loop. Each scenario
+    /// focuses a different preview widget before the pane is rebuilt.
+    #[test]
+    fn preview_focus_survives_selecting_another_row_d325() { gtk_thread::run(preview_focus_survives_selecting_another_row_d325_on_gtk_thread); }
+
+    fn preview_focus_survives_selecting_another_row_d325_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        LOGGED.lock().unwrap().clear();
+        glib::log_set_default_handler(|domain, level, message| {
+            if level == glib::LogLevel::Critical || level == glib::LogLevel::Warning {
+                LOGGED.lock().unwrap().push(format!("{domain:?}: {message}"));
+            }
+        });
+        let root = crate::native_core::scratch_root().join(format!("wf-d325-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("d");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for n in ["one.txt", "two.txt", "three.txt"] {
+            std::fs::write(dir.join("sub").join(n), "x").unwrap();
+        }
+        std::fs::write(dir.join("b.txt"), "hello").unwrap();
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "sine=d=2", "-y"])
+            .arg(dir.join("a.mp3")).status().map(|s| s.success()).unwrap_or(false)
+            && std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=160x120:r=10", "-pix_fmt", "yuv420p", "-y"])
+                .arg(dir.join("c.mp4")).status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "ffmpeg makes the stand-ins");
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d325test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.set_default_size(1100, 700);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 4);
+        let pick = |name: &str| {
+            let i = state.borrow().visible_entries.iter().position(|e| e.name == name).unwrap();
+            ui.list_selection.select_item(i as u32, true);
+            for _ in 0..6 { pump(); }
+        };
+        let first_focusable = |root: &gtk::Widget| -> Option<gtk::Widget> {
+            all_widgets(root).into_iter().find(|w| w.is::<gtk::Button>() || w.is::<gtk::Scale>())
+        };
+        // Scenario 1: the audio Play button holds focus.
+        pick("a.mp3");
+        wait_for("audio loaded", || ui.preview_audio_play.is_sensitive());
+        ui.preview_audio_play.grab_focus();
+        assert!(focus_within(&ui.window, &ui.preview_scroll), "setup: focus is in the preview pane");
+        pick("b.txt");
+        assert!(
+            !focus_within(&ui.window, &ui.preview_scroll),
+            "choosing another row takes the focus out of the preview pane before it is rebuilt"
+        );
+        // Scenario 2: the seek scale holds focus.
+        pick("a.mp3");
+        wait_for("audio loaded again", || ui.preview_audio_play.is_sensitive());
+        ui.preview_audio_scale.grab_focus();
+        pick("b.txt");
+        // Scenario 3: a button inside the folder preview holds focus, then
+        // the pane is rebuilt for another folder-less file.
+        pick("sub");
+        wait_for("folder rows", || all_widgets(ui.preview_folder.clone().upcast_ref()).iter().filter(|w| w.is::<gtk::Button>()).count() >= 3);
+        let row = first_focusable(ui.preview_folder.clone().upcast_ref()).expect("a folder preview button");
+        row.grab_focus();
+        pick("b.txt");
+        pick("sub");
+        wait_for("folder rows again", || all_widgets(ui.preview_folder.clone().upcast_ref()).iter().filter(|w| w.is::<gtk::Button>()).count() >= 3);
+        first_focusable(ui.preview_folder.clone().upcast_ref()).unwrap().grab_focus();
+        // Choosing the same folder again rebuilds its rows while one is focused.
+        pick("sub");
+        pick("b.txt");
+        // Scenario 4: a control inside the video pane holds focus.
+        pick("c.mp4");
+        wait_for("video prepared", || ui.preview_media_controls.media_stream().map(|m| m.is_prepared()).unwrap_or(false));
+        if let Some(control) = first_focusable(ui.preview_media_controls.clone().upcast_ref()) {
+            control.grab_focus();
+        }
+        pick("b.txt");
+        // A click on a row must still be able to take the focus.
+        ui.list.grab_focus();
+        pick("a.mp3");
+        let seen = LOGGED.lock().unwrap().clone();
+        ui.window.destroy();
+        pump();
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        assert!(seen.is_empty(), "GTK logged while the preview was rebuilt: {seen:#?}");
+    }
+
+    /// D-326: two windows in one process. The preview's "is this still the
+    /// selection?" counter was shared by every window, so any preview update
+    /// in window B (a folder refresh is enough) threw away the picture window
+    /// A was still decoding, and A stayed on its placeholder for good.
+    #[test]
+    fn a_preview_in_one_window_does_not_cancel_another_windows_d326() { gtk_thread::run(a_preview_in_one_window_does_not_cancel_another_windows_d326_on_gtk_thread); }
+
+    fn a_preview_in_one_window_does_not_cancel_another_windows_d326_on_gtk_thread() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d326-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("pics");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "words").unwrap();
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=320x240:r=1", "-frames:v", "1", "-y"])
+            .arg(dir.join("photo.jpg")).status().map(|s| s.success()).unwrap_or(false);
+        assert!(made, "ffmpeg makes the stand-in jpeg");
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d326test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        let mine = |ui: &Ui| ui.window.application().as_ref() == Some(app.upcast_ref());
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state_a, ui_a) = WINDOWS.with(|w| w.borrow().active(|ui| mine(ui))).expect("window a");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (_state_b, ui_b) = WINDOWS
+            .with(|w| w.borrow().active(|ui| mine(ui) && ui.window != ui_a.window))
+            .expect("window b");
+        for ui in [&ui_a, &ui_b] {
+            ui.window.set_default_size(900, 600);
+            ui.window.present();
+        }
+        wait_for("listing a", || state_a.borrow().visible_entries.len() == 2);
+        let entry_of = |name: &str| state_a.borrow().visible_entries.iter().find(|e| e.name == name).cloned().unwrap();
+        let (photo, note) = (entry_of("photo.jpg"), entry_of("note.txt"));
+        // A starts decoding the picture; before it finishes, B shows a note.
+        update_preview(&ui_a, &photo);
+        update_preview(&ui_b, &note);
+        wait_for("window a shows its picture", || ui_a.preview_stack.visible_child_name().as_deref() == Some("image"));
+        assert!(ui_a.preview_picture.paintable().is_some(), "the picture is painted");
+        ui_a.window.destroy();
+        ui_b.window.destroy();
+        pump();
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+    }
+
+    /// D-324 repro: `--select` on a real mp3 inside a big folder of mostly
+    /// damaged files. The wanted row must be the selection and the preview pane
+    /// must show the audio controls for it.
+    #[test]
+    fn select_big_folder_audio_preview_d324() { gtk_thread::run(select_big_folder_audio_preview_d324_on_gtk_thread); }
+
+    fn select_big_folder_audio_preview_d324_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let root = crate::native_core::scratch_root().join(format!("wf-d324-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("SFX");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..1700u32 {
+            std::fs::write(dir.join(format!("f{}.mp3", 1000000 + i * 7)), b"not audio at all").unwrap();
+        }
+        let wanted = dir.join("f33058132.mp3");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "sine=d=2", "-y"])
+            .arg(&wanted)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(made, "ffmpeg must write the stand-in mp3");
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        // The owner's setup: Details view sorted by Kind. XDG_CONFIG_HOME is
+        // moved too, or the test would write into the real settings file.
+        let cfg = home.join(".config");
+        std::fs::create_dir_all(cfg.join("wayfinder")).unwrap();
+        std::fs::write(
+            cfg.join("wayfinder").join("native-config.json"),
+            r#"{"view_mode":"details","sort_key":"Kind","sort_ascending":true,"folder_placement":"Top","onboarded":true}"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d324test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let wanted_str = wanted.to_string_lossy().to_string();
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), Some(wanted_str.clone()));
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.set_default_size(1100, 700);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 1701);
+        for _ in 0..10 {
+            pump();
+        }
+        let selected: Vec<String> = (0..ui.list_selection.n_items())
+            .filter(|i| ui.list_selection.is_selected(*i))
+            .filter_map(|i| state.borrow().visible_entries.get(i as usize).and_then(|e| e.source.real_path_string()))
+            .collect();
+        eprintln!("D324 selected={selected:?} stack={:?} title={:?} audio_path={:?}",
+            ui.preview_stack.visible_child_name(), ui.preview_audio_title.text(), ui.preview_audio_path.borrow());
+        eprintln!("D324 geometry scroll={}x{} mapped={} title_mapped={} title_w={} stack_w={} play_mapped={} pos={}",
+            ui.preview_scroll.width(), ui.preview_scroll.height(), ui.preview_scroll.is_mapped(),
+            ui.preview_audio_title.is_mapped(), ui.preview_audio_title.width(), ui.preview_stack.width(),
+            ui.preview_audio_play.is_mapped(), ui.file_preview.position());
+        assert_eq!(selected, vec![wanted_str.clone()], "--select highlights the requested file");
+        assert_eq!(ui.preview_audio_title.text().as_str(), "f33058132.mp3", "the pane names the file");
+        assert_eq!(ui.preview_stack.visible_child_name().as_deref(), Some("audio"));
+        assert!(ui.preview_audio_path.borrow().is_some(), "the song is loaded");
+        ui.window.destroy();
+        pump();
+        match old_xdg {
+            Some(x) => std::env::set_var("XDG_CONFIG_HOME", x),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-324: an "mp3" that holds a GIF, and a "gif" that holds MP3 audio. The
+    /// pane says what each really is, in one line, and offers no Play button.
+    #[test]
+    fn damaged_files_say_what_they_really_are_d324() { gtk_thread::run(damaged_files_say_what_they_really_are_d324_on_gtk_thread); }
+
+    fn damaged_files_say_what_they_really_are_d324_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let root = crate::native_core::scratch_root().join(format!("wf-d324b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("old");
+        for d in [&home.join(".config"), &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dir.join("liar.mp3"), b"GIF89a\x01\x00\x01\x00\x00\x00\x00;").unwrap();
+        std::fs::write(dir.join("empty.mp3"), b"").unwrap();
+        std::fs::write(dir.join("noise.mp3"), [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d324btest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.set_default_size(1000, 700);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        let info_for = |name: &str| -> String {
+            let i = state.borrow().visible_entries.iter().position(|e| e.name == name).unwrap();
+            ui.list_selection.select_item(i as u32, true);
+            pump();
+            // Unknown bytes go to the player, whose error arrives on the next tick.
+            wait_for("the pane gives up on it", || !ui.preview_audio_play.is_sensitive());
+            assert_eq!(ui.preview_stack.visible_child_name().as_deref(), Some("audio"), "{name}: the pane is never blank");
+            assert_eq!(ui.preview_audio_title.text().as_str(), name);
+            assert!(!ui.preview_audio_play.is_sensitive(), "{name}: no working Play button");
+            ui.preview_audio_info.text().to_string()
+        };
+        let liar = info_for("liar.mp3");
+        assert!(liar.contains("This file is actually a GIF image, not a .mp3 audio file."), "{liar}");
+        let empty = info_for("empty.mp3");
+        assert!(empty.contains("Empty file"), "{empty}");
+        let noise = info_for("noise.mp3");
+        assert!(noise.contains("Unreadable data"), "{noise}");
+        ui.window.destroy();
+        pump();
+        match old_xdg {
+            Some(x) => std::env::set_var("XDG_CONFIG_HOME", x),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-310 repro: Wayfinder froze at 100% CPU looping on keyboard focus while a
+    /// right-click menu opened over a folder being written to. The listing was
+    /// being rebuilt under the focused row. This reopens menus while the folder
+    /// changes under them; a hang here is the bug.
+    #[test]
+    fn popover_focus_repro_d310() { gtk_thread::run(popover_focus_repro_d310_on_gtk_thread); }
+
+    fn popover_focus_repro_d310_on_gtk_thread() {
+        gst::init().expect("gstreamer init");
+        let root = crate::native_core::scratch_root().join(format!("wf-d310-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        for d in [&home, &dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("song-{i:03}.mp3")), "x").unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d310test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 40);
+        pump();
+        let has_right_click = |w: &gtk::Widget| {
+            let c = w.observe_controllers();
+            (0..c.n_items()).any(|i| c.item(i).and_then(|o| o.downcast::<gtk::GestureClick>().ok()).is_some_and(|g| g.button() == 3))
+        };
+        let mut n = 0usize;
+        for round in 0..30 {
+            ui.list_selection.select_item((round % 20) as u32, true);
+            update_selection(&state, &ui);
+            ui.list.grab_focus();
+            pump();
+            // The folder changes under the focused row: files appear and go.
+            for k in 0..6 {
+                n += 1;
+                std::fs::write(dir.join(format!("new-{n:04}-{k}.mp3")), "y").unwrap();
+            }
+            if round % 3 == 0 {
+                for k in 0..4 {
+                    let _ = std::fs::remove_file(dir.join(format!("song-{:03}.mp3", (round * 4 + k) % 40)));
+                }
+            }
+            for _ in 0..4 {
+                pump();
+            }
+            let Some(row) = all_widgets(ui.list.upcast_ref()).into_iter().find(|w| w.is::<gtk::Box>() && has_right_click(w)) else {
+                continue;
+            };
+            let Some(entry) = state.borrow().visible_entries.first().cloned() else { continue };
+            show_item_context_menu(&row, state.clone(), ui.clone(), entry, 5.0, 5.0);
+            // Rebuild the listing while the menu is open, then close it.
+            std::fs::write(dir.join(format!("open-{round}.mp3")), "z").unwrap();
+            for _ in 0..3 {
+                pump();
+            }
+            if let Some(menu) = popovers_of(&row).pop() {
+                menu.popdown();
+            }
+            pump();
+        }
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn pump() {
         let ctx = glib::MainContext::default();
         for _ in 0..40 {
@@ -36541,7 +39272,7 @@ Broken: Either state is wrong.\n";
             entry("file2.txt", false, 0),
             entry("File1.txt", false, 0),
         ];
-        sort_entries(&mut v, SortKey::Name, true);
+        sort_entries(&mut v, SortKey::Name, true, FolderPlacement::Top);
         let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["File1.txt", "file2.txt", "file10.txt"]);
     }
@@ -36553,6 +39284,106 @@ Broken: Either state is wrong.\n";
             "file:///home/user/Desktop/Projects".to_string(),
         ];
         assert_eq!(gtk_launch_args(&args), args);
+    }
+
+    /// D-328: `--select` becomes a plain path plus one marker, so a window in
+    /// another process can tell "show this in its parent" from "open this".
+    #[test]
+    fn select_adds_the_marker_and_a_plain_launch_does_not_d328() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let marker = native_core::SELECT_MARKER_URI.to_string();
+        assert_eq!(gtk_launch_args(&a(&["wf", "--select", "/x/y"])), vec!["wf".to_string(), "/x/y".to_string(), marker.clone()]);
+        assert_eq!(gtk_launch_args(&a(&["wf", "--select=/x/y"])), vec!["wf".to_string(), "/x/y".to_string(), marker.clone()]);
+        assert_eq!(gtk_launch_args(&a(&["wf", "/x/y"])), a(&["wf", "/x/y"]));
+        // A --select with no value adds nothing.
+        assert_eq!(gtk_launch_args(&a(&["wf", "--select"])), a(&["wf"]));
+    }
+
+    /// D-328: what the receiving window is told, for every kind of target.
+    /// Goes through real `gio::File`s, the same objects `connect_open` gets.
+    #[test]
+    fn launch_from_files_reads_the_marker_d328() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d328-lff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        std::fs::create_dir_all(root.join("Images/Animals")).unwrap();
+        std::fs::write(root.join("Images/a.txt"), "x").unwrap();
+        let file = |p: &str| gio::File::for_commandline_arg(p);
+        let marker = file(native_core::SELECT_MARKER_URI);
+        assert_eq!(marker.uri_scheme().as_deref(), Some(native_core::SELECT_MARKER_SCHEME), "the marker survives as a file with its own scheme");
+        let images = root.join("Images");
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        // --select FOLDER: the parent, with the folder highlighted.
+        assert_eq!(launch_from_files(&[file(&s(&images)), marker.clone()]), (Some(s(&root)), Some(s(&images))));
+        // --select FILE: its folder, with the file highlighted.
+        let a = images.join("a.txt");
+        assert_eq!(launch_from_files(&[file(&s(&a)), marker.clone()]), (Some(s(&images)), Some(s(&a))));
+        // --select MISSING: the nearest folder that exists, nothing highlighted.
+        let gone = images.join("Gone/x.png");
+        assert_eq!(launch_from_files(&[file(&s(&gone)), marker.clone()]), (Some(s(&images)), None));
+        // A plain launch is unchanged: a folder opens inside itself.
+        assert_eq!(launch_from_files(&[file(&s(&images))]), (Some(s(&images)), None));
+        assert_eq!(launch_from_files(&[file(&s(&a))]), (Some(s(&images)), Some(s(&a))));
+    }
+
+    /// D-328: a launch through the real open path always leaves a mapped
+    /// window, for a folder, a file and a path that is gone, and the folder
+    /// target is highlighted in its parent.
+    #[test]
+    fn select_launches_always_open_a_window_d328() { gtk_thread::run(select_launches_always_open_a_window_d328_on_gtk_thread); }
+
+    fn select_launches_always_open_a_window_d328_on_gtk_thread() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d328-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(root.join("lib/Images/Animals")).unwrap();
+        std::fs::create_dir_all(root.join("lib/Music")).unwrap();
+        std::fs::write(root.join("lib/Images/a.txt"), "x").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d328test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register");
+        let marker = gio::File::for_commandline_arg(native_core::SELECT_MARKER_URI);
+        let lib = root.join("lib");
+        let images = lib.join("Images");
+        let cases: Vec<(&str, std::path::PathBuf, std::path::PathBuf, Option<std::path::PathBuf>)> = vec![
+            ("folder", images.clone(), lib.clone(), Some(images.clone())),
+            ("file", images.join("a.txt"), images.clone(), Some(images.join("a.txt"))),
+            ("missing", images.join("Gone/deeper/x.png"), images.clone(), None),
+        ];
+        for (tag, target, want_folder, want_selected) in cases {
+            let files = [gio::File::for_commandline_arg(target.to_str().unwrap()), marker.clone()];
+            let before = app.windows().len();
+            // The same two lines `connect_open` runs.
+            let (initial, select) = launch_from_files(&files);
+            build_ui(&app, initial, select);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("a window is registered");
+            wait_for("the window to map", || ui.window.is_mapped());
+            wait_for("the listing", || state.borrow().cwd.real_path_string().as_deref() == want_folder.to_str() && !state.borrow().visible_entries.is_empty());
+            assert_eq!(app.windows().len(), before + 1, "{tag}: one new window");
+            assert_eq!(state.borrow().cwd.real_path_string().as_deref(), want_folder.to_str(), "{tag}: opens this folder");
+            let selected: Vec<String> = (0..ui.list_selection.n_items())
+                .filter(|i| ui.list_selection.is_selected(*i))
+                .filter_map(|i| state.borrow().visible_entries.get(i as usize).and_then(|e| e.source.real_path_string()))
+                .collect();
+            match want_selected {
+                Some(want) => assert_eq!(selected, vec![want.to_string_lossy().to_string()], "{tag}: highlighted"),
+                None => assert!(selected.is_empty(), "{tag}: nothing highlighted, got {selected:?}"),
+            }
+            ui.window.destroy();
+            pump();
+        }
+        match old_xdg { Some(x) => std::env::set_var("XDG_CONFIG_HOME", x), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
     }
 
     #[test]
@@ -36567,6 +39398,86 @@ Broken: Either state is wrong.\n";
     }
 
     /// D-19: two windows share one config file. A window changing its view
+    fn d297_dir(tag: &str) -> (PathBuf, ScratchCleanup) {
+        let dir = crate::native_core::scratch_root().join(format!("wf-d297-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), ScratchCleanup(dir))
+    }
+
+    /// D-297: a config that stops parsing is moved aside, never replaced by
+    /// defaults in place, and the settings come back from the last good write.
+    #[test]
+    fn damaged_config_is_kept_aside_and_recovered_from_the_backup_d297() {
+        let (dir, _cleanup) = d297_dir("damaged");
+        let path = dir.join("native-config.json");
+        update_config_at(&path, |c| c.show_hidden = true);
+        update_config_at(&path, |c| c.sort_ascending = false); // makes the .bak
+        fs::write(&path, "{ this is not json").unwrap();
+        // Reading a damaged file gives the last good copy, not blank defaults.
+        let read = read_config_at(&path);
+        assert!(read.show_hidden, "settings must come back from the backup");
+        // The next write must not destroy the damaged file.
+        update_config_at(&path, |c| c.drop_ask = true);
+        assert_eq!(
+            fs::read_to_string(config_quarantine_path(&path)).unwrap(),
+            "{ this is not json",
+            "the damaged file has to survive as .corrupt"
+        );
+        let c = read_config_at(&path);
+        assert!(c.show_hidden && c.drop_ask, "recovered settings plus the new change");
+    }
+
+    /// D-297: with no backup to fall back on, a damaged file is still kept.
+    #[test]
+    fn damaged_config_with_no_backup_is_never_lost_d297() {
+        let (dir, _cleanup) = d297_dir("nobak");
+        let path = dir.join("native-config.json");
+        fs::write(&path, [0xff, 0xfe, 0x00, 0x41]).unwrap(); // not even UTF-8
+        update_config_at(&path, |c| c.show_hidden = true);
+        assert_eq!(fs::read(config_quarantine_path(&path)).unwrap(), vec![0xff, 0xfe, 0x00, 0x41]);
+        assert!(read_config_at(&path).show_hidden);
+    }
+
+    /// D-299: no shared temp name, and nothing left behind after a write.
+    #[test]
+    fn config_write_leaves_no_temp_file_and_uses_a_per_process_name_d299() {
+        let (dir, _cleanup) = d297_dir("temp");
+        let path = dir.join("native-config.json");
+        update_config_at(&path, |c| c.show_hidden = true);
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n.ends_with(".tmp")), "left a temp file: {names:?}");
+        assert!(!names.iter().any(|n| n == "native-config.json.tmp"), "{names:?}");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        assert!(tmp.to_string_lossy().contains(&std::process::id().to_string()));
+    }
+
+    /// D-299: two writers that both read the old file must not erase each
+    /// other. Eight threads each add one favorite; all eight must survive.
+    #[test]
+    fn concurrent_config_updates_all_survive_d299() {
+        let (dir, _cleanup) = d297_dir("race");
+        let path = dir.join("native-config.json");
+        update_config_at(&path, |c| c.favorites.clear());
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    update_config_at(&path, |c| {
+                        c.favorites.push(Bookmark { name: format!("f{i}"), path: format!("/f{i}") });
+                    });
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(read_config_at(&path).favorites.len(), 8, "a concurrent write was lost");
+    }
+
     /// settings must not undo another window's favorites or recents, and
     /// concurrent favorite/recent updates must both survive.
     #[test]
@@ -36751,10 +39662,212 @@ Broken: Either state is wrong.\n";
             is_image: false, icon: String::new(), metadata_error: None,
         };
         let mut v = vec![entry("f10", false, 1), entry("F2", false, 3), entry("d2", true, 0), entry("d10", true, 0), entry("f1", false, 2)];
-        sort_entries(&mut v, SortKey::Name, true);
+        sort_entries(&mut v, SortKey::Name, true, FolderPlacement::Top);
         assert_eq!(v.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["d2", "d10", "f1", "F2", "f10"]);
-        sort_entries(&mut v, SortKey::Size, false);
+        sort_entries(&mut v, SortKey::Size, false, FolderPlacement::Top);
         assert_eq!(v.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["d2", "d10", "F2", "f1", "f10"]);
+    }
+
+    fn placement_entry(name: &str, is_dir: bool, size: u64, modified: i64) -> Entry {
+        Entry {
+            name: name.to_string(), source: native_core::EntrySource::real(format!("/t/{name}")), is_dir, size, modified,
+            is_image: false, icon: String::new(), metadata_error: None,
+        }
+    }
+
+    fn placement_names(v: &[Entry]) -> Vec<&str> {
+        v.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// Folder placement: every header sorts inside each group when grouped,
+    /// and across the whole list when mixed.
+    #[test]
+    fn folder_placement_top_bottom_and_mixed_sort_by_every_header() {
+        let base = || vec![
+            placement_entry("b.txt", false, 5, 30), placement_entry("zdir", true, 0, 10),
+            placement_entry("a.txt", false, 9, 20), placement_entry("adir", true, 0, 40),
+            placement_entry("c.txt", false, 1, 50),
+        ];
+        let run = |key, asc, place| { let mut v = base(); sort_entries(&mut v, key, asc, place); v };
+        // Top: folders first, then each group by the key.
+        assert_eq!(placement_names(&run(SortKey::Name, true, FolderPlacement::Top)), ["adir", "zdir", "a.txt", "b.txt", "c.txt"]);
+        assert_eq!(placement_names(&run(SortKey::Size, false, FolderPlacement::Top)), ["adir", "zdir", "a.txt", "b.txt", "c.txt"]);
+        assert_eq!(placement_names(&run(SortKey::Modified, false, FolderPlacement::Top)), ["adir", "zdir", "c.txt", "b.txt", "a.txt"]);
+        // Bottom: files first, then folders, each group still sorted by the key.
+        assert_eq!(placement_names(&run(SortKey::Name, true, FolderPlacement::Bottom)), ["a.txt", "b.txt", "c.txt", "adir", "zdir"]);
+        assert_eq!(placement_names(&run(SortKey::Name, false, FolderPlacement::Bottom)), ["c.txt", "b.txt", "a.txt", "zdir", "adir"]);
+        // Mixed: one list, ordered by the key alone.
+        assert_eq!(placement_names(&run(SortKey::Name, true, FolderPlacement::Mixed)), ["a.txt", "adir", "b.txt", "c.txt", "zdir"]);
+        assert_eq!(placement_names(&run(SortKey::Modified, false, FolderPlacement::Mixed)), ["c.txt", "adir", "b.txt", "a.txt", "zdir"]);
+        assert_eq!(placement_names(&run(SortKey::Size, true, FolderPlacement::Mixed)), ["adir", "zdir", "c.txt", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn group_boundary_marks_the_first_row_of_the_second_section_only() {
+        let mut v = vec![placement_entry("d1", true, 0, 1), placement_entry("d2", true, 0, 2), placement_entry("f1", false, 1, 3)];
+        assert_eq!(group_boundary_index(&v, FolderPlacement::Top), Some(2));
+        assert_eq!(group_boundary_index(&v, FolderPlacement::Mixed), None, "no divider when mixed");
+        // Folders at the bottom: boundary is where the first folder starts.
+        sort_entries(&mut v, SortKey::Name, true, FolderPlacement::Bottom);
+        assert_eq!(placement_names(&v), ["f1", "d1", "d2"]);
+        assert_eq!(group_boundary_index(&v, FolderPlacement::Bottom), Some(1));
+        // Only one kind present: nothing to divide.
+        assert_eq!(group_boundary_index(&v[1..], FolderPlacement::Top), None);
+        assert_eq!(group_boundary_index(&v[..1], FolderPlacement::Top), None);
+        assert_eq!(group_boundary_index(&[], FolderPlacement::Top), None);
+    }
+
+    #[test]
+    fn folder_placement_resolves_per_folder_and_caps_the_overrides() {
+        let mut overrides = Vec::new();
+        assert_eq!(resolve_placement(FolderPlacement::Top, &overrides, "/a"), FolderPlacement::Top);
+        set_placement_override(&mut overrides, "/a", Some(FolderPlacement::Mixed));
+        assert_eq!(resolve_placement(FolderPlacement::Top, &overrides, "/a"), FolderPlacement::Mixed);
+        assert_eq!(resolve_placement(FolderPlacement::Top, &overrides, "/b"), FolderPlacement::Top, "other folders follow the default");
+        assert_eq!(resolve_placement(FolderPlacement::Bottom, &overrides, "/b"), FolderPlacement::Bottom);
+        set_placement_override(&mut overrides, "/a", Some(FolderPlacement::Bottom));
+        assert_eq!(overrides.len(), 1, "a second choice replaces the first");
+        set_placement_override(&mut overrides, "/a", None);
+        assert!(overrides.is_empty(), "clearing hands the folder back to the default");
+        for i in 0..(PLACEMENT_OVERRIDE_CAP + 25) {
+            set_placement_override(&mut overrides, &format!("/f{i}"), Some(FolderPlacement::Mixed));
+        }
+        assert_eq!(overrides.len(), PLACEMENT_OVERRIDE_CAP);
+        assert!(overrides.iter().all(|(p, _)| p != "/f0"), "the oldest choice is the one dropped");
+        assert!(overrides.iter().any(|(p, _)| *p == format!("/f{}", PLACEMENT_OVERRIDE_CAP + 24)));
+    }
+
+    #[test]
+    fn folder_placement_survives_old_and_odd_config_files() {
+        let (dir, _cleanup) = d297_dir("placement");
+        let path = dir.join("native-config.json");
+        // A config from before this setting existed reads as folders-on-top.
+        let legacy = r#"{"favorites":[],"recents":[],"show_hidden":false,"view_mode":"details","search_in_files":false,"sort_key":"Name","sort_ascending":true}"#;
+        fs::write(&path, legacy).unwrap();
+        let c = read_config_at(&path);
+        assert_eq!(c.folder_placement, FolderPlacement::Top);
+        assert!(c.folder_placement_overrides.is_empty());
+        // An unknown value is the default, not a reason to lose every setting.
+        fs::write(&path, legacy.replace("\"sort_ascending\":true", "\"sort_ascending\":false,\"folder_placement\":\"Sideways\"")).unwrap();
+        let c = read_config_at(&path);
+        assert_eq!((c.folder_placement, c.sort_ascending), (FolderPlacement::Top, false));
+        // A real choice round-trips through the write path.
+        update_config_at(&path, |c| {
+            c.folder_placement = FolderPlacement::Bottom;
+            set_placement_override(&mut c.folder_placement_overrides, "/x", Some(FolderPlacement::Mixed));
+        });
+        let c = read_config_at(&path);
+        assert_eq!(c.folder_placement, FolderPlacement::Bottom);
+        assert_eq!(c.folder_placement_overrides, vec![("/x".to_string(), FolderPlacement::Mixed)]);
+    }
+
+    /// Nothing may be forced above the folders: a file the window was opened on
+    /// is selected, never moved out of its sorted place.
+    #[test]
+    fn no_row_is_forced_out_of_its_sorted_place() {
+        let all = include_str!("native.rs");
+        let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
+        let repop = &app[app.find("fn repopulate_rows(").unwrap()..];
+        let repop = &repop[..repop.find("\nfn ").unwrap_or(repop.len())];
+        assert!(!repop.contains("visible_entries.insert(0"), "no row may be moved to the top");
+        assert!(!repop.contains("pinned_top"), "repopulate_rows must not read the pin");
+    }
+
+    /// A `state.borrow()` in an `if let` header lives through the whole body.
+    /// Selecting the opened-on file scrolls rows into view, a bind takes
+    /// `borrow_mut`, and the window died at startup (17 Nov 2026).
+    #[test]
+    fn config_path_honours_xdg_config_home_and_ignores_bad_values_d290() {
+        use std::ffi::OsStr;
+        let at = |base: &str| PathBuf::from(base).join("wayfinder").join("native-config.json");
+        assert_eq!(config_path_from(Some(OsStr::new("/x/cfg")), Some("/h")), Some(at("/x/cfg")));
+        assert_eq!(config_path_from(None, Some("/h")), Some(at("/h/.config")));
+        assert_eq!(config_path_from(Some(OsStr::new("")), Some("/h")), Some(at("/h/.config")), "empty is unset");
+        assert_eq!(config_path_from(Some(OsStr::new("rel/cfg")), Some("/h")), Some(at("/h/.config")), "relative is ignored");
+        assert_eq!(config_path_from(Some(OsStr::new("/x/cfg")), None), Some(at("/x/cfg")), "no HOME is fine with an XDG path");
+        assert_eq!(config_path_from(None, None), None);
+    }
+
+    #[test]
+    fn legacy_config_is_copied_once_and_never_over_a_newer_one_d290() {
+        let base = crate::native_core::scratch_root().join(format!("wf-d290-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _cleanup = ScratchCleanup(base.clone());
+        let legacy = base.join("home/.config/wayfinder/native-config.json");
+        let new = base.join("xdg/wayfinder/native-config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{\"old\":1}").unwrap();
+        adopt_legacy_config(&new, &legacy);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "{\"old\":1}", "copied across");
+        assert!(legacy.is_file(), "the old file stays where it was");
+        std::fs::write(&new, "{\"new\":2}").unwrap();
+        adopt_legacy_config(&new, &legacy);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "{\"new\":2}", "never over settings already there");
+        let none = base.join("elsewhere/wayfinder/native-config.json");
+        adopt_legacy_config(&none, &base.join("missing.json"));
+        assert!(!none.exists(), "nothing to copy, nothing created");
+        adopt_legacy_config(&legacy, &legacy);
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "{\"old\":1}", "same path is left alone");
+    }
+
+    /// D-291: keyboard focus must be drawn, and drawn at 3:1 or better against
+    /// every surface it can sit on (WCAG 2.4.7, 1.4.11). The colours are read
+    /// out of the stylesheet itself, so changing one without the other fails.
+    #[test]
+    fn keyboard_focus_ring_is_drawn_and_readable_on_every_surface_d291() {
+        let color = |name: &str| -> (f64, f64, f64) {
+            let line = APP_CSS
+                .lines()
+                .find(|l| l.starts_with(&format!("@define-color {name} ")))
+                .unwrap_or_else(|| panic!("no colour {name}"));
+            let hex = line.split('#').nth(1).unwrap().trim().trim_end_matches(';');
+            let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            (c(0), c(2), c(4))
+        };
+        let lum = |(r, g, b): (f64, f64, f64)| {
+            let f = |c: f64| if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        };
+        let ratio = |a, b| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        assert!(
+            APP_CSS.contains("button:focus-visible,") && APP_CSS.contains("outline: 2px solid @wf_accent_hover;"),
+            "a :focus-visible rule draws a 2px ring"
+        );
+        assert!(
+            !APP_CSS.contains("button:focus-visible,\nrow:focus,"),
+            ":focus-visible must not be switched off again alongside :focus"
+        );
+        let ring = color("wf_accent_hover");
+        for surface in ["wf_base", "wf_chrome", "wf_raised", "wf_control", "wf_control_hover"] {
+            let r = ratio(ring, color(surface));
+            assert!(r >= 3.0, "ring on {surface} is {r:.2}:1, needs 3:1");
+        }
+    }
+
+    #[test]
+    fn opened_on_file_is_selected_after_the_state_borrow_ends() {
+        let all = include_str!("native.rs");
+        let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(
+            !app.contains("if let Some(target) = state.borrow().pinned_top.clone()"),
+            "the borrow must end before select_entry_by_source runs"
+        );
+    }
+
+    /// The divider must stay a style on an existing row. A row of its own would
+    /// sit inside selection, arrow keys, counts and drop targets.
+    #[test]
+    fn group_divider_is_a_style_on_the_row_not_a_row() {
+        let all = include_str!("native.rs");
+        let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(app.contains(".wf-list .wf-group-boundary {"), "the stylesheet draws the divider");
+        assert!(app.contains("line.add_css_class(\"wf-group-boundary\")"), "the row carries it");
+        let repop = &app[app.find("fn repopulate_rows(").unwrap()..];
+        let repop = &repop[..repop.find("\nfn ").unwrap_or(repop.len())];
+        assert!(repop.contains("group_boundary"), "repopulate_rows decides where it goes");
     }
 
     /// D-82: the listing worker must wake the main loop directly. A 40 ms poll
@@ -36906,7 +40019,10 @@ Broken: Either state is wrong.\n";
     /// exists, and no guide card ever appeared.
     #[cfg(not(feature = "guide"))]
     #[test]
-    fn default_build_never_reads_guide_invoke_or_request_d197() {
+    fn default_build_never_reads_guide_invoke_or_request_d197() { gtk_thread::run(default_build_never_reads_guide_invoke_or_request_d197_on_gtk_thread); }
+
+    #[cfg(not(feature = "guide"))]
+    fn default_build_never_reads_guide_invoke_or_request_d197_on_gtk_thread() {
         gtk::init().expect("gtk init on the virtual display");
         let root = crate::native_core::scratch_root().join(format!("wf-d197-default-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
