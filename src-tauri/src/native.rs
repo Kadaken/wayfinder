@@ -304,11 +304,27 @@ button.wf-icon-button:checked:hover {
     padding: 0 1px;
 }
 
+/* D-332: the address is its own field, framed like the search box, so it
+   reads as a separate place and not as part of the toolbar. */
 .wf-address-box {
-    background: transparent;
-    border: 0;
-    border-radius: 0;
+    background: @wf_base;
+    border: 1px solid @wf_border;
+    border-radius: 6px;
     min-height: 26px;
+    padding: 0 2px;
+}
+
+.wf-path-edit {
+    min-height: 22px;
+    min-width: 22px;
+    padding: 0 4px;
+    border-radius: 5px;
+    color: @wf_text_dim;
+}
+
+.wf-path-edit:hover {
+    background: @wf_control;
+    color: #ffffff;
 }
 
 .wf-search-scope {
@@ -2657,6 +2673,8 @@ struct Ui {
     column_header: gtk::Box,
     columns: ColumnSizing,
     path_stack: gtk::Stack,
+    /// D-332: the one way into address editing (besides Ctrl+L); crumbs only navigate.
+    path_edit: gtk::Button,
     path_crumbs: gtk::Box,
     path_entry: gtk::Entry,
     search: gtk::SearchEntry,
@@ -4479,10 +4497,21 @@ fn build_ui_in(
     path_stack.add_named(&path_label, Some("label"));
     path_stack.add_named(&path_entry, Some("entry"));
     path_stack.set_visible_child_name("label");
-    let path_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    // D-332 (19 Nov 2026, the owner): every folder in the address is a link, and the
+    // text box opens only from this button at the front of the address field.
+    let path_edit = gtk::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Type an address (Ctrl+L)")
+        .valign(gtk::Align::Center)
+        .build();
+    path_edit.set_widget_name("wf-path-edit");
+    path_edit.add_css_class("flat");
+    path_edit.add_css_class("wf-path-edit");
+    let path_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     path_box.add_css_class("wf-address-box");
     path_box.set_hexpand(true);
     path_box.set_height_request(24);
+    path_box.append(&path_edit);
     path_box.append(&path_stack);
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Filter here · Enter to search subfolders")
@@ -5134,6 +5163,7 @@ fn build_ui_in(
         column_header,
         columns,
         path_stack,
+        path_edit,
         path_crumbs,
         path_entry,
         search,
@@ -5241,14 +5271,10 @@ fn build_ui_in(
     {
         let state = state.clone();
         let ui = ui.clone();
-        let click = gtk::GestureClick::new();
-        click.set_button(1);
-        click.connect_pressed(move |_, n_press, _, _| {
-            if n_press >= 1 {
-                edit_path_action(&state, &ui);
-            }
-        });
-        path_box.add_controller(click);
+        // D-332: no click-anywhere gesture on the address any more; it turned a
+        // crumb click into the text box. Only the edit button (and Ctrl+L) edits.
+        let button = ui.path_edit.clone();
+        button.connect_clicked(move |_| edit_path_action(&state, &ui));
     }
     connect_file_drop(&files_scroll, state.clone(), ui.clone());
     connect_file_drop(&grid_scroll, state.clone(), ui.clone());
@@ -23085,6 +23111,7 @@ Broken: Either state is wrong.\n";
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
         rewritten_selected_file_reloads_preview_d331();
+        address_crumbs_navigate_and_edit_button_edits_d332();
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
         sustained_stream_keeps_objects_pointer_and_timing_d22();
         tabs_keep_independent_history_d27();
@@ -34394,6 +34421,69 @@ Broken: Either state is wrong.\n";
         // ---- Everything the brief locks stays unchanged.
         assert_eq!(dir_names(&dir).len(), 81, "{tag}: no sibling lost or gained");
 
+        if let Some(home) = old_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    /// D-332: a crumb click navigates and never opens the text box; the edit
+    /// button at the front of the address field is what opens it.
+    fn address_crumbs_navigate_and_edit_button_edits_d332() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d332-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("outer").join("inner");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d332test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        let outer = root.join("outer").to_string_lossy().to_string();
+        let edit_box = ui.path_edit.parent().expect("edit button has a parent");
+        assert!(edit_box.has_css_class("wf-address-box"), "D-332: the edit button sits inside the address field");
+        assert_eq!(edit_box.first_child().as_ref(), Some(ui.path_edit.upcast_ref::<gtk::Widget>()), "D-332: the edit button is first");
+        assert_eq!(edit_box.observe_controllers().n_items(), 0, "D-332: no click-anywhere gesture on the address field");
+
+        let crumb = button_labelled(ui.path_crumbs.clone().upcast_ref(), "outer").expect("an outer crumb");
+        crumb.emit_clicked();
+        wait_for("crumb went up to outer", || state.borrow().cwd.display_string() == outer);
+        assert_eq!(ui.path_stack.visible_child_name().as_deref(), Some("label"), "D-332: a crumb click keeps the crumbs");
+
+        ui.path_edit.emit_clicked();
+        drain_d232();
+        assert_eq!(ui.path_stack.visible_child_name().as_deref(), Some("entry"), "D-332: the edit button opens the text box");
+        assert_eq!(ui.path_entry.text().as_str(), outer, "D-332: the text box holds the current folder");
+
+        // Up is the parent folder, not the last place visited: jump from outer
+        // to home (Back would return to outer), then Up must land on root.
+        ui.path_stack.set_visible_child_name("label");
+        let home_str = home.to_string_lossy().to_string();
+        navigate(&state, crate::native_core::Location::real(&home));
+        wait_for("jumped to home", || state.borrow().cwd.display_string() == home_str);
+        let bar = ui.back.parent().expect("nav bar");
+        let mut child = bar.first_child();
+        let mut up = None;
+        while let Some(w) = child {
+            if w.tooltip_text().as_deref() == Some("Up") { up = w.clone().downcast::<gtk::Button>().ok(); }
+            child = w.next_sibling();
+        }
+        up.expect("the Up button").emit_clicked();
+        let root_str = root.to_string_lossy().to_string();
+        wait_for("Up went to the parent of home", || state.borrow().cwd.display_string() == root_str);
+
+        ui.window.close();
         if let Some(home) = old_home {
             std::env::set_var("HOME", home);
         } else {
