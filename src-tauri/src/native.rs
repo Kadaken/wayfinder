@@ -17245,10 +17245,9 @@ fn build_drop_target(
             show_drop_action_dialog(state.clone(), ui.clone(), txn);
             return true;
         }
-        // D-317: a drag is easy to release by accident (a refused drop once
-        // ran anyway and moved 66 GB into the wrong folder), so every drop
-        // asks first, naming the destination, before anything moves.
-        show_drop_confirm_dialog(state.clone(), ui.clone(), txn);
+        // D-317 confirm removed (owner found it annoying): drop proceeds
+        // straight to the transfer, which still runs its own clash preflight.
+        transfer_with_preflight(state.clone(), ui.clone(), txn.into_transfer());
         true
     });
     drop
@@ -17334,38 +17333,14 @@ fn write_transfer_report(is_copy: bool, report: &[native_core::ReportRow]) -> Op
 
 /// D-320: after a verified transfer, a saved list AND a window naming every
 /// item that was checked. Both exist so the person can say which they prefer.
-fn show_transfer_report(ui: &Ui, is_copy: bool, report: &[native_core::ReportRow]) {
+fn show_transfer_report(_ui: &Ui, is_copy: bool, report: &[native_core::ReportRow]) {
     if report.is_empty() {
         return;
     }
-    let saved = write_transfer_report(is_copy, report);
-    let verb = if is_copy { "Copy" } else { "Move" };
-    let total_files: u64 = report.iter().map(|r| r.files_total).sum();
-    let total_bytes: u64 = report.iter().map(|r| r.bytes).sum();
-    let heading = format!(
-        "{verb} verified: {} file{}, {}",
-        total_files,
-        plural(total_files as usize),
-        native_core::fmt_size(total_bytes)
-    );
-    let mut body = String::new();
-    for r in report.iter().take(12) {
-        let name = Path::new(&r.to).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        body.push_str(&format!("\u{2713} {name}  \u{2014}  {}, {} file{}\n", native_core::fmt_size(r.bytes), r.files_total, plural(r.files_total as usize)));
-    }
-    if report.len() > 12 {
-        body.push_str(&format!("... and {} more items\n", report.len() - 12));
-    }
-    match &saved {
-        Some(path) => body.push_str(&format!("\nFull list saved to:\n{}", path.display())),
-        None => body.push_str("\nThe full list could not be saved."),
-    }
-    let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-    dialog.add_responses(&[("ok", "OK")]);
-    dialog.set_default_response(Some("ok"));
-    dialog.set_close_response("ok");
-    eprintln!("wf-event: transfer_report shown items={} files={}", report.len(), total_files);
-    dialog.present(Some(&ui.window));
+    // The "Move verified" OK dialog was removed (owner found it annoying); the
+    // full report is still written to disk, and the status strip already says
+    // the transfer finished. Keep the write so the record is not lost.
+    let _ = write_transfer_report(is_copy, report);
 }
 
 /// D-320: a transfer that fails its check is never only a line in the status
