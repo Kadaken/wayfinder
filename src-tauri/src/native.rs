@@ -5141,7 +5141,10 @@ fn build_ui_in(
                 .build();
             window.set_size_request(1, 1);
             window.add_css_class("wayfinder-window");
-            connect_window_drag(&path_drag_handle, &window);
+            // D-333 (19 Nov 2026, the owner): the manual drag gesture called begin_move
+            // on every press, so a click on a crumb or the edit button started a
+            // window move and never reached the button. The WindowHandle already
+            // drags the window natively (on drag, not click) — drop the override.
             connect_titlebar_buttons(&window, minimize_button, maximize_button, close_button);
             add_resize_grips(&root_overlay, &window);
             window
