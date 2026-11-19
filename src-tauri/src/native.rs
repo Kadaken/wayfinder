@@ -4642,6 +4642,11 @@ fn build_ui_in(
     preview_stack.add_named(&preview_media_box, Some("media"));
     preview_stack.add_named(&preview_audio_box, Some("audio"));
     preview_stack.set_visible_child_name("text");
+    // D-329: size to the page showing, not the tallest page. Homogeneous (the
+    // default) left a song's controls below a long text preview's height, out
+    // of sight until scrolled.
+    preview_stack.set_vhomogeneous(false);
+    preview_stack.set_hhomogeneous(false);
     // Spacing lives in CSS padding so the status bar's background runs the full
     // width of the window. With margins it stopped short on both sides.
     let status = gtk::Label::builder().xalign(0.0).hexpand(true).build();
@@ -4883,6 +4888,20 @@ fn build_ui_in(
     preview_scroll.set_size_request(0, 0);
     preview_scroll.set_hexpand(false);
     preview_scroll.add_css_class("wf-preview");
+    // D-329: an image, video or song fits the pane and never scrolls; folder
+    // and text previews keep their scrollbar.
+    {
+        let scroll = preview_scroll.clone();
+        preview_stack.connect_visible_child_name_notify(move |stack| {
+            let fixed = matches!(stack.visible_child_name().as_deref(), Some("image" | "media" | "audio"));
+            scroll.set_vscrollbar_policy(if fixed { gtk::PolicyType::External } else { gtk::PolicyType::Automatic });
+            scroll.set_hscrollbar_policy(if fixed { gtk::PolicyType::External } else { gtk::PolicyType::Automatic });
+            if fixed {
+                scroll.vadjustment().set_value(0.0);
+                scroll.hadjustment().set_value(0.0);
+            }
+        });
+    }
 
     let file_preview = gtk::Paned::new(gtk::Orientation::Horizontal);
     file_preview.set_hexpand(true);
