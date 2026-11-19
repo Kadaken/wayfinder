@@ -9869,6 +9869,8 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
                 merge(&mut boxed.borrow_mut::<Entry>());
             }
         }
+        let changed_sources: Vec<native_core::EntrySource> =
+            changed_paths.iter().map(|entry| entry.source.clone()).collect();
         let labels = state.borrow().meta_labels.clone();
         for entry in changed_paths {
             if let Some((size, modified)) = labels.get(&entry.source) {
@@ -9881,6 +9883,7 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
                 }
             }
         }
+        reload_preview_if_changed(state, ui, &changed_sources);
         return;
     }
 
@@ -9902,6 +9905,29 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
     ));
     // Same as the navigate path (D-226/D-233): every view keeps its position.
     reapply_scroll(&ui.list_scroll, saved_scroll);
+}
+
+/// D-331: the one selected file was rewritten on disk (a handoff Claude
+/// overwrote, say). Its preview is reloaded and the status bar says so, so no
+/// second window is needed to see the new version. A song or video is left
+/// alone: reloading it would stop what is playing.
+fn reload_preview_if_changed(state: &Rc<RefCell<AppState>>, ui: &Ui, changed: &[native_core::EntrySource]) {
+    let selected = selected_entries(state, ui);
+    let [entry] = selected.as_slice() else {
+        return;
+    };
+    if entry.is_dir || !changed.contains(&entry.source) {
+        return;
+    }
+    if let native_core::EntrySource::Real(path) = &entry.source {
+        let path_str = path.to_string_lossy();
+        if native_core::is_audio_path(&path_str) || native_core::is_video_path(&path_str) {
+            return;
+        }
+    }
+    update_preview(ui, entry);
+    eprintln!("wf-event: preview reloaded, file changed: {}", entry.name);
+    ui.status.set_label(&format!("Updated: {} is the latest version", entry.name));
 }
 
 /// True once the adjustment is where it was asked to go. An offset past the
@@ -23058,6 +23084,7 @@ Broken: Either state is wrong.\n";
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Details, "details");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Compact, "compact");
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
+        rewritten_selected_file_reloads_preview_d331();
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
         sustained_stream_keeps_objects_pointer_and_timing_d22();
         tabs_keep_independent_history_d27();
@@ -34367,6 +34394,62 @@ Broken: Either state is wrong.\n";
         // ---- Everything the brief locks stays unchanged.
         assert_eq!(dir_names(&dir).len(), 81, "{tag}: no sibling lost or gained");
 
+        if let Some(home) = old_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    /// D-331: a selected file rewritten on disk reloads its preview in the
+    /// window already open, and the status bar says it is the latest version.
+    fn rewritten_selected_file_reloads_preview_d331() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d331-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("handoff.md");
+        std::fs::write(&file, "version one").unwrap();
+        std::fs::write(dir.join("other.md"), "other").unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d331test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        let dir_str = dir.to_string_lossy().to_string();
+        build_ui(&app, Some(dir_str.clone()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 2);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        set_preview_visible(&state, &ui, true);
+        let file_str = file.to_string_lossy().to_string();
+        let index = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .position(|e| e.source.real_path_string().unwrap_or_default() == file_str)
+            .expect("handoff listed");
+        ui.list_selection.select_item(index as u32, true);
+        update_selection(&state, &ui);
+        wait_for("first version previewed", || ui.preview.label().contains("version one"));
+
+        std::fs::write(&file, "version two, rewritten").unwrap();
+        let listing = crate::native_core::list_dir_cancellable(&dir, false, &AtomicBool::new(false))
+            .expect("relist after the rewrite");
+        apply_monitor_scan(&state, &ui, listing);
+        assert!(ui.preview.label().contains("version two"), "D-331: preview shows the rewritten file, got {:?}", ui.preview.label());
+        assert_eq!(ui.status.label(), "Updated: handoff.md is the latest version", "D-331: status says it is updated");
+        assert_eq!(selected_paths(&state, &ui), vec![file_str.clone()], "D-331: the file stays selected");
+
+        ui.window.close();
         if let Some(home) = old_home {
             std::env::set_var("HOME", home);
         } else {
