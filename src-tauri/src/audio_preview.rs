@@ -187,6 +187,24 @@ impl AudioPlayer {
                 .map_or(true, |t| t.nseconds() == 0)
     }
 
+    /// Loudness, 0.0 to 1.0. With PipeWire this is the app's own stream
+    /// volume, the same one the system mixer shows and remembers.
+    pub fn volume(&self) -> f64 {
+        self.pipeline.property::<f64>("volume").clamp(0.0, 1.0)
+    }
+
+    pub fn set_volume(&self, volume: f64) {
+        self.pipeline.set_property("volume", volume.clamp(0.0, 1.0));
+    }
+
+    pub fn muted(&self) -> bool {
+        self.pipeline.property::<bool>("mute")
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.pipeline.set_property("mute", muted);
+    }
+
     /// Jumps to `secs`. Clamped to the file, because a scrubber dragged to its
     /// very end asks for a position one tick past the last sample and the
     /// pipeline answers that with an error.
@@ -473,6 +491,29 @@ mod tests {
             eprintln!("MIDI-PROBE position before seek {before:.2}, after seek to 30: {after:.2}");
             assert!(before < 10.0, "before the seek it was at {before}");
             assert!(after >= 29.5 && after < 40.0, "a seek to 30 s landed at {after}");
+        });
+    }
+
+    #[test]
+    fn volume_and_mute_are_set_and_read_back() {
+        in_main_context(|| {
+            if !gst_ready() {
+                return;
+            }
+            let path = one_second_wav("volume", 1000.0);
+            let Ok(player) = AudioPlayer::open(path.to_str().unwrap()) else {
+                let _ = std::fs::remove_file(&path);
+                return;
+            };
+            player.set_volume(0.4);
+            assert!((player.volume() - 0.4).abs() < 0.01, "volume read back as {}", player.volume());
+            player.set_volume(7.0);
+            assert!(player.volume() <= 1.0, "volume is held to 1.0");
+            player.set_muted(true);
+            assert!(player.muted(), "mute is on");
+            player.set_muted(false);
+            assert!(!player.muted(), "mute is off");
+            let _ = std::fs::remove_file(&path);
         });
     }
 

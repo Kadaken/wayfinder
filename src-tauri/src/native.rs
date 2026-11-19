@@ -2690,6 +2690,8 @@ struct Ui {
     preview_audio_info: gtk::Label,
     preview_audio_play: gtk::Button,
     preview_audio_scale: gtk::Scale,
+    preview_audio_mute: gtk::Button,
+    preview_audio_volume: gtk::Scale,
     preview_audio_elapsed: gtk::Label,
     preview_audio_total: gtk::Label,
     /// The file currently loaded, if any. Dropping it is what stops the
@@ -4617,6 +4619,21 @@ fn build_ui_in(
     preview_audio_transport.append(&preview_audio_elapsed);
     preview_audio_transport.append(&preview_audio_scale);
     preview_audio_transport.append(&preview_audio_total);
+    // D-330: mute and volume. They show the stream's real state, so a mute
+    // the system mixer remembered is visible here instead of silent.
+    let preview_audio_mute = gtk::Button::from_icon_name("audio-volume-high-symbolic");
+    preview_audio_mute.set_tooltip_text(Some("Mute"));
+    preview_audio_mute.add_css_class("flat");
+    preview_audio_mute.set_widget_name("wf-audio-mute");
+    let preview_audio_volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+    preview_audio_volume.set_draw_value(false);
+    preview_audio_volume.set_hexpand(true);
+    preview_audio_volume.set_value(1.0);
+    preview_audio_volume.set_tooltip_text(Some("Volume"));
+    preview_audio_volume.set_widget_name("wf-audio-volume");
+    let preview_audio_volume_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    preview_audio_volume_row.append(&preview_audio_mute);
+    preview_audio_volume_row.append(&preview_audio_volume);
     let preview_audio_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     preview_audio_box.set_valign(gtk::Align::Center);
     preview_audio_box.set_hexpand(true);
@@ -4630,6 +4647,7 @@ fn build_ui_in(
     preview_audio_box.append(&preview_audio_title);
     preview_audio_box.append(&preview_audio_info);
     preview_audio_box.append(&preview_audio_transport);
+    preview_audio_box.append(&preview_audio_volume_row);
 
     let preview_folder = gtk::Box::new(gtk::Orientation::Vertical, 2);
     preview_folder.set_hexpand(true);
@@ -5140,6 +5158,8 @@ fn build_ui_in(
         preview_audio_info,
         preview_audio_play,
         preview_audio_scale,
+        preview_audio_mute,
+        preview_audio_volume,
         preview_audio_elapsed,
         preview_audio_total,
         preview_audio: Rc::new(RefCell::new(None)),
@@ -17548,6 +17568,7 @@ fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
     ui.preview_audio_scale.set_value(0.0);
     ui.preview_audio_seeking.set(false);
 
+    show_preview_volume(ui, player.volume(), player.muted());
     *ui.preview_audio.borrow_mut() = Some(player);
     *ui.preview_audio_path.borrow_mut() = Some(path.to_string());
     ui.preview_stack.set_visible_child_name("audio");
@@ -17661,6 +17682,57 @@ fn connect_preview_audio_controls(ui: &Ui) {
                 }
             });
     }
+    {
+        let ui = ui.clone();
+        ui.preview_audio_mute.clone().connect_clicked(move |_| {
+            let state = ui.preview_audio.borrow().as_ref().map(|player| {
+                player.set_muted(!player.muted());
+                (player.volume(), player.muted())
+            });
+            if let Some((volume, muted)) = state {
+                show_preview_volume(&ui, volume, muted);
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
+        ui.preview_audio_volume
+            .clone()
+            .connect_value_changed(move |scale| {
+                let state = ui.preview_audio.borrow().as_ref().and_then(|player| {
+                    if (player.volume() - scale.value()).abs() < 0.001 {
+                        return None;
+                    }
+                    player.set_volume(scale.value());
+                    // Dragging the volume up is a request to hear it.
+                    if scale.value() > 0.0 && player.muted() {
+                        player.set_muted(false);
+                    }
+                    Some((player.volume(), player.muted()))
+                });
+                if let Some((volume, muted)) = state {
+                    show_preview_volume(&ui, volume, muted);
+                }
+            });
+    }
+}
+
+/// D-330: puts the stream's volume and mute on the controls.
+fn show_preview_volume(ui: &Ui, volume: f64, muted: bool) {
+    if (ui.preview_audio_volume.value() - volume).abs() >= 0.001 {
+        ui.preview_audio_volume.set_value(volume);
+    }
+    let icon = if muted || volume <= 0.0 {
+        "audio-volume-muted-symbolic"
+    } else if volume < 0.34 {
+        "audio-volume-low-symbolic"
+    } else if volume < 0.67 {
+        "audio-volume-medium-symbolic"
+    } else {
+        "audio-volume-high-symbolic"
+    };
+    ui.preview_audio_mute.set_icon_name(icon);
+    ui.preview_audio_mute.set_tooltip_text(Some(if muted { "Unmute" } else { "Mute" }));
 }
 
 fn set_preview_text(ui: &Ui, text: &str) {
