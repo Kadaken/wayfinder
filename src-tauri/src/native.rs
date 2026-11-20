@@ -2124,6 +2124,22 @@ fn inspect_config_file(path: &Path) -> ConfigFile {
 }
 
 fn read_config_at(path: &Path) -> AppConfig {
+    let mut config = read_config_keeping_pins_at(path);
+    // D-359: a pin for something that is gone is ignored, and the next write
+    // removes it from the file.
+    prune_missing_pins(&mut config);
+    config
+}
+
+fn prune_missing_pins(config: &mut AppConfig) {
+    config.pins.retain(|p| Path::new(p).symlink_metadata().is_ok());
+}
+
+/// D-359: the config with its pins untouched. A write must start from this, not
+/// from `read_config_at`: a rename has already moved the file when the pin
+/// follow hook runs, so the old pin looks missing and would be pruned before
+/// the hook could rewrite it to the new name.
+fn read_config_keeping_pins_at(path: &Path) -> AppConfig {
     let mut config = match inspect_config_file(path) {
         ConfigFile::Parsed(config) => config,
         ConfigFile::Missing => AppConfig::default(),
@@ -2138,9 +2154,6 @@ fn read_config_at(path: &Path) -> AppConfig {
     // them from the file as well, so nothing has to be cleaned up by hand.
     config.recents.retain(|b| !native_core::is_vault_content(&b.path));
     config.recent_files.retain(|b| !native_core::is_vault_content(&b.path));
-    // D-359: a pin for something that is gone is ignored, and the next write
-    // removes it from the file.
-    config.pins.retain(|p| Path::new(p).symlink_metadata().is_ok());
     config
 }
 
@@ -2193,8 +2206,10 @@ fn update_config_at(path: &Path, change: impl FnOnce(&mut AppConfig)) -> AppConf
 
     let on_disk = inspect_config_file(path);
     let damaged = matches!(on_disk, ConfigFile::Unparseable);
-    let mut config = read_config_at(path);
+    let mut config = read_config_keeping_pins_at(path);
     change(&mut config);
+    // D-359: pins for things that are gone are dropped after the change ran.
+    prune_missing_pins(&mut config);
 
     if let Ok(raw) = serde_json::to_string_pretty(&config) {
         if damaged {
@@ -11656,7 +11671,10 @@ fn apply_path_changes(pins: &mut Vec<String>, changes: &[(String, Option<String>
 /// D-359: the hook the file operations call, so a pin follows its item.
 fn pins_follow_paths(changes: &[(String, Option<String>)]) {
     // Read first: most renames touch no pin, and those must not rewrite the config.
-    let current = load_pins();
+    // Unpruned: the item was already renamed or removed, so its pin looks missing.
+    let current: HashSet<String> = config_path()
+        .map(|path| read_config_keeping_pins_at(&path).pins.into_iter().collect())
+        .unwrap_or_default();
     if current.is_empty() {
         return;
     }
