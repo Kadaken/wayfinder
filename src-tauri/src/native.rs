@@ -252,7 +252,7 @@ button.wf-icon-button:checked:hover {
 .wf-pathbar {
     background: @wf_raised;
     border-bottom: 1px solid @wf_line;
-    min-height: 32px;
+    min-height: 44px;
     padding: 0 6px;
 }
 
@@ -271,11 +271,15 @@ button.wf-icon-button:checked:hover {
     margin: 5px 5px;
 }
 
+entry.wf-address,
 .wf-address {
     background: transparent;
     color: @wf_text;
     border: 0;
     padding: 0 8px;
+    /* D-337: the hidden text box sets the field's height too (the stack
+       sizes to its tallest page), so keep it to the search box's height. */
+    min-height: 24px;
 }
 
 .wf-crumb {
@@ -306,6 +310,9 @@ button.wf-icon-button:checked:hover {
 
 /* D-332: the address is its own field, framed like the search box, so it
    reads as a separate place and not as part of the toolbar. */
+/* D-337 (19 Nov 2026, the owner): the field sits INSIDE its row with clear space
+   above and below, as Explorer's does (32 px boxes in a 48 px row), instead
+   of filling the row edge to edge. Search matches it exactly. */
 .wf-address-box {
     background: @wf_base;
     border: 1px solid @wf_border;
@@ -332,12 +339,13 @@ button.wf-icon-button:checked:hover {
     font-size: 12px;
 }
 
+entry.wf-search,
 .wf-search {
     background: @wf_base;
     color: @wf_text;
     border: 1px solid @wf_border;
     border-radius: 6px;
-    min-height: 26px;
+    min-height: 28px;
 }
 
 .wf-main {
@@ -2482,6 +2490,10 @@ struct AppState {
     /// D-334 (19 Nov 2026, the owner): after a rename the rows keep the order he was
     /// looking at; only a sort click (or leaving the folder) re-sorts.
     held_order: Option<Vec<native_core::EntrySource>>,
+    /// D-338: a live folder update that arrived while he was typing a new
+    /// name. Rebuilding the rows then destroyed the editor (typing lost, view
+    /// jumped); it is applied once the edit ends instead.
+    deferred_scan: Option<native_core::DirectoryListing>,
     /// Last plain click on a Name label: source and when, for slow-second-click.
     last_name_click: Option<(native_core::EntrySource, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
@@ -4412,6 +4424,7 @@ fn build_ui_in(
         reveal_path: None,
         reveal_focus: false,
         held_order: None,
+        deferred_scan: None,
         last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: native_core::Location::real(&initial_cwd),
@@ -4518,6 +4531,7 @@ fn build_ui_in(
     path_box.add_css_class("wf-address-box");
     path_box.set_hexpand(true);
     path_box.set_height_request(24);
+    path_box.set_valign(gtk::Align::Center);
     path_box.append(&path_edit);
     path_box.append(&path_stack);
     let search = gtk::SearchEntry::builder()
@@ -4525,6 +4539,7 @@ fn build_ui_in(
         .tooltip_text("Filter this folder by name. Press Enter to search subfolders.")
         .width_request(80)
         .height_request(24)
+        .valign(gtk::Align::Center)
         .build();
     search.add_css_class("wf-search");
     let search_in_files = gtk::CheckButton::builder()
@@ -4915,6 +4930,8 @@ fn build_ui_in(
     files_stack.add_named(&list_overlay, Some("list"));
     files_stack.add_named(&grid_scroll, Some("grid"));
     files_stack.set_visible_child_name("list");
+    watch_scroll_jumps(&files_scroll, "list");
+    watch_scroll_jumps(&grid_scroll, "grid");
     let (column_header, columns) = details_header();
     let (quick_access, quick_access_tiles) = build_tile_strip("Quick access");
     let (recent_files_strip, recent_files_tiles) = build_tile_strip("Recent files");
@@ -9523,13 +9540,16 @@ fn navigate_to_with_message(
     let same_folder = state.borrow().cwd == path;
     if same_folder {
         forget_tree_answers_for(state, &path);
+        mark_scroll_cause("reload of the same folder");
+    } else {
+        mark_scroll_cause("opened another folder");
     }
     // A pending reveal (e.g. the just-renamed row) owns the scroll position for
     // this reload via `apply_pending_reveal`; restoring the pre-reload scroll
     // 16ms later would silently drag the view back off the revealed row.
     let has_pending_reveal = state.borrow().reveal_path.is_some();
     let saved_scroll = if same_folder && !has_pending_reveal {
-        ui.as_ref().map(|ui| ui.list_scroll.vadjustment().value())
+        ui.as_ref().map(|ui| view_scroller(state, ui).vadjustment().value())
     } else {
         None
     };
@@ -9549,6 +9569,7 @@ fn navigate_to_with_message(
             queue.borrow().cancelled.cancel();
         }
         state.listing_generation = state.listing_generation.wrapping_add(1);
+        state.deferred_scan = None;
         let cancelled = Arc::new(AtomicBool::new(false));
         state.listing_cancel = Some(cancelled.clone());
         (state.listing_generation, cancelled)
@@ -9600,6 +9621,9 @@ fn navigate_to_with_message(
                 }
                 if state.cwd != path {
                     state.held_order = None;
+                    // D-341: leaving the folder ends any rename in it, so
+                    // coming back never finds a stale name box.
+                    state.inline_rename = None;
                 }
                 state.cwd = path.clone();
                 let tab = state.tabs.active_mut();
@@ -9671,7 +9695,7 @@ fn navigate_to_with_message(
                 // correction is never a frame anybody sees -- unlike the old
                 // 16ms timer, which is what he could see.
                 if let Some(value) = saved_scroll {
-                    reapply_scroll(&ui.list_scroll, value);
+                    reapply_scroll(&view_scroller(&state, ui), value);
                 }
             }
             glib::ControlFlow::Break
@@ -9928,8 +9952,15 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         return;
     }
 
+    // D-338: never rebuild the rows under an open rename editor.
+    if state.borrow().inline_rename.is_some() {
+        state.borrow_mut().deferred_scan = Some(listing);
+        return;
+    }
+    mark_scroll_cause("folder watcher refresh");
     let selected = selected_sources(state, ui);
-    let saved_scroll = ui.list_scroll.vadjustment().value();
+    let scroller = view_scroller(state, ui);
+    let saved_scroll = scroller.vadjustment().value();
     let (item_count, metadata_unavailable, unreadable_entries) = (
         listing.entries.len(),
         listing.metadata_unavailable,
@@ -9945,7 +9976,7 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         unreadable_entries,
     ));
     // Same as the navigate path (D-226/D-233): every view keeps its position.
-    reapply_scroll(&ui.list_scroll, saved_scroll);
+    reapply_scroll(&scroller, saved_scroll);
 }
 
 /// D-331: the one selected file was rewritten on disk (a handoff Claude
@@ -9979,6 +10010,62 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
     (value - target).abs() < 0.5
 }
 
+thread_local! {
+    /// D-345: the last thing Wayfinder itself did that can move the list, and when.
+    static SCROLL_CAUSE: RefCell<(&'static str, Option<Instant>)> = const { RefCell::new(("", None)) };
+}
+
+/// D-345: tag what is about to move the list, so a jump in the log names it.
+fn mark_scroll_cause(cause: &'static str) {
+    SCROLL_CAUSE.with(|c| *c.borrow_mut() = (cause, Some(Instant::now())));
+}
+
+/// D-345: append every list jump of more than 200px to
+/// ~/.cache/wayfinder/scroll-jumps.log with the last cause marked in the past
+/// two seconds. A jump with no cause is the user's wheel or GTK itself.
+fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
+    let last = Rc::new(Cell::new(scroller.vadjustment().value()));
+    scroller.vadjustment().connect_value_changed(move |adj| {
+        let (from, to) = (last.get(), adj.value());
+        last.set(to);
+        if (to - from).abs() <= 200.0 {
+            return;
+        }
+        let cause = SCROLL_CAUSE.with(|c| {
+            let (tag, at) = *c.borrow();
+            match at {
+                Some(at) if at.elapsed() < Duration::from_secs(2) => {
+                    format!("{tag} ({}ms before)", at.elapsed().as_millis())
+                }
+                _ => "no app cause (wheel, drag edge, or GTK)".to_string(),
+            }
+        });
+        let Some(dir) = dirs_cache_dir() else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("scroll-jumps.log")) {
+            use std::io::Write as _;
+            let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
+            let _ = writeln!(f, "{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}", adj.upper() - adj.page_size());
+        }
+    });
+}
+
+fn dirs_cache_dir() -> Option<PathBuf> {
+    Some(glib::user_cache_dir().join("wayfinder"))
+}
+
+/// D-336: the scroller the current view actually scrolls. Icon view has its
+/// own; holding only the list's offset let every icon-view refresh (a move,
+/// a delete, a live folder change) throw him back to the top.
+fn view_scroller(state: &Rc<RefCell<AppState>>, ui: &Ui) -> gtk::ScrolledWindow {
+    if state.borrow().view_mode == ViewMode::Grid {
+        if let Some(grid) = ui.files_stack.child_by_name("grid").and_then(|w| w.downcast::<gtk::ScrolledWindow>().ok()) {
+            return grid;
+        }
+    }
+    ui.list_scroll.clone()
+}
+
 /// Puts the view back where it was after a rebuild, with no visible frame
 /// anywhere else (D-226).
 ///
@@ -9991,6 +10078,7 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
 /// held for two frames, and in any case within 400ms, so it can never fight
 /// the user's own scrolling.
 fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
+    mark_scroll_cause("restore after refresh");
     let adj = scroller.vadjustment();
     adj.set_value(target);
     // The list moves the offset itself DURING layout -- it scrolls its focused
@@ -10241,11 +10329,23 @@ fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::Ent
     let Some(entry) = state.borrow().visible_entries.iter().find(|e| &e.source == source).cloned() else {
         return;
     };
-    let pos = state.borrow().visible_entries.iter().position(|e| &e.source == source).unwrap_or(0);
+    // D-344: find the row in the model itself. The list of entries and the
+    // model can differ for a moment (a reload between them), and splicing at
+    // a position past the model's end aborts the whole app.
+    let pos = (0..ui.list_store.n_items()).find(|&i| {
+        ui.list_store
+            .item(i)
+            .and_then(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+            .is_some_and(|boxed| &boxed.borrow::<Entry>().source == source)
+    });
+    let Some(pos) = pos else {
+        eprintln!("wf-event: refresh_row skipped, row not in the model");
+        return;
+    };
     // A real replace, not items_changed: ListView only rebinds a row when the
     // model reports a different item there.
-    ui.list_store.splice(pos as u32, 1, &[glib::BoxedAnyObject::new(entry)]);
-    ui.list_selection.select_item(pos as u32, true);
+    ui.list_store.splice(pos, 1, &[glib::BoxedAnyObject::new(entry)]);
+    ui.list_selection.select_item(pos, true);
 }
 
 fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
@@ -10266,6 +10366,11 @@ fn cancel_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         return;
     };
     refresh_row(state, ui, &native_core::EntrySource::real(&edit.path));
+    // D-338: catch up on any folder change held back while he typed.
+    let deferred = state.borrow_mut().deferred_scan.take();
+    if let Some(listing) = deferred {
+        apply_monitor_scan(state, ui, listing);
+    }
 }
 
 /// The one commit path for Enter and focus loss. Success renames on disk,
@@ -10291,41 +10396,19 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
         cancel_inline_rename(state, ui);
         return;
     }
-    match native_core::rename_path(&path, &typed) {
-        Ok(to) => {
-            state.borrow_mut().inline_rename = None;
-            match native_core::fingerprint(&to) {
-                Ok(fp) => push_undo(state, UndoAction::Renamed { from: path.clone(), to: to.clone(), fp }),
-                Err(err) => ui.status.set_label(&format!(
-                    "Renamed, but could not record Undo (no fingerprint: {err})"
-                )),
-            }
-            // D-91 follow-up: arm the one-shot reveal so the reload below reselects
-            // and scrolls to the renamed row, at its natural sorted position
-            // (never pinned_top, which would jump it out of sort order).
-            // D-334: and the row stays where it was. Hold the order on screen,
-            // with the old name swapped for the new, so the reload cannot move it.
-            {
-                let mut st = state.borrow_mut();
-                let old = native_core::EntrySource::real(&path);
-                let new = native_core::EntrySource::real(&to);
-                let mut order = st
-                    .held_order
-                    .take()
-                    .unwrap_or_else(|| st.visible_entries.iter().map(|e| e.source.clone()).collect());
-                for s in order.iter_mut() {
-                    if *s == old {
-                        *s = new.clone();
-                    }
-                }
-                st.held_order = Some(order);
-                st.reveal_focus = true;
-            }
-            state.borrow_mut().reveal_path = Some(native_core::EntrySource::real(to));
-            let cwd = state.borrow().cwd.clone();
-            navigate(state, cwd);
-            ui.status.set_label(&format!("Renamed {old_name} to {typed}"));
+    // D-340: the name is taken by another item. Ask the way Windows does:
+    // offer "name (2)" instead, and No goes back to editing.
+    let parent = Path::new(&path).parent().map(Path::to_path_buf);
+    if let Some(parent) = parent {
+        let dest = parent.join(&typed);
+        let same_item = matches!((std::fs::canonicalize(&dest), std::fs::canonicalize(&path)), (Ok(a), Ok(b)) if a == b);
+        if native_core::validate_name(&typed).is_ok() && dest.symlink_metadata().is_ok() && !same_item {
+            ask_rename_taken(state, ui, path, old_name, typed, parent);
+            return;
         }
+    }
+    match native_core::rename_path(&path, &typed) {
+        Ok(to) => finish_inline_rename(state, ui, &path, to, &old_name, &typed),
         Err(err) => {
             if let Some(edit) = state.borrow_mut().inline_rename.as_mut() {
                 edit.fail(err.clone());
@@ -10349,6 +10432,80 @@ struct InlineHost {
     cancel: Rc<dyn Fn()>,
     /// Whether this editor is still the live one.
     active: Rc<dyn Fn() -> bool>,
+}
+
+/// The success half of a rename: Undo, hold the row in place, reload, report.
+fn finish_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str, to: String, old_name: &str, typed: &str) {
+    let path = path.to_string();
+    state.borrow_mut().inline_rename = None;
+    match native_core::fingerprint(&to) {
+        Ok(fp) => push_undo(state, UndoAction::Renamed { from: path.clone(), to: to.clone(), fp }),
+        Err(err) => ui.status.set_label(&format!(
+            "Renamed, but could not record Undo (no fingerprint: {err})"
+        )),
+    }
+    // D-91 follow-up: arm the one-shot reveal so the reload below reselects
+    // and scrolls to the renamed row, at its natural sorted position
+    // (never pinned_top, which would jump it out of sort order).
+    // D-334: and the row stays where it was. Hold the order on screen,
+    // with the old name swapped for the new, so the reload cannot move it.
+    {
+        let mut st = state.borrow_mut();
+        let old = native_core::EntrySource::real(&path);
+        let new = native_core::EntrySource::real(&to);
+        let mut order = st
+            .held_order
+            .take()
+            .unwrap_or_else(|| st.visible_entries.iter().map(|e| e.source.clone()).collect());
+        for s in order.iter_mut() {
+            if *s == old {
+                *s = new.clone();
+            }
+        }
+        st.held_order = Some(order);
+        st.reveal_focus = true;
+    }
+    state.borrow_mut().reveal_path = Some(native_core::EntrySource::real(to));
+    let cwd = state.borrow().cwd.clone();
+    navigate(state, cwd);
+    ui.status.set_label(&format!("Renamed {old_name} to {typed}"));
+}
+
+/// D-340: Windows Explorer's "There is already a file with the same name in
+/// this location" prompt. Yes renames to the first free "name (n)"; No reopens
+/// the editor on the same row with what he typed, caret at the end.
+fn ask_rename_taken(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String, old_name: String, typed: String, parent: PathBuf) {
+    // The dialog takes focus, which would cancel the editor anyway; close it
+    // cleanly first so nothing half-written is left on the row.
+    if let Some(edit) = state.borrow_mut().inline_rename.as_mut() {
+        edit.pending = false;
+    }
+    cancel_inline_rename(state, ui);
+    let is_dir = Path::new(&path).is_dir();
+    let suggestion = native_core::free_sibling_name(&parent, &typed, is_dir);
+    let kind = if is_dir { "folder" } else { "file" };
+    let heading = if is_dir { "Rename Folder" } else { "Rename File" };
+    let body = format!(
+        "There is already a {kind} named \"{typed}\" in this folder.\n\nRename \"{old_name}\" to \"{suggestion}\" instead?"
+    );
+    let dialog = adw::AlertDialog::new(Some(heading), Some(&body));
+    dialog.add_responses(&[("no", "No"), ("yes", "Yes")]);
+    dialog.set_response_appearance("yes", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("yes"));
+    dialog.set_close_response("no");
+    let (state, ui2) = (state.clone(), ui.clone());
+    dialog.connect_response(None, move |_, response| {
+        if response == "yes" {
+            match native_core::rename_path(&path, &suggestion) {
+                Ok(to) => finish_inline_rename(&state, &ui2, &path, to, &old_name, &suggestion),
+                Err(err) => ui2.status.set_label(&format!("Cannot rename {old_name} to {suggestion}: {err}")),
+            }
+        } else {
+            state.borrow_mut().inline_rename = Some(InlineRename::new(&path, &typed));
+            refresh_row(&state, &ui2, &native_core::EntrySource::real(&path));
+        }
+    });
+    dialog.present(Some(&ui.window));
 }
 
 fn is_self_or_descendant(widget: &gtk::Widget, field: &gtk::Widget) -> bool {
@@ -10453,6 +10610,18 @@ fn build_inline_editor(
     let field = gtk::Entry::builder().text(&edit.text).hexpand(true).build();
     field.add_css_class("wf-file-name");
     let path = edit.path.clone();
+    // D-338: remember what he has typed, so a row that gets rebuilt while the
+    // edit is open comes back with his text, not the old name.
+    {
+        let (state, path) = (state.clone(), path.clone());
+        field.connect_changed(move |f| {
+            if let Ok(mut st) = state.try_borrow_mut() {
+                if let Some(edit) = st.inline_rename.as_mut().filter(|e| e.path == path && !e.pending) {
+                    edit.text = f.text().to_string();
+                }
+            }
+        });
+    }
     wire_inline_editor(
         &field,
         ui.window.upcast_ref::<gtk::Window>(),
@@ -10483,9 +10652,16 @@ fn build_inline_editor(
         }
     };
     let f = field.clone();
+    // D-338: a rebuilt editor already holding his typing gets the caret at
+    // the end, not a selection the next key would wipe out.
+    let resumed = edit.text != entry.name;
     glib::idle_add_local_once(move || {
         f.grab_focus();
-        f.select_region(0, end);
+        if resumed {
+            f.set_position(-1);
+        } else {
+            f.select_region(0, end);
+        }
     });
     field
 }
@@ -11163,6 +11339,7 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             // D-334: after a rename the row takes keyboard focus, so arrows and
             // F2 work at once; creation leaves focus to its inline editor.
             let flags = if state.borrow().reveal_focus { gtk::ListScrollFlags::FOCUS } else { gtk::ListScrollFlags::NONE };
+            mark_scroll_cause("reveal a renamed/new item");
             ui.list.scroll_to(index as u32, flags, None);
             // scroll_to(FOCUS) only lands when the row widget already exists;
             // right after a reload it may not, so put focus on the list itself,
@@ -11174,6 +11351,39 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
     state.borrow_mut().reveal_focus = false;
     update_selection(state, ui);
+}
+
+/// D-342 (19 Nov 2026, the owner): a new folder appears at the top of what he is
+/// looking at, so naming it never scrolls him anywhere. It used to land at
+/// the very bottom (after a rename held the order) or wherever its name
+/// sorted, and the view followed it there.
+fn hold_new_item_on_screen(state: &Rc<RefCell<AppState>>, ui: &Ui, source: native_core::EntrySource) {
+    let scroller = view_scroller(state, ui);
+    let adj = scroller.vadjustment();
+    let mut st = state.borrow_mut();
+    let mut order = st
+        .held_order
+        .take()
+        .unwrap_or_else(|| st.visible_entries.iter().map(|e| e.source.clone()).collect());
+    order.retain(|s| *s != source);
+    let n = order.len();
+    // First row fully on screen: rows are even, so the offset's share of the
+    // whole height is the row's share of the rows (rounded up = fully shown).
+    let span = adj.upper() - adj.lower();
+    let top = if n == 0 || span <= 0.0 {
+        0
+    } else {
+        let mut ix = ((adj.value() - adj.lower()) / span * n as f64).ceil() as usize;
+        if st.view_mode == ViewMode::Grid {
+            // Icon view: keep the new item at the start of a row of icons.
+            let per_row = ui.grid.max_children_per_line().max(1) as usize;
+            let cols = (0..n).take_while(|i| ui.grid.child_at_index(*i as i32).and_then(|c| c.compute_bounds(&ui.grid)).map(|b| b.y() < 1.0).unwrap_or(false)).count().clamp(1, per_row);
+            ix = ix.div_ceil(cols) * cols;
+        }
+        ix.min(n)
+    };
+    order.insert(top, source);
+    st.held_order = Some(order);
 }
 
 /// D-334: rows he has already seen keep their held positions; anything new
@@ -12556,6 +12766,7 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
             // select_item(.., true) clears the rest, and scroll_to brings the row
             // into view — with virtualization the row may not be realized yet.
             ui.list_selection.select_item(index as u32, true);
+            mark_scroll_cause("select_index scroll_to");
             ui.list
                 .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
         }
@@ -12570,6 +12781,33 @@ fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
 }
 
 fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
+    // D-341 (19 Nov 2026): Enter or a double-click meant for the name box of
+    // the item being named must not open it. He named a new folder and was
+    // dropped inside it. Put him back in the name box instead.
+    let naming_this = {
+        let st = state.borrow();
+        st.inline_rename.as_ref().is_some_and(|edit| entry.source.real_path_string().as_deref() == Some(edit.path.as_str()))
+    };
+    if naming_this {
+        eprintln!("wf-event: open refused, item is being named");
+        // Hand focus straight back to the live name box. Rebuilding the row
+        // instead would take focus off the old box, which cancels the rename.
+        let root: gtk::Widget = if state.borrow().view_mode == ViewMode::Grid { ui.grid.clone().upcast() } else { ui.list.clone().upcast() };
+        let mut stack = vec![root];
+        while let Some(w) = stack.pop() {
+            if let Some(field) = w.downcast_ref::<gtk::Entry>().filter(|e| e.has_css_class("wf-file-name")) {
+                field.grab_focus();
+                field.set_position(-1);
+                break;
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        return;
+    }
     // D-237: the borrow ends on this line. Written as
     // `if let Some(picker) = state.borrow().picker.clone()`, the temporary
     // `Ref` lives until the end of the whole if-let body (2021 edition), so
@@ -12731,9 +12969,10 @@ fn create_folder_action(state: Rc<RefCell<AppState>>, ui: Ui) {
                 UndoAction::Created { paths: vec![path] },
             ))
         },
-        |state, _, outcome| {
+        |state, ui, outcome| {
             if let Some(UndoAction::Created { paths }) = &outcome.undo {
                 if let Some(path) = paths.first() {
+                    hold_new_item_on_screen(state, ui, native_core::EntrySource::real(path));
                     let name = Path::new(path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -16971,7 +17210,10 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
     }
     {
         let slot = pressed_selection.clone();
-        drag.connect_drag_end(move |_, _, _| *slot.borrow_mut() = None);
+        drag.connect_drag_end(move |_, _, _| {
+            mark_scroll_cause("file drag ended");
+            *slot.borrow_mut() = None;
+        });
         let slot = pressed_selection.clone();
         drag.connect_drag_cancel(move |_, _, _| {
             *slot.borrow_mut() = None;
@@ -16986,6 +17228,7 @@ fn build_file_drag_source<W: IsA<gtk::Widget>>(
     {
         let (count, grab, path) = (drag_count.clone(), grab.clone(), path.clone());
         drag.connect_drag_begin(move |_, drag| {
+            mark_scroll_cause("file drag started");
             let (overlay, ghost) = build_drag_ghost(&path, count.get());
             gtk::DragIcon::for_drag(drag).set_child(Some(&overlay));
             let (hot_x, hot_y) = ghost_hotspot(grab.get(), &ghost);
@@ -17273,6 +17516,7 @@ fn build_drop_target(
         }
     });
     drop.connect_drop(move |_, value, _, _| {
+        mark_scroll_cause("file dropped");
         let Some(dest) = dest_of() else {
             slot.borrow_mut().take();
             ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
@@ -23141,6 +23385,15 @@ Broken: Either state is wrong.\n";
         rename_reselects_and_reveals_at_natural_sort_position_d91(ViewMode::Grid, "grid");
         rewritten_selected_file_reloads_preview_d331();
         address_crumbs_navigate_and_edit_button_edits_d332();
+        split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details", false);
+        split_move_keeps_source_pane_scroll_d336(ViewMode::Grid, "grid", false);
+        split_same_folder_move_into_subfolder_keeps_place_d343();
+        // D-336 real-drag and D-339 pointer tests: off until the Xvfb pointer reaches the window.
+        // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
+        folder_change_waits_for_open_rename_d338();
+        rename_onto_taken_name_offers_numbered_name_d340();
+        new_folder_naming_stays_put_d341();
+        // bottom_row_press_does_not_run_away_d339();
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
         sustained_stream_keeps_objects_pointer_and_timing_d22();
         tabs_keep_independent_history_d27();
@@ -23241,7 +23494,10 @@ Broken: Either state is wrong.\n";
         start_thumbnail_jobs(queue.clone());
         let mut saw_max = false;
         let ctx = glib::MainContext::default();
-        for _ in 0..80 {
+        // A deadline, not a fixed 80 x 5ms: under a loaded machine two decodes
+        // were still running at 400ms (r13), which is load, not a stuck queue.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
             let active = queue.borrow().active;
             assert!(
                 active <= MAX_CONCURRENT_THUMBNAILS,
@@ -25683,9 +25939,9 @@ Broken: Either state is wrong.\n";
             "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
              while [ $i -lt 3 ]; do\n\
              dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
-             i=$((i+1)); sleep 0.2; done\n",
+             i=$((i+1)); sleep 1; done\n",
         )
-        .unwrap();
+        .unwrap(); // D-335: 1 s per chunk; at 0.2 s the copy ended before the Cancel check
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -25995,6 +26251,483 @@ Broken: Either state is wrong.\n";
         wait_for("the left pane went to Documents", || state.borrow().cwd.display_string().ends_with("Documents"));
         assert!(pane_state.borrow().cwd.display_string().ends_with("Music"), "the right pane stayed put");
         let _ = &pane_ui;
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-336 (19 Nov 2026, the owner): moving a file from one split pane to the
+    /// other must leave the pane it came from where he was, not at the top.
+    fn split_move_keeps_source_pane_scroll_d336(view: ViewMode, tag: &str, real_drag: bool) {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d336-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, left, right) = (root.join("home"), root.join("left"), root.join("right"));
+        for d in [&home, &left, &right] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..160 {
+            std::fs::write(left.join(format!("f-{i:03}.txt")), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id(format!("com.kadaken.wayfinder.d336{tag}"))
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(left.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("left listing", || state.borrow().visible_entries.len() == 160);
+        toggle_split(&state, &ui);
+        pump();
+        let pane_state = ui.split.borrow().clone().expect("split pane").state;
+        let pane_ui = ui_for_state(&pane_state).expect("second pane ui");
+        navigate(&pane_state, native_core::Location::real(&right));
+        wait_for("right pane on the right folder", || {
+            pane_state.borrow().cwd.real_path_string().unwrap_or_default() == right.to_string_lossy()
+        });
+        set_view_mode(&state, &ui, view);
+        let scroller: gtk::ScrolledWindow = if view == ViewMode::Grid {
+            ui.files_stack.child_by_name("grid").and_then(|w| w.downcast::<gtk::ScrolledWindow>().ok()).expect("grid scroller")
+        } else {
+            ui.list_scroll.clone()
+        };
+        let adj = scroller.vadjustment();
+        wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
+        let target = (adj.upper() - adj.page_size()) / 2.0;
+        adj.set_value(target);
+        for _ in 0..20 { pump(); }
+        let before = adj.value();
+        assert!(before > 100.0, "{tag}: scrolled well down before the move ({before})");
+
+        // The drop lands on the right pane, so the right pane runs the move.
+        let moved_name = if real_drag {
+            // His real gesture: press a visible row in the left pane, drag it
+            // over to the right pane, let go. Xvfb pointer only.
+            ui.window.set_title(Some(&format!("wf-d336-proof-{tag}")));
+            for _ in 0..10 { pump(); }
+            let mut geo = String::new();
+            for _ in 0..50 {
+                if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").args(["search", "--name", &format!("wf-d336-proof-{tag}"), "getwindowgeometry", "--shell"]).output() {
+                    if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+                }
+                pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = std::process::Command::new("/usr/bin/xdotool").args(["search", "--name", &format!("wf-d336-proof-{tag}"), "windowraise"]).output();
+            let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+            let (wx, wy) = (num("X="), num("Y="));
+            let sb = ui.list_scroll.compute_bounds(&ui.window).expect("left scroller");
+            let mid = sb.y() + sb.height() / 2.0;
+            let row = all_widgets(ui.list.upcast_ref()).into_iter().filter(|w| w.has_css_class("wf-file-row"))
+                .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w.clone(), b)))
+                .find(|(_, b)| b.y() <= mid && b.y() + b.height() > mid).expect("a row mid-list");
+            let name = Path::new(&row.0.tooltip_text().unwrap().to_string()).file_name().unwrap().to_string_lossy().to_string();
+            let rb = pane_ui.list_scroll.compute_bounds(&ui.window).expect("right scroller");
+            let xdo = |a: &[&str]| { let _ = std::process::Command::new("/usr/bin/xdotool").args(a).output(); for _ in 0..4 { pump(); std::thread::sleep(Duration::from_millis(30)); } };
+            let (sx, sy) = (wx + (row.1.x() + 60.0) as i32, wy + (row.1.y() + row.1.height() / 2.0) as i32);
+            let (dx, dy) = (wx + (rb.x() + rb.width() / 2.0) as i32, wy + (rb.y() + rb.height() / 2.0) as i32);
+            xdo(&["mousemove", &sx.to_string(), &sy.to_string()]);
+            xdo(&["mousedown", "1"]);
+            for k in 1..=12 {
+                let x = sx + (dx - sx) * k / 12;
+                let y = sy + (dy - sy) * k / 12;
+                xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+            }
+            xdo(&["mouseup", "1"]);
+            name
+        } else {
+            run_transfer(
+                pane_state.clone(),
+                pane_ui.clone(),
+                Transfer { srcs: vec![left.join("f-080.txt")], dest: right.clone(), is_copy: false, cut_offer: None, style: TransferStyle::Paste },
+                native_core::PasteConflict::KeepBoth,
+            );
+            "f-080.txt".to_string()
+        };
+        eprintln!("wf-test D-336 {tag} dragging {moved_name}");
+        wait_for("file moved", || right.join(&moved_name).exists() && !left.join(&moved_name).exists());
+        wait_for("right pane shows it", || pane_state.borrow().visible_entries.len() == 1);
+        wait_for("left pane drops it", || state.borrow().visible_entries.len() == 159);
+        for _ in 0..40 { pump(); }
+        let after = adj.value();
+        eprintln!("wf-test D-336 {tag} before={before} after={after}");
+        assert!((after - before).abs() < 80.0, "{tag}: D-336 the source pane kept its place ({before} -> {after})");
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-343 (19 Nov 2026, the owner, screenshot): both panes on the SAME folder,
+    /// a selected file in the left pane dropped on the "Delete" folder row in
+    /// the right pane. Neither pane may jump.
+    fn split_same_folder_move_into_subfolder_keeps_place_d343() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d343-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        let bin = dir.join("Delete");
+        for d in [&home, &dir, &bin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for i in 0..160 {
+            std::fs::write(dir.join(format!("f-{i:03}.txt")), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d343test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1400, 800);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 161);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        toggle_split(&state, &ui);
+        pump();
+        let pane_state = ui.split.borrow().clone().expect("split pane").state;
+        let pane_ui = ui_for_state(&pane_state).expect("second pane ui");
+        wait_for("right pane lists the same folder", || pane_state.borrow().visible_entries.len() == 161);
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
+        adj.set_value((adj.upper() - adj.page_size()) / 2.0);
+        for _ in 0..20 { pump(); }
+        // He clicked the file first: it is selected and the list has focus.
+        let ix = state.borrow().visible_entries.iter().position(|e| e.name == "f-080.txt").unwrap() as u32;
+        ui.list_selection.select_item(ix, true);
+        update_selection(&state, &ui);
+        ui.list.grab_focus();
+        for _ in 0..20 { pump(); }
+        let before = adj.value();
+        let right_adj = pane_ui.list_scroll.vadjustment();
+        let right_before = right_adj.value();
+        assert!(before > 100.0, "scrolled well down first ({before})");
+
+        // The drop on the right pane's folder row: the right pane runs it.
+        run_transfer(
+            pane_state.clone(),
+            pane_ui.clone(),
+            Transfer { srcs: vec![dir.join("f-080.txt")], dest: bin.clone(), is_copy: false, cut_offer: None, style: TransferStyle::Paste },
+            native_core::PasteConflict::KeepBoth,
+        );
+        wait_for("file moved", || bin.join("f-080.txt").exists() && !dir.join("f-080.txt").exists());
+        wait_for("left pane drops it", || state.borrow().visible_entries.len() == 160);
+        wait_for("right pane drops it", || pane_state.borrow().visible_entries.len() == 160);
+        for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let (after, right_after) = (adj.value(), right_adj.value());
+        eprintln!("wf-test D-343 left {before} -> {after}, right {right_before} -> {right_after}");
+        assert!((after - before).abs() < 80.0, "D-343: the left pane kept its place ({before} -> {after})");
+        assert!((right_after - right_before).abs() < 80.0, "D-343: the right pane kept its place ({right_before} -> {right_after})");
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-338 (19 Nov 2026, the owner): a folder change while he is typing a new
+    /// name must not rebuild the rows (it killed the editor and jumped the
+    /// view); it lands once the edit ends.
+    fn folder_change_waits_for_open_rename_d338() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d338-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("f-{i:02}.txt")), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d338test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 30);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        ui.list_selection.select_item(10, true);
+        update_selection(&state, &ui);
+        rename_action(state.clone(), ui.clone());
+        let root_widget: gtk::Widget = ui.list.clone().upcast();
+        wait_for("inline editor", || inline_field(&root_widget).is_some());
+        let field = inline_field(&root_widget).unwrap();
+        field.set_text("half-typed");
+
+        std::fs::write(dir.join("arrived.txt"), "new").unwrap();
+        let listing = crate::native_core::list_dir_cancellable(&dir, false, &AtomicBool::new(false)).expect("relist");
+        apply_monitor_scan(&state, &ui, listing);
+        for _ in 0..10 { pump(); }
+        let still = inline_field(&root_widget).expect("D-338: the editor survives a folder change");
+        assert_eq!(still.text().as_str(), "half-typed", "D-338: his typing is kept");
+        assert_eq!(state.borrow().visible_entries.len(), 30, "D-338: rows are not rebuilt while he types");
+        assert!(state.borrow().deferred_scan.is_some(), "D-338: the change is held, not dropped");
+
+        cancel_inline_rename(&state, &ui);
+        wait_for("held change lands after the edit", || state.borrow().visible_entries.len() == 31);
+        assert!(state.borrow().deferred_scan.is_none(), "D-338: held change consumed");
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-340 (19 Nov 2026, the owner): renaming onto a name that is taken asks
+    /// the Windows question. Yes renames to "name (2)"; No reopens the editor
+    /// with his typing; nothing is ever overwritten.
+    fn rename_onto_taken_name_offers_numbered_name_d340() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d340-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        std::fs::write(dir.join("c.txt"), "c").unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d340test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        let root_widget: gtk::Widget = ui.list.clone().upcast();
+        let ix_of = |name: &str| state.borrow().visible_entries.iter().position(|e| e.name == name).expect(name) as u32;
+        let alert = || ui.window.visible_dialog().and_then(|d| d.downcast::<adw::AlertDialog>().ok());
+
+        // No: back to editing, his typing kept, nothing renamed.
+        ui.list_selection.select_item(ix_of("a.txt"), true);
+        update_selection(&state, &ui);
+        rename_action(state.clone(), ui.clone());
+        wait_for("inline editor", || inline_field(&root_widget).is_some());
+        let field = inline_field(&root_widget).unwrap();
+        field.set_text("b.txt");
+        field.emit_activate();
+        wait_for("the taken-name question", || alert().is_some());
+        let body = alert().unwrap().body().to_string();
+        eprintln!("wf-test D-340 asks: {body:?}");
+        assert!(body.contains("b (2).txt"), "D-340: offers the numbered name: {body}");
+        button_labelled(alert().unwrap().upcast_ref(), "No").expect("the No button").emit_clicked();
+        wait_for("the question closes", || alert().is_none());
+        wait_for("editor reopened", || inline_field(&root_widget).is_some());
+        assert_eq!(inline_field(&root_widget).unwrap().text().as_str(), "b.txt", "D-340: No keeps his typing");
+        assert!(dir.join("a.txt").exists() && std::fs::read_to_string(dir.join("b.txt")).unwrap() == "b", "D-340: No changes nothing");
+
+        // Yes: renamed to the free numbered name, the other file untouched.
+        let field = inline_field(&root_widget).unwrap();
+        field.emit_activate();
+        wait_for("the question again", || alert().is_some());
+        button_labelled(alert().unwrap().upcast_ref(), "Yes").expect("the Yes button").emit_clicked();
+        wait_for("the question closes", || alert().is_none());
+        wait_for("renamed to b (2).txt", || dir.join("b (2).txt").exists() && !dir.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("b (2).txt")).unwrap(), "a", "D-340: the renamed file is a.txt's");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b", "D-340: the taken name is never overwritten");
+        wait_for("listing shows it", || state.borrow().visible_entries.iter().any(|e| e.name == "b (2).txt"));
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-341 (19 Nov 2026, the owner): naming a new folder dropped him inside it,
+    /// and the name box was still waiting when he backed out. The folder
+    /// appearing on disk must not take the name box away, opening the item
+    /// being named must not happen, and leaving the folder ends the rename.
+    fn new_folder_naming_stays_put_d341() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d341-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..120 {
+            std::fs::write(dir.join(format!("f-{i:02}.txt")), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d341test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 120);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        let root_widget: gtk::Widget = ui.list.clone().upcast();
+        let cwd = state.borrow().cwd.clone();
+
+        // D-342: scrolled to the middle, after a rename held the order (the
+        // case that sent the new folder to the very bottom).
+        for _ in 0..10 { pump(); }
+        let adj = ui.list_scroll.vadjustment();
+        adj.set_value((adj.upper() - adj.page_size()) / 2.0);
+        for _ in 0..10 { pump(); }
+        let before = adj.value();
+        {
+            let mut st = state.borrow_mut();
+            st.held_order = Some(st.visible_entries.iter().map(|e| e.source.clone()).collect());
+        }
+        create_folder_action(state.clone(), ui.clone());
+        wait_for("name box on the new folder", || inline_field(&root_widget).is_some() && dir.join("New Folder").is_dir());
+        for _ in 0..10 { pump(); }
+        // The folder's own arrival, reported by the folder watcher.
+        let listing = crate::native_core::list_dir_cancellable(&dir, false, &AtomicBool::new(false)).expect("relist");
+        apply_monitor_scan(&state, &ui, listing);
+        for _ in 0..10 { pump(); }
+        let field = inline_field(&root_widget).expect("D-341: the name box survives the folder watcher");
+        let after = ui.list_scroll.vadjustment().value();
+        let at = state.borrow().visible_entries.iter().position(|e| e.name == "New Folder").unwrap();
+        eprintln!("wf-test D-342 scroll before={before} after={after} new-folder-row={at}");
+        assert!((after - before).abs() < 60.0, "D-342: making a folder does not scroll ({before} -> {after})");
+        assert!(at > 20 && at < 100, "D-342: the new folder sits where he is looking, row {at}");
+        field.set_text("mom");
+        // A stray Enter/double-click on the folder itself.
+        let entry = state.borrow().visible_entries.iter().find(|e| e.name == "New Folder").cloned().expect("new folder row");
+        open_entry(&state, &ui, entry);
+        for _ in 0..10 { pump(); }
+        assert!(state.borrow().cwd == cwd, "D-341: still in the same folder, not inside the new one");
+        let field = inline_field(&root_widget).expect("D-341: name box still open");
+        assert_eq!(field.text().as_str(), "mom", "D-341: his typing is kept");
+        field.emit_activate();
+        wait_for("renamed to mom", || dir.join("mom").is_dir() && !dir.join("New Folder").exists());
+        assert!(state.borrow().cwd == cwd, "D-341: Enter names it and stays put");
+
+        // Leaving the folder ends a rename that was open in it.
+        let row = state.borrow().visible_entries.iter().position(|e| e.name == "f-05.txt").unwrap() as u32;
+        ui.list_selection.select_item(row, true);
+        update_selection(&state, &ui);
+        rename_action(state.clone(), ui.clone());
+        wait_for("name box", || inline_field(&root_widget).is_some());
+        navigate(&state, native_core::Location::real(dir.join("mom")));
+        wait_for("inside mom", || state.borrow().cwd != cwd);
+        assert!(state.borrow().inline_rename.is_none(), "D-341: leaving the folder ends the rename");
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-339 (19 Nov 2026, the owner): pressing on the half-shown row at the
+    /// bottom of the list and holding must select that row and leave the
+    /// view still; it used to scroll and keep running down the list.
+    /// Real pointer on the test's own Xvfb display (never his screen).
+    fn bottom_row_press_does_not_run_away_d339() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d339-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..120 {
+            std::fs::write(dir.join(format!("f-{i:03}.txt")), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d339test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d339-proof"));
+        ui.window.set_default_size(900, 600);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 120);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        for _ in 0..30 { pump(); }
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let mut geo = String::new();
+        for _ in 0..50 {
+            if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").args(["search", "--name", "wf-d339-proof", "getwindowgeometry", "--shell"]).output() {
+                if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+        let (wx, wy) = (num("X="), num("Y="));
+        let _ = std::process::Command::new("/usr/bin/xdotool").args(["search", "--name", "wf-d339-proof", "windowraise"]).output();
+        for _ in 0..10 { pump(); }
+        let scroll_b = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
+        let bottom = scroll_b.y() + scroll_b.height();
+        let rows: Vec<gtk::Widget> = all_widgets(ui.list.upcast_ref()).into_iter().filter(|w| w.has_css_class("wf-file-row")).collect();
+        let cut = rows.iter().filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w.clone(), b)))
+            .find(|(_, b)| b.y() < bottom - 3.0 && b.y() + b.height() > bottom + 1.0);
+        let Some((row, b)) = cut else {
+            eprintln!("wf-test D-339 SKIP: no half-shown row at the bottom (bottom={bottom})");
+            return;
+        };
+        let path = row.tooltip_text().map(|t| t.to_string()).unwrap_or_default();
+        let adj = ui.list_scroll.vadjustment();
+        let before = adj.value();
+        let (x, y) = (wx + (b.x() + 40.0) as i32, wy + (bottom - 3.0) as i32);
+        let picked = ui.window.pick(b.x() as f64 + 40.0, bottom as f64 - 3.0, gtk::PickFlags::DEFAULT).map(|w| w.type_().name().to_string());
+        eprintln!("wf-test D-339 window=({wx},{wy}) point=({x},{y}) picked={picked:?}");
+        xdo(&["mousemove", &x.to_string(), &y.to_string()]);
+        pump();
+        xdo(&["mousedown", "1"]);
+        for _ in 0..30 { pump(); std::thread::sleep(Duration::from_millis(50)); }
+        let held = adj.value();
+        xdo(&["mouseup", "1"]);
+        for _ in 0..10 { pump(); }
+        let after = adj.value();
+        let sel = selected_paths(&state, &ui);
+        eprintln!("wf-test D-339 before={before} held={held} after={after} pressed={path} selected={sel:?}");
+        assert_eq!(sel, vec![path.clone()], "D-339: the pressed row is the selected row");
+        assert!(after - before <= b.height() as f64 + 2.0, "D-339: the view moves at most enough to show the pressed row ({before} -> {after})");
+
         ui.window.destroy();
         pump();
         match old_home {
@@ -34509,6 +35242,14 @@ Broken: Either state is wrong.\n";
         let outer = root.join("outer").to_string_lossy().to_string();
         let edit_box = ui.path_edit.parent().expect("edit button has a parent");
         assert!(edit_box.has_css_class("wf-address-box"), "D-332: the edit button sits inside the address field");
+        // D-337: the address field and the search box sit inside their row
+        // with clear space above and below, and match each other's height.
+        let row = edit_box.parent().expect("the path bar row");
+        wait_for("bar laid out", || row.height() > 0 && edit_box.height() > 0);
+        let (row_h, box_h, search_h) = (row.height(), edit_box.height(), ui.search.height());
+        eprintln!("wf-test D-337 row={row_h} address={box_h} search={search_h}");
+        assert!(row_h - box_h >= 8, "D-337: address field leaves space in its row ({box_h} of {row_h})");
+        assert!((box_h - search_h).abs() <= 2, "D-337: search matches the address height ({search_h} vs {box_h})");
         assert_eq!(edit_box.first_child().as_ref(), Some(ui.path_edit.upcast_ref::<gtk::Widget>()), "D-332: the edit button is first");
         assert_eq!(edit_box.observe_controllers().n_items(), 0, "D-332: no click-anywhere gesture on the address field");
 
@@ -34708,13 +35449,17 @@ Broken: Either state is wrong.\n";
         wait_for("shortcut folder", || created("New Folder (4)").is_dir());
         wait_for("shortcut editor", || inline_field(ui.list.upcast_ref()).is_some());
 
-        // A colliding rename stays open with its exact reason and changes nothing.
+        // A colliding rename asks the Windows question (D-340); No changes
+        // nothing and puts him back in the name box.
         let field = inline_field(ui.list.upcast_ref()).unwrap();
         field.set_text("taken");
         field.emit_activate();
-        wait_for("collision error", || state.borrow().inline_rename.as_ref().is_some_and(|e| e.error.is_some()));
+        let alert = || ui.window.visible_dialog().and_then(|d| d.downcast::<adw::AlertDialog>().ok());
+        wait_for("taken-name question", || alert().is_some());
+        button_labelled(alert().unwrap().upcast_ref(), "No").expect("No button").emit_clicked();
+        wait_for("question closes", || alert().is_none());
         assert!(created("New Folder (4)").is_dir() && created("taken").is_file());
-        assert!(inline_field(ui.list.upcast_ref()).is_some(), "the editor stays open");
+        wait_for("the editor reopens", || inline_field(ui.list.upcast_ref()).is_some());
         cancel_inline_rename(&state, &ui);
 
         // ---- Grid: background menu on the grid surface, same editor and commit.

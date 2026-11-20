@@ -2825,6 +2825,20 @@ pub fn new_file(parent: &str, name: &str) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// D-340: the Windows answer to a rename onto a taken name: the first free
+/// "stem (n).ext" in the same folder, n from 2. A folder keeps its whole name
+/// as the stem, so "a.b" becomes "a.b (2)".
+pub fn free_sibling_name(parent: &Path, name: &str, is_dir: bool) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 && !is_dir => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    (2..)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|cand| parent.join(cand).symlink_metadata().is_err())
+        .expect("a free name exists")
+}
+
 pub fn rename_path(path: &str, new_name: &str) -> Result<String, String> {
     validate_name(new_name)?;
     let parent = Path::new(path).parent().ok_or("no parent")?;
@@ -5852,7 +5866,7 @@ pub fn fmt_modified_exact(seconds: i64) -> String {
     format!("Modified: {stamp}")
 }
 
-fn validate_name(name: &str) -> Result<(), String> {
+pub fn validate_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err("invalid name".into());
     }
