@@ -10982,7 +10982,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         if let Some(path) = entry.is_dir.then(|| entry.source.real_path()).flatten() {
             connect_file_drop_to_dir(&line, state.clone(), ui.clone(), path.to_path_buf());
         }
-        connect_row_context(&line, item.position(), state.clone(), ui.clone(), entry.clone());
+        connect_row_context(&line, state.clone(), ui.clone(), entry.clone());
         if entry.is_dir {
             // Middle-click a folder to open it in a new tab, like a browser.
             let middle = gtk::GestureClick::new();
@@ -13169,6 +13169,24 @@ fn create_file_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 
 fn rename_action(state: Rc<RefCell<AppState>>, ui: Ui) {
     let entries = selected_entries(&state, &ui);
+    rename_entries(state, ui, entries);
+}
+
+/// D-360: the item menu renames the entry that was right-clicked, resolved by
+/// its own path captured at click time, never by whatever the selection holds
+/// by position when the menu item is pressed. A multi-selection that contains
+/// the clicked entry still batch-renames.
+fn rename_clicked_entry(state: Rc<RefCell<AppState>>, ui: Ui, clicked: Entry) {
+    let selected = selected_entries(&state, &ui);
+    let entries = if selected.len() > 1 && selected.iter().any(|e| e.source == clicked.source) {
+        selected
+    } else {
+        vec![clicked]
+    };
+    rename_entries(state, ui, entries);
+}
+
+fn rename_entries(state: Rc<RefCell<AppState>>, ui: Ui, entries: Vec<Entry>) {
     if entries.iter().any(|e| e.source.is_zip()) {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
@@ -16258,7 +16276,6 @@ fn first_hash_run(value: &str) -> Option<(usize, usize)> {
 
 fn connect_row_context(
     row: &gtk::Box,
-    position: u32,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
     entry: Entry,
@@ -16270,9 +16287,20 @@ fn connect_row_context(
         // Claim the gesture so the ListView's background handler does not also
         // fire and clear the selection out from under the menu.
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        if !ui.list_selection.is_selected(position) {
-            ui.list_selection.select_item(position, true);
-            update_selection(&state, &ui);
+        // D-360: the row's position at bind time goes stale when a same-folder
+        // refresh inserts or removes rows above a kept row. Find the entry's
+        // place now, by its path.
+        let position = state
+            .borrow()
+            .visible_entries
+            .iter()
+            .position(|e| e.source == entry.source)
+            .map(|i| i as u32);
+        if let Some(position) = position {
+            if !ui.list_selection.is_selected(position) {
+                ui.list_selection.select_item(position, true);
+                update_selection(&state, &ui);
+            }
         }
         show_item_context_menu(
             &row_for_click,
@@ -16486,8 +16514,8 @@ fn show_item_context_menu(
                 "document-edit-symbolic",
                 "Rename",
                 Box::new({
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move || rename_action(state.clone(), ui.clone())
+                    let (state, ui, entry) = (state.clone(), ui.clone(), entry.clone());
+                    move || rename_clicked_entry(state.clone(), ui.clone(), entry.clone())
                 }),
             ),
             if viewing_trash(&state) {
@@ -16627,13 +16655,14 @@ fn show_item_context_menu(
         {
             let state = state.clone();
             let ui = ui.clone();
+            let entry = entry.clone();
             let label = if selected_entries(&state, &ui).len() > 1 {
                 "Batch Rename..."
             } else {
                 "Rename"
             };
             menu.append(&context_button(label, &popover, move || {
-                rename_action(state.clone(), ui.clone())
+                rename_clicked_entry(state.clone(), ui.clone(), entry.clone())
             }));
         }
         {
@@ -23573,6 +23602,7 @@ Broken: Either state is wrong.\n";
         // D-336 real-drag and D-339 pointer tests: off until the Xvfb pointer reaches the window.
         // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
         folder_change_waits_for_open_rename_d338();
+        rename_from_menu_renames_the_clicked_file_d360();
         rename_onto_taken_name_offers_numbered_name_d340();
         new_folder_naming_stays_put_d341();
         // bottom_row_press_does_not_run_away_d339();
@@ -26685,6 +26715,117 @@ Broken: Either state is wrong.\n";
         cancel_inline_rename(&state, &ui);
         wait_for("held change lands after the edit", || state.borrow().visible_entries.len() == 31);
         assert!(state.borrow().deferred_scan.is_none(), "D-338: held change consumed");
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-360 (20 Nov 2026, the owner): Rename from the right-click menu renamed a
+    /// different file (IMG_1103.JPG became dfsfsdf.JPG). A kept row is not
+    /// rebound by a same-folder refresh (D-347), so the row position the
+    /// right-click handler captured at bind time went stale. The menu must act
+    /// on the file that was right-clicked, by path, and nothing else.
+    fn rename_from_menu_renames_the_clicked_file_d360() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d360-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(100_000);
+        let stamp = |path: &Path, age_secs: u64| {
+            let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(50_000 - age_secs)).unwrap();
+        };
+        for i in 0..80u64 {
+            let name = match i {
+                3 => "Photo_bald_man_red_shirt_holding_sleeping_newborn_01.jpg".to_string(),
+                9 => "Photo_woman_blue_dress_walking_a_small_brown_dog_in_the_park_02.jpg".to_string(),
+                _ => format!("IMG_{:04}.JPG", 1100 + i),
+            };
+            std::fs::write(dir.join(&name), name.as_bytes()).unwrap();
+            stamp(&dir.join(&name), i * 60);
+        }
+        let before = dir_names(&dir);
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d360test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 600);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 80);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        {
+            let mut st = state.borrow_mut();
+            st.sort_key = SortKey::Modified;
+            st.sort_ascending = false;
+        }
+        repopulate_rows(&state, &ui);
+        for _ in 0..10 { pump(); }
+
+        // New files arrive at the top (newest first): kept rows shift down
+        // without being rebound.
+        for i in 0..4u64 {
+            let p = dir.join(format!("NEW_{i}.JPG"));
+            std::fs::write(&p, "n").unwrap();
+            stamp(&p, 0);
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(i + 1)).unwrap();
+        }
+        let before = {
+            let mut b = before;
+            b.extend((0..4).map(|i| format!("NEW_{i}.JPG")));
+            b.sort();
+            b
+        };
+        let listing = crate::native_core::list_dir_cancellable(&dir, false, &AtomicBool::new(false)).expect("relist");
+        apply_monitor_scan(&state, &ui, listing);
+        for _ in 0..10 { pump(); }
+
+        let target = "IMG_1105.JPG";
+        let target_path = dir.join(target).to_string_lossy().to_string();
+        let list_widget: gtk::Widget = ui.list.clone().upcast();
+        let row = all_widgets(&list_widget)
+            .into_iter()
+            .find(|w| {
+                w.has_css_class("wf-file-row")
+                    && w.tooltip_text().is_some_and(|t| t.lines().next().is_some_and(|l| l.ends_with(target)))
+            })
+            .expect("the target row is on screen");
+        let gesture = row
+            .observe_controllers()
+            .into_iter()
+            .filter_map(|o| o.ok()?.downcast::<gtk::GestureClick>().ok())
+            .find(|g| g.button() == 3)
+            .expect("row right-click gesture");
+        gesture.emit_by_name::<()>("pressed", &[&1i32, &5.0f64, &5.0f64]);
+        pump();
+        let rename = button_labelled(&row, "Rename").expect("the menu has a labelled Rename");
+        rename.emit_clicked();
+        wait_for("inline editor", || inline_field(&list_widget).is_some());
+        let opened_on = state.borrow().inline_rename.as_ref().map(|e| e.path.clone());
+        assert_eq!(opened_on.as_deref(), Some(target_path.as_str()), "D-360: the editor opens on the right-clicked file");
+        let field = inline_field(&list_widget).unwrap();
+        field.set_text("dfsfsdf.JPG");
+        field.emit_activate();
+        wait_for("rename lands", || dir.join("dfsfsdf.JPG").is_file());
+        assert!(!dir.join(target).exists(), "D-360: the right-clicked file was renamed");
+        let mut expected = before;
+        expected.retain(|n| n != target);
+        expected.push("dfsfsdf.JPG".to_string());
+        expected.sort();
+        assert_eq!(dir_names(&dir), expected, "D-360: no other file changed its name");
 
         ui.window.destroy();
         pump();
