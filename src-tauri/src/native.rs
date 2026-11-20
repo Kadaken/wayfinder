@@ -2477,6 +2477,11 @@ struct AppState {
     inline_rename: Option<InlineRename>,
     /// A row to select and scroll to once the next listing is on screen.
     reveal_path: Option<native_core::EntrySource>,
+    /// D-334: the reveal also puts keyboard focus on the row (after a rename).
+    reveal_focus: bool,
+    /// D-334 (19 Nov 2026, the owner): after a rename the rows keep the order he was
+    /// looking at; only a sort click (or leaving the folder) re-sorts.
+    held_order: Option<Vec<native_core::EntrySource>>,
     /// Last plain click on a Name label: source and when, for slow-second-click.
     last_name_click: Option<(native_core::EntrySource, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
@@ -4405,6 +4410,8 @@ fn build_ui_in(
     let state = Rc::new(RefCell::new(AppState {
         inline_rename: None,
         reveal_path: None,
+        reveal_focus: false,
+        held_order: None,
         last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: native_core::Location::real(&initial_cwd),
@@ -8710,6 +8717,7 @@ fn connect_sort_headers(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 button.connect_clicked(move |_| {
                     {
                         let mut state_ref = state.borrow_mut();
+                        state_ref.held_order = None;
                         if state_ref.sort_key == key {
                             state_ref.sort_ascending = !state_ref.sort_ascending;
                         } else {
@@ -8751,6 +8759,7 @@ fn toggle_column(state: &Rc<RefCell<AppState>>, ui: &Ui, column: MetaColumn) {
         state_ref.columns_visible.set(column, shown);
         let fallback = !shown && state_ref.sort_key == column.sort_key();
         if fallback {
+            state_ref.held_order = None;
             state_ref.sort_key = SortKey::Name;
             state_ref.sort_ascending = true;
         }
@@ -9589,6 +9598,9 @@ fn navigate_to_with_message(
                     state.sort_key = SortKey::Modified;
                     state.sort_ascending = false;
                 }
+                if state.cwd != path {
+                    state.held_order = None;
+                }
                 state.cwd = path.clone();
                 let tab = state.tabs.active_mut();
                 match mode {
@@ -10283,7 +10295,7 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
         Ok(to) => {
             state.borrow_mut().inline_rename = None;
             match native_core::fingerprint(&to) {
-                Ok(fp) => push_undo(state, UndoAction::Renamed { from: path, to: to.clone(), fp }),
+                Ok(fp) => push_undo(state, UndoAction::Renamed { from: path.clone(), to: to.clone(), fp }),
                 Err(err) => ui.status.set_label(&format!(
                     "Renamed, but could not record Undo (no fingerprint: {err})"
                 )),
@@ -10291,6 +10303,24 @@ fn commit_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, field: &gtk::Ent
             // D-91 follow-up: arm the one-shot reveal so the reload below reselects
             // and scrolls to the renamed row, at its natural sorted position
             // (never pinned_top, which would jump it out of sort order).
+            // D-334: and the row stays where it was. Hold the order on screen,
+            // with the old name swapped for the new, so the reload cannot move it.
+            {
+                let mut st = state.borrow_mut();
+                let old = native_core::EntrySource::real(&path);
+                let new = native_core::EntrySource::real(&to);
+                let mut order = st
+                    .held_order
+                    .take()
+                    .unwrap_or_else(|| st.visible_entries.iter().map(|e| e.source.clone()).collect());
+                for s in order.iter_mut() {
+                    if *s == old {
+                        *s = new.clone();
+                    }
+                }
+                st.held_order = Some(order);
+                st.reveal_focus = true;
+            }
             state.borrow_mut().reveal_path = Some(native_core::EntrySource::real(to));
             let cwd = state.borrow().cwd.clone();
             navigate(state, cwd);
@@ -10880,6 +10910,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     };
     let placement = effective_placement(&state.borrow());
     sort_entries(&mut visible_entries, sort_key, sort_ascending, placement);
+    if let Some(held) = state.borrow().held_order.as_ref() {
+        apply_held_order(&mut visible_entries, held);
+    }
 
     // No row is forced out of its sorted place. A file the window was opened
     // on is selected (see navigation), not moved: it sits where the chosen sort
@@ -11127,10 +11160,28 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         }
         ViewMode::Details | ViewMode::Compact => {
             ui.list_selection.select_item(index as u32, true);
-            ui.list.scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
+            // D-334: after a rename the row takes keyboard focus, so arrows and
+            // F2 work at once; creation leaves focus to its inline editor.
+            let flags = if state.borrow().reveal_focus { gtk::ListScrollFlags::FOCUS } else { gtk::ListScrollFlags::NONE };
+            ui.list.scroll_to(index as u32, flags, None);
+            // scroll_to(FOCUS) only lands when the row widget already exists;
+            // right after a reload it may not, so put focus on the list itself,
+            // which hands it to its focus row (the one just selected).
+            if state.borrow().reveal_focus && !focus_within(&ui.window, &ui.list) {
+                ui.list.grab_focus();
+            }
         }
     }
+    state.borrow_mut().reveal_focus = false;
     update_selection(state, ui);
+}
+
+/// D-334: rows he has already seen keep their held positions; anything new
+/// (not in the held list) follows, in the sorted order it already has.
+fn apply_held_order(entries: &mut Vec<Entry>, held: &[native_core::EntrySource]) {
+    let rank: HashMap<&native_core::EntrySource, usize> = held.iter().enumerate().map(|(i, s)| (s, i)).collect();
+    // Stable sort: held rows by their held index, unheld rows after, unchanged.
+    entries.sort_by_key(|e| rank.get(&e.source).copied().unwrap_or(usize::MAX));
 }
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, ascending: bool, placement: FolderPlacement) {
@@ -34333,15 +34384,21 @@ Broken: Either state is wrong.\n";
         assert!(!Path::new(&old_path).exists(), "{tag}: old path gone");
         assert_eq!(std::fs::read(&new_path).unwrap(), b"TARGET-BYTES", "{tag}: new path present, same bytes");
 
-        // ---- Reselection at the natural sorted position.
+        // ---- D-334 (19 Nov 2026, the owner): the renamed row stays exactly where it
+        // was; no re-sort until he asks for one.
         assert_eq!(selected_paths(&state, &ui), vec![new_path.clone()], "{tag}: exactly the renamed row is selected");
         let new_index = index_of(&state, &new_path).expect("renamed entry present after reload");
+        assert_eq!(new_index, start_index, "{tag}: D-334 the renamed row keeps its place, no auto-sort");
         let mut expected = state.borrow().visible_entries.clone();
         sort_entries(&mut expected, state.borrow().sort_key, state.borrow().sort_ascending, effective_placement(&state.borrow()));
         let names: Vec<&str> = expected.iter().map(|e| e.name.as_str()).collect();
         let sorted_index = names.iter().position(|&n| n == new_name).expect("renamed name in freshly-sorted order");
-        assert_eq!(new_index, sorted_index, "{tag}: row sits at its natural sort position, not pinned or moved");
+        assert_ne!(sorted_index, start_index, "{tag}: the fixture really would move under a re-sort");
         assert_eq!(state.borrow().pinned_top, pinned_before, "{tag}: pinned_top untouched by rename reveal");
+        if view != ViewMode::Grid {
+            for _ in 0..50 { if focus_within(&ui.window, &ui.list) { break; } pump(); }
+            wait_for(&format!("{tag}: D-334 keyboard focus is on the file list after the rename"), || focus_within(&ui.window, &ui.list));
+        }
 
         // ---- reveal_path is a one-shot: consumed by the reveal it armed.
         assert!(state.borrow().reveal_path.is_none(), "{tag}: reveal_path consumed");
@@ -34395,6 +34452,27 @@ Broken: Either state is wrong.\n";
             selected_paths(&state, &ui).is_empty(),
             "{tag}: an unrelated refresh must not reselect the renamed row via a stale reveal"
         );
+        assert_eq!(index_of(&state, &new_path), Some(start_index), "{tag}: D-334 a live refresh keeps the held place too");
+
+        // ---- D-334: only a sort click re-sorts. Click the current sort column
+        // twice (reverse, then back) so the final order is the original sort.
+        fn find_named(w: &gtk::Widget, name: &str) -> Option<gtk::Button> {
+            if w.widget_name() == name {
+                if let Ok(b) = w.clone().downcast::<gtk::Button>() { return Some(b); }
+            }
+            let mut c = w.first_child();
+            while let Some(x) = c { if let Some(b) = find_named(&x, name) { return Some(b); } c = x.next_sibling(); }
+            None
+        }
+        let header_name = match state.borrow().sort_key { SortKey::Name => "sort-name", SortKey::Size => "sort-size", SortKey::Kind => "sort-kind", SortKey::Modified => "sort-modified" };
+        if let Some(header) = find_named(ui.window.upcast_ref(), header_name) {
+            header.emit_clicked();
+            header.emit_clicked();
+            pump();
+            assert_eq!(index_of(&state, &new_path), Some(sorted_index), "{tag}: D-334 a sort click puts the row at its sorted place");
+        } else {
+            assert_eq!(view, ViewMode::Grid, "{tag}: sort headers exist in the list views");
+        }
 
         // ---- Everything the brief locks stays unchanged.
         assert_eq!(dir_names(&dir).len(), 81, "{tag}: no sibling lost or gained");
