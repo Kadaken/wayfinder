@@ -2494,8 +2494,6 @@ struct AppState {
     /// name. Rebuilding the rows then destroyed the editor (typing lost, view
     /// jumped); it is applied once the edit ends instead.
     deferred_scan: Option<native_core::DirectoryListing>,
-    /// Last plain click on a Name label: source and when, for slow-second-click.
-    last_name_click: Option<(native_core::EntrySource, std::time::Instant)>,
     activation_gate: Rc<RefCell<ActivationGate>>,
     cwd: native_core::Location,
     tabs: TabSet,
@@ -4470,7 +4468,6 @@ fn build_ui_in(
         reveal_focus: false,
         held_order: None,
         deferred_scan: None,
-        last_name_click: None,
         activation_gate: Rc::new(RefCell::new(ActivationGate::default())),
         cwd: native_core::Location::real(&initial_cwd),
         tabs: TabSet::new(native_core::Location::real(&initial_cwd)),
@@ -10450,15 +10447,13 @@ fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::Ent
 }
 
 fn begin_inline_rename(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: &Entry) {
-    // D-188: a ZIP member has no real path to rename on disk; the slow-click
-    // gate has no is_zip() check of its own, so refuse here (REJECT 1).
+    // D-188: a ZIP member has no real path to rename on disk, so refuse here.
     if entry.source.is_zip() {
         ui.status.set_label(native_core::ZIP_READ_ONLY_MESSAGE);
         return;
     }
     let Some(real_path) = entry.source.real_path_string() else { return };
     state.borrow_mut().inline_rename = Some(InlineRename::new(&real_path, &entry.name));
-    state.borrow_mut().last_name_click = None;
     refresh_row(state, ui, &entry.source);
 }
 
@@ -10767,35 +10762,6 @@ fn build_inline_editor(
     field
 }
 
-/// Slow second click on an already-selected Name starts the inline edit.
-fn connect_name_slow_click(
-    label: &gtk::Label,
-    state: &Rc<RefCell<AppState>>,
-    ui: &Ui,
-    source: &native_core::EntrySource,
-) {
-    let click = gtk::GestureClick::new();
-    click.set_button(1);
-    let (state, ui, source) = (state.clone(), ui.clone(), source.clone());
-    click.connect_released(move |_, n_press, _, _| {
-        let prior = state
-            .borrow()
-            .last_name_click
-            .as_ref()
-            .filter(|(s, _)| *s == source)
-            .map(|(_, at)| at.elapsed());
-        let only_this = selected_sources(&state, &ui) == vec![source.clone()];
-        state.borrow_mut().last_name_click = Some((source.clone(), std::time::Instant::now()));
-        if slow_click_starts_rename(prior, n_press, only_this) {
-            let entry = state.borrow().visible_entries.iter().find(|e| e.source == source).cloned();
-            if let Some(entry) = entry {
-                begin_inline_rename(&state, &ui, &entry);
-            }
-        }
-    });
-    label.add_controller(click);
-}
-
 fn row_size_text(entry: &Entry) -> String {
     if entry.metadata_error.is_some() {
         "—".to_string()
@@ -10941,10 +10907,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .cloned();
         let name: gtk::Widget = match editing {
             Some(edit) => build_inline_editor(&state, &ui, &entry, &edit).upcast(),
-            None => {
-                connect_name_slow_click(&name, &state, &ui, &entry.source);
-                name.upcast()
-            }
+            None => name.upcast(),
         };
         let size_text = row_size_text(&entry);
         // max_width_chars is deliberately small on all three: it only sets the
@@ -15939,19 +15902,6 @@ fn connect_gated_activate(
             started.elapsed().as_millis()
         );
     });
-}
-
-/// A slow second click renames only when the name was already selected by an
-/// earlier click, and is neither the first click nor a double-click (open).
-fn slow_click_starts_rename(
-    prior_click_on_same_path: Option<Duration>,
-    n_press: i32,
-    only_this_selected: bool,
-) -> bool {
-    n_press == 1
-        && only_this_selected
-        && prior_click_on_same_path
-            .is_some_and(|d| d >= Duration::from_millis(500) && d <= Duration::from_millis(2000))
 }
 
 #[allow(deprecated)]
@@ -40555,15 +40505,28 @@ Broken: Either state is wrong.\n";
         assert!(!f2_starts_inline_rename(1, ViewMode::Grid), "grid is not in this round");
     }
 
+    /// D-356: a click on a name only selects. Renaming is F2 and the context
+    /// menu, which both go through `rename_action`; nothing else may start it.
     #[test]
-    fn slow_click_needs_an_already_selected_name() {
-        let slow = Some(Duration::from_millis(900));
-        assert!(slow_click_starts_rename(slow, 1, true));
-        assert!(!slow_click_starts_rename(None, 1, true), "first click only selects");
-        assert!(!slow_click_starts_rename(slow, 2, true), "double-click opens");
-        assert!(!slow_click_starts_rename(Some(Duration::from_millis(150)), 1, true), "too fast");
-        assert!(!slow_click_starts_rename(Some(Duration::from_secs(5)), 1, true), "too old");
-        assert!(!slow_click_starts_rename(slow, 1, false), "not the only selection");
+    fn name_click_never_renames_d356() {
+        let all = include_str!("native.rs");
+        let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = app.find("\nfn rename_action(").expect("rename_action exists");
+        let body = &app[start + 1..];
+        let end = body[1..].find("\nfn ").map(|i| i + 1).unwrap_or(body.len());
+        let (lo, hi) = (start + 1, start + 1 + end);
+        let call = concat!("begin_inline", "_rename(");
+        let mut calls = 0;
+        for (at, _) in app.match_indices(call) {
+            if app[..at].ends_with("fn ") {
+                continue;
+            }
+            assert!(at >= lo && at < hi, "begin_inline_rename called outside rename_action (F2/menu) at byte {at}");
+            calls += 1;
+        }
+        assert!(calls >= 1, "F2 and the menu must still start the inline rename");
+        assert!(!app.contains(concat!("slow_click", "_starts_rename")), "slow-click rename is gone");
+        assert!(!app.contains(concat!("last_name", "_click")), "slow-click state is gone");
     }
 
     #[test]
