@@ -23550,6 +23550,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test place-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d360") {
+            rename_from_menu_renames_the_clicked_file_d360();
+            eprintln!("wf-test d360-only run done");
+            return;
+        }
         // First: earlier tests leave modal dialogs that would swallow real pointer input.
         real_pointer_drag_carries_the_press_time_selection();
         enumerated_choice_label_lands_in_the_real_widget_tree();
