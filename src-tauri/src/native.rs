@@ -19626,9 +19626,10 @@ fn set_preview_media(ui: &Ui, path: &str) {
         if m.error().is_none() || ui_for_error.preview_generation.get() != generation {
             return;
         }
-        ui_for_error
-            .preview_media_controls
-            .set_media_stream(None::<&gtk::MediaStream>);
+        // The controls keep the failed stream until the next selection clears
+        // them: taking it away here would be a second "media-stream" change
+        // for one selection (D-86 counts them), and the controls are off
+        // screen once the frame or text page is showing.
         ui_for_error
             .preview_media_picture
             .set_paintable(None::<&gdk::Paintable>);
@@ -25116,6 +25117,12 @@ Broken: Either state is wrong.\n";
             bottom_row_click_keeps_place_d350();
             split_same_folder_move_into_subfolder_keeps_place_d343();
             eprintln!("wf-test place-only run done");
+            return;
+        }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d86") {
+            selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
+            mpg_counts_as_video_and_shows_a_frame_d362();
+            eprintln!("wf-test d86-only run done");
             return;
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d362") {
