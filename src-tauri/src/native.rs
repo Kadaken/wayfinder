@@ -3,6 +3,7 @@
 
 mod crash;
 mod native_core;
+mod native_viewers;
 mod audio_preview;
 mod native_smb;
 mod update;

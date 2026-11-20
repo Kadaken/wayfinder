@@ -12,12 +12,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const IMG_EXT: [&str; 16] = [
+const IMG_EXT: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
     // D-251: these three were missing, so they were not even treated as images.
     "heif", "avifs", "jxl",
     // D-322: a Canon camera's video thumbnail (MVI_0001.THM) is a plain JPEG.
     "thm",
+    // D-362: formats GTK cannot all load itself. Each one is converted to a
+    // cached PNG by ffmpeg or ImageMagick (see TRANSCODE_THUMB_EXT).
+    "jfif", "apng", "tga", "pcx", "ppm", "pgm", "pbm", "pnm", "exr", "hdr", "jp2", "j2k", "dds",
+    "psd", "xcf",
+    // D-362: raw camera files.
+    "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf", "srw", "pef",
 ];
 /// Every sound-file extension the preview offers to play.
 ///
@@ -30,7 +36,7 @@ const IMG_EXT: [&str; 16] = [
 ///
 /// Playlists (.m3u, .pls, .cue) are deliberately absent: they are text files
 /// listing other files, so the text preview is the right one for them.
-const AUDIO_EXT: [&str; 50] = [
+const AUDIO_EXT: &[&str] = &[
     // MPEG audio
     "mp3", "mp2", "mp1", "mpga", "m4a", "m4b", "m4r", "aac", "adts", "aa3", "oma",
     // Free and lossless
@@ -49,9 +55,14 @@ const AUDIO_EXT: [&str; 50] = [
     "dsf", "dff", "mpc",
     // MIDI (played through the fluidsynth GStreamer plugin, D-327)
     "mid", "midi", "kar", "rmi",
+    // D-362: protected AAC, tracker modules and a few more containers.
+    "m4p", "xm", "mod", "s3m", "it", "mp4a", "ofr", "mlp", "wvc",
 ];
-const VIDEO_EXT: [&str; 12] = [
+const VIDEO_EXT: &[&str] = &[
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "ts", "3gp", "ogv", "mpeg",
+    // D-362: every other container ffmpeg reads. "mpg" was missing entirely.
+    "mpg", "mpe", "m2v", "m2ts", "mts", "vob", "divx", "xvid", "asf", "rm", "rmvb", "f4v", "3g2",
+    "ogm", "dv", "mxf", "nut", "qt", "mjpeg", "h264", "h265", "hevc", "264",
 ];
 
 #[derive(Clone, Debug)]
@@ -6104,19 +6115,28 @@ fn icon_name(path: &Path, is_dir: bool) -> &'static str {
         .to_lowercase()
         .as_str()
     {
+        // D-362: the lists above are the one source for what counts as sound,
+        // video or a picture; the named arms keep their own icon choices.
         "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" | "aiff"
         | "aif" | "alac" => "audio-x-generic",
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "wmv" | "m4v" | "mpg" | "mpeg" | "3gp" | "flv"
         | "ts" => "video-x-generic",
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "svg" | "ico"
         | "avif" | "heic" | "heif" | "avifs" | "jxl" => "image-x-generic",
+        other if IMG_EXT.contains(&other) => "image-x-generic",
+        other if VIDEO_EXT.contains(&other) => "video-x-generic",
+        other if AUDIO_EXT.contains(&other) => "audio-x-generic",
         "pdf" => "application-pdf",
         "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "lz" | "lzma"
         | "cab" => "application-x-archive",
         "txt" | "log" | "md" | "rst" | "nfo" | "text" => "text-x-generic",
-        "doc" | "docx" | "odt" | "rtf" => "x-office-document",
-        "xls" | "xlsx" | "ods" | "csv" => "x-office-spreadsheet",
-        "ppt" | "pptx" | "odp" => "x-office-presentation",
+        "doc" | "docx" | "odt" | "rtf" | "dot" | "dotx" | "ott" | "wpd" | "wps" | "pages" => {
+            "x-office-document"
+        }
+        "xls" | "xlsx" | "ods" | "csv" | "xlt" | "xltx" | "ots" | "numbers" => "x-office-spreadsheet",
+        "ppt" | "pptx" | "odp" | "pot" | "potx" | "pps" | "ppsx" | "otp" | "key" => {
+            "x-office-presentation"
+        }
         "html" | "htm" => "text-html",
         "json" => "application-json",
         "sh" | "bash" | "zsh" | "fish" => "text-x-script",
@@ -11603,10 +11623,18 @@ mod vault_privacy_tests {
 /// thumbnail for one of those files decoded to nothing and the tile kept its
 /// plain file icon forever. These are the extensions that have to be decoded
 /// by an outside tool first and thumbnailed from the result.
-const TRANSCODE_THUMB_EXT: [&str; 5] = ["avif", "heic", "heif", "avifs", "jxl"];
+const TRANSCODE_THUMB_EXT: &[&str] = &[
+    "avif", "heic", "heif", "avifs", "jxl",
+    // D-362: no in-process loader is relied on for these.
+    "psd", "xcf", "pcx", "exr", "hdr", "jp2", "j2k", "dds",
+    "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf", "srw", "pef",
+    "jfif",
+];
 
 pub fn needs_transcoded_thumbnail(path: &str) -> bool {
-    has_extension(path, &TRANSCODE_THUMB_EXT)
+    // D-362: a BMP with RLE compression or a negative height is sent to the
+    // outside decoders too; the in-process BMP reader stalled on them.
+    has_extension(path, TRANSCODE_THUMB_EXT) || crate::native_viewers::bmp_needs_converter(path)
 }
 
 /// D-260: Details, List and Compact can draw a thumbnail in the same slot the
