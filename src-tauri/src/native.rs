@@ -4320,8 +4320,10 @@ static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// D-346: one line per startup milestone in ~/.cache/wayfinder/startup.log,
 /// each label once per process and only in the first minute.
-#[cfg(not(test))]
 fn startup_mark(what: &'static str) {
+    if cfg!(test) {
+        return;
+    }
     thread_local! {
         static SEEN: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
@@ -4338,9 +4340,6 @@ fn startup_mark(what: &'static str) {
         let _ = writeln!(f, "pid {} {what}: {ms}ms", std::process::id());
     }
 }
-
-#[cfg(test)]
-fn startup_mark(_what: &'static str) {}
 
 /// D-346: the worker-thread form; logs only the first call per process.
 fn startup_mark_any_thread(what: &'static str) {
