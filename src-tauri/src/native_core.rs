@@ -12337,7 +12337,11 @@ mod midi_duration_tests {
 
     #[test]
     fn real_songs_match_their_wav_renders_when_present() {
-        let dir = "/home/user/Music/For Suno";
+        // Read the folder from $HOME so no username sits in a tracked file; skip if HOME is unset.
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let dir = format!("{home}/Music/For Suno");
         for song in ["song1", "Song2", "song3", "song4", "song7", "song8", "song9", "song10", "song11", "lara2"] {
             let mid = format!("{dir}/{song}.mid");
             let wav = format!("{dir}/{song}.wav");

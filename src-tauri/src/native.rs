@@ -1299,6 +1299,10 @@ struct AppConfig {
     /// scroll and ran the list away from him.
     #[serde(default)]
     edge_autoscroll: bool,
+    /// D-352: the sidebar shut with its toolbar button. Only that button
+    /// changes it; the divider can no longer close it.
+    #[serde(default)]
+    sidebar_hidden: bool,
     /// Set once the first-run setup has been answered, however it was answered.
     /// An upgrade from a version without this field reads false and therefore
     /// shows the setup once; that is deliberate, since the options it offers
@@ -2041,6 +2045,7 @@ impl Default for AppConfig {
             trash_keep_days: 0,
             drop_ask: false,
             edge_autoscroll: false,
+            sidebar_hidden: false,
             onboarded: false,
             install_convention: true,
             recent_files: Vec::new(),
@@ -4913,6 +4918,21 @@ fn build_ui_in(
     // Open Terminal were unreachable from the toolbar.
     let command_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     command_bar.add_css_class("wf-commandbar");
+    // D-352: the one way to shut and reopen the sidebar. First on the row, so
+    // it sits in the same place whether the sidebar is open or shut.
+    let sidebar_toggle = gtk::ToggleButton::builder()
+        .tooltip_text("Show or hide the sidebar")
+        .active(true)
+        .build();
+    sidebar_toggle.set_widget_name("wf-sidebar-toggle");
+    match sidebar_toggle_icon() {
+        Some(name) => sidebar_toggle.set_icon_name(name),
+        None => sidebar_toggle.set_label("\u{25E7}"),
+    }
+    sidebar_toggle.add_css_class("wf-icon-button");
+    size_toolbar_button(&sidebar_toggle);
+    command_bar.append(&sidebar_toggle);
+    command_bar.append(&command_divider());
     command_bar.append(&new_folder);
     command_bar.append(&new_file);
     command_bar.append(&command_divider());
@@ -5057,7 +5077,8 @@ fn build_ui_in(
     main.set_wide_handle(false);
     main.set_resize_start_child(false);
     main.set_resize_end_child(true);
-    main.set_shrink_start_child(true);
+    // D-352: never shrinks under its width, so a drag cannot shut it.
+    main.set_shrink_start_child(false);
     main.set_shrink_end_child(true);
     main.set_start_child(Some(&sidebar_scroll));
     main.set_end_child(Some(&file_preview));
@@ -5195,12 +5216,23 @@ fn build_ui_in(
     // One window per pane pair. The first pane builds it; a second pane takes
     // the one it was handed and hangs its body off the split's Paned.
     let embedded = host.is_some();
+    if !embedded {
+        // D-352: open as he left it.
+        if load_config().sidebar_hidden {
+            sidebar_toggle.set_active(false);
+            sidebar_scroll.set_visible(false);
+        }
+        let (main, sidebar) = (main.clone(), sidebar_scroll.clone());
+        sidebar_toggle.connect_toggled(move |button| set_sidebar_shown(&main, &sidebar, button.is_active()));
+    }
     let window = match host {
         Some(host) => {
             host.paned.set_end_child(Some(&split_slot));
             // One Places list per window: the left pane's.
             sidebar_scroll.set_visible(false);
             main.set_position(0);
+            // The left pane's button owns the one sidebar.
+            sidebar_toggle.set_visible(false);
             host.window
         }
         None => {
@@ -5231,6 +5263,7 @@ fn build_ui_in(
             // drags the window natively (on drag, not click) — drop the override.
             connect_titlebar_buttons(&window, minimize_button, maximize_button, close_button);
             add_resize_grips(&root_overlay, &window);
+            record_window_sizes(&window);
             window
         }
     };
@@ -5820,6 +5853,16 @@ fn size_toolbar_button(button: &impl IsA<gtk::Widget>) {
 /// Home shows in full at its indent.
 const SIDEBAR_FIXED_WIDTH: i32 = 230;
 
+/// D-352: show or hide the sidebar and remember it. The toggle button's
+/// handler is the only caller.
+fn set_sidebar_shown(main: &gtk::Paned, sidebar: &gtk::ScrolledWindow, shown: bool) {
+    sidebar.set_visible(shown);
+    if shown {
+        main.set_position(SIDEBAR_FIXED_WIDTH);
+    }
+    update_config(|config| config.sidebar_hidden = !shown);
+}
+
 /// Hold the sidebar at one width. The divider used to be draggable, and a
 /// stray drag squashed the names or shut the sidebar altogether with nothing
 /// to say it had happened (7 Nov 2026, the owner: "remove the resize feature for
@@ -5832,8 +5875,13 @@ fn lock_sidebar_width(paned: &gtk::Paned) {
         if *holding.borrow() {
             return;
         }
+        // D-352: a drag to 0 used to be let through as if it were the second
+        // pane hiding its copy, and it shut the sidebar with no way back
+        // (20 Nov 2026). Now only a hidden sidebar (its button, or a second
+        // pane) is left alone; every other width snaps back.
+        let shown = pane.start_child().is_some_and(|c| c.is_visible());
         let position = pane.position();
-        if position == 0 || position == SIDEBAR_FIXED_WIDTH {
+        if !shown || position == SIDEBAR_FIXED_WIDTH {
             return;
         }
         *holding.borrow_mut() = true;
@@ -6056,6 +6104,43 @@ fn title_button(icon_name: &str, tooltip: &str) -> gtk::Button {
         .build();
     button.add_css_class("wf-title-button");
     button
+}
+
+/// D-354: two windows tiled 50/50 overlapped (20 Nov 2026). Log every size
+/// KWin offers this window against the width it can shrink to, so the next
+/// tile names the cause: ~/.cache/wayfinder/window-sizes.log.
+fn record_window_sizes(window: &adw::ApplicationWindow) {
+    let weak = window.downgrade();
+    window.connect_realize(move |_| {
+        let Some(window) = weak.upgrade() else { return };
+        let Some(toplevel) = window.surface().and_then(|s| s.downcast::<gdk::Toplevel>().ok()) else { return };
+        let last = Rc::new(RefCell::new(String::new()));
+        let weak = window.downgrade();
+        toplevel.connect_compute_size(move |toplevel, size| {
+            let Some(window) = weak.upgrade() else { return };
+            let (bw, bh) = size.bounds();
+            let (min_w, _, _, _) = window.measure(gtk::Orientation::Horizontal, -1);
+            let state = toplevel.state();
+            let line = format!(
+                "bounds={bw}x{bh} now={}x{} min_w={min_w} tiled={} maximized={}",
+                window.width(),
+                window.height(),
+                state.intersects(gdk::ToplevelState::TILED | gdk::ToplevelState::LEFT_TILED | gdk::ToplevelState::RIGHT_TILED),
+                state.contains(gdk::ToplevelState::MAXIMIZED),
+            );
+            if *last.borrow() == line {
+                return;
+            }
+            *last.borrow_mut() = line.clone();
+            let Some(dir) = dirs_cache_dir() else { return };
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("window-sizes.log")) {
+                use std::io::Write as _;
+                let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
+                let _ = writeln!(f, "{when} window {:p} {line}", window.as_ptr());
+            }
+        });
+    });
 }
 
 fn connect_titlebar_buttons(
@@ -8290,6 +8375,15 @@ fn connect_actions(
     }
 }
 
+/// D-352: the first left-sidebar icon the theme has, or None for the glyph.
+fn sidebar_toggle_icon() -> Option<&'static str> {
+    let display = gdk::Display::default()?;
+    let theme = gtk::IconTheme::for_display(&display);
+    ["sidebar-show-symbolic", "sidebar-show-left-symbolic", "view-left-pane-symbolic", "sidebar-expand-left-symbolic"]
+        .into_iter()
+        .find(|name| theme.has_icon(name))
+}
+
 /// The first right-pane icon the current theme actually has (Adwaita and Breeze
 /// name it differently), or None so the button falls back to the glyph.
 fn preview_toggle_icon() -> Option<&'static str> {
@@ -10199,6 +10293,7 @@ fn hold_list_at_edges(scroller: &gtk::ScrolledWindow) {
         }
         // Put back inside GTK's own set_value, so its edge-scroll tick reads
         // no movement and stops itself.
+        tag_scroll_cause("edge hold: put back");
         snapping.set(true);
         adj.set_value(value);
         snapping.set(false);
@@ -10216,8 +10311,15 @@ fn scroll_generation() -> u64 {
 
 /// D-345: tag what is about to move the list, so a jump in the log names it.
 fn mark_scroll_cause(cause: &'static str) {
-    SCROLL_CAUSE.with(|c| *c.borrow_mut() = (cause, Some(Instant::now())));
+    tag_scroll_cause(cause);
     note_scroll_input();
+}
+
+/// Names a move in the jump log without counting it as his input. The holds
+/// use this for their snap-backs: counting one as input would make the hold
+/// think he scrolled and let go of itself.
+fn tag_scroll_cause(cause: &'static str) {
+    SCROLL_CAUSE.with(|c| *c.borrow_mut() = (cause, Some(Instant::now())));
 }
 
 /// D-345: append every list jump of more than 200px to
@@ -10302,8 +10404,8 @@ fn view_scroller(state: &Rc<RefCell<AppState>>, ui: &Ui) -> gtk::ScrolledWindow 
 /// timer, and that correction is the jump he could see. A tick callback runs
 /// before each frame is painted, so reasserting the offset there means the list
 /// is never drawn anywhere but where it was. It stops as soon as the offset has
-/// held for two frames, and in any case within 400ms, so it can never fight
-/// the user's own scrolling.
+/// held for 1.5 seconds (the deadline below), and it comes off the moment he
+/// scrolls, clicks or types, so it never fights his own scrolling.
 fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     mark_scroll_cause("restore after refresh");
     let started = scroll_generation();
@@ -10337,6 +10439,7 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
             if stand_down() || snapping_check.get() || scroll_target_reached(adj.value(), target) {
                 return;
             }
+            tag_scroll_cause("restore hold: put back");
             snapping_check.set(true);
             adj.set_value(target);
             snapping_check.set(false);
@@ -10347,6 +10450,7 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
         let adj = scroller.vadjustment();
         let off = stand_down();
         if !off && !scroll_target_reached(adj.value(), target) {
+            tag_scroll_cause("restore hold: put back");
             adj.set_value(target);
         }
         if off || Instant::now() > deadline {
@@ -11000,6 +11104,22 @@ fn start_modified_retick(state: &Rc<RefCell<AppState>>) {
     });
 }
 
+/// D-355: wraps the name (label or rename box) in an overlay whose size is set
+/// by an invisible two-line label in the same font, so row height is constant.
+fn fixed_two_line_name(name: gtk::Widget, zoom: f64) -> gtk::Widget {
+    // The height of two lines of this very font, measured on the name itself,
+    // so no hidden second label is needed (a hidden label also trips the
+    // drag-ghost opacity guard, drag_ghost_is_compact_icon_and_name_d18).
+    let probe = name.create_pango_layout(Some("A\nA"));
+    probe.set_attributes(Some(&name_zoom_attrs(zoom)));
+    // One pixel over, so rounding can never make a two-line name taller than
+    // the minimum and bring back rows of two different heights.
+    let two_lines = probe.pixel_size().1 + 1;
+    name.set_size_request(-1, two_lines);
+    name.set_valign(gtk::Align::Center);
+    name
+}
+
 fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let state = state.clone();
     let state_for_unbind = state.clone();
@@ -11080,6 +11200,12 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 name.upcast()
             }
         };
+        // D-355/D-358: every non-compact row is as tall as two lines of name,
+        // whether or not this name wraps. Rows of mixed 1- and 2-line height
+        // made GtkListView re-estimate the whole list's height as rows were
+        // measured and realized (38,000 <-> 48,700 in his log; 29,727 <-> 35,973
+        // in test D-358) and move the place with it on a click.
+        let name = if compact { name } else { fixed_two_line_name(name, icon_zoom) };
         let size_text = row_size_text(&entry);
         // max_width_chars is deliberately small on all three: it only sets the
         // shrink floor. The real width comes from the header's size_request via
@@ -11691,8 +11817,9 @@ fn hold_new_item_on_screen(state: &Rc<RefCell<AppState>>, ui: &Ui, source: nativ
         .unwrap_or_else(|| st.visible_entries.iter().map(|e| e.source.clone()).collect());
     order.retain(|s| *s != source);
     let n = order.len();
-    // First row fully on screen: rows are even, so the offset's share of the
-    // whole height is the row's share of the rows (rounded up = fully shown).
+    // First row fully on screen: every list row is the same height (D-355,
+    // fixed two-line names), so the offset's share of the whole height is the
+    // row's share of the rows (rounded up = fully shown).
     let span = adj.upper() - adj.lower();
     let top = if n == 0 || span <= 0.0 {
         0
@@ -23971,6 +24098,8 @@ Broken: Either state is wrong.\n";
         );
         // A quick run of the place-keeping tests alone, for iterating on them.
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("place") {
+            sidebar_button_not_divider_d352();
+            split_wrapped_names_click_keeps_place_d358();
             compare_window_shows_both_files_d351();
             bottom_row_click_keeps_place_d350();
             split_same_folder_move_into_subfolder_keeps_place_d343();
@@ -24028,6 +24157,8 @@ Broken: Either state is wrong.\n";
         split_same_folder_move_into_subfolder_keeps_place_d343();
         bottom_row_click_keeps_place_d350();
         compare_window_shows_both_files_d351();
+        sidebar_button_not_divider_d352();
+        split_wrapped_names_click_keeps_place_d358();
         // D-336 real-drag and D-339 pointer tests: off until the Xvfb pointer reaches the window.
         // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
         folder_change_waits_for_open_rename_d338();
@@ -27493,6 +27624,175 @@ Broken: Either state is wrong.\n";
         assert!(moved_off.abs() < 1.0, "D-350: held with the switch off, the list stayed still (moved {moved_off})");
         assert!((wheel + 120.0).abs() < 1.0, "D-350: his wheel still scrolls while held (moved {wheel})");
         assert!(moved_on > 20.0, "D-350: with the switch on, the edge scroll still works (moved {moved_on})");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-358: his real conditions. Split view, a narrow left pane, a long
+    /// folder, names of mixed length so some wrap to two lines. Clicking rows
+    /// must not move the list when he did not scroll, and the list height must
+    /// not flip between two values.
+    fn split_wrapped_names_click_keeps_place_d358() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d358-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 900usize;
+        for i in 0..total {
+            // The number leads, so short and long names sort side by side.
+            let name = match i % 4 {
+                0 => format!("{i:04}.jpg"),
+                1 => format!("{i:04} Holiday photos - Lisbon trip with the whole family and friends, day {}.jpg", i % 9),
+                2 => format!("{i:04}-notes.txt"),
+                _ => format!("{i:04} Quarterly report draft (final) reviewed by accounting and legal before sending.pdf"),
+            };
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d358test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1300, 800);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        toggle_split(&state, &ui);
+        pump();
+        let pane_state = ui.split.borrow().clone().expect("split pane").state;
+        wait_for("right pane lists the folder", || pane_state.borrow().visible_entries.len() == total);
+        // The left pane narrow, as in his window.
+        let paned = ui.split.borrow().clone().expect("split pane").paned;
+        paned.set_position(900);
+        for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        eprintln!("wf-test D-358 left pane width={} paned position={}", ui.list_scroll.width(), paned.position());
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
+        mark_scroll_cause("test: his own scroll");
+        adj.set_value((adj.upper() - adj.page_size()) / 2.0);
+        for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let mapped_rows = |ui: &Ui| -> Vec<gtk::Widget> {
+            all_widgets(ui.list.upcast_ref()).into_iter().filter(|w| w.has_css_class("wf-file-row") && w.is_mapped()).collect()
+        };
+        let mut distinct: Vec<i32> = mapped_rows(&ui).iter().map(|w| w.height()).collect();
+        distinct.sort();
+        distinct.dedup();
+        eprintln!("wf-test D-358 distinct row heights={distinct:?} rows mapped={} upper={} value={} page={}", mapped_rows(&ui).len(), adj.upper(), adj.value(), adj.page_size());
+        // The names really wrap: some name labels draw two lines, some one.
+        let drawn: Vec<i32> = all_widgets(ui.list.upcast_ref()).into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .filter(|l| l.has_css_class("wf-file-name") && l.is_mapped())
+            .map(|l| l.layout().line_count())
+            .collect();
+        eprintln!("wf-test D-358 name lines drawn: one-line={} two-line={}", drawn.iter().filter(|n| **n == 1).count(), drawn.iter().filter(|n| **n == 2).count());
+        assert!(drawn.contains(&1) && drawn.contains(&2), "D-358: the fixture really wraps: names of one and of two lines ({drawn:?})");
+        // D-355: and every row is still one height, so GTK has nothing to re-estimate.
+        assert_eq!(distinct.len(), 1, "D-358/D-355: every row is the same height ({distinct:?})");
+        let mut problems: Vec<String> = Vec::new();
+        // Click at five places in the viewport, at two scroll positions:
+        // mid-list, then near the bottom of the list.
+        for (stage, frac) in [("mid", 0.5f64), ("bottom", 0.97f64)] {
+            mark_scroll_cause("test: his own scroll");
+            adj.set_value((adj.upper() - adj.page_size()) * frac);
+            for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+            for (n, slot) in [0.15f64, 0.5, 0.85, 0.3, 0.7].iter().enumerate() {
+                let scroll_b = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
+                let mut rows: Vec<(gtk::Widget, gtk::graphene::Rect)> = mapped_rows(&ui).into_iter()
+                    .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w, b)))
+                    .filter(|(_, b)| b.y() >= scroll_b.y() && b.y() + b.height() <= scroll_b.y() + scroll_b.height())
+                    .collect();
+                rows.sort_by(|a, b| a.1.y().partial_cmp(&b.1.y()).unwrap());
+                let (row, _) = rows[((rows.len() - 1) as f64 * slot) as usize].clone();
+                let path = row.tooltip_text().map(|t| t.to_string()).unwrap_or_default();
+                let pos = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().as_deref() == Some(path.as_str())).expect("row in the listing");
+                let mut item = row.parent();
+                while let Some(p) = item.clone() {
+                    if p.type_().name() == "GtkListItemWidget" { break; }
+                    item = p.parent();
+                }
+                let item = item.expect("list item widget");
+                let (before, upper_before) = (adj.value(), adj.upper());
+                item.activate_action("list.select-item", Some(&(pos as u32, false, false).to_variant())).expect("select-item");
+                let mut uppers: Vec<f64> = vec![upper_before];
+                for _ in 0..80 {
+                    pump();
+                    std::thread::sleep(Duration::from_millis(10));
+                    if (adj.upper() - uppers[uppers.len() - 1]).abs() > 0.5 { uppers.push(adj.upper()); }
+                }
+                let (after, upper_after) = (adj.value(), adj.upper());
+                // A -> B -> A: the height returns to an earlier value after changing.
+                let flips = uppers.windows(3).filter(|w| (w[0] - w[2]).abs() < 1.0 && (w[0] - w[1]).abs() > 50.0).count();
+                eprintln!("wf-test D-358 {stage} click {n} (row {pos}): value {before} -> {after} (moved {:.1}), upper {upper_before} -> {upper_after}, upper steps={}, A-B-A flips={flips}", after - before, uppers.len() - 1);
+                if (after - before).abs() > 3.0 { problems.push(format!("{stage} click {n} moved the list {before} -> {after}")); }
+                if flips > 0 || (upper_after - upper_before).abs() > 3.0 { problems.push(format!("{stage} click {n} height {upper_before} -> {upper_after}, {flips} flips")); }
+            }
+        }
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(problems.is_empty(), "D-358: clicking moved the list or flipped its height: {problems:?}");
+    }
+
+    fn sidebar_button_not_divider_d352() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d352-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d352test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (_state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1000, 640);
+        ui.window.present();
+        for _ in 0..40 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let main = ui.sidebar_scroll.parent().and_then(|p| p.downcast::<gtk::Paned>().ok()).expect("sidebar sits in the main Paned");
+        let toggle = all_widgets(ui.window.upcast_ref()).into_iter().find(|w| w.widget_name() == "wf-sidebar-toggle")
+            .and_then(|w| w.downcast::<gtk::ToggleButton>().ok()).expect("sidebar button");
+        // The drag that shut it: the divider pulled all the way left.
+        main.set_position(0);
+        for _ in 0..10 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        eprintln!("wf-test D-352 after drag to 0: position={} shown={}", main.position(), ui.sidebar_scroll.is_visible());
+        assert_eq!(main.position(), SIDEBAR_FIXED_WIDTH, "D-352: a drag cannot shut the sidebar");
+        assert!(ui.sidebar_scroll.is_visible(), "D-352: the sidebar is still shown");
+        let at = |w: &gtk::ToggleButton| w.compute_bounds(&ui.window).map(|b| (b.x().round(), b.y().round())).expect("button bounds");
+        let open_at = at(&toggle);
+        toggle.set_active(false);
+        for _ in 0..20 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let shut_at = at(&toggle);
+        let hidden_saved = load_config().sidebar_hidden;
+        eprintln!("wf-test D-352 button open={open_at:?} shut={shut_at:?} shown={} saved_hidden={hidden_saved}", ui.sidebar_scroll.is_visible());
+        assert!(!ui.sidebar_scroll.is_visible(), "D-352: the button shuts the sidebar");
+        assert!(hidden_saved, "D-352: shut is remembered");
+        assert_eq!(open_at, shut_at, "D-352: the button stays in the same place");
+        toggle.set_active(true);
+        for _ in 0..20 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        assert!(ui.sidebar_scroll.is_visible(), "D-352: the button opens it again");
+        assert_eq!(main.position(), SIDEBAR_FIXED_WIDTH, "D-352: it opens at its width");
+        assert!(!load_config().sidebar_hidden, "D-352: open is remembered");
         ui.window.destroy();
         pump();
         match old_home {

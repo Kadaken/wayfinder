@@ -62,6 +62,13 @@ case_expect_fail(){
     NOTRUN=$((NOTRUN+1)); return
   fi
   local out; out="$(run_audit)"
+  # Compare against THIS id's own baseline result, not the whole baseline: if the
+  # id already FAILs on an untouched clone, a FAIL after the breakage proves
+  # nothing, so the case is reported as not isolated instead of FIRED.
+  if grep -qE "^FAIL   $id " <<<"$base_out"; then
+    printf 'NOTRUN %-9s %s (this id already FAILs on the untouched baseline, so it is not isolated)\n' "$id" "$label"
+    NOTRUN=$((NOTRUN+1)); return
+  fi
   if grep -qE "^FAIL   $id " <<<"$out"; then
     printf 'FIRED  %-9s %s\n' "$id" "$label"
     OK=$((OK+1))
@@ -73,6 +80,7 @@ case_expect_fail(){
 }
 
 BASE="$(git rev-parse HEAD)"
+base_out=""   # set by the baseline block; case_expect_fail grades each id against it
 
 # ---------------------------------------------------------------- the baseline
 reset_clone
@@ -156,6 +164,10 @@ case_expect_fail W5.3 "the flatpak manifest carries a stale tag" \
 echo
 echo "-- the judged half: an unanswered check must block, an answered one must clear"
 reset_clone
+# S1 has a real answer in audit/ANSWERS.md now, so the committed clone would never
+# print OPEN for it. Delete S1's answer line(s) inside the throwaway clone first,
+# so the "unanswered" state is set up here instead of depending on the ledger.
+sed -i '/^S1 @ /d' audit/ANSWERS.md
 out="$(run_audit)"; rc_open=0; grep -qE "^OPEN   S1 " <<<"$out" && rc_open=1
 run_audit >/dev/null 2>&1; exit_with_open=$?
 if (( rc_open == 1 && exit_with_open != 0 )); then
