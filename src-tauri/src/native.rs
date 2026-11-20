@@ -2204,6 +2204,29 @@ fn write_config_durably(path: &Path, raw: &str) -> std::io::Result<()> {
 /// write erase the first (D-299). A damaged file is moved aside, never
 /// overwritten, and the last good copy is kept as `.bak` (D-297).
 fn update_config_at(path: &Path, change: impl FnOnce(&mut AppConfig)) -> AppConfig {
+    let (config, saved) = try_update_config_at(path, change);
+    if let Err(message) = saved {
+        eprintln!("wayfinder: {message}");
+    }
+    config
+}
+
+/// Audit #12: what the user is told when settings could not be written. Says
+/// what failed and what to do.
+fn config_save_failure_message(path: &Path, step: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Settings were not saved ({step}: {error}). Free some disk space or make {} writable, then change the setting again.",
+        path.parent().unwrap_or(path).display()
+    )
+}
+
+/// Same as `update_config_at`, but says whether the write reached disk. The
+/// returned config is the in-memory result either way.
+fn try_update_config_at(
+    path: &Path,
+    change: impl FnOnce(&mut AppConfig),
+) -> (AppConfig, Result<(), String>) {
+    let mut failure: Option<String> = None;
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -2224,23 +2247,52 @@ fn update_config_at(path: &Path, change: impl FnOnce(&mut AppConfig)) -> AppConf
     // D-359: pins for things that are gone are dropped after the change ran.
     prune_missing_pins(&mut config);
 
-    if let Ok(raw) = serde_json::to_string_pretty(&config) {
-        if damaged {
-            // Keep the evidence: a typo in a hand-edited file is recoverable
-            // only if the file is still there.
-            let _ = fs::rename(path, config_quarantine_path(path));
-        } else if matches!(on_disk, ConfigFile::Parsed(_)) {
-            let _ = fs::copy(path, config_backup_path(path));
+    match serde_json::to_string_pretty(&config) {
+        Ok(raw) => {
+            if damaged {
+                // Keep the evidence: a typo in a hand-edited file is recoverable
+                // only if the file is still there.
+                if let Err(e) = fs::rename(path, config_quarantine_path(path)) {
+                    failure.get_or_insert(config_save_failure_message(path, "moving the damaged file aside", &e));
+                }
+            } else if matches!(on_disk, ConfigFile::Parsed(_)) {
+                if let Err(e) = fs::copy(path, config_backup_path(path)) {
+                    failure.get_or_insert(config_save_failure_message(path, "making the backup", &e));
+                }
+            }
+            if let Err(e) = write_config_durably(path, &raw) {
+                // The write is the one that matters; it names the failure.
+                failure = Some(config_save_failure_message(path, "writing the file", &e));
+            }
         }
-        let _ = write_config_durably(path, &raw);
+        Err(e) => failure = Some(config_save_failure_message(path, "encoding", &e)),
     }
     // The lock is released when `lock` is dropped.
     drop(lock);
-    config
+    (config, failure.map_or(Ok(()), Err))
 }
 
 fn update_config(change: impl FnOnce(&mut AppConfig)) -> Option<AppConfig> {
-    config_path().map(|path| update_config_at(&path, change))
+    config_path().map(|path| {
+        let (config, saved) = try_update_config_at(&path, change);
+        if let Err(message) = saved {
+            eprintln!("wayfinder: {message}");
+            show_config_save_failure(&message);
+        }
+        config
+    })
+}
+
+/// Audit #12: the app's own error channel is the status line, so a failed save
+/// goes there, in the window the user is looking at.
+fn show_config_save_failure(message: &str) {
+    let ui = WINDOWS
+        .try_with(|windows| windows.try_borrow().ok().and_then(|w| w.active(|ui| ui.window.is_active())))
+        .ok()
+        .flatten();
+    if let Some((_, ui)) = ui {
+        ui.status.set_label(message);
+    }
 }
 
 // Each view control persists only the field the user changed, so a window
@@ -43729,3 +43781,25 @@ mod audit_guide_hatch_tests {
     }
 }
 
+#[cfg(test)]
+mod audit_config_save_tests {
+    use super::*;
+
+    #[test]
+    fn failed_settings_save_is_reported_not_swallowed_audit12() {
+        let root = std::env::temp_dir().join(format!("wf-audit12-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // A path whose parent is a regular file cannot be created or written.
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let (config, saved) = try_update_config_at(&blocker.join("cfg").join("native-config.json"), |c| c.sidebar_hidden = true);
+        assert!(config.sidebar_hidden, "in-memory result still carries the change");
+        let message = saved.expect_err("the failure must be returned");
+        assert!(message.contains("not saved") && message.contains("then change the setting again"), "{message}");
+        // And a healthy path reports success.
+        let (_, ok) = try_update_config_at(&root.join("good").join("native-config.json"), |c| c.sidebar_hidden = true);
+        assert!(ok.is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+}
