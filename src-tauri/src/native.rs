@@ -40657,7 +40657,12 @@ Broken: Either state is wrong.\n";
     fn name_click_never_renames_d356() {
         let all = include_str!("native.rs");
         let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
-        let start = app.find("\nfn rename_action(").expect("rename_action exists");
+        // D-360: rename_action (F2, toolbar) and rename_clicked_entry (item menu)
+        // both hand off to rename_entries, the one function that starts the
+        // inline editor. Nothing else may.
+        assert!(app.contains("\nfn rename_action("), "rename_action exists");
+        assert!(app.contains("\nfn rename_clicked_entry("), "rename_clicked_entry exists");
+        let start = app.find("\nfn rename_entries(").expect("rename_entries exists");
         let body = &app[start + 1..];
         let end = body[1..].find("\nfn ").map(|i| i + 1).unwrap_or(body.len());
         let (lo, hi) = (start + 1, start + 1 + end);
@@ -40667,7 +40672,7 @@ Broken: Either state is wrong.\n";
             if app[..at].ends_with("fn ") {
                 continue;
             }
-            assert!(at >= lo && at < hi, "begin_inline_rename called outside rename_action (F2/menu) at byte {at}");
+            assert!(at >= lo && at < hi, "begin_inline_rename called outside rename_entries (the F2/menu path) at byte {at}");
             calls += 1;
         }
         assert!(calls >= 1, "F2 and the menu must still start the inline rename");
