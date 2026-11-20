@@ -24926,7 +24926,7 @@ Broken: Either state is wrong.\n";
         gtk::init().expect("gtk init on the virtual display");
         let d = d362_open("mpg", |dir| {
             assert!(
-                d362_run("ffmpeg", &["-v", "error", "-f", "lavfi", "-i", "testsrc=d=2:s=160x120:r=10", "-y", "clip.mpg"], dir),
+                d362_run("ffmpeg", &["-v", "error", "-f", "lavfi", "-i", "testsrc=d=2:s=160x120:r=25", "-y", "clip.mpg"], dir),
                 "ffmpeg makes the .mpg"
             );
         }, 1);

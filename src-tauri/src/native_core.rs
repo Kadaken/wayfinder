@@ -2828,21 +2828,22 @@ pub fn decode_text_bytes(bytes: &[u8], cut: bool) -> Option<String> {
         }
         return None;
     }
+    // Control bytes other than tab, line breaks, form feed and escape mean
+    // data, not writing -- valid UTF-8 included, since every byte below 0x80
+    // is valid UTF-8.
+    let controls = bytes
+        .iter()
+        .filter(|b| **b < 0x20 && !matches!(**b, b'\t' | b'\n' | b'\r' | 0x0c | 0x1b))
+        .count();
+    if controls * 50 > bytes.len() {
+        return None;
+    }
     match std::str::from_utf8(bytes) {
         Ok(text) => Some(text.to_string()),
         Err(err) if cut && err.error_len().is_none() => {
             Some(String::from_utf8_lossy(&bytes[..err.valid_up_to()]).into_owned())
         }
         Err(_) => {
-            // 8-bit text: control bytes other than tab, line breaks and form
-            // feed mean it is data, not writing.
-            let controls = bytes
-                .iter()
-                .filter(|b| **b < 0x20 && !matches!(**b, b'\t' | b'\n' | b'\r' | 0x0c))
-                .count();
-            if controls * 50 > bytes.len() {
-                return None;
-            }
             const HIGH: [char; 32] = [
                 '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
                 '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}',
