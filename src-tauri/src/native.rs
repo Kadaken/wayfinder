@@ -4280,7 +4280,7 @@ fn startup_mark(what: &'static str) {
         return;
     }
     SEEN.with(|s| s.borrow_mut().push(what));
-    let dir = glib::user_cache_dir().join("wayfinder");
+    let dir = wayfinder_cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
         use std::io::Write as _;
@@ -4298,7 +4298,7 @@ fn startup_mark_any_thread(what: &'static str) {
         return;
     }
     let Some(start) = PROCESS_START.get() else { return };
-    let dir = glib::user_cache_dir().join("wayfinder");
+    let dir = wayfinder_cache_dir();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
         use std::io::Write as _;
         let _ = writeln!(f, "pid {} {what}: {}ms", std::process::id(), start.elapsed().as_millis());
@@ -6330,7 +6330,7 @@ fn record_window_sizes(window: &adw::ApplicationWindow) {
                 return;
             }
             *last.borrow_mut() = line.clone();
-            let Some(dir) = dirs_cache_dir() else { return };
+            let dir = wayfinder_cache_dir();
             let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
             let _ = native_core::append_capped_log(
                 &dir.join("window-sizes.log"),
@@ -10554,7 +10554,7 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
                 _ => "no app cause (wheel, drag edge, or GTK)".to_string(),
             }
         });
-        let Some(dir) = dirs_cache_dir() else { return };
+        let dir = wayfinder_cache_dir();
         let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
         let mut entry = format!("{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}\n", adj.upper() - adj.page_size());
         // A big jump also records who moved it: our functions and GTK's,
@@ -10577,8 +10577,9 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
 /// Audit #13: the cap for every diagnostic log under the cache folder.
 const DIAGNOSTIC_LOG_CAP: u64 = 256 * 1024;
 
-fn dirs_cache_dir() -> Option<PathBuf> {
-    Some(glib::user_cache_dir().join("wayfinder"))
+/// Audit #25: the one place that names Wayfinder's cache folder.
+fn wayfinder_cache_dir() -> PathBuf {
+    glib::user_cache_dir().join("wayfinder")
 }
 
 /// D-336: the scroller the current view actually scrolls. Icon view has its
@@ -19980,7 +19981,7 @@ fn note_job_poll_tick() {}
 /// them a moment later, so an unplugged drive is gone at once.
 #[cfg(not(test))]
 fn remembered_drives() -> Vec<Drive> {
-    std::fs::read(glib::user_cache_dir().join("wayfinder").join("drives.json"))
+    std::fs::read(wayfinder_cache_dir().join("drives.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
@@ -19993,7 +19994,7 @@ fn remembered_drives() -> Vec<Drive> {
 
 #[cfg(not(test))]
 fn remember_drives(drives: &[Drive]) {
-    let dir = glib::user_cache_dir().join("wayfinder");
+    let dir = wayfinder_cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_vec(drives) {
         let tmp = dir.join("drives.json.new");
@@ -43702,5 +43703,16 @@ Broken: Either state is wrong.\n";
 
         ui.window.destroy();
         pump();
+    }
+}
+
+#[cfg(test)]
+mod audit_cache_dir_tests {
+    #[test]
+    fn cache_folder_is_built_in_one_place_audit25() {
+        assert_eq!(super::wayfinder_cache_dir(), super::glib::user_cache_dir().join("wayfinder"));
+        let all = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs")).unwrap();
+        let app = &all[..all.find("#[cfg(test)]\nmod audit_cache_dir_tests").unwrap()];
+        assert_eq!(app.matches("user_cache_dir()").count(), 1, "build the cache path only in wayfinder_cache_dir");
     }
 }
