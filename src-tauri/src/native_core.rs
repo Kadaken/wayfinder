@@ -581,6 +581,29 @@ impl std::fmt::Display for ZipNameError {
     }
 }
 
+/// Audit #13: every diagnostic log under ~/.cache/wayfinder goes through here
+/// so none can grow without limit. Appends `text`; when the file is past `cap`
+/// bytes first, it keeps only the newest half of the cap, cut at a line start.
+pub fn append_capped_log(path: &Path, text: &str, cap: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > cap {
+        let bytes = std::fs::read(path)?;
+        let keep_from = bytes.len().saturating_sub((cap / 2) as usize);
+        let tail = &bytes[keep_from..];
+        let start = if keep_from == 0 {
+            0
+        } else {
+            tail.iter().position(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0)
+        };
+        std::fs::write(path, &tail[start..])?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(text.as_bytes())
+}
+
 /// True when a Unix mode's file-type bits (S_IFMT) name anything other than
 /// a regular file or a directory — a symlink, device, FIFO or socket — which
 /// D-188 must reject at index time, not just symlinks (REJECT 6).
@@ -12653,5 +12676,27 @@ mod select_launch_tests {
     fn the_root_has_no_parent_and_opens_itself_d328() {
         let got = select_launch_target("/");
         assert_eq!((got.folder.as_str(), got.select), ("/", None));
+    }
+}
+
+#[cfg(test)]
+mod audit_log_cap_tests {
+    use super::*;
+
+    #[test]
+    fn capped_log_stays_under_cap_and_keeps_newest_lines_audit13() {
+        let dir = std::env::temp_dir().join(format!("wf-audit13-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("sub").join("x.log");
+        let cap = 4096u64;
+        for i in 0..2000 {
+            append_capped_log(&log, &format!("line {i:05} padding padding\n"), cap).unwrap();
+        }
+        let len = std::fs::metadata(&log).unwrap().len();
+        assert!(len <= cap + 64, "log is {len} bytes, cap {cap}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.ends_with("line 01999 padding padding\n"));
+        assert!(text.starts_with("line "), "cut must fall on a line start");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

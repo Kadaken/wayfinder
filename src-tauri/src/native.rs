@@ -6331,12 +6331,12 @@ fn record_window_sizes(window: &adw::ApplicationWindow) {
             }
             *last.borrow_mut() = line.clone();
             let Some(dir) = dirs_cache_dir() else { return };
-            let _ = std::fs::create_dir_all(&dir);
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("window-sizes.log")) {
-                use std::io::Write as _;
-                let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
-                let _ = writeln!(f, "{when} window {:p} {line}", window.as_ptr());
-            }
+            let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
+            let _ = native_core::append_capped_log(
+                &dir.join("window-sizes.log"),
+                &format!("{when} window {:p} {line}\n", window.as_ptr()),
+                DIAGNOSTIC_LOG_CAP,
+            );
         });
     });
 }
@@ -10555,27 +10555,27 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
             }
         });
         let Some(dir) = dirs_cache_dir() else { return };
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("scroll-jumps.log")) {
-            use std::io::Write as _;
-            let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
-            let _ = writeln!(f, "{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}", adj.upper() - adj.page_size());
-            // A big jump also records who moved it: our functions and GTK's,
-            // so the next one names the exact call, not a guess.
-            if (to - from).abs() > 1000.0 {
-                let trace = std::backtrace::Backtrace::force_capture().to_string();
-                for line in trace
-                    .lines()
-                    .filter(|l| l.contains("native::") || l.contains("gtk_") || l.contains("_gtk"))
-                    .filter(|l| !l.contains("watch_scroll_jumps"))
-                    .take(14)
-                {
-                    let _ = writeln!(f, "      {}", line.trim());
-                }
+        let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
+        let mut entry = format!("{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}\n", adj.upper() - adj.page_size());
+        // A big jump also records who moved it: our functions and GTK's,
+        // so the next one names the exact call, not a guess.
+        if (to - from).abs() > 1000.0 {
+            let trace = std::backtrace::Backtrace::force_capture().to_string();
+            for line in trace
+                .lines()
+                .filter(|l| l.contains("native::") || l.contains("gtk_") || l.contains("_gtk"))
+                .filter(|l| !l.contains("watch_scroll_jumps"))
+                .take(14)
+            {
+                entry.push_str(&format!("      {}\n", line.trim()));
             }
         }
+        let _ = native_core::append_capped_log(&dir.join("scroll-jumps.log"), &entry, DIAGNOSTIC_LOG_CAP);
     });
 }
+
+/// Audit #13: the cap for every diagnostic log under the cache folder.
+const DIAGNOSTIC_LOG_CAP: u64 = 256 * 1024;
 
 fn dirs_cache_dir() -> Option<PathBuf> {
     Some(glib::user_cache_dir().join("wayfinder"))
