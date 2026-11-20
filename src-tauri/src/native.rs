@@ -4150,7 +4150,6 @@ fn guide_repaint_on_close(popover: &gtk::Popover, state: &Rc<RefCell<AppState>>)
 /// popover that was closed and unparented is unavailable even if something
 /// still holds it (the menu buttons hold their popover, so it is not freed).
 #[cfg(feature = "guide")]
-#[allow(dead_code)] // first user is the ring round; the D-51 test reads it
 fn guide_live_target(state: &Rc<RefCell<AppState>>) -> Option<gtk::Widget> {
     let widget = state.borrow().guide_target.as_ref()?.upgrade()?;
     let ui = ui_for_state(state)?;
@@ -6088,7 +6087,6 @@ fn lock_sidebar_width(paned: &gtk::Paned) {
     });
 }
 
-#[allow(dead_code)]
 fn clamp_paned_position(paned: &gtk::Paned, min_start: i32, min_end: i32) {
     let adjusting = Rc::new(RefCell::new(false));
     let adjusting_for_notify = adjusting.clone();
@@ -7853,20 +7851,6 @@ fn toggle_tree_only(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
             state_ref.tree_expanded.insert(path.to_string());
         }
     }
-    rebuild_sidebar(state, ui);
-}
-
-#[allow(dead_code)]
-fn toggle_tree_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
-    {
-        let mut state_ref = state.borrow_mut();
-        if state_ref.tree_expanded.contains(path) {
-            state_ref.tree_expanded.remove(path);
-        } else {
-            state_ref.tree_expanded.insert(path.to_string());
-        }
-    }
-    navigate(state, native_core::Location::real(path));
     rebuild_sidebar(state, ui);
 }
 
@@ -43716,3 +43700,19 @@ mod audit_cache_dir_tests {
         assert_eq!(app.matches("user_cache_dir()").count(), 1, "build the cache path only in wayfinder_cache_dir");
     }
 }
+
+#[cfg(test)]
+mod audit_dead_code_tests {
+    #[test]
+    fn dead_function_is_gone_and_live_ones_are_unmarked_audit24() {
+        let all = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs")).unwrap();
+        let app = &all[..all.find("#[cfg(test)]\nmod audit_dead_code_tests").unwrap()];
+        assert!(!app.contains("fn toggle_tree_path"));
+        for name in ["fn clamp_paned_position", "fn guide_live_target"] {
+            let at = app.find(name).unwrap();
+            let before = app[..at].lines().rev().take(2).collect::<Vec<_>>().join("\n");
+            assert!(!before.contains("allow(dead_code)"), "{name} is live; no marker");
+        }
+    }
+}
+

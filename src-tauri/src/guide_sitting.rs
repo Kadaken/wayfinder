@@ -83,7 +83,7 @@ pub trait Adapter {
 }
 
 #[derive(Debug)]
-pub struct SittingError(#[allow(dead_code)] pub String);
+pub struct SittingError(#[allow(dead_code)] pub String); // read only through Debug (unwrap messages)
 
 pub fn sitting_path(descriptor: &Path) -> PathBuf {
     side_path(descriptor, "sitting")
@@ -219,7 +219,7 @@ impl<A: Adapter> Sitting<A> {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_timeout(&mut self, t: Duration) {
         self.timeout = t;
     }
@@ -1749,7 +1749,6 @@ thread_local! {
 
 /// The live sittings of this process (test seam).
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn live_sittings() -> Vec<Rc<RefCell<Sitting<GtkAdapter>>>> {
     LIVE_SITTING.with(|l| l.borrow().clone())
 }
