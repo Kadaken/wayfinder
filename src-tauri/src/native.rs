@@ -3123,8 +3123,7 @@ fn export_file_manager1(app: &adw::Application) {
 #[cfg(feature = "guide")]
 #[inline(never)]
 fn guide_markers_inert() -> usize {
-    const MARKERS: [&str; 5] = [
-        "/.local/share/crew/guide/",
+    const MARKERS: [&str; 4] = [
         "WF_GUIDE_FILE",
         "WAYFINDER_GUIDE_ONLY_V1",
         "WAYFINDER_GUIDE_CIRCLE_V1",
@@ -3148,21 +3147,21 @@ enum GuideRequest {
 const GUIDE_REGISTRY: &str = include_str!("guide-names.json");
 
 /// The one file this process watches, taken from its own `WF_GUIDE_DESCRIPTOR`
-/// when one is set (D-153 phase 2), or the plain `WF_GUIDE_FILE` env var, or the
-/// shared default. Never inferred from another process's launcher script.
+/// when one is set (D-153 phase 2), or the plain `WF_GUIDE_FILE` env var.
+/// Audit #27: there is no built-in default path; with neither set the guide
+/// has no file and stays idle. Never inferred from another process's script.
 #[cfg(feature = "guide")]
-fn guide_file_path() -> PathBuf {
+fn guide_file_path() -> Option<PathBuf> {
     if let Some(desc) = guide_descriptor_path() {
         if let Some(request_path) = guide_read_descriptor(&desc).and_then(|v| {
             v.get("request_path").and_then(|x| x.as_str()).map(str::to_owned)
         }) {
-            return PathBuf::from(request_path);
+            return Some(PathBuf::from(request_path));
         }
     }
     match std::env::var("WF_GUIDE_FILE") {
-        Ok(path) if !path.is_empty() => PathBuf::from(path),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".local/share/crew/guide/wayfinder.json"),
+        Ok(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        _ => None,
     }
 }
 
@@ -3379,7 +3378,7 @@ mod guide_descriptor_tests {
         const WIN: usize = 1;
         guide_claim_descriptor(WIN);
 
-        assert_eq!(guide_file_path(), request_path, "guide_file_path takes the path FROM the descriptor, never inventing one");
+        assert_eq!(guide_file_path(), Some(request_path.clone()), "guide_file_path takes the path FROM the descriptor, never inventing one");
         let ack_path = PathBuf::from(format!("{}.ack", desc.to_string_lossy()));
         let ack: serde_json::Value = serde_json::from_str(&fs::read_to_string(&ack_path).unwrap()).unwrap();
         assert_eq!(ack["token"], "tok-abc123");
@@ -3864,7 +3863,6 @@ fn guide_sync_crucial(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 /// duplicate, unresolved or other-window control can never clear the request.
 #[cfg(feature = "guide")]
 fn guide_connect_use(state: &Rc<RefCell<AppState>>, target: &gtk::Widget) -> Option<GuideHook> {
-    if std::env::var("RED").is_ok() { return None; }
     let button = target.downcast_ref::<gtk::Button>()?;
     let weak = Rc::downgrade(state);
     let id = button.connect_clicked(move |used| {
@@ -4170,7 +4168,9 @@ fn guide_apply(state: &Rc<RefCell<AppState>>, request: GuideRequest) {
     }
     guide_resolve(state);
     if let Some(name) = unknown {
-        guide_write_unknown(&guide_file_path(), &name);
+        if let Some(path) = guide_file_path() {
+            guide_write_unknown(&path, &name);
+        }
     }
 }
 
@@ -4219,7 +4219,7 @@ fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
     let window_key = Rc::as_ptr(state) as usize;
     guide_claim_descriptor(window_key);
     guide_sitting::start(state, window_key);
-    let path = guide_file_path();
+    let Some(path) = guide_file_path() else { return };
     if let Some(old) = state.borrow_mut().guide_monitor.take() {
         old.cancel();
     }
@@ -31594,9 +31594,9 @@ Broken: Either state is wrong.\n";
         std::env::set_var("HOME", &home);
         let file = dir.join("wayfinder.json");
         std::env::set_var("WF_GUIDE_FILE", &file);
-        assert_eq!(guide_file_path(), file);
+        assert_eq!(guide_file_path(), Some(file.clone()));
         std::env::set_var("WF_GUIDE_FILE", "");
-        assert_eq!(guide_file_path(), home.join(".local/share/crew/guide/wayfinder.json"));
+        assert_eq!(guide_file_path(), None, "no built-in default path (audit #27)");
         std::env::set_var("WF_GUIDE_FILE", &file);
 
         let app = adw::Application::builder()
@@ -43713,6 +43713,19 @@ mod audit_dead_code_tests {
             let before = app[..at].lines().rev().take(2).collect::<Vec<_>>().join("\n");
             assert!(!before.contains("allow(dead_code)"), "{name} is live; no marker");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_guide_hatch_tests {
+    #[test]
+    fn guide_code_has_no_test_hatch_or_personal_path_audit27() {
+        let all = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs")).unwrap();
+        let app = &all[..all.find("#[cfg(test)]\nmod audit_guide_hatch_tests").unwrap()];
+        let hatch = ["env::var(\"R", "ED\")"].concat();
+        let path = ["share/", "crew"].concat();
+        assert!(!app.contains(&hatch), "no RED test switch in product code");
+        assert!(!app.contains(&path), "no personal crew path in product code");
     }
 }
 
