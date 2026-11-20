@@ -10066,17 +10066,44 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
 thread_local! {
     /// D-345: the last thing Wayfinder itself did that can move the list, and when.
     static SCROLL_CAUSE: RefCell<(&'static str, Option<Instant>)> = const { RefCell::new(("", None)) };
+    /// D-349: counts every deliberate scroll, so the place guard can step
+    /// aside the moment Wayfinder moves the list on purpose.
+    static SCROLL_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
+/// D-349: his own wheel, click or key, or a deliberate scroll by Wayfinder.
+fn note_scroll_input() {
+    SCROLL_GENERATION.with(|g| g.set(g.get() + 1));
+}
+
+fn scroll_generation() -> u64 {
+    SCROLL_GENERATION.with(|g| g.get())
 }
 
 /// D-345: tag what is about to move the list, so a jump in the log names it.
 fn mark_scroll_cause(cause: &'static str) {
     SCROLL_CAUSE.with(|c| *c.borrow_mut() = (cause, Some(Instant::now())));
+    note_scroll_input();
 }
 
 /// D-345: append every list jump of more than 200px to
 /// ~/.cache/wayfinder/scroll-jumps.log with the last cause marked in the past
 /// two seconds. A jump with no cause is the user's wheel or GTK itself.
 fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
+    // D-349: any wheel, press or key inside the view is his own doing, and
+    // takes the place guard off at once. A plain listener, never claims anything.
+    let input = gtk::EventControllerLegacy::new();
+    input.set_propagation_phase(gtk::PropagationPhase::Capture);
+    input.connect_event(|_, event| {
+        if matches!(
+            event.event_type(),
+            gdk::EventType::Scroll | gdk::EventType::ButtonPress | gdk::EventType::KeyPress | gdk::EventType::TouchBegin
+        ) {
+            note_scroll_input();
+        }
+        glib::Propagation::Proceed
+    });
+    scroller.add_controller(input);
     let last = Rc::new(Cell::new(scroller.vadjustment().value()));
     scroller.vadjustment().connect_value_changed(move |adj| {
         let (from, to) = (last.get(), adj.value());
@@ -10145,6 +10172,7 @@ fn view_scroller(state: &Rc<RefCell<AppState>>, ui: &Ui) -> gtk::ScrolledWindow 
 /// the user's own scrolling.
 fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     mark_scroll_cause("restore after refresh");
+    let started = scroll_generation();
     let adj = scroller.vadjustment();
     adj.set_value(target);
     // The list moves the offset itself DURING layout -- it scrolls its focused
@@ -10156,31 +10184,38 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     // anything is drawn. The tick callback below stays as the backstop and is
     // what takes the guard off again.
     let snapping = Rc::new(Cell::new(false));
+    // D-349: the guard used to come off after two steady frames (~33ms). GTK
+    // lays the rows out again ~120-190ms after a refresh and recomputes the
+    // offset from its remembered row; that recompute landed on 0 and threw him
+    // to the top (scroll-jumps.log, 19 Nov 2026 22:41-22:52, eighteen times,
+    // backtrace gtk_widget_allocate -> gtk_adjustment_configure). The guard now
+    // holds for 1.5s and comes off the moment he scrolls, clicks or types, so it
+    // never fights his own scrolling.
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    // His input (counted by watch_scroll_jumps) or any deliberate scroll by
+    // Wayfinder after this one.
+    let stand_down = move || scroll_generation() != started;
+    let snapping_check = snapping;
     let handler = adj.connect_value_changed({
-        let snapping = snapping.clone();
+        let stand_down = stand_down.clone();
         move |adj| {
-            if snapping.get() || scroll_target_reached(adj.value(), target) {
+            // Only GTK's own moves are put back; his are left alone.
+            if stand_down() || snapping_check.get() || scroll_target_reached(adj.value(), target) {
                 return;
             }
-            snapping.set(true);
+            snapping_check.set(true);
             adj.set_value(target);
-            snapping.set(false);
+            snapping_check.set(false);
         }
     });
-    let deadline = Instant::now() + Duration::from_millis(400);
-    let stable = Cell::new(0u8);
     let handler = RefCell::new(Some(handler));
     scroller.add_tick_callback(move |scroller, _| {
         let adj = scroller.vadjustment();
-        if scroll_target_reached(adj.value(), target) {
-            stable.set(stable.get().saturating_add(1));
-        } else {
-            // The offset cannot be reached at all -- a shorter list clamps it --
-            // so stop trying rather than fight the user's own scrolling.
-            stable.set(stable.get().saturating_add(1));
+        let off = stand_down();
+        if !off && !scroll_target_reached(adj.value(), target) {
             adj.set_value(target);
         }
-        if stable.get() >= 2 || Instant::now() > deadline {
+        if off || Instant::now() > deadline {
             if let Some(handler) = handler.borrow_mut().take() {
                 adj.disconnect(handler);
             }
@@ -11476,6 +11511,7 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                     let widget: gtk::Widget = child_for_scroll.clone().upcast();
                     if let Some(bounds) = widget.compute_bounds(&scroller) {
                         let adj = scroller.vadjustment();
+                        mark_scroll_cause("grid scroll to selection");
                         let top = adj.value() + f64::from(bounds.y());
                         let bottom = top + f64::from(bounds.height());
                         let page = adj.page_size();
@@ -26498,6 +26534,7 @@ Broken: Either state is wrong.\n";
         let adj = scroller.vadjustment();
         wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
         let target = (adj.upper() - adj.page_size()) / 2.0;
+        mark_scroll_cause("test: his own scroll");
         adj.set_value(target);
         for _ in 0..20 { pump(); }
         let before = adj.value();
@@ -26602,6 +26639,7 @@ Broken: Either state is wrong.\n";
         wait_for("right pane lists the same folder", || pane_state.borrow().visible_entries.len() == 161);
         let adj = ui.list_scroll.vadjustment();
         wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
+        mark_scroll_cause("test: his own scroll");
         adj.set_value((adj.upper() - adj.page_size()) / 2.0);
         for _ in 0..20 { pump(); }
         // He clicked the file first: it is selected and the list has focus.
@@ -26809,6 +26847,7 @@ Broken: Either state is wrong.\n";
         // case that sent the new folder to the very bottom).
         for _ in 0..10 { pump(); }
         let adj = ui.list_scroll.vadjustment();
+        mark_scroll_cause("test: his own scroll");
         adj.set_value((adj.upper() - adj.page_size()) / 2.0);
         for _ in 0..10 { pump(); }
         let before = adj.value();
@@ -29914,6 +29953,7 @@ Broken: Either state is wrong.\n";
         } else if monitor_h <= 480 {
             assert!(popover.height() > 0 && popover.height() <= monitor_h, "tiny screen: outer menu {} px on {monitor_h}", popover.height());
             assert!(range > 1.0, "tiny screen ({monitor_h} px): the menu scrolls, range {range}");
+            mark_scroll_cause("test: his own scroll");
             adj.set_value(adj.upper() - adj.page_size());
             pump();
             let b = terminal.compute_bounds(&scroller).expect("terminal bounds");
@@ -37910,6 +37950,7 @@ Broken: Either state is wrong.\n";
             pump();
             adj.upper() - adj.page_size() > 200.0
         });
+        mark_scroll_cause("test: his own scroll");
         adj.set_value(200.0);
         pump();
         let before = adj.value();
@@ -38720,6 +38761,7 @@ Broken: Either state is wrong.\n";
             pump();
             adj.upper() - adj.page_size() > 200.0
         });
+        mark_scroll_cause("test: his own scroll");
         adj.set_value(200.0);
         pump();
 
