@@ -23747,6 +23747,12 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d360-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d359") {
+            pin_keeps_item_on_top_d359();
+            pinned_row_unbind_frees_size_groups_d359();
+            eprintln!("wf-test d359-only run done");
+            return;
+        }
         // First: earlier tests leave modal dialogs that would swallow real pointer input.
         real_pointer_drag_carries_the_press_time_selection();
         enumerated_choice_label_lands_in_the_real_widget_tree();
@@ -27285,6 +27291,10 @@ Broken: Either state is wrong.\n";
         }
         assert_eq!(mine.len(), 3, "D-359: the pinned row has its size, kind and modified labels");
         let groups = [&ui.columns.size, &ui.columns.kind, &ui.columns.modified];
+        let count_in = || -> Vec<usize> {
+            mine.iter().zip(groups.iter()).map(|(w, g)| g.widgets().iter().filter(|x| *x == w).count()).collect()
+        };
+        let before = count_in();
         for (w, g) in mine.iter().zip(groups.iter()) {
             assert!(g.widgets().contains(w), "D-359: the bound row's label is in its SizeGroup");
         }
@@ -27293,6 +27303,11 @@ Broken: Either state is wrong.\n";
         ui.list.set_model(None::<&gtk::SelectionModel>);
         pump();
         pump();
+        let after = count_in();
+        eprintln!(
+            "wf-test D-359 unbind: before size/kind/modified in groups = {}/{}/{}, after = {}/{}/{}",
+            before[0], before[1], before[2], after[0], after[1], after[2]
+        );
         for (w, g) in mine.iter().zip(groups.iter()) {
             assert!(
                 !g.widgets().contains(w),
