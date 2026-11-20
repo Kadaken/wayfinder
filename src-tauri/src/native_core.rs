@@ -2766,10 +2766,9 @@ pub fn read_text_preview(path: &str) -> Result<String, String> {
         }
     }
     buf.truncate(n);
-    if buf.contains(&0) {
-        return Err("binary".into());
-    }
-    let text = String::from_utf8_lossy(&buf).into_owned();
+    // D-362: UTF-16 (Windows .reg, many .ini/.inf) and 8-bit legacy text are
+    // text too; only what is none of those is called binary.
+    let text = decode_text_bytes(&buf, md.len() as usize > n).ok_or_else(|| "binary".to_string())?;
     // D-240: what is read and what is shown are different sizes. The preview
     // is one GtkLabel, and Pango lays out and measures every character in it
     // before the window can draw again, so handing it a quarter of a megabyte
@@ -2785,6 +2784,82 @@ pub fn read_text_preview(path: &str) -> Result<String, String> {
         out.push_str("\n\n... (preview truncated)");
     }
     Ok(out)
+}
+
+/// D-362: turns the first bytes of a file into text, or `None` when they are
+/// not text. Understands a UTF-8 BOM, UTF-16 with a BOM (either order),
+/// UTF-16 without one (a zero in every other byte), UTF-8, and falls back to
+/// Windows-1252 for 8-bit text so accented letters do not turn into
+/// replacement marks. `cut` says the bytes are only the start of a longer
+/// file, so a character split by the cut is not an error.
+pub fn decode_text_bytes(bytes: &[u8], cut: bool) -> Option<String> {
+    fn utf16(bytes: &[u8], big: bool) -> String {
+        let units = bytes.chunks_exact(2).map(|p| {
+            if big {
+                u16::from_be_bytes([p[0], p[1]])
+            } else {
+                u16::from_le_bytes([p[0], p[1]])
+            }
+        });
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or('\u{fffd}'))
+            .collect()
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return Some(utf16(&bytes[2..], false));
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return Some(utf16(&bytes[2..], true));
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes);
+    if bytes.contains(&0) {
+        // No BOM: UTF-16 of mostly Latin text has a zero in every second byte.
+        let pairs = bytes.len() / 2;
+        if pairs < 2 {
+            return None;
+        }
+        let odd = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+        let even = bytes.iter().step_by(2).filter(|b| **b == 0).count();
+        if odd * 10 >= pairs * 3 && even * 50 <= pairs {
+            return Some(utf16(bytes, false));
+        }
+        if even * 10 >= pairs * 3 && odd * 50 <= pairs {
+            return Some(utf16(bytes, true));
+        }
+        return None;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.to_string()),
+        Err(err) if cut && err.error_len().is_none() => {
+            Some(String::from_utf8_lossy(&bytes[..err.valid_up_to()]).into_owned())
+        }
+        Err(_) => {
+            // 8-bit text: control bytes other than tab, line breaks and form
+            // feed mean it is data, not writing.
+            let controls = bytes
+                .iter()
+                .filter(|b| **b < 0x20 && !matches!(**b, b'\t' | b'\n' | b'\r' | 0x0c))
+                .count();
+            if controls * 50 > bytes.len() {
+                return None;
+            }
+            const HIGH: [char; 32] = [
+                '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+                '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}',
+                '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+                '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}', '\u{178}',
+            ];
+            Some(
+                bytes
+                    .iter()
+                    .map(|&b| match b {
+                        0x80..=0x9f => HIGH[(b - 0x80) as usize],
+                        _ => b as char,
+                    })
+                    .collect(),
+            )
+        }
+    }
 }
 
 /// The longest slice of `text` a preview label is allowed to hold: at most

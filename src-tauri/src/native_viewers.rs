@@ -443,6 +443,69 @@ pub fn swf_description(info: &Result<SwfInfo, String>) -> String {
     }
 }
 
+const ARCHIVE_EXT: [&str; 20] = [
+    "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst", "lz", "lzma", "cab", "iso",
+    "jar", "war", "apk", "rpm", "deb",
+];
+
+/// D-362: a file whose pane is a listing of what is inside it.
+pub fn is_archive_path(path: &str) -> bool {
+    ARCHIVE_EXT.contains(&ext_of(path).as_str())
+}
+
+/// Runs `cmd` under `timeout` so it cannot hang the pane, and returns its
+/// standard output with at most `max_lines` lines.
+fn capture_limited(program: &str, args: &[&str], secs: u32, max_lines: usize) -> Result<String, String> {
+    let out = Command::new("timeout")
+        .args(["-k", "2", &secs.to_string(), program])
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not start {program}: {e}"))?;
+    if out.status.code() == Some(124) {
+        return Err(format!("{program} took longer than {secs} seconds"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() && text.trim().is_empty() {
+        return Err(format!("{program} could not read this file"));
+    }
+    let mut lines: Vec<&str> = text.lines().collect();
+    let more = lines.len() > max_lines;
+    lines.truncate(max_lines);
+    let mut shown = lines.join("\n");
+    if more {
+        shown.push_str("\n... (listing truncated)");
+    }
+    Ok(shown)
+}
+
+/// What `file -b` says the content is, or why it cannot say.
+pub fn file_description(path: &str) -> String {
+    match capture_limited("file", &["-b", "--", path], 5, 3) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => "unknown content".to_string(),
+        Err(_) if !tool_in_path("file") => "Install file to see what this is.".to_string(),
+        Err(why) => why,
+    }
+}
+
+/// D-362: the words under the summary for a file with no picture, no text and
+/// no player: the list of files inside an archive, or what the content is.
+/// Slow (starts 7z or file); call it off the main thread.
+pub fn describe_file(path: &str) -> String {
+    if is_archive_path(path) {
+        if !tool_in_path("7z") {
+            return "Install 7zip to see what is inside this archive.".to_string();
+        }
+        return match capture_limited("7z", &["l", "-bd", "-y", "--", path], 20, 300) {
+            Ok(list) => format!("Contents\n{}", list.trim_end()),
+            Err(why) => format!("{}\nThe archive list is not available: {why}.", file_description(path)),
+        };
+    }
+    format!("Content: {}", file_description(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +617,165 @@ mod tests {
         assert_eq!(doc_kind("/a/b.html"), Some(DocKind::Html));
         assert_eq!(doc_kind("/a/b.csv"), None, "csv stays a text preview");
         assert!(is_swf_path("/a/game.SWF"));
+    }
+
+    fn d362_scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wf-d362-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn utf16_bytes(text: &str, big: bool, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend_from_slice(if big { &[0xfe, 0xff] } else { &[0xff, 0xfe] });
+        }
+        for u in text.encode_utf16() {
+            out.extend_from_slice(&if big { u.to_be_bytes() } else { u.to_le_bytes() });
+        }
+        out
+    }
+
+    #[test]
+    fn utf16_text_with_a_bom_is_shown_d362() {
+        let reg = "Windows Registry Editor Version 5.00\r\n[HKEY_CURRENT_USER\\Test]\r\n\"A\"=\"\u{e9}t\u{e9}\"\r\n";
+        for big in [false, true] {
+            let got = crate::native_core::decode_text_bytes(&utf16_bytes(reg, big, true), false);
+            assert_eq!(got.as_deref(), Some(reg));
+        }
+        // A real file goes through read_text_preview, the function the pane calls.
+        let dir = d362_scratch("reg");
+        let file = dir.join("settings.REG");
+        std::fs::write(&file, utf16_bytes(reg, false, true)).unwrap();
+        let shown = crate::native_core::read_text_preview(file.to_str().unwrap()).unwrap();
+        assert!(shown.contains("Registry Editor") && shown.contains("\u{e9}t\u{e9}"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn utf16_text_without_a_bom_is_shown_d362() {
+        let ini = "[Section]\r\nName=Value\r\nOther=Thing\r\n";
+        for big in [false, true] {
+            let got = crate::native_core::decode_text_bytes(&utf16_bytes(ini, big, false), false);
+            assert_eq!(got.as_deref(), Some(ini));
+        }
+    }
+
+    #[test]
+    fn eight_bit_text_keeps_its_letters_and_data_stays_binary_d362() {
+        // Windows-1252: e acute, euro sign, curly quote.
+        let got = crate::native_core::decode_text_bytes(b"caf\xe9 \x80 \x93x\x94\n", false).unwrap();
+        assert_eq!(got, "caf\u{e9} \u{20ac} \u{201c}x\u{201d}\n");
+        // Valid UTF-8 and a UTF-8 BOM are unchanged.
+        assert_eq!(crate::native_core::decode_text_bytes("\u{feff}h\u{e9}".as_bytes(), false).as_deref(), Some("h\u{e9}"));
+        // A character split by the 256 KB cut is not an error.
+        let mut cut = "ab".as_bytes().to_vec();
+        cut.push(0xc3);
+        assert_eq!(crate::native_core::decode_text_bytes(&cut, true).as_deref(), Some("ab"));
+        // Zeros that are not UTF-16, and control-byte soup, stay binary.
+        let mut data = vec![0u8; 64];
+        data[10] = 7;
+        assert!(crate::native_core::decode_text_bytes(&data, false).is_none());
+        let soup: Vec<u8> = (1u8..32).cycle().take(300).collect();
+        assert!(crate::native_core::decode_text_bytes(&soup, false).is_none());
+    }
+
+    #[test]
+    fn upper_case_extensions_pick_the_same_viewer_d362() {
+        assert_eq!(doc_kind("/x/SLIDES.PPT"), Some(DocKind::Office));
+        assert_eq!(doc_kind("/x/Page.HTML"), Some(DocKind::Html));
+        assert_eq!(doc_kind("/x/Report.PDF"), Some(DocKind::Pdf));
+        assert!(is_swf_path("/x/GAME.SWF"));
+        assert!(is_archive_path("/x/BACKUP.ZIP"));
+        assert!(crate::native_core::is_image_path("/x/PHOTO.JPG"));
+        assert!(crate::native_core::is_image_path("/x/Old.BMP"));
+        assert!(crate::native_core::is_audio_path("/x/SONG.RMI"));
+        assert!(crate::native_core::is_audio_path("/x/Tune.MID"));
+    }
+
+    #[test]
+    fn midi_inside_a_riff_wrapper_has_a_length_d362() {
+        let mut smf = b"MThd".to_vec();
+        smf.extend_from_slice(&6u32.to_be_bytes());
+        smf.extend_from_slice(&[0, 0, 0, 1, 0x01, 0xe0]); // format 0, one track, 480 ticks
+        let track: Vec<u8> = vec![0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, 0x8f, 0x00, 0xff, 0x2f, 0];
+        smf.extend_from_slice(b"MTrk");
+        smf.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        smf.extend_from_slice(&track);
+        assert_eq!(crate::native_core::midi_duration_from_bytes(&smf), Some(2.0));
+        let mut rmi = b"RIFF".to_vec();
+        rmi.extend_from_slice(&((smf.len() + 12) as u32).to_le_bytes());
+        rmi.extend_from_slice(b"RMID");
+        rmi.extend_from_slice(b"data");
+        rmi.extend_from_slice(&(smf.len() as u32).to_le_bytes());
+        rmi.extend_from_slice(&smf);
+        assert_eq!(crate::native_core::midi_duration_from_bytes(&rmi), Some(2.0));
+    }
+
+    #[test]
+    fn archive_listing_names_the_files_inside_d362() {
+        if !tool_in_path("7z") {
+            return;
+        }
+        let dir = d362_scratch("arc");
+        std::fs::write(dir.join("inside-one.txt"), "hello").unwrap();
+        std::fs::write(dir.join("inside-two.txt"), "world").unwrap();
+        let archive = dir.join("pack.7z");
+        let made = Command::new("7z")
+            .args(["a", "-bd", "-y"])
+            .arg(&archive)
+            .arg(dir.join("inside-one.txt"))
+            .arg(dir.join("inside-two.txt"))
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let said = describe_file(archive.to_str().unwrap());
+        assert!(said.starts_with("Contents") && said.contains("inside-one.txt") && said.contains("inside-two.txt"), "{said}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_binary_says_what_it_is_d362() {
+        let dir = d362_scratch("bin");
+        let file = dir.join("carved.bin");
+        let mut bytes = vec![0u8; 2048];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        std::fs::write(&file, &bytes).unwrap();
+        let said = describe_file(file.to_str().unwrap());
+        assert!(said.starts_with("Content: "), "{said}");
+        assert!(said.len() > "Content: ".len());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Coverage harness (not run by default): prints, for each path in the
+    /// file named by WAYFINDER_COVERAGE_LIST, which viewer the pane picks and
+    /// whether it produced content. Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn coverage_paths_d362() {
+        let Ok(list) = std::env::var("WAYFINDER_COVERAGE_LIST") else { return };
+        for path in std::fs::read_to_string(list).unwrap().lines() {
+            let kind = if crate::native_core::is_image_path(path) {
+                "image"
+            } else if crate::native_core::is_audio_path(path) {
+                "audio"
+            } else if crate::native_core::is_video_path(path) {
+                "video"
+            } else if doc_kind(path).is_some() {
+                "doc"
+            } else if is_swf_path(path) {
+                "swf"
+            } else if is_archive_path(path) {
+                "archive"
+            } else {
+                match crate::native_core::read_text_preview(path) {
+                    Ok(_) => "text",
+                    Err(e) => e.leak(),
+                }
+            };
+            println!("{kind}\t{path}");
+        }
     }
 }

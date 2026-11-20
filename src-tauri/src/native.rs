@@ -18914,10 +18914,30 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
-    match native_core::read_text_preview(&path_str) {
-        Ok(text) => set_preview_text(ui, &text),
-        Err(_) => set_preview_text(ui, &native_core::entry_summary(entry)),
+    if !native_viewers::is_archive_path(&path_str) {
+        if let Ok(text) = native_core::read_text_preview(&path_str) {
+            set_preview_text(ui, &text);
+            return;
+        }
     }
+    // D-362: not text. The summary shows at once; the archive list or the
+    // `file` description follows when the worker is done.
+    let summary = native_core::entry_summary(entry);
+    set_preview_text(ui, &format!("{summary}\n\nReading\u{2026}"));
+    let generation = ui.preview_generation.get();
+    let live = ui.preview_generation.clone();
+    let words = ui.preview.clone();
+    let source = path_str.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let made = gio::spawn_blocking(move || native_viewers::describe_file(&source)).await;
+        if live.get() != generation {
+            return;
+        }
+        match made {
+            Ok(more) => words.set_label(&format!("{summary}\n\n{more}")),
+            Err(_) => words.set_label(&summary),
+        }
+    });
 }
 
 fn preview_zoom_for(ui: &Ui) -> f64 {
