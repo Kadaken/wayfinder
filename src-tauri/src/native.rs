@@ -10935,6 +10935,9 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .build();
         size.add_css_class("wf-file-meta");
         size.add_css_class("wf-meta-size");
+        // D-359: unbind finds these three by name, not by position, because a
+        // pinned row has a badge between the name and the size.
+        size.set_widget_name("wf-col-size");
         ui.columns.size.add_widget(&size);
         let kind = gtk::Label::builder()
             .label(&native_core::kind_label(&entry))
@@ -10943,6 +10946,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         kind.add_css_class("wf-file-meta");
+        kind.set_widget_name("wf-col-kind");
         ui.columns.kind.add_widget(&kind);
         let modified_text = row_modified_text(&entry);
         let modified = gtk::Label::builder()
@@ -10952,6 +10956,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         modified.add_css_class("wf-file-meta");
+        modified.set_widget_name("wf-col-modified");
         modified.set_tooltip_text(Some(&row_modified_tooltip(&entry)));
         ui.columns.modified.add_widget(&modified);
         let columns_visible = state.borrow().columns_visible;
@@ -11041,8 +11046,12 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 child = widget.next_sibling();
                 children.push(widget);
             }
-            // Order matches the bind above: icon, name, size, kind, modified.
-            if children.len() >= 5 {
+            // D-359: found by name, never by position. A pinned row carries a
+            // badge between the name and the size, so indexes are not stable.
+            let find = |name: &str| children.iter().find(|w| w.widget_name() == name).cloned();
+            if let (Some(size_w), Some(kind_w), Some(modified_w)) =
+                (find("wf-col-size"), find("wf-col-kind"), find("wf-col-modified"))
+            {
                 if let Some(source) = item
                     .item()
                     .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
@@ -11056,16 +11065,16 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                     // dead, and every later reader ignores a dead Weak.
                     if let Ok(mut state) = state_for_unbind.try_borrow_mut() {
                         let ours = state.meta_labels.get(&source).is_some_and(|(size, _)| {
-                            size.upgrade().is_some_and(|l| l.upcast_ref::<gtk::Widget>() == &children[2])
+                            size.upgrade().is_some_and(|l| l.upcast_ref::<gtk::Widget>() == &size_w)
                         });
                         if ours {
                             state.meta_labels.remove(&source);
                         }
                     }
                 }
-                ui_for_unbind.columns.size.remove_widget(&children[2]);
-                ui_for_unbind.columns.kind.remove_widget(&children[3]);
-                ui_for_unbind.columns.modified.remove_widget(&children[4]);
+                ui_for_unbind.columns.size.remove_widget(&size_w);
+                ui_for_unbind.columns.kind.remove_widget(&kind_w);
+                ui_for_unbind.columns.modified.remove_widget(&modified_w);
             }
         }
         // D-260: this row is leaving the screen. Stop its thumbnail job: drop
@@ -23793,6 +23802,7 @@ Broken: Either state is wrong.\n";
         rename_from_menu_renames_the_clicked_file_d360();
         rename_onto_taken_name_offers_numbered_name_d340();
         pin_keeps_item_on_top_d359();
+        pinned_row_unbind_frees_size_groups_d359();
         new_folder_naming_stays_put_d341();
         // bottom_row_press_does_not_run_away_d339();
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
@@ -27216,6 +27226,80 @@ Broken: Either state is wrong.\n";
         assert!(config_pins().is_empty(), "D-359: a pin for a missing path is ignored on load");
         update_config(|_| {});
         assert!(!std::fs::read_to_string(config_path().unwrap()).unwrap().contains("y.txt"), "D-359: and pruned from the file");
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-359: a pinned row has a badge between its name and its size, so the
+    /// unbind that assumed icon, name, size, kind, modified removed the wrong
+    /// widget from the SizeGroups (GTK critical, then abort) and left the real
+    /// labels in them. Unbinding a pinned row must free exactly its own three.
+    fn pinned_row_unbind_frees_size_groups_d359() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d359u-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.txt", "b.txt", "z.txt"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d359unbindtest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        let z = dir.join("z.txt").to_string_lossy().to_string();
+        update_config(|c| apply_pin_change(&mut c.pins, std::slice::from_ref(&z), true));
+        repopulate_rows(&state, &ui);
+        pump();
+        pump();
+
+        // The pinned row's three labels, found through its badge.
+        let badge = all_widgets(ui.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.widget_name() == "wf-pin-badge")
+            .expect("D-359: the pinned row is bound with a badge");
+        let line = badge.parent().expect("the badge sits in the row");
+        let mut mine = Vec::new();
+        let mut child = line.first_child();
+        while let Some(w) = child {
+            child = w.next_sibling();
+            if w.widget_name().starts_with("wf-col-") {
+                mine.push(w);
+            }
+        }
+        assert_eq!(mine.len(), 3, "D-359: the pinned row has its size, kind and modified labels");
+        let groups = [&ui.columns.size, &ui.columns.kind, &ui.columns.modified];
+        for (w, g) in mine.iter().zip(groups.iter()) {
+            assert!(g.widgets().contains(w), "D-359: the bound row's label is in its SizeGroup");
+        }
+
+        // Unbind every row: the list drops its model, which unbinds each item.
+        ui.list.set_model(None::<&gtk::SelectionModel>);
+        pump();
+        pump();
+        for (w, g) in mine.iter().zip(groups.iter()) {
+            assert!(
+                !g.widgets().contains(w),
+                "D-359: unbinding the pinned row left {} in its SizeGroup",
+                w.widget_name()
+            );
+        }
 
         ui.window.destroy();
         pump();
