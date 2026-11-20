@@ -1293,6 +1293,12 @@ struct AppConfig {
     /// anyone who already has it and never gets a prompt they did not ask for.
     #[serde(default)]
     drop_ask: bool,
+    /// D-350: let the list scroll by itself when a box-select or a file drag
+    /// reaches its top or bottom edge. Off by default: with it on, a click on
+    /// one of the bottom rows that moved the pointer a few pixels started the
+    /// scroll and ran the list away from him.
+    #[serde(default)]
+    edge_autoscroll: bool,
     /// Set once the first-run setup has been answered, however it was answered.
     /// An upgrade from a version without this field reads false and therefore
     /// shows the setup once; that is deliberate, since the options it offers
@@ -2034,6 +2040,7 @@ impl Default for AppConfig {
             remembered_networks: Vec::new(),
             trash_keep_days: 0,
             drop_ask: false,
+            edge_autoscroll: false,
             onboarded: false,
             install_convention: true,
             recent_files: Vec::new(),
@@ -2218,6 +2225,10 @@ fn config_search_in_files(config: &mut AppConfig, value: bool) {
 
 fn config_drop_ask(config: &mut AppConfig, value: bool) {
     config.drop_ask = value;
+}
+
+fn config_edge_autoscroll(config: &mut AppConfig, value: bool) {
+    config.edge_autoscroll = value;
 }
 
 fn config_onboarded(config: &mut AppConfig, value: bool) {
@@ -4464,6 +4475,7 @@ fn build_ui_in(
                 .map(|(_, path)| path.clone())
         })
         .unwrap_or_else(|| "/".to_string());
+    EDGE_AUTOSCROLL.with(|c| c.set(config.edge_autoscroll));
     let state = Rc::new(RefCell::new(AppState {
         inline_rename: None,
         reveal_path: None,
@@ -4978,6 +4990,8 @@ fn build_ui_in(
     files_stack.set_visible_child_name("list");
     watch_scroll_jumps(&files_scroll, "list");
     watch_scroll_jumps(&grid_scroll, "grid");
+    hold_list_at_edges(&files_scroll);
+    hold_list_at_edges(&grid_scroll);
     let (column_header, columns) = details_header();
     let (quick_access, quick_access_tiles) = build_tile_strip("Quick access");
     let (recent_files_strip, recent_files_tiles) = build_tile_strip("Recent files");
@@ -8372,6 +8386,15 @@ fn set_placement_this_folder_only(state: &Rc<RefCell<AppState>>, ui: &Ui, own: b
     repopulate_rows(state, ui);
 }
 
+/// D-350: the one path for the edge-scroll setting.
+fn set_edge_autoscroll(value: bool) {
+    if EDGE_AUTOSCROLL.with(|c| c.get()) == value {
+        return;
+    }
+    EDGE_AUTOSCROLL.with(|c| c.set(value));
+    update_config(|config| config_edge_autoscroll(config, value));
+}
+
 fn set_drop_ask(state: &Rc<RefCell<AppState>>, value: bool) {
     if state.borrow().drop_ask == value {
         return;
@@ -9003,6 +9026,22 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             move || set_drop_ask(&state, !state.borrow().drop_ask),
         );
         row.set_widget_name("wf-drop-ask-option");
+        if checked {
+            row.add_css_class("wf-checked");
+        }
+        menu.append(&row);
+    }
+    {
+        // D-350: off by default; `set_edge_autoscroll` is the only writer.
+        let checked = EDGE_AUTOSCROLL.with(|c| c.get());
+        let row = context_item(
+            if checked { "object-select-symbolic" } else { "" },
+            "Scroll at Edges While Dragging",
+            "",
+            &popover,
+            move || set_edge_autoscroll(!checked),
+        );
+        row.set_widget_name("wf-edge-scroll-option");
         if checked {
             row.add_css_class("wf-checked");
         }
@@ -10069,6 +10108,101 @@ thread_local! {
     /// D-349: counts every deliberate scroll, so the place guard can step
     /// aside the moment Wayfinder moves the list on purpose.
     static SCROLL_GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// D-350: mirror of `AppConfig::edge_autoscroll`, read on every list move.
+    static EDGE_AUTOSCROLL: Cell<bool> = const { Cell::new(false) };
+    /// D-350: each view's hold, so the tests can press it the way a click does.
+    static EDGE_HOLDS: RefCell<Vec<(glib::WeakRef<gtk::Widget>, Rc<Cell<Option<(f64, u64)>>>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// D-350: the place the list is held at while a button is down on it or a file
+/// drag is over it, and the input count at that moment.
+fn edge_hold_for(view: &gtk::Widget) -> Option<Rc<Cell<Option<(f64, u64)>>>> {
+    EDGE_HOLDS.with(|h| {
+        h.borrow()
+            .iter()
+            .find(|(w, _)| w.upgrade().as_ref() == Some(view))
+            .map(|(_, pin)| pin.clone())
+    })
+}
+
+/// D-350: GTK scrolls a list by itself while a box-select or a file drag sits
+/// within 30px of its top or bottom edge (gtklistbase.c update_autoscroll). A
+/// click on one of the bottom rows that moved the pointer a few pixels started
+/// it, and the list ran up under him at ~250px a second until he let go
+/// (screencast 20 Nov 2026 10:04, 4.1s-7.3s). Unless the Options switch is on,
+/// the list is held where it was from the press to the release, and while a
+/// drag is over it. His wheel and keys, and every deliberate scroll by
+/// Wayfinder, bump the input count and are let through.
+fn hold_list_at_edges(scroller: &gtk::ScrolledWindow) {
+    let Some(view) = scroller.child() else { return };
+    let pin: Rc<Cell<Option<(f64, u64)>>> = Rc::new(Cell::new(None));
+    EDGE_HOLDS.with(|h| {
+        let mut h = h.borrow_mut();
+        h.retain(|(w, _)| w.upgrade().is_some());
+        h.push((view.downgrade(), pin.clone()));
+    });
+    let adj = scroller.vadjustment();
+    // On the view, not the scroller: a press on the scrollbar must stay free.
+    let press = gtk::EventControllerLegacy::new();
+    press.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let (pin, adj) = (pin.clone(), adj.clone());
+        press.connect_event(move |_, event| {
+            match event.event_type() {
+                gdk::EventType::ButtonPress => pin.set(Some((adj.value(), scroll_generation()))),
+                gdk::EventType::ButtonRelease => pin.set(None),
+                // A release can go missing (a drag takes the pointer); moving
+                // with no button down is proof it is over.
+                gdk::EventType::MotionNotify
+                    if !event.modifier_state().intersects(
+                        gdk::ModifierType::BUTTON1_MASK | gdk::ModifierType::BUTTON2_MASK | gdk::ModifierType::BUTTON3_MASK,
+                    ) =>
+                {
+                    pin.set(None)
+                }
+                _ => {}
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    view.add_controller(press);
+    let over = gtk::DropControllerMotion::new();
+    {
+        let (pin, adj) = (pin.clone(), adj.clone());
+        let hold = move || {
+            if pin.get().is_none() {
+                pin.set(Some((adj.value(), scroll_generation())));
+            }
+        };
+        let hold2 = hold.clone();
+        over.connect_enter(move |_, _, _| hold());
+        over.connect_motion(move |_, _, _| hold2());
+    }
+    {
+        let pin = pin.clone();
+        over.connect_leave(move |_| pin.set(None));
+    }
+    view.add_controller(over);
+    let snapping = Rc::new(Cell::new(false));
+    adj.connect_value_changed(move |adj| {
+        let Some((value, generation)) = pin.get() else { return };
+        if snapping.get() || EDGE_AUTOSCROLL.with(|c| c.get()) {
+            return;
+        }
+        if scroll_generation() != generation {
+            // His wheel or key, or Wayfinder moving it on purpose.
+            pin.set(None);
+            return;
+        }
+        if scroll_target_reached(adj.value(), value) {
+            return;
+        }
+        // Put back inside GTK's own set_value, so its edge-scroll tick reads
+        // no movement and stops itself.
+        snapping.set(true);
+        adj.set_value(value);
+        snapping.set(false);
+    });
 }
 
 /// D-349: his own wheel, click or key, or a deliberate scroll by Wayfinder.
@@ -13753,11 +13887,13 @@ fn transfer_with_preflight(state: Rc<RefCell<AppState>>, ui: Ui, transfer: Trans
             let ui_for_choice = ui.clone();
             // Held once: a choice takes it and runs it, Cancel takes it and drops
             // it, so a cut's claim on its offer ends with the dialog (D-232).
+            let pairs = clash_pairs(&transfer, &conflicts);
             let held = Rc::new(RefCell::new(Some(transfer)));
             let dismissed = held.clone();
             show_conflict_dialog(
                 &ui,
                 &conflicts,
+                pairs,
                 move |mode| {
                     let transfer = held.borrow_mut().take();
                     if let Some(transfer) = transfer {
@@ -13825,13 +13961,41 @@ fn conflict_dialog_text(conflicts: &[String]) -> (String, Option<String>) {
     )
 }
 
-fn show_conflict_dialog<F>(ui: &Ui, conflicts: &[String], on_choice: F, on_dismiss: impl Fn() + 'static)
-where
+/// D-351: each clashing item as (the one coming in, the one already here).
+fn clash_pairs(transfer: &Transfer, conflicts: &[String]) -> Vec<(PathBuf, PathBuf)> {
+    conflicts
+        .iter()
+        .filter_map(|name| {
+            let src = transfer.srcs.iter().find(|s| s.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))?;
+            Some((src.clone(), transfer.dest.join(name)))
+        })
+        .collect()
+}
+
+fn show_conflict_dialog<F>(
+    ui: &Ui,
+    conflicts: &[String],
+    pairs: Vec<(PathBuf, PathBuf)>,
+    on_choice: F,
+    on_dismiss: impl Fn() + 'static,
+) where
     F: Fn(native_core::PasteConflict) + 'static,
 {
     let (heading, detail) = conflict_dialog_text(conflicts);
 
     let dialog = adw::AlertDialog::new(Some(&heading), detail.as_deref());
+    // D-351: a button inside the dialog, not a response, so comparing leaves
+    // the choice still open.
+    if !pairs.is_empty() {
+        let compare = gtk::Button::with_label(if pairs.len() == 1 { "Compare the Two Files" } else { "Compare Them Side by Side" });
+        compare.set_widget_name("wf-compare-clash");
+        compare.set_halign(gtk::Align::Center);
+        let parent = ui.window.clone();
+        compare.connect_clicked(move |_| {
+            show_compare_window(parent.upcast_ref(), pairs.clone());
+        });
+        dialog.set_extra_child(Some(&compare));
+    }
     dialog.add_responses(&[
         ("cancel", "Cancel"),
         ("duplicate", "Duplicate"),
@@ -13847,6 +14011,246 @@ where
         apply_conflict_response(response, &on_choice);
     });
     dialog.present(Some(&ui.window));
+}
+
+/// D-351: "Coming in" and "Already here" side by side, so he can see whether
+/// two files with the same name hold the same picture, video or text before
+/// choosing Overwrite. Several clashes step through with Previous and Next.
+fn show_compare_window(parent: &gtk::Window, pairs: Vec<(PathBuf, PathBuf)>) -> gtk::Window {
+    let window = gtk::Window::builder()
+        .title("Compare")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(1100)
+        .default_height(720)
+        .build();
+    window.set_widget_name("wf-compare-window");
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    outer.set_margin_top(12);
+    outer.set_margin_bottom(12);
+    outer.set_margin_start(12);
+    outer.set_margin_end(12);
+    // One page per pair, built the first time it is shown and never removed:
+    // taking the previews out of a live window tripped a GTK abort
+    // (gtk_widget_is_ancestor on a dead widget).
+    let sides = gtk::Stack::new();
+    sides.set_vexpand(true);
+    let verdict = gtk::Label::new(None);
+    verdict.set_widget_name("wf-compare-verdict");
+    verdict.add_css_class("title-4");
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let prev = gtk::Button::with_label("Previous");
+    let next = gtk::Button::with_label("Next");
+    let counter = gtk::Label::new(None);
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let close = gtk::Button::with_label("Close");
+    close.add_css_class("suggested-action");
+    if pairs.len() > 1 {
+        bar.append(&prev);
+        bar.append(&counter);
+        bar.append(&next);
+    }
+    bar.append(&spacer);
+    bar.append(&close);
+    outer.append(&sides);
+    outer.append(&verdict);
+    outer.append(&bar);
+    window.set_child(Some(&outer));
+
+    let pairs = Rc::new(pairs);
+    let index = Rc::new(Cell::new(0usize));
+    // Each showing takes a number, so a slow byte check from the pair before
+    // never writes its answer under the next pair.
+    let shown = Rc::new(Cell::new(0u64));
+    let show: Rc<dyn Fn()> = {
+        let (pairs, index, shown) = (pairs.clone(), index.clone(), shown.clone());
+        let (sides, verdict, counter, prev, next) = (sides.clone(), verdict.clone(), counter.clone(), prev.clone(), next.clone());
+        Rc::new(move || {
+            let i = index.get();
+            let (incoming, existing) = pairs[i].clone();
+            pause_videos(sides.upcast_ref());
+            let page = format!("pair-{i}");
+            if sides.child_by_name(&page).is_none() {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row.set_homogeneous(true);
+                row.append(&compare_side("Coming in", &incoming));
+                row.append(&compare_side("Already here", &existing));
+                sides.add_named(&row, Some(&page));
+            }
+            sides.set_visible_child_name(&page);
+            counter.set_label(&format!("{} of {}", i + 1, pairs.len()));
+            prev.set_sensitive(i > 0);
+            next.set_sensitive(i + 1 < pairs.len());
+            let ticket = shown.get() + 1;
+            shown.set(ticket);
+            if incoming.is_dir() || existing.is_dir() {
+                verdict.set_label("Folders: Overwrite merges into the one already here.");
+                return;
+            }
+            verdict.set_label("Checking whether the contents match…");
+            let (verdict, shown) = (verdict.clone(), shown.clone());
+            glib::spawn_future_local(async move {
+                let same = gio::spawn_blocking(move || files_identical(&incoming, &existing)).await;
+                if shown.get() != ticket {
+                    return;
+                }
+                verdict.set_label(match same {
+                    Ok(Ok(true)) => "Identical: the two files hold exactly the same bytes.",
+                    Ok(Ok(false)) => "Different: the contents do not match.",
+                    _ => "Could not read both files to check.",
+                });
+            });
+        })
+    };
+    {
+        let (index, show) = (index.clone(), show.clone());
+        prev.connect_clicked(move |_| {
+            index.set(index.get().saturating_sub(1));
+            show();
+        });
+    }
+    {
+        let (index, show, count) = (index.clone(), show.clone(), pairs.len());
+        next.connect_clicked(move |_| {
+            index.set((index.get() + 1).min(count - 1));
+            show();
+        });
+    }
+    {
+        let window = window.clone();
+        close.connect_clicked(move |_| window.close());
+    }
+    // Stop any video playing in it when it closes.
+    window.connect_close_request(|window| {
+        pause_videos(window.upcast_ref());
+        glib::Propagation::Proceed
+    });
+    show();
+    window.present();
+    window
+}
+
+fn pause_videos(root: &gtk::Widget) {
+    for widget in all_descendants(root) {
+        if let Some(stream) = widget.downcast::<gtk::Video>().ok().and_then(|v| v.media_stream()) {
+            stream.pause();
+        }
+    }
+}
+
+fn all_descendants(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(w) = stack.pop() {
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c.clone());
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// D-351: same length and same bytes, read in 1 MB pieces.
+fn files_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// One side of the compare window: its heading, the file shown the way the
+/// preview pane shows it, and its name, size and date.
+fn compare_side(heading: &str, path: &Path) -> gtk::Box {
+    let side = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    side.add_css_class("wf-compare-side");
+    let title = gtk::Label::new(Some(heading));
+    title.add_css_class("title-3");
+    side.append(&title);
+    let path_str = path.to_string_lossy().into_owned();
+    let view: gtk::Widget = if path.is_dir() {
+        let count = fs::read_dir(path).map(|r| r.count()).unwrap_or(0);
+        compare_text(&format!("Folder, {count} item{}", plural(count)))
+    } else if native_core::is_image_path(&path_str) {
+        let picture = gtk::Picture::new();
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_can_shrink(true);
+        picture.set_widget_name("wf-compare-image");
+        // Decoded off the main thread: a large photo must not freeze the window.
+        let (picture_w, file) = (picture.clone(), path.to_path_buf());
+        glib::spawn_future_local(async move {
+            if let Ok(Ok(bytes)) = gio::spawn_blocking(move || fs::read(file)).await {
+                if let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+                    picture_w.set_tooltip_text(Some(&format!("{} × {} pixels", texture.width(), texture.height())));
+                    picture_w.set_paintable(Some(&texture));
+                }
+            }
+        });
+        picture.upcast()
+    } else if native_core::is_video_path(&path_str) {
+        // Same GtkMediaFile path as the preview pane; paused until he plays it.
+        let video = gtk::Video::for_filename(Some(path));
+        video.set_autoplay(false);
+        video.upcast()
+    } else if native_core::is_audio_path(&path_str) {
+        // Never GtkMediaFile for audio: see update_preview.
+        compare_text("Audio file")
+    } else {
+        match native_core::read_text_preview(&path_str) {
+            Ok(text) => compare_text(&text),
+            Err(_) => compare_text("No preview for this kind of file."),
+        }
+    };
+    view.set_vexpand(true);
+    view.set_hexpand(true);
+    let frame = gtk::Frame::new(None);
+    frame.set_child(Some(&view));
+    frame.set_vexpand(true);
+    side.append(&frame);
+    let meta = fs::metadata(path).ok();
+    let size = meta.as_ref().filter(|m| m.is_file()).map(|m| native_core::fmt_size(m.len())).unwrap_or_default();
+    let when = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| glib::DateTime::from_unix_local(d.as_secs() as i64).ok())
+        .and_then(|d| d.format("%d %b %Y %H:%M").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let info = gtk::Label::new(Some(&[name, size, when].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("   ·   ")));
+    info.set_wrap(true);
+    info.set_selectable(true);
+    side.append(&info);
+    let folder = gtk::Label::new(path.parent().map(|p| p.to_string_lossy().into_owned()).as_deref());
+    folder.add_css_class("dim-label");
+    folder.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    side.append(&folder);
+    side
+}
+
+fn compare_text(text: &str) -> gtk::Widget {
+    let view = gtk::TextView::new();
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_monospace(true);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view.buffer().set_text(text);
+    let scroll = gtk::ScrolledWindow::builder().child(&view).build();
+    scroll.upcast()
 }
 
 /// The opt-in drag-and-drop action menu: Copy / Move / Link / Cancel, asked
@@ -23567,6 +23971,8 @@ Broken: Either state is wrong.\n";
         );
         // A quick run of the place-keeping tests alone, for iterating on them.
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("place") {
+            compare_window_shows_both_files_d351();
+            bottom_row_click_keeps_place_d350();
             split_same_folder_move_into_subfolder_keeps_place_d343();
             eprintln!("wf-test place-only run done");
             return;
@@ -23620,6 +24026,8 @@ Broken: Either state is wrong.\n";
         split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details", false);
         split_move_keeps_source_pane_scroll_d336(ViewMode::Grid, "grid", false);
         split_same_folder_move_into_subfolder_keeps_place_d343();
+        bottom_row_click_keeps_place_d350();
+        compare_window_shows_both_files_d351();
         // D-336 real-drag and D-339 pointer tests: off until the Xvfb pointer reaches the window.
         // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
         folder_change_waits_for_open_rename_d338();
@@ -26980,6 +27388,186 @@ Broken: Either state is wrong.\n";
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// D-350 (20 Nov 2026, the owner's screencast 10:04): clicking one of the
+    /// bottom two or three rows jolted the list up about four rows. A click
+    /// goes through the row's "list.select-item" action, exactly as here.
+    fn bottom_row_click_keeps_place_d350() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d350-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("f-{i:03}.txt")), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d350test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 600);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 300);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        for _ in 0..30 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("scrollable", || adj.upper() > adj.page_size() * 3.0);
+        mark_scroll_cause("test: his own scroll");
+        adj.set_value((adj.upper() - adj.page_size()) / 2.0);
+        for _ in 0..40 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        for from_bottom in [1usize, 2, 3] {
+            let scroll_b = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
+            let bottom = scroll_b.y() + scroll_b.height();
+            let mut rows: Vec<(gtk::Widget, gtk::graphene::Rect)> = all_widgets(ui.list.upcast_ref())
+                .into_iter()
+                .filter(|w| w.has_css_class("wf-file-row"))
+                .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w, b)))
+                .filter(|(_, b)| b.y() + b.height() <= bottom - 1.0 && b.y() >= scroll_b.y())
+                .collect();
+            rows.sort_by(|a, b| a.1.y().partial_cmp(&b.1.y()).unwrap());
+            let (row, _) = rows[rows.len() - from_bottom].clone();
+            let path = row.tooltip_text().map(|t| t.to_string()).unwrap_or_default();
+            let pos = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().as_deref() == Some(path.as_str())).expect("row in the listing");
+            let item = row.ancestor(gtk::Widget::static_type()).and_then(|_| {
+                let mut w = row.parent();
+                while let Some(p) = w.clone() {
+                    if p.type_().name() == "GtkListItemWidget" { return Some(p); }
+                    w = p.parent();
+                }
+                None
+            }).expect("list item widget");
+            let before = adj.value();
+            item.activate_action("list.select-item", Some(&(pos as u32, false, false).to_variant())).expect("select-item");
+            for _ in 0..80 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+            let after = adj.value();
+            let sel = selected_paths(&state, &ui);
+            eprintln!("wf-test D-350 row {from_bottom} from bottom: {before} -> {after}, selected={}", sel.len());
+            assert_eq!(sel, vec![path.clone()], "D-350: the clicked row is selected");
+            assert!((after - before).abs() < 2.0, "D-350: clicking row {from_bottom} from the bottom kept the list still ({before} -> {after})");
+        }
+        // GTK's edge-scroll, as gtklistbase.c autoscroll_cb does it: add a step
+        // each frame and stop once a step no longer moves the list.
+        let edge_scroll = |adj: &gtk::Adjustment| -> f64 {
+            let start = adj.value();
+            let ran = Rc::new(Cell::new(0u32));
+            let ran_tick = ran.clone();
+            let adj_tick = adj.clone();
+            ui.list.add_tick_callback(move |_, _| {
+                let v = adj_tick.value();
+                adj_tick.set_value(v + 5.0);
+                ran_tick.set(ran_tick.get() + 1);
+                if adj_tick.value() != v && ran_tick.get() < 30 { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+            });
+            for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+            eprintln!("wf-test D-350 edge-scroll ran {} frames", ran.get());
+            adj.value() - start
+        };
+        let pin = edge_hold_for(ui.list.upcast_ref()).expect("the list has an edge hold");
+        // Held, switch off (the default): the list stays put.
+        assert!(!EDGE_AUTOSCROLL.with(|c| c.get()), "D-350: edge scroll is off by default");
+        pin.set(Some((adj.value(), scroll_generation())));
+        let moved_off = edge_scroll(&adj);
+        // His wheel while held still scrolls.
+        note_scroll_input();
+        let before_wheel = adj.value();
+        adj.set_value(before_wheel - 120.0);
+        pump();
+        let wheel = adj.value() - before_wheel;
+        pin.set(None);
+        // Switch on: GTK's edge scroll runs as before.
+        EDGE_AUTOSCROLL.with(|c| c.set(true));
+        pin.set(Some((adj.value(), scroll_generation())));
+        let moved_on = edge_scroll(&adj);
+        EDGE_AUTOSCROLL.with(|c| c.set(false));
+        pin.set(None);
+        eprintln!("wf-test D-350 edge-scroll off={moved_off} on={moved_on} wheel={wheel}");
+        assert!(moved_off.abs() < 1.0, "D-350: held with the switch off, the list stayed still (moved {moved_off})");
+        assert!((wheel + 120.0).abs() < 1.0, "D-350: his wheel still scrolls while held (moved {wheel})");
+        assert!(moved_on > 20.0, "D-350: with the switch on, the edge scroll still works (moved {moved_on})");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn compare_window_shows_both_files_d351() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d351-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (a, b) = (root.join("incoming"), root.join("here"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let png = |r: u8| {
+            let px: Vec<u8> = (0..40 * 30).flat_map(|_| [r, 40, 90, 255]).collect();
+            gdk::MemoryTexture::new(40, 30, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(px), 160).save_to_png_bytes().to_vec()
+        };
+        std::fs::write(a.join("same.png"), png(200)).unwrap();
+        std::fs::write(b.join("same.png"), png(200)).unwrap();
+        std::fs::write(a.join("photo.png"), png(10)).unwrap();
+        std::fs::write(b.join("photo.png"), png(250)).unwrap();
+        std::fs::write(a.join("note.txt"), "coming in").unwrap();
+        std::fs::write(b.join("note.txt"), "already here").unwrap();
+        let transfer = Transfer {
+            srcs: vec![a.join("same.png"), a.join("photo.png"), a.join("note.txt")],
+            dest: b.clone(),
+            is_copy: true,
+            cut_offer: None,
+            style: TransferStyle::Paste,
+        };
+        let names = match plan_transfer(&transfer) {
+            TransferPlan::Ask(names) => names,
+            other => panic!("D-351: expected a clash, got {other:?}"),
+        };
+        let pairs = clash_pairs(&transfer, &names);
+        assert_eq!(pairs.len(), 3, "D-351: every clash has a pair");
+        let parent = gtk::Window::new();
+        parent.present();
+        let window = show_compare_window(&parent, pairs);
+        let verdict = || {
+            all_widgets(window.upcast_ref()).into_iter().find(|w| w.widget_name() == "wf-compare-verdict")
+                .and_then(|w| w.downcast::<gtk::Label>().ok()).map(|l| l.label().to_string()).unwrap_or_default()
+        };
+        let buttons = |label: &str| {
+            all_widgets(window.upcast_ref()).into_iter().filter(|w| w.is_mapped()).filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.label().as_deref() == Some(label)).expect("button")
+        };
+        let mut seen = Vec::new();
+        for step in 0..3 {
+            wait_for("verdict", || !verdict().starts_with("Checking"));
+            wait_for("pictures decoded", || {
+                let pics: Vec<gtk::Picture> = all_widgets(window.upcast_ref()).into_iter().filter(|w| w.is_mapped()).filter_map(|w| w.downcast::<gtk::Picture>().ok()).filter(|p| p.widget_name() == "wf-compare-image").collect();
+                pics.is_empty() || pics.iter().all(|p| p.paintable().is_some())
+            });
+            let pics = all_widgets(window.upcast_ref()).into_iter().filter(|w| w.is_mapped()).filter(|w| w.widget_name() == "wf-compare-image").count();
+            let texts: Vec<String> = all_widgets(window.upcast_ref()).into_iter().filter(|w| w.is_mapped()).filter_map(|w| w.downcast::<gtk::TextView>().ok())
+                .map(|t| { let b = t.buffer(); b.text(&b.start_iter(), &b.end_iter(), false).to_string() }).collect();
+            eprintln!("wf-test D-351 step {step}: pictures={pics} texts={texts:?} verdict={}", verdict());
+            seen.push((pics, texts, verdict()));
+            if step < 2 {
+                buttons("Next").emit_clicked();
+                for _ in 0..30 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+            }
+        }
+        assert_eq!(seen[0].0, 2, "D-351: both pictures shown side by side");
+        assert!(seen[0].2.starts_with("Identical"), "D-351: same picture reads identical");
+        assert_eq!(seen[1].0, 2, "D-351: both pictures shown");
+        assert!(seen[1].2.starts_with("Different"), "D-351: different picture reads different");
+        assert_eq!(seen[2].1, vec!["coming in".to_string(), "already here".to_string()], "D-351: both texts shown, incoming on the left");
+        assert!(seen[2].2.starts_with("Different"), "D-351: different text reads different");
+        window.close();
+        parent.destroy();
+        pump();
     }
 
     fn split_view_opens_a_second_real_pane_d241() {
