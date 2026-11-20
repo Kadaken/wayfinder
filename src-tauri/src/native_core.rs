@@ -5557,6 +5557,12 @@ pub fn not_audio_reason(path: &str) -> Option<String> {
     plainly_wrong.then(|| damaged_file_reason(path, "audio file"))
 }
 
+/// D-362: containers shown as one frame and a length rather than handed to
+/// GStreamer: raw elementary streams and formats it plays unreliably.
+pub fn video_frame_only(path: &str) -> bool {
+    has_extension(path, &["h264", "h265", "hevc", "264", "mjpeg", "rm", "rmvb", "mxf", "nut"])
+}
+
 pub fn is_video_path(path: &str) -> bool {
     has_extension(path, &VIDEO_EXT)
 }
@@ -11630,6 +11636,14 @@ const TRANSCODE_THUMB_EXT: &[&str] = &[
     "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf", "srw", "pef",
     "jfif",
 ];
+
+/// D-362: formats ffmpeg cannot read but ImageMagick can.
+pub fn prefers_magick(path: &str) -> bool {
+    has_extension(
+        path,
+        &["psd", "xcf", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf", "srw", "pef"],
+    )
+}
 
 pub fn needs_transcoded_thumbnail(path: &str) -> bool {
     // D-362: a BMP with RLE compression or a negative height is sent to the

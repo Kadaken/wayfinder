@@ -411,3 +411,34 @@ pub fn read_swf_info(path: &str) -> Result<SwfInfo, String> {
         .map_err(|e| e.to_string())?;
     parse_swf_header(&data)
 }
+
+/// What the pane tells him when no decoder could read a picture.
+pub fn image_failure_hint() -> String {
+    if !tool_in_path("ffmpeg") && !tool_in_path("magick") {
+        "Install ffmpeg or imagemagick to open more picture formats.".into()
+    } else {
+        "Tried gdk-pixbuf, ffmpeg and ImageMagick.".into()
+    }
+}
+
+/// Whether Ruffle is installed as a Flatpak (user or system).
+pub fn ruffle_installed() -> bool {
+    Command::new("flatpak")
+        .args(["info", "rs.ruffle.Ruffle"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn swf_description(info: &Result<SwfInfo, String>) -> String {
+    match info {
+        Ok(i) => format!(
+            "Flash file (SWF)\nVersion {}\nStage {:.0} x {:.0} pixels\n{:.1} frames per second\n{} frames\nCompression: {}",
+            i.version, i.width, i.height, i.frame_rate, i.frames, i.compression
+        ),
+        Err(e) => format!("Flash file (SWF)\nThe header could not be read: {e}"),
+    }
+}

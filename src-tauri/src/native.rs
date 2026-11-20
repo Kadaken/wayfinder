@@ -2713,6 +2713,171 @@ struct VideoPosterQueue {
     live: Vec<(gst::Pipeline, gst::bus::BusWatchGuard)>,
 }
 
+/// D-362: the state behind the document (PDF page) viewer.
+#[derive(Default)]
+struct DocState {
+    pdf: Option<PathBuf>,
+    page: u32,
+    pages: u32,
+    /// Set when the selection moves on, so a running converter is killed.
+    cancel: Arc<AtomicBool>,
+    /// Moves on with every page turn, so a slow page never replaces a newer one.
+    seq: u64,
+    /// The preview generation this document was started for.
+    generation: u64,
+}
+
+/// D-362: widgets of the document viewer and of the frame viewer (a video
+/// that will not play, a Flash file).
+#[derive(Clone)]
+struct ViewerPanes {
+    doc_root: gtk::Box,
+    doc_picture: gtk::Picture,
+    doc_prev: gtk::Button,
+    doc_next: gtk::Button,
+    doc_label: gtk::Label,
+    doc_source_toggle: gtk::ToggleButton,
+    doc_source_scroll: gtk::ScrolledWindow,
+    doc_source_label: gtk::Label,
+    doc: Rc<RefCell<DocState>>,
+    frame_root: gtk::Box,
+    frame_picture: gtk::Picture,
+    frame_info: gtk::Label,
+    frame_button: gtk::Button,
+    frame_path: Rc<RefCell<String>>,
+}
+
+impl ViewerPanes {
+    fn cancel_current(&self) {
+        self.doc.borrow().cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
+    let doc_picture = gtk::Picture::new();
+    doc_picture.set_content_fit(gtk::ContentFit::Contain);
+    doc_picture.set_can_shrink(true);
+    doc_picture.set_hexpand(true);
+    doc_picture.set_vexpand(true);
+    doc_picture.set_widget_name("wf-doc-page");
+    let doc_prev = gtk::Button::with_label("Previous");
+    doc_prev.set_widget_name("wf-doc-prev");
+    let doc_next = gtk::Button::with_label("Next");
+    doc_next.set_widget_name("wf-doc-next");
+    let doc_label = gtk::Label::new(Some("Page 1 of 1"));
+    doc_label.set_widget_name("wf-doc-pages");
+    doc_label.set_hexpand(true);
+    let doc_source_toggle = gtk::ToggleButton::with_label("Show source");
+    doc_source_toggle.set_widget_name("wf-doc-source");
+    doc_source_toggle.set_visible(false);
+    let nav = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    nav.set_margin_start(8);
+    nav.set_margin_end(8);
+    nav.set_margin_bottom(6);
+    nav.append(&doc_prev);
+    nav.append(&doc_label);
+    nav.append(&doc_source_toggle);
+    nav.append(&doc_next);
+    let doc_source_label = gtk::Label::builder().xalign(0.0).yalign(0.0).selectable(true).build();
+    doc_source_label.set_margin_start(10);
+    doc_source_label.set_margin_end(10);
+    doc_source_label.set_margin_top(10);
+    doc_source_label.add_css_class("monospace");
+    let doc_source_scroll = gtk::ScrolledWindow::builder()
+        .child(&doc_source_label)
+        .vexpand(true)
+        .hexpand(true)
+        .visible(false)
+        .build();
+    let doc_root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    doc_root.set_hexpand(true);
+    doc_root.set_vexpand(true);
+    doc_root.set_size_request(0, 0);
+    doc_root.append(&doc_picture);
+    doc_root.append(&doc_source_scroll);
+    doc_root.append(&nav);
+
+    let frame_picture = gtk::Picture::new();
+    frame_picture.set_content_fit(gtk::ContentFit::Contain);
+    frame_picture.set_can_shrink(true);
+    frame_picture.set_vexpand(true);
+    frame_picture.set_widget_name("wf-frame-picture");
+    let frame_info = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    frame_info.set_widget_name("wf-frame-info");
+    frame_info.set_margin_start(10);
+    frame_info.set_margin_end(10);
+    let frame_button = gtk::Button::with_label("Play in Ruffle");
+    frame_button.set_widget_name("wf-frame-button");
+    frame_button.set_margin_start(10);
+    frame_button.set_margin_end(10);
+    frame_button.set_margin_bottom(8);
+    let frame_root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    frame_root.set_hexpand(true);
+    frame_root.set_vexpand(true);
+    frame_root.set_size_request(0, 0);
+    frame_root.append(&frame_picture);
+    frame_root.append(&frame_info);
+    frame_root.append(&frame_button);
+
+    let panes = ViewerPanes {
+        doc_root,
+        doc_picture,
+        doc_prev,
+        doc_next,
+        doc_label,
+        doc_source_toggle,
+        doc_source_scroll,
+        doc_source_label,
+        doc: Rc::new(RefCell::new(DocState::default())),
+        frame_root,
+        frame_picture,
+        frame_info,
+        frame_button,
+        frame_path: Rc::new(RefCell::new(String::new())),
+    };
+    {
+        let (p, live) = (panes.clone(), live_generation.clone());
+        panes.doc_prev.connect_clicked(move |_| doc_turn(&p, &live, -1));
+    }
+    {
+        let (p, live) = (panes.clone(), live_generation.clone());
+        panes.doc_next.connect_clicked(move |_| doc_turn(&p, &live, 1));
+    }
+    {
+        let p = panes.clone();
+        panes.doc_source_toggle.connect_toggled(move |t| {
+            p.doc_source_scroll.set_visible(t.is_active());
+            p.doc_picture.set_visible(!t.is_active());
+        });
+    }
+    {
+        let p = panes.clone();
+        panes.frame_button.connect_clicked(move |_| {
+            let path = p.frame_path.borrow().clone();
+            if path.is_empty() {
+                return;
+            }
+            // Detached, in its own process group, so closing Wayfinder never
+            // closes the player.
+            use std::os::unix::process::CommandExt;
+            if let Ok(mut child) = std::process::Command::new("flatpak")
+                .args(["run", "rs.ruffle.Ruffle"])
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+            {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        });
+    }
+    panes
+}
+
 #[derive(Clone)]
 struct Ui {
     window: adw::ApplicationWindow,
@@ -2758,6 +2923,8 @@ struct Ui {
     preview_saved_position: Rc<std::cell::Cell<i32>>,
     /// D-326: this window's preview generation (was one counter shared by every window).
     preview_generation: Rc<std::cell::Cell<u64>>,
+    /// D-362: the document and frame viewers.
+    viewers: ViewerPanes,
     preview_picture: gtk::Picture,
     preview_media_picture: gtk::Picture,
     preview_media_controls: gtk::MediaControls,
@@ -4793,7 +4960,11 @@ fn build_ui_in(
     preview_folder.set_hexpand(true);
     preview_folder.set_valign(gtk::Align::Start);
     preview_folder.add_css_class("wf-preview-folder");
+    let preview_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    let viewers = build_viewer_panes(&preview_generation);
     let preview_stack = gtk::Stack::new();
+    preview_stack.add_named(&viewers.doc_root, Some("doc"));
+    preview_stack.add_named(&viewers.frame_root, Some("frame"));
     preview_stack.add_named(&preview_folder, Some("folder"));
     preview_stack.add_named(&preview, Some("text"));
     preview_stack.add_named(&preview_picture, Some("image"));
@@ -5070,7 +5241,7 @@ fn build_ui_in(
     {
         let scroll = preview_scroll.clone();
         preview_stack.connect_visible_child_name_notify(move |stack| {
-            let fixed = matches!(stack.visible_child_name().as_deref(), Some("image" | "media" | "audio"));
+            let fixed = matches!(stack.visible_child_name().as_deref(), Some("image" | "media" | "audio" | "doc" | "frame"));
             scroll.set_vscrollbar_policy(if fixed { gtk::PolicyType::External } else { gtk::PolicyType::Automatic });
             scroll.set_hscrollbar_policy(if fixed { gtk::PolicyType::External } else { gtk::PolicyType::Automatic });
             if fixed {
@@ -5326,7 +5497,8 @@ fn build_ui_in(
         file_preview: file_preview.clone(),
         preview_toggle: preview_toggle.clone(),
         preview_saved_position: Rc::new(std::cell::Cell::new(0)),
-        preview_generation: Rc::new(std::cell::Cell::new(0)),
+        preview_generation,
+        viewers,
         preview_picture,
         preview_media_picture,
         preview_media_controls,
@@ -12600,6 +12772,14 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
     // with "Unable to choose an output format" every single time, so no
     // AVIF ever decoded (7 Nov 2026, found on the owner's screen).
     let part = dir.join(format!("{key:016x}.part.png"));
+    // D-362: raw camera files, PSD and XCF are not something ffmpeg reads, so
+    // ImageMagick goes first for them; everything else tries ffmpeg first and
+    // ImageMagick second.
+    let magick_first = native_core::prefers_magick(source);
+    if magick_first && native_viewers::magick_to_png(source, &part, want_w) {
+        fs::rename(&part, &cached).ok()?;
+        return Some(cached);
+    }
     let status = std::process::Command::new("ffmpeg")
         .arg("-nostdin")
         .arg("-v")
@@ -12626,6 +12806,11 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
             Some(cached)
         }
         other => {
+            let _ = fs::remove_file(&part);
+            if !magick_first && native_viewers::magick_to_png(source, &part, want_w) {
+                fs::rename(&part, &cached).ok()?;
+                return Some(cached);
+            }
             let _ = fs::remove_file(&part);
             eprintln!("wf-event: no preview for {source:?}, ffmpeg said {other:?}");
             None
@@ -18720,6 +18905,15 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
+    if let Some(kind) = native_viewers::doc_kind(&path_str) {
+        set_preview_document(ui, &path_str, kind);
+        return;
+    }
+    if native_viewers::is_swf_path(&path_str) {
+        set_preview_swf(ui, &path_str);
+        return;
+    }
+
     match native_core::read_text_preview(&path_str) {
         Ok(text) => set_preview_text(ui, &text),
         Err(_) => set_preview_text(ui, &native_core::entry_summary(entry)),
@@ -19022,6 +19216,8 @@ fn set_preview_text(ui: &Ui, text: &str) {
 fn next_preview_generation(ui: &Ui) -> u64 {
     let next = ui.preview_generation.get().wrapping_add(1);
     ui.preview_generation.set(next);
+    // D-362: a converter still running for the old selection is killed.
+    ui.viewers.cancel_current();
     next
 }
 
@@ -19197,32 +19393,17 @@ fn set_preview_image(ui: &Ui, path: &str) {
     // the main thread, and that is what the pane shows.
     if native_core::needs_transcoded_thumbnail(path) {
         ui.preview_picture.set_file(None::<&gio::File>);
+        ui.preview_picture.set_paintable(None::<&gdk::Paintable>);
         ui.preview.set_label("Opening preview\u{2026}");
         ui.preview_stack.set_visible_child_name("text");
-        let source = path.to_string();
-        let picture = ui.preview_picture.clone();
-        let stack = ui.preview_stack.clone();
-        let words = ui.preview.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let decoded =
-                gio::spawn_blocking(move || transcoded_thumbnail_file(&source, PREVIEW_DECODE_WIDTH))
-                    .await;
-            if live_generation.get() != generation {
-                return;
-            }
-            match decoded {
-                Ok(Some(cached)) => {
-                    picture.set_file(Some(&gio::File::for_path(cached)));
-                    stack.set_visible_child_name("image");
-                }
-                _ => {
-                    words.set_label(
-                        "No preview for this picture.\nIt needs ffmpeg on the machine to decode.",
-                    );
-                    stack.set_visible_child_name("text");
-                }
-            }
-        });
+        glib::MainContext::default().spawn_local(preview_image_outside(
+            path.to_string(),
+            ui.preview_picture.clone(),
+            ui.preview_stack.clone(),
+            ui.preview.clone(),
+            live_generation,
+            generation,
+        ));
         return;
     }
 
@@ -19236,6 +19417,11 @@ fn set_preview_image(ui: &Ui, path: &str) {
     // rather than full size, and fall back to the outside decoder and then to
     // words. A very large picture also stops holding the window still while
     // it decodes.
+    //
+    // D-362: a decode that never answers (an RLE8 BMP with a negative height
+    // left the pane on "Opening preview..." for good) is given
+    // PREVIEW_DECODE_SECONDS, then the outside decoders take over. Whatever
+    // happens, the pane ends on a picture or on a sentence saying what failed.
     let source = path.to_string();
     let picture = ui.preview_picture.clone();
     let stack = ui.preview_stack.clone();
@@ -19244,13 +19430,33 @@ fn set_preview_image(ui: &Ui, path: &str) {
     ui.preview_picture.set_paintable(None::<&gdk::Paintable>);
     ui.preview.set_label("Opening preview\u{2026}");
     ui.preview_stack.set_visible_child_name("text");
+    // 0 = decoding, 1 = settled, 2 = timed out and handed to the outside decoders.
+    let phase = Rc::new(Cell::new(0u8));
+    {
+        let (source, picture, stack, words, live_generation, phase) = (
+            source.clone(),
+            picture.clone(),
+            stack.clone(),
+            words.clone(),
+            live_generation.clone(),
+            phase.clone(),
+        );
+        glib::MainContext::default().spawn_local(async move {
+            glib::timeout_future_seconds(PREVIEW_DECODE_SECONDS).await;
+            if phase.get() == 0 && live_generation.get() == generation {
+                phase.set(2);
+                eprintln!("wf-event: preview decode of {source:?} timed out, trying ffmpeg and ImageMagick");
+                preview_image_outside(source, picture, stack, words, live_generation, generation).await;
+            }
+        });
+    }
     glib::MainContext::default().spawn_local(async move {
         // The header alone says how big it is, so the decode can scale down
         // without ever scaling up: `from_stream_at_scale` with a width would
         // blow a 16px icon up to the pane and show a blurred smear, and -1
         // means "leave this dimension alone".
         let header = Pixbuf::file_info_future(source.clone()).await;
-        if live_generation.get() != generation {
+        if live_generation.get() != generation || phase.get() == 2 {
             return;
         }
         let too_big = matches!(
@@ -19265,9 +19471,10 @@ fn set_preview_image(ui: &Ui, path: &str) {
                 .ok(),
             Err(_) => None,
         };
-        if live_generation.get() != generation {
+        if live_generation.get() != generation || phase.get() == 2 {
             return;
         }
+        phase.set(1);
         if let Some(pixbuf) = decoded {
             #[allow(deprecated)]
             let texture = gdk::Texture::for_pixbuf(&pixbuf);
@@ -19275,35 +19482,53 @@ fn set_preview_image(ui: &Ui, path: &str) {
             stack.set_visible_child_name("image");
             return;
         }
-        // Nothing here could read it. The outside decoder is the last resort,
-        // the same one AVIF and HEIC take.
-        let fallback_source = source.clone();
-        let cached = gio::spawn_blocking(move || {
-            transcoded_thumbnail_file(&fallback_source, PREVIEW_DECODE_WIDTH)
-        })
-        .await;
-        if live_generation.get() != generation {
-            return;
-        }
-        match cached {
-            Ok(Some(cached)) => {
-                picture.set_file(Some(&gio::File::for_path(cached)));
-                stack.set_visible_child_name("image");
-            }
-            _ => {
-                note_media_failure(
-                    &source,
-                    "preview: nothing on this machine could decode it",
-                    "gdk-pixbuf and the outside decoder both refused it",
-                );
-                words.set_label(&format!(
-                    "No preview for this picture.\n{}",
-                    native_core::damaged_file_reason(&source, "picture")
-                ));
-                stack.set_visible_child_name("text");
-            }
-        }
+        // Nothing here could read it. The outside decoders are the last
+        // resort, the same ones AVIF and HEIC take.
+        preview_image_outside(source, picture, stack, words, live_generation, generation).await;
     });
+}
+
+/// D-362: how long gdk-pixbuf gets before the outside decoders step in.
+const PREVIEW_DECODE_SECONDS: u32 = 6;
+
+/// D-362: the last resort for a picture, shared by every way a preview can
+/// fail: ffmpeg, then ImageMagick, into a cached PNG, off the main thread.
+/// It always ends on a picture or on a sentence saying what failed.
+async fn preview_image_outside(
+    source: String,
+    picture: gtk::Picture,
+    stack: gtk::Stack,
+    words: gtk::Label,
+    live_generation: Rc<Cell<u64>>,
+    generation: u64,
+) {
+    let fallback_source = source.clone();
+    let cached = gio::spawn_blocking(move || {
+        transcoded_thumbnail_file(&fallback_source, PREVIEW_DECODE_WIDTH)
+    })
+    .await;
+    if live_generation.get() != generation {
+        return;
+    }
+    match cached {
+        Ok(Some(cached)) => {
+            picture.set_file(Some(&gio::File::for_path(cached)));
+            stack.set_visible_child_name("image");
+        }
+        _ => {
+            note_media_failure(
+                &source,
+                "preview: nothing on this machine could decode it",
+                "gdk-pixbuf, ffmpeg and ImageMagick all refused it",
+            );
+            words.set_label(&format!(
+                "No preview for this picture.\n{}\n{}",
+                native_core::damaged_file_reason(&source, "picture"),
+                native_viewers::image_failure_hint()
+            ));
+            stack.set_visible_child_name("text");
+        }
+    }
 }
 
 fn set_preview_media(ui: &Ui, path: &str) {
@@ -19313,6 +19538,16 @@ fn set_preview_media(ui: &Ui, path: &str) {
     // Moving to any other kind of file silences a song; see
     // `stop_preview_audio`.
     stop_preview_audio(ui);
+    // D-362: containers GStreamer here is not trusted with show one frame and
+    // the length, the same as a video it fails to play.
+    if native_core::video_frame_only(path) {
+        ui.preview_media_controls
+            .set_media_stream(None::<&gtk::MediaStream>);
+        ui.preview_media_picture
+            .set_paintable(None::<&gdk::Paintable>);
+        set_preview_video_frame(ui, path, "This video format is not played in the pane.");
+        return;
+    }
     let file = gio::File::for_path(PathBuf::from(path));
     let media = gtk::MediaFile::for_file(&file);
     let zoom = preview_zoom_for(ui);
@@ -19326,6 +19561,251 @@ fn set_preview_media(ui: &Ui, path: &str) {
     ui.preview_media_picture.set_paintable(Some(&media));
     ui.preview_media_controls.set_media_stream(Some(&media));
     ui.preview_stack.set_visible_child_name("media");
+    // D-362: a video GStreamer cannot play used to sit as a black box. It now
+    // falls back to a frame from ffmpeg and the duration.
+    let generation = ui.preview_generation.get();
+    let ui_for_error = ui.clone();
+    let path_for_error = path.to_string();
+    media.connect_error_notify(move |m| {
+        if m.error().is_none() || ui_for_error.preview_generation.get() != generation {
+            return;
+        }
+        ui_for_error
+            .preview_media_controls
+            .set_media_stream(None::<&gtk::MediaStream>);
+        ui_for_error
+            .preview_media_picture
+            .set_paintable(None::<&gdk::Paintable>);
+        set_preview_video_frame(&ui_for_error, &path_for_error, "This video cannot be played in the pane.");
+    });
+}
+
+/// D-362: one frame from ffmpeg plus the duration, for a video the player
+/// cannot play. Never blocks the main loop; a newer selection wins.
+fn set_preview_video_frame(ui: &Ui, path: &str, why: &str) {
+    let generation = ui.preview_generation.get();
+    let live = ui.preview_generation.clone();
+    let panes = ui.viewers.clone();
+    let stack = ui.preview_stack.clone();
+    let words = ui.preview.clone();
+    let (source, why) = (path.to_string(), why.to_string());
+    panes.frame_button.set_visible(false);
+    panes.frame_picture.set_paintable(None::<&gdk::Paintable>);
+    panes.frame_info.set_text("");
+    words.set_label("Opening preview\u{2026}");
+    stack.set_visible_child_name("text");
+    glib::MainContext::default().spawn_local(async move {
+        let src = source.clone();
+        let made = gio::spawn_blocking(move || {
+            (
+                transcoded_thumbnail_file(&src, PREVIEW_DECODE_WIDTH),
+                native_viewers::video_duration_secs(&src),
+            )
+        })
+        .await;
+        if live.get() != generation {
+            return;
+        }
+        match made {
+            Ok((Some(png), duration)) => {
+                panes.frame_picture.set_file(Some(&gio::File::for_path(png)));
+                let length = duration
+                    .map(|d| format!("\nLength {}", native_viewers::clock(d)))
+                    .unwrap_or_default();
+                panes.frame_info.set_text(&format!("{why}{length}"));
+                stack.set_visible_child_name("frame");
+            }
+            _ => {
+                words.set_label(&format!(
+                    "{why}\nNo frame could be read. Install ffmpeg to see a frame of videos like this."
+                ));
+                stack.set_visible_child_name("text");
+            }
+        }
+    });
+}
+
+/// D-362: Flash. The header is read here, a frame comes from ffmpeg when it
+/// can read the file, and a button hands the file to Ruffle.
+fn set_preview_swf(ui: &Ui, path: &str) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
+    stop_preview_audio(ui);
+    ui.preview_media_controls
+        .set_media_stream(None::<&gtk::MediaStream>);
+    ui.preview_media_picture
+        .set_paintable(None::<&gdk::Paintable>);
+    let generation = ui.preview_generation.get();
+    let live = ui.preview_generation.clone();
+    let panes = ui.viewers.clone();
+    let stack = ui.preview_stack.clone();
+    let words = ui.preview.clone();
+    let source = path.to_string();
+    *panes.frame_path.borrow_mut() = source.clone();
+    panes.frame_picture.set_paintable(None::<&gdk::Paintable>);
+    panes.frame_button.set_visible(true);
+    panes.frame_button.set_sensitive(false);
+    words.set_label("Opening preview\u{2026}");
+    stack.set_visible_child_name("text");
+    glib::MainContext::default().spawn_local(async move {
+        let src = source.clone();
+        let made = gio::spawn_blocking(move || {
+            (
+                native_viewers::read_swf_info(&src),
+                native_viewers::ruffle_installed(),
+                transcoded_thumbnail_file(&src, PREVIEW_DECODE_WIDTH),
+            )
+        })
+        .await;
+        if live.get() != generation {
+            return;
+        }
+        let Ok((info, ruffle, frame)) = made else {
+            words.set_label("No preview for this Flash file.\nThe preview worker stopped.");
+            return;
+        };
+        panes.frame_info.set_text(&native_viewers::swf_description(&info));
+        match frame {
+            Some(png) => panes.frame_picture.set_file(Some(&gio::File::for_path(png))),
+            None => panes.frame_picture.set_paintable(None::<&gdk::Paintable>),
+        }
+        if ruffle {
+            panes.frame_button.set_label("Play in Ruffle");
+            panes.frame_button.set_sensitive(true);
+        } else {
+            panes
+                .frame_button
+                .set_label("Install Ruffle (Flathub: rs.ruffle.Ruffle) to play Flash files");
+            panes.frame_button.set_sensitive(false);
+        }
+        stack.set_visible_child_name("frame");
+    });
+}
+
+/// How wide a page is drawn: the pane's width in device pixels.
+fn doc_render_width(p: &ViewerPanes) -> i32 {
+    let w = p.doc_root.width();
+    let w = if w < 200 { 700 } else { w };
+    (w - 20).max(200) * p.doc_root.scale_factor().max(1)
+}
+
+fn doc_update_nav(p: &ViewerPanes) {
+    let st = p.doc.borrow();
+    p.doc_label.set_text(&format!("Page {} of {}", st.page, st.pages));
+    p.doc_prev.set_sensitive(st.page > 1);
+    p.doc_next.set_sensitive(st.page < st.pages);
+}
+
+/// D-362: turn the page. A page that finishes after another turn, or after
+/// the selection moved on, is dropped.
+fn doc_turn(p: &ViewerPanes, live: &Rc<Cell<u64>>, delta: i64) {
+    let (pdf, page, seq, generation, cancel, pages) = {
+        let mut st = p.doc.borrow_mut();
+        let Some(pdf) = st.pdf.clone() else { return };
+        let target = (st.page as i64 + delta).clamp(1, st.pages as i64) as u32;
+        if target == st.page {
+            return;
+        }
+        st.page = target;
+        st.seq += 1;
+        (pdf, target, st.seq, st.generation, st.cancel.clone(), st.pages)
+    };
+    doc_update_nav(p);
+    let width = doc_render_width(p);
+    let (p, live) = (p.clone(), live.clone());
+    glib::MainContext::default().spawn_local(async move {
+        let drawn =
+            gio::spawn_blocking(move || native_viewers::render_pdf_page(&pdf, page, width, &cancel))
+                .await;
+        let current = p.doc.borrow().seq == seq && live.get() == generation;
+        if !current {
+            return;
+        }
+        match drawn {
+            Ok(Ok(png)) => p.doc_picture.set_file(Some(&gio::File::for_path(png))),
+            Ok(Err(message)) => p.doc_label.set_text(&format!("Page {page} of {pages}: {message}")),
+            Err(_) => {}
+        }
+    });
+}
+
+/// D-362: PDFs, office documents, PostScript and web pages, shown as pages.
+/// The conversion and every page are drawn on a worker; changing the
+/// selection kills the converter and drops whatever it was making.
+fn set_preview_document(ui: &Ui, path: &str, kind: native_viewers::DocKind) {
+    if !ui.preview_scroll.is_visible() {
+        return;
+    }
+    stop_preview_audio(ui);
+    ui.preview_media_controls
+        .set_media_stream(None::<&gtk::MediaStream>);
+    ui.preview_media_picture
+        .set_paintable(None::<&gdk::Paintable>);
+    if let Some(message) = native_viewers::missing_tool_message(kind) {
+        set_preview_text(ui, &message);
+        return;
+    }
+    let generation = ui.preview_generation.get();
+    let panes = ui.viewers.clone();
+    {
+        let mut st = panes.doc.borrow_mut();
+        st.cancel = Arc::new(AtomicBool::new(false));
+        st.pdf = None;
+        st.page = 0;
+        st.pages = 0;
+        st.seq += 1;
+        st.generation = generation;
+    }
+    let cancel = panes.doc.borrow().cancel.clone();
+    let is_html = kind == native_viewers::DocKind::Html;
+    panes.doc_source_toggle.set_active(false);
+    panes.doc_source_toggle.set_visible(is_html);
+    if is_html {
+        panes
+            .doc_source_label
+            .set_text(&native_core::read_text_preview(path).unwrap_or_default());
+    }
+    panes.doc_picture.set_paintable(None::<&gdk::Paintable>);
+    set_preview_text(ui, "Preparing preview\u{2026}");
+    let live = ui.preview_generation.clone();
+    let stack = ui.preview_stack.clone();
+    let words = ui.preview.clone();
+    let width = doc_render_width(&panes);
+    let source = PathBuf::from(path);
+    glib::MainContext::default().spawn_local(async move {
+        let made = gio::spawn_blocking(move || {
+            let pdf = native_viewers::pdf_for(&source, kind, &cancel)?;
+            let pages = native_viewers::pdf_page_count(&pdf)?;
+            let png = native_viewers::render_pdf_page(&pdf, 1, width, &cancel)?;
+            Ok::<_, String>((pdf, pages, png))
+        })
+        .await;
+        if live.get() != generation {
+            return;
+        }
+        match made {
+            Ok(Ok((pdf, pages, png))) => {
+                {
+                    let mut st = panes.doc.borrow_mut();
+                    st.pdf = Some(pdf);
+                    st.page = 1;
+                    st.pages = pages;
+                }
+                doc_update_nav(&panes);
+                panes.doc_picture.set_file(Some(&gio::File::for_path(png)));
+                stack.set_visible_child_name("doc");
+            }
+            Ok(Err(message)) => {
+                words.set_label(&format!("No preview for this document.\n{message}"));
+                stack.set_visible_child_name("text");
+            }
+            Err(_) => {
+                words.set_label("No preview for this document.\nThe preview worker stopped.");
+                stack.set_visible_child_name("text");
+            }
+        }
+    });
 }
 
 fn plural(count: usize) -> &'static str {
