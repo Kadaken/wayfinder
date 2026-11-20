@@ -2587,6 +2587,9 @@ struct AppState {
     /// Last drive scan (with space), filled off the window thread. The sidebar and
     /// row activation read only this, never a fresh scan.
     drives: Vec<Drive>,
+    /// D-347: the next repopulate is a refresh of the same folder: change only
+    /// the rows that changed, so the list keeps its place and focus row.
+    diff_refresh: bool,
     drive_refresh_in_flight: bool,
     /// A refresh was asked for while one ran; run once more when it lands.
     drive_refresh_again: bool,
@@ -4053,7 +4056,49 @@ fn start_guide_watch(state: &Rc<RefCell<AppState>>) {
     guide_apply(state, request);
 }
 
+/// D-346: when the process started, for the startup timing log.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// D-346: one line per startup milestone in ~/.cache/wayfinder/startup.log,
+/// each label once per process and only in the first minute.
+#[cfg(not(test))]
+fn startup_mark(what: &'static str) {
+    thread_local! {
+        static SEEN: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+    let Some(start) = PROCESS_START.get() else { return };
+    let ms = start.elapsed().as_millis();
+    if ms > 60_000 || SEEN.with(|s| s.borrow().contains(&what)) {
+        return;
+    }
+    SEEN.with(|s| s.borrow_mut().push(what));
+    let dir = glib::user_cache_dir().join("wayfinder");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "pid {} {what}: {ms}ms", std::process::id());
+    }
+}
+
+#[cfg(test)]
+fn startup_mark(_what: &'static str) {}
+
+/// D-346: the worker-thread form; logs only the first call per process.
+fn startup_mark_any_thread(what: &'static str) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if cfg!(test) || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(start) = PROCESS_START.get() else { return };
+    let dir = glib::user_cache_dir().join("wayfinder");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "pid {} {what}: {}ms", std::process::id(), start.elapsed().as_millis());
+    }
+}
+
 fn main() {
+    let _ = PROCESS_START.set(Instant::now());
     // First, before anything can fail: a crash that says nothing is a bug
     // report nobody can file.
     crash::install("wayfinder");
@@ -4476,7 +4521,8 @@ fn build_ui_in(
         thumbnail_queue: None,
         video_poster_queue: None,
         zip_open_cache_roots: Rc::new(RefCell::new(Vec::new())),
-        drives: Vec::new(),
+        drives: remembered_drives(),
+        diff_refresh: false,
         drive_refresh_in_flight: false,
         drive_refresh_again: false,
         drive_scan: drive_scan(),
@@ -5281,6 +5327,7 @@ fn build_ui_in(
 
     rebuild_tabs(&state, &ui);
     rebuild_sidebar(&state, &ui);
+    startup_mark("window built, sidebar drawn");
     if picker.is_none() && !embedded {
         sweep_expired_trash(&state, &ui);
     }
@@ -9662,6 +9709,7 @@ fn navigate_to_with_message(
                 ui.path_stack.set_visible_child_name("label");
                 ui.search.set_text("");
                 set_preview_text(ui, "Select a file");
+                state.borrow_mut().diff_refresh = same_folder;
                 repopulate_rows(&state, ui);
                 update_selection(&state, ui);
                 update_nav_buttons(&state, ui);
@@ -9678,6 +9726,7 @@ fn navigate_to_with_message(
                 if let Some(target) = opened_on {
                     select_entry_by_source(&state, ui, &native_core::EntrySource::real(&target));
                 }
+                startup_mark("first folder listed");
                 ui.status.set_label(&listing_status(
                     item_count,
                     metadata_unavailable,
@@ -9966,7 +10015,11 @@ fn apply_monitor_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, listing: native_co
         listing.metadata_unavailable,
         listing.unreadable_entries,
     );
-    state.borrow_mut().entries = listing.entries;
+    {
+        let mut st = state.borrow_mut();
+        st.entries = listing.entries;
+        st.diff_refresh = true;
+    }
     repopulate_rows(state, ui);
     restore_selection(state, ui, &selected);
     update_selection(state, ui);
@@ -10046,6 +10099,19 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
             use std::io::Write as _;
             let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
             let _ = writeln!(f, "{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}", adj.upper() - adj.page_size());
+            // A big jump also records who moved it: our functions and GTK's,
+            // so the next one names the exact call, not a guess.
+            if (to - from).abs() > 1000.0 {
+                let trace = std::backtrace::Backtrace::force_capture().to_string();
+                for line in trace
+                    .lines()
+                    .filter(|l| l.contains("native::") || l.contains("gtk_") || l.contains("_gtk"))
+                    .filter(|l| !l.contains("watch_scroll_jumps"))
+                    .take(14)
+                {
+                    let _ = writeln!(f, "      {}", line.trim());
+                }
+            }
         }
     });
 }
@@ -11042,6 +11108,74 @@ fn selected_indices(ui: &Ui) -> Vec<usize> {
     out
 }
 
+/// D-347: whether a refreshed entry looks the same as the row on screen.
+fn same_row(a: &Entry, b: &Entry) -> bool {
+    a.source == b.source
+        && a.name == b.name
+        && a.is_dir == b.is_dir
+        && a.size == b.size
+        && a.modified == b.modified
+        && a.icon == b.icon
+        && a.metadata_error == b.metadata_error
+}
+
+/// D-347: brings the list model to `new` by removing and inserting only the
+/// rows that differ. Replacing every row made GTK move its focus row to the
+/// first item and scroll there a moment after the scroll was restored: after
+/// a move he was thrown to the top (scroll-jumps.log, 19 Nov 2026: 3868 -> 0,
+/// 10291 -> 0). Falls back to one full replace when the surviving rows are in
+/// a different order (a re-sort), where keeping rows means nothing.
+fn update_list_model(store: &gio::ListStore, new: &[Entry], rebind: &[native_core::EntrySource]) {
+    let old: Vec<Entry> = (0..store.n_items())
+        .filter_map(|i| store.item(i).and_then(|o| o.downcast::<glib::BoxedAnyObject>().ok()))
+        .map(|b| b.borrow::<Entry>().clone())
+        .collect();
+    let full = || {
+        let items: Vec<glib::BoxedAnyObject> = new.iter().cloned().map(glib::BoxedAnyObject::new).collect();
+        store.splice(0, store.n_items(), &items);
+    };
+    if old.is_empty() || new.is_empty() || old.len() as u32 != store.n_items() {
+        full();
+        return;
+    }
+    let new_set: HashSet<&native_core::EntrySource> = new.iter().map(|e| &e.source).collect();
+    let old_set: HashSet<&native_core::EntrySource> = old.iter().map(|e| &e.source).collect();
+    let same_order = old
+        .iter()
+        .filter(|e| new_set.contains(&e.source))
+        .map(|e| &e.source)
+        .eq(new.iter().filter(|e| old_set.contains(&e.source)).map(|e| &e.source));
+    if !same_order {
+        full();
+        return;
+    }
+    let (mut i, mut j, mut pos) = (0usize, 0usize, 0u32);
+    while i < old.len() || j < new.len() {
+        let mut removed = 0u32;
+        while i < old.len() && !new_set.contains(&old[i].source) {
+            i += 1;
+            removed += 1;
+        }
+        let mut inserted = Vec::new();
+        while j < new.len() && !old_set.contains(&new[j].source) {
+            inserted.push(glib::BoxedAnyObject::new(new[j].clone()));
+            j += 1;
+        }
+        if removed > 0 || !inserted.is_empty() {
+            store.splice(pos, removed, &inserted);
+            pos += inserted.len() as u32;
+        }
+        if i < old.len() && j < new.len() {
+            if !same_row(&old[i], &new[j]) || rebind.contains(&new[j].source) {
+                store.splice(pos, 1, &[glib::BoxedAnyObject::new(new[j].clone())]);
+            }
+            i += 1;
+            j += 1;
+            pos += 1;
+        }
+    }
+}
+
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // D-245: the strip belongs to the folder on screen, so it is rebuilt with
     // the rows, not left behind from the last folder.
@@ -11093,16 +11227,29 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // No row is forced out of its sorted place. A file the window was opened
     // on is selected (see navigation), not moved: it sits where the chosen sort
     // and the folder placement put it, like every other file.
+    let diff = std::mem::take(&mut state.borrow_mut().diff_refresh)
+        && view_mode != ViewMode::Grid
+        // Test-only: proves the place tests catch the old full replace.
+        && !(cfg!(test) && std::env::var_os("WF_TEST_FULL_SPLICE").is_some());
+    let mut rebind: Vec<native_core::EntrySource> = Vec::new();
     {
         let boundary = group_boundary_index(&visible_entries, placement)
             .map(|index| visible_entries[index].source.clone());
-        state.borrow_mut().group_boundary = boundary;
+        // D-347: a kept row is not rebound, so the rows that gain or lose the
+        // group divider are replaced on purpose.
+        rebind.extend(boundary.clone());
+        let old = std::mem::replace(&mut state.borrow_mut().group_boundary, boundary);
+        rebind.extend(old);
     }
 
     let (thumbnail_queue, video_poster_queue) = {
         let mut state_ref = state.borrow_mut();
-        if let Some(previous) = state_ref.thumbnail_queue.take() {
-            previous.borrow().cancelled.cancel();
+        // D-347: a same-folder refresh keeps the queue, because the rows it
+        // is decoding for stay on screen and are not bound again.
+        if !diff {
+            if let Some(previous) = state_ref.thumbnail_queue.take() {
+                previous.borrow().cancelled.cancel();
+            }
         }
         if let Some(previous) = state_ref.video_poster_queue.take() {
             let previous_ref = previous.borrow();
@@ -11116,6 +11263,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         // view wants it only while the setting is on. Turning the setting off
         // takes this same branch, cancels the old queue and leaves none.
         let thumbs = (view_mode == ViewMode::Grid || details_thumbnails).then(|| {
+            if let Some(kept) = state_ref.thumbnail_queue.clone() {
+                return kept;
+            }
             let queue = Rc::new(RefCell::new(ThumbnailQueue {
                 cancelled: gio::Cancellable::new(),
                 pending: VecDeque::new(),
@@ -11158,9 +11308,13 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             .cloned()
             .map(glib::BoxedAnyObject::new)
             .collect();
-        // One splice: the old rows out and the new rows in, in a single change,
-        // so the list is never momentarily empty (D-226).
-        ui.list_store.splice(0, ui.list_store.n_items(), &items);
+        if diff {
+            update_list_model(&ui.list_store, &visible_entries, &rebind);
+        } else {
+            // One splice: the old rows out and the new rows in, in a single
+            // change, so the list is never momentarily empty (D-226).
+            ui.list_store.splice(0, ui.list_store.n_items(), &items);
+        }
     } else {
         ui.list_store.remove_all();
     }
@@ -14569,7 +14723,9 @@ fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
     let scan = state.borrow().drive_scan.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(scan());
+        let drives = scan();
+        startup_mark_any_thread("first drive scan finished on its worker");
+        let _ = tx.send(drives);
     });
     let weak = Rc::downgrade(state);
     glib::timeout_add_local(Duration::from_millis(40), move || {
@@ -14590,6 +14746,7 @@ fn request_drive_refresh(state: &Rc<RefCell<AppState>>) {
             return glib::ControlFlow::Break;
         };
         if let Some(drives) = result {
+            startup_mark("first drive scan arrived");
             apply_drive_scan(&state, &ui, drives);
             #[cfg(feature = "guide")]
             guide_sync_crucial(&state, &ui);
@@ -14629,6 +14786,7 @@ fn apply_drive_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, scanned: Vec<Drive>)
         native_core::DriveChange::Same => true,
         native_core::DriveChange::SpaceOnly => match update_drive_space(state, ui, &scanned) {
             Ok(()) => {
+                remember_drives(&scanned);
                 state.borrow_mut().drives = scanned.clone();
                 true
             }
@@ -14647,6 +14805,7 @@ fn apply_drive_scan(state: &Rc<RefCell<AppState>>, ui: &Ui, scanned: Vec<Drive>)
         state.borrow_mut().drives_pending = Some(scanned);
         return;
     }
+    remember_drives(&scanned);
     {
         let mut state = state.borrow_mut();
         state.drives = scanned;
@@ -18557,6 +18716,37 @@ fn note_job_poll_tick() {
 
 #[cfg(not(test))]
 fn note_job_poll_tick() {}
+
+/// D-346: the drives from the last scan, so the sidebar lists them at the
+/// first paint instead of after the first scan lands. The live scan replaces
+/// them a moment later, so an unplugged drive is gone at once.
+#[cfg(not(test))]
+fn remembered_drives() -> Vec<Drive> {
+    std::fs::read(glib::user_cache_dir().join("wayfinder").join("drives.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn remembered_drives() -> Vec<Drive> {
+    Vec::new()
+}
+
+#[cfg(not(test))]
+fn remember_drives(drives: &[Drive]) {
+    let dir = glib::user_cache_dir().join("wayfinder");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_vec(drives) {
+        let tmp = dir.join("drives.json.new");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, dir.join("drives.json"));
+        }
+    }
+}
+
+#[cfg(test)]
+fn remember_drives(_drives: &[Drive]) {}
 
 /// The real scan, or in tests a synthetic one; tests never touch a real drive.
 #[cfg(not(test))]
@@ -23339,6 +23529,12 @@ Broken: Either state is wrong.\n";
             "GTK tests must run on the virtual X display, got {}",
             display.name()
         );
+        // A quick run of the place-keeping tests alone, for iterating on them.
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("place") {
+            split_same_folder_move_into_subfolder_keeps_place_d343();
+            eprintln!("wf-test place-only run done");
+            return;
+        }
         // First: earlier tests leave modal dialogs that would swallow real pointer input.
         real_pointer_drag_carries_the_press_time_selection();
         enumerated_choice_label_lands_in_the_real_widget_tree();
@@ -26432,6 +26628,17 @@ Broken: Either state is wrong.\n";
         for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
         let (after, right_after) = (adj.value(), right_adj.value());
         eprintln!("wf-test D-343 left {before} -> {after}, right {right_before} -> {right_after}");
+        // D-348: what his screen does next. When the drag ends the window gets
+        // focus back and the list re-focuses its focus row. With every row
+        // replaced that row was the first one, and the list scrolled to it:
+        // the jump to the top in his video (19 Nov 2026, 22:33).
+        pane_ui.list.grab_focus();
+        for _ in 0..10 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        ui.list.grab_focus();
+        for _ in 0..40 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let refocused = adj.value();
+        eprintln!("wf-test D-348 left after refocus {after} -> {refocused}");
+        assert!((refocused - before).abs() < 80.0, "D-348: refocusing the list kept its place ({before} -> {refocused})");
         assert!((after - before).abs() < 80.0, "D-343: the left pane kept its place ({before} -> {after})");
         assert!((right_after - right_before).abs() < 80.0, "D-343: the right pane kept its place ({right_before} -> {right_after})");
 

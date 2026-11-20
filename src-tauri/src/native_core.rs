@@ -4,7 +4,7 @@
 use adw::gtk::gio;
 use adw::gtk::gio::prelude::FileExt;
 use adw::gtk::glib;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::fs;
@@ -119,7 +119,7 @@ pub struct FileProperties {
     pub items: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drive {
     pub name: String,
     pub path: String,
@@ -132,7 +132,7 @@ pub struct Drive {
     pub space: Option<Space>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Space {
     pub total: u64,
     pub available: u64,
