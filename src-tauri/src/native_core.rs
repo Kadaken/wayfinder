@@ -3604,6 +3604,7 @@ pub fn conflict_response(response: &str) -> Option<PasteConflict> {
     match response {
         "replace" => Some(PasteConflict::Replace),
         "duplicate" => Some(PasteConflict::KeepBoth),
+        "add_number" => Some(PasteConflict::KeepBothPlainNumber),
         _ => None,
     }
 }
@@ -3613,6 +3614,9 @@ pub fn conflict_response(response: &str) -> Option<PasteConflict> {
 pub enum PasteConflict {
     /// Paste alongside, as "name (2)". Never destroys anything.
     KeepBoth,
+    /// D-361: paste alongside, with a plain number on the end of the name and
+    /// no space or brackets: "Sheree2.jpg", "Sheree3.jpg". Never destroys anything.
+    KeepBothPlainNumber,
     /// Overwrite the existing item. DESTRUCTIVE and not undoable — the undo
     /// stack can move the pasted item back out, but whatever was overwritten is
     /// already gone.
@@ -4246,17 +4250,14 @@ fn plan_transfer_items(
         let planned = |p: &Path| plan.iter().any(|item| item.dest == p);
         let (dest, kind) = if entry_exists(&target)? || planned(&target) {
             match on_conflict {
-                PasteConflict::KeepBoth => {
-                    let (stem, ext) = match name.rfind('.') {
-                        Some(i) if i > 0 => (&name[..i], &name[i..]),
-                        _ => (name, ""),
-                    };
+                PasteConflict::KeepBoth | PasteConflict::KeepBothPlainNumber => {
+                    let plain = on_conflict == PasteConflict::KeepBothPlainNumber;
                     let mut n = 1;
                     let candidate = loop {
                         let cand = if n == 1 {
                             Path::new(dest_dir).join(name)
                         } else {
-                            Path::new(dest_dir).join(format!("{stem} ({n}){ext}"))
+                            Path::new(dest_dir).join(numbered_name(name, n, plain))
                         };
                         n += 1;
                         if !entry_exists(&cand)? && !planned(&cand) {
@@ -5897,19 +5898,34 @@ fn file_contains(path: &Path, query: &str) -> bool {
     String::from_utf8_lossy(&buf).to_lowercase().contains(query)
 }
 
+/// The name for attempt `n` (2, 3...) of a clashing `name`. `plain` false is
+/// "stem (n).ext" (Duplicate); true is "stemn.ext" (D-361, no space or
+/// brackets). A leading dot is not an extension, so ".bashrc" is all stem.
+fn numbered_name(name: &str, n: u32, plain: bool) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    if plain {
+        format!("{stem}{n}{ext}")
+    } else {
+        format!("{stem} ({n}){ext}")
+    }
+}
+
 fn unique_target(dest_dir: &str, name: &str) -> PathBuf {
+    unique_target_styled(dest_dir, name, false)
+}
+
+fn unique_target_styled(dest_dir: &str, name: &str, plain: bool) -> PathBuf {
     let base = Path::new(dest_dir);
     let first = base.join(name);
     if !first.exists() {
         return first;
     }
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
-    };
     let mut n = 2;
     loop {
-        let cand = base.join(format!("{} ({}){}", stem, n, ext));
+        let cand = base.join(numbered_name(name, n, plain));
         if !cand.exists() {
             return cand;
         }
@@ -5928,13 +5944,9 @@ fn unique_link_target(dest_dir: &str, name: &str) -> PathBuf {
     if !taken(&first) {
         return first;
     }
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
-    };
     let mut n = 2;
     loop {
-        let cand = base.join(format!("{} ({}){}", stem, n, ext));
+        let cand = base.join(numbered_name(name, n, false));
         if !taken(&cand) {
             return cand;
         }
@@ -8698,6 +8710,46 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
         assert_eq!(fs::read(&a).unwrap(), b"a");
         assert_eq!(fs::read(&b).unwrap(), b"b");
         assert!(!d.join("dest/a.txt").exists() && !d.join("dest/b.txt").exists());
+    }
+
+    #[test]
+    fn plain_number_names_d361() {
+        let d = scratch_case("wf-addnum");
+        let dir = d.to_string_lossy().to_string();
+        for name in ["Sheree.jpg", "IMG_1103.JPG", "README", ".bashrc"] {
+            fs::write(d.join(name), b"x").unwrap();
+        }
+        let next = |name: &str| unique_target_styled(&dir, name, true);
+        assert_eq!(next("Sheree.jpg"), d.join("Sheree2.jpg"));
+        fs::write(d.join("Sheree2.jpg"), b"x").unwrap();
+        assert_eq!(next("Sheree.jpg"), d.join("Sheree3.jpg"));
+        assert_eq!(next("IMG_1103.JPG"), d.join("IMG_11032.JPG"));
+        assert_eq!(next("README"), d.join("README2"));
+        assert_eq!(next(".bashrc"), d.join(".bashrc2"));
+        assert_eq!(next("free.txt"), d.join("free.txt"));
+        // Duplicate's format is unchanged
+        assert_eq!(unique_target(&dir, "Sheree.jpg"), d.join("Sheree (2).jpg"));
+    }
+
+    #[test]
+    fn paste_with_plain_number_keeps_both_d361() {
+        let d = scratch_case("wf-addnum-paste");
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("dest")).unwrap();
+        fs::write(d.join("src/Sheree.jpg"), b"NEW").unwrap();
+        fs::write(d.join("dest/Sheree.jpg"), b"OLD").unwrap();
+        let src = d.join("src/Sheree.jpg").to_string_lossy().to_string();
+        let dest = d.join("dest").to_string_lossy().to_string();
+        let mode = conflict_response("add_number").unwrap();
+        let out = resolve_paste(&[src.clone()], &dest, true, mode).unwrap();
+        assert!(out[0].to.ends_with("Sheree2.jpg"));
+        assert_eq!(fs::read(d.join("dest/Sheree.jpg")).unwrap(), b"OLD");
+        assert_eq!(fs::read(d.join("dest/Sheree2.jpg")).unwrap(), b"NEW");
+        assert_eq!(fs::read(&src).unwrap(), b"NEW");
+        // a second paste takes the next free number
+        let again = resolve_paste(&[src], &dest, true, mode).unwrap();
+        assert!(again[0].to.ends_with("Sheree3.jpg"));
+        assert_eq!(fs::read(d.join("dest/Sheree.jpg")).unwrap(), b"OLD");
     }
 
     #[test]

@@ -14070,7 +14070,7 @@ fn cut_consumes_offer(cut_offer: Option<u64>, succeeded: bool, now: u64) -> bool
     succeeded && cut_offer == Some(now)
 }
 
-/// Replace / Duplicate / Cancel. Escape or closing the window is Cancel.
+/// Replace / Duplicate / Add 2 / Cancel. Escape or closing the window is Cancel.
 /// Heading and optional detail. One clash: heading only. Several: the names and
 /// the one-choice-applies-to-all statement, and no explanation of the buttons.
 fn conflict_dialog_text(conflicts: &[String]) -> (String, Option<String>) {
@@ -14126,6 +14126,7 @@ fn show_conflict_dialog<F>(
     dialog.add_responses(&[
         ("cancel", "Cancel"),
         ("duplicate", "Duplicate"),
+        ("add_number", "Add 2"),
         ("replace", "Overwrite"),
     ]);
     dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
@@ -20162,7 +20163,12 @@ mod tests {
             assert_eq!(m, native_core::PasteConflict::KeepBoth);
             started.set(started.get() + 1);
         });
-        assert_eq!(started.get(), 2);
+        // D-361: the fourth choice keeps both with a plain number on the name
+        apply_conflict_response("add_number", |m| {
+            assert_eq!(m, native_core::PasteConflict::KeepBothPlainNumber);
+            started.set(started.get() + 1);
+        });
+        assert_eq!(started.get(), 3);
         // cut clipboard: kept on failure or when not a cut, cleared only on success,
         // and (D-232) only while the clipboard still holds the very offer that was cut
         assert!(!cut_consumes_offer(Some(7), false, 7));
