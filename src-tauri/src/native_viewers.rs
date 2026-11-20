@@ -442,3 +442,117 @@ pub fn swf_description(info: &Result<SwfInfo, String>) -> String {
         Err(e) => format!("Flash file (SWF)\nThe header could not be read: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A 550x400 pixel stage (11000 x 8000 twips), 24 fps, 12 frames.
+    fn swf_body() -> Vec<u8> {
+        let nbits = 15u32;
+        let mut bits: Vec<bool> = Vec::new();
+        let mut put = |value: u32, count: u32| {
+            for i in (0..count).rev() {
+                bits.push((value >> i) & 1 == 1);
+            }
+        };
+        put(nbits, 5);
+        for v in [0u32, 11000, 0, 8000] {
+            put(v, nbits);
+        }
+        let mut body: Vec<u8> = bits
+            .chunks(8)
+            .map(|c| c.iter().enumerate().fold(0u8, |b, (i, on)| b | ((*on as u8) << (7 - i))))
+            .collect();
+        body.extend_from_slice(&[0, 24]); // 24.0 frames per second, 8.8 fixed point
+        body.extend_from_slice(&12u16.to_le_bytes());
+        body
+    }
+
+    fn swf(signature: &[u8; 3], compress: bool) -> Vec<u8> {
+        let body = swf_body();
+        let mut out = signature.to_vec();
+        out.push(9);
+        out.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
+        if compress {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(&body).unwrap();
+            out.extend_from_slice(&z.finish().unwrap());
+        } else {
+            out.extend_from_slice(&body);
+        }
+        out
+    }
+
+    #[test]
+    fn swf_header_parses_plain_and_zlib_files_d362() {
+        for (sig, compress, name) in [(b"FWS", false, "none"), (b"CWS", true, "zlib")] {
+            let info = parse_swf_header(&swf(sig, compress)).unwrap();
+            assert_eq!(
+                info,
+                SwfInfo { compression: name, version: 9, width: 550.0, height: 400.0, frame_rate: 24.0, frames: 12 }
+            );
+        }
+        assert!(parse_swf_header(b"GIF89a..").is_err());
+        assert!(parse_swf_header(b"FWS").is_err());
+        assert!(swf_description(&parse_swf_header(&swf(b"FWS", false))).contains("Stage 550 x 400 pixels"));
+    }
+
+    #[test]
+    fn lzma_swf_header_parses_when_xz_is_present_d362() {
+        if !tool_in_path("xz") {
+            return;
+        }
+        // Compress the body with xz in .lzma format, then rewrap it as SWF's
+        // ZWS layout: 8 bytes, 4 bytes packed length, 5 bytes props, raw stream.
+        let body = swf_body();
+        let mut child = Command::new("xz")
+            .args(["--format=lzma", "-zc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&body).unwrap();
+        let lzma = child.wait_with_output().unwrap().stdout;
+        let mut out = b"ZWS".to_vec();
+        out.push(13);
+        out.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
+        out.extend_from_slice(&((lzma.len() - 13) as u32).to_le_bytes());
+        out.extend_from_slice(&lzma[0..5]);
+        out.extend_from_slice(&lzma[13..]);
+        let info = parse_swf_header(&out).unwrap();
+        assert_eq!((info.width, info.height, info.frames, info.compression), (550.0, 400.0, 12, "LZMA"));
+    }
+
+    fn bmp_head(height: i32, compression: u32) -> Vec<u8> {
+        let mut h = b"BM".to_vec();
+        h.extend_from_slice(&[0u8; 12]);
+        h.extend_from_slice(&40u32.to_le_bytes());
+        h.extend_from_slice(&32i32.to_le_bytes());
+        h.extend_from_slice(&height.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(&8u16.to_le_bytes());
+        h.extend_from_slice(&compression.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn only_risky_bmp_headers_go_to_the_outside_decoders_d362() {
+        assert!(bmp_header_is_unsafe(&bmp_head(8, 1)), "RLE8");
+        assert!(bmp_header_is_unsafe(&bmp_head(8, 2)), "RLE4");
+        assert!(bmp_header_is_unsafe(&bmp_head(-8192, 0)), "top-down");
+        assert!(!bmp_header_is_unsafe(&bmp_head(8, 0)), "plain 24-bit stays in process");
+        assert!(!bmp_header_is_unsafe(b"not a bitmap at all, just text....."));
+    }
+
+    #[test]
+    fn documents_are_told_apart_by_extension_d362() {
+        assert_eq!(doc_kind("/a/b.PDF"), Some(DocKind::Pdf));
+        assert_eq!(doc_kind("/a/b.docx"), Some(DocKind::Office));
+        assert_eq!(doc_kind("/a/b.eps"), Some(DocKind::PostScript));
+        assert_eq!(doc_kind("/a/b.html"), Some(DocKind::Html));
+        assert_eq!(doc_kind("/a/b.csv"), None, "csv stays a text preview");
+        assert!(is_swf_path("/a/game.SWF"));
+    }
+}

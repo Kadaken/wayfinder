@@ -24746,6 +24746,286 @@ Broken: Either state is wrong.\n";
         undo_redo_gate_d187();
     }
 
+    // ---- D-362: viewers -------------------------------------------------
+
+    /// One window in a sandbox HOME, with sample files made at run time by the
+    /// installed tools. Restores HOME and closes the window when dropped.
+    struct D362 {
+        state: Rc<RefCell<AppState>>,
+        ui: Ui,
+        old_home: Option<String>,
+        _cleanup: ScratchCleanup,
+        _app: adw::Application,
+    }
+
+    impl Drop for D362 {
+        fn drop(&mut self) {
+            self.ui.window.destroy();
+            pump();
+            match &self.old_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn d362_open(tag: &str, make: impl FnOnce(&Path), expect_files: usize) -> D362 {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d362-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        make(&dir);
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id(format!("com.kadaken.wayfinder.d362{tag}test"))
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 650);
+        ui.window.present();
+        d362_wait("the listing", 20, || state.borrow().visible_entries.len() == expect_files);
+        D362 { state, ui, old_home, _cleanup: cleanup, _app: app }
+    }
+
+    fn d362_wait(what: &str, seconds: u64, cond: impl Fn() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(seconds) {
+            if cond() {
+                return;
+            }
+            pump();
+        }
+        panic!("timed out after {seconds}s waiting for {what}");
+    }
+
+    fn d362_show(d: &D362, name: &str) {
+        let entry = d
+            .state
+            .borrow()
+            .visible_entries
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        update_preview(&d.ui, &entry);
+    }
+
+    fn d362_stack(d: &D362) -> String {
+        d.ui.preview_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_default()
+    }
+
+    fn d362_run(program: &str, args: &[&str], cwd: &Path) -> bool {
+        std::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Makes a docx from a text file with the real LibreOffice, in a profile
+    /// of its own so it never meets the owner's running one.
+    fn d362_make_docx(dir: &Path) {
+        std::fs::write(dir.join("words.txt"), "Hello from D-362\nsecond line\n").unwrap();
+        let profile = format!("-env:UserInstallation=file://{}/lo-profile-d362", dir.parent().unwrap().display());
+        assert!(
+            d362_run("soffice", &["--headless", &profile, "--convert-to", "docx", "--outdir", ".", "words.txt"], dir),
+            "soffice makes the sample docx"
+        );
+        std::fs::remove_file(dir.join("words.txt")).unwrap();
+        assert!(dir.join("words.docx").is_file());
+    }
+
+    /// D-362: a 2-page PDF shows page 1 of 2, and Next shows page 2.
+    fn pdf_preview_shows_page_one_of_two_and_next_shows_page_two_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("pdf", |dir| {
+            assert!(
+                d362_run("magick", &["-size", "300x200", "xc:white", "-size", "300x200", "xc:gray", "two.pdf"], dir),
+                "magick makes the 2-page PDF"
+            );
+        }, 1);
+        d362_show(&d, "two.pdf");
+        d362_wait("the PDF page", 60, || d362_stack(&d) == "doc" && d.ui.viewers.doc_picture.file().is_some());
+        assert_eq!(d.ui.viewers.doc_label.text(), "Page 1 of 2");
+        assert!(!d.ui.viewers.doc_prev.is_sensitive() && d.ui.viewers.doc_next.is_sensitive());
+        let first = d.ui.viewers.doc_picture.file().unwrap().path();
+        d.ui.viewers.doc_next.emit_clicked();
+        d362_wait("page 2", 60, || {
+            d.ui.viewers.doc_label.text() == "Page 2 of 2"
+                && d.ui.viewers.doc_picture.file().map(|f| f.path()) != Some(first.clone())
+        });
+        assert!(d.ui.viewers.doc_prev.is_sensitive() && !d.ui.viewers.doc_next.is_sensitive());
+    }
+
+    /// D-362: a .docx converts through LibreOffice and previews as rendered pages.
+    fn docx_previews_as_rendered_pages_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("docx", d362_make_docx, 1);
+        d362_show(&d, "words.docx");
+        d362_wait("the converted pages", 180, || d362_stack(&d) == "doc" && d.ui.viewers.doc_picture.file().is_some());
+        assert_eq!(d.ui.viewers.doc_label.text(), "Page 1 of 1");
+        let home = std::env::var("HOME").unwrap();
+        let cached = std::fs::read_dir(format!("{home}/.cache/wayfinder/doc-pdf"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().map(|x| x == "pdf").unwrap_or(false));
+        assert!(cached, "the converted PDF is kept in the cache");
+    }
+
+    /// D-362: an HTML file renders as a page through LibreOffice, and Show
+    /// source swaps in its text.
+    fn html_renders_as_a_page_and_shows_source_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("html", |dir| {
+            std::fs::write(dir.join("page.html"), "<html><body><h1>Hello D-362</h1><p>text</p></body></html>").unwrap();
+        }, 1);
+        d362_show(&d, "page.html");
+        d362_wait("the rendered page", 180, || d362_stack(&d) == "doc" && d.ui.viewers.doc_picture.file().is_some());
+        assert!(d.ui.viewers.doc_source_toggle.is_visible(), "an HTML page offers Show source");
+        d.ui.viewers.doc_source_toggle.set_active(true);
+        assert!(d.ui.viewers.doc_source_scroll.is_visible() && !d.ui.viewers.doc_picture.is_visible());
+        assert!(d.ui.viewers.doc_source_label.text().contains("<h1>Hello D-362</h1>"));
+        d.ui.viewers.doc_source_toggle.set_active(false);
+        assert!(d.ui.viewers.doc_picture.is_visible());
+    }
+
+    /// D-362: .mpg is video (it was missing from the list), and the pane
+    /// shows the video or, when the player cannot, a frame with the length.
+    fn mpg_counts_as_video_and_shows_a_frame_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("mpg", |dir| {
+            assert!(
+                d362_run("ffmpeg", &["-v", "error", "-f", "lavfi", "-i", "testsrc=d=2:s=160x120:r=10", "-y", "clip.mpg"], dir),
+                "ffmpeg makes the .mpg"
+            );
+        }, 1);
+        assert!(crate::native_core::is_video_path("/x/clip.mpg") && !crate::native_core::is_image_path("/x/clip.mpg"));
+        d362_show(&d, "clip.mpg");
+        d362_wait("the video or its frame", 40, || {
+            let stack = d362_stack(&d);
+            (stack == "media" && d.ui.preview_media_picture.paintable().is_some())
+                || (stack == "frame" && d.ui.viewers.frame_picture.file().is_some())
+        });
+        // The fallback itself, on the same file: one frame and the length.
+        let path = d.state.borrow().visible_entries[0].source.real_path_string().unwrap();
+        set_preview_video_frame(&d.ui, &path, "This video cannot be played in the pane.");
+        d362_wait("the frame fallback", 40, || d362_stack(&d) == "frame" && d.ui.viewers.frame_picture.file().is_some());
+        assert!(d.ui.viewers.frame_info.text().contains("Length 0:02"), "{}", d.ui.viewers.frame_info.text());
+    }
+
+    /// D-362: new picture formats preview as pictures: tga, pnm, psd and dds,
+    /// converted to a cached PNG when GTK cannot load them itself.
+    fn new_image_formats_preview_as_pictures_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let names = ["pic.tga", "pic.pnm", "pic.psd", "pic.dds"];
+        let d = d362_open("img", |dir| {
+            for n in names {
+                assert!(d362_run("magick", &["-size", "64x48", "gradient:red-blue", n], dir), "magick makes {n}");
+            }
+            std::fs::write(dir.join("note.txt"), "words").unwrap();
+        }, 5);
+        for n in names {
+            assert!(crate::native_core::is_image_path(n), "{n} counts as an image");
+            d362_show(&d, "note.txt");
+            d362_wait("the note", 10, || d362_stack(&d) == "text");
+            d.ui.preview_picture.set_paintable(None::<&gdk::Paintable>);
+            d362_show(&d, n);
+            d362_wait(&format!("{n} as a picture"), 40, || {
+                d362_stack(&d) == "image" && d.ui.preview_picture.paintable().is_some()
+            });
+        }
+    }
+
+    /// D-362: work for an earlier selection never replaces the current preview.
+    fn stale_work_never_replaces_the_current_preview_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("stale", |dir| {
+            d362_make_docx(dir);
+            assert!(d362_run("magick", &["-size", "40x30", "xc:green", "later.png"], dir));
+        }, 2);
+        // The docx starts converting; the selection moves on at once.
+        d362_show(&d, "words.docx");
+        d362_show(&d, "later.png");
+        d362_wait("the picture", 30, || d362_stack(&d) == "image" && d.ui.preview_picture.paintable().is_some());
+        assert!(d.ui.viewers.doc.borrow().cancel.load(std::sync::atomic::Ordering::Relaxed), "the converter was told to stop");
+        // Give the old conversion every chance to land late.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(8) {
+            pump();
+        }
+        assert_eq!(d362_stack(&d), "image", "the old document must not take the pane back");
+        assert!(d.ui.viewers.doc.borrow().pdf.is_none());
+    }
+
+    /// D-362: an RLE8 top-down BMP (gdk-pixbuf stalled on these) previews as a
+    /// picture, and a corrupt picture ends in a message, never "Opening preview".
+    fn rle_bmp_previews_and_corrupt_picture_ends_in_a_message_d362() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("bmp", |dir| {
+            // 4x4, 8 bits, RLE8, height -4 (top-down), palette entry 1 = red.
+            let (w, h) = (4i32, 4i32);
+            let mut palette = vec![0u8; 256 * 4];
+            palette[4..8].copy_from_slice(&[0, 0, 255, 0]);
+            let mut rows = Vec::new();
+            for _ in 0..h {
+                rows.extend_from_slice(&[4, 1, 0, 0]);
+            }
+            rows.extend_from_slice(&[0, 1]);
+            let offset = 14 + 40 + palette.len() as u32;
+            let mut bmp = b"BM".to_vec();
+            bmp.extend_from_slice(&(offset + rows.len() as u32).to_le_bytes());
+            bmp.extend_from_slice(&[0, 0, 0, 0]);
+            bmp.extend_from_slice(&offset.to_le_bytes());
+            bmp.extend_from_slice(&40u32.to_le_bytes());
+            bmp.extend_from_slice(&w.to_le_bytes());
+            bmp.extend_from_slice(&(-h).to_le_bytes());
+            bmp.extend_from_slice(&1u16.to_le_bytes());
+            bmp.extend_from_slice(&8u16.to_le_bytes());
+            bmp.extend_from_slice(&1u32.to_le_bytes());
+            bmp.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            bmp.extend_from_slice(&[0x13, 0x0B, 0, 0, 0x13, 0x0B, 0, 0]);
+            bmp.extend_from_slice(&256u32.to_le_bytes());
+            bmp.extend_from_slice(&0u32.to_le_bytes());
+            bmp.extend_from_slice(&palette);
+            bmp.extend_from_slice(&rows);
+            std::fs::write(dir.join("rle.bmp"), bmp).unwrap();
+            std::fs::write(dir.join("corrupt.png"), b"this is not a picture at all").unwrap();
+        }, 2);
+        assert!(crate::native_viewers::bmp_needs_converter(
+            &d.state.borrow().visible_entries.iter().find(|e| e.name == "rle.bmp").unwrap().source.real_path_string().unwrap()
+        ));
+        d362_show(&d, "rle.bmp");
+        d362_wait("the BMP as a picture", 40, || d362_stack(&d) == "image" && d.ui.preview_picture.paintable().is_some());
+        d.ui.preview_picture.set_paintable(None::<&gdk::Paintable>);
+        d362_show(&d, "corrupt.png");
+        d362_wait("an answer for the corrupt picture", 60, || {
+            d362_stack(&d) == "text" && !d.ui.preview.label().starts_with("Opening preview")
+        });
+        assert!(d.ui.preview.label().starts_with("No preview for this picture."), "{}", d.ui.preview.label());
+    }
+
+    /// D-362 on its own, under a private display, without the full suite.
+    fn d362_all() {
+        pdf_preview_shows_page_one_of_two_and_next_shows_page_two_d362();
+        docx_previews_as_rendered_pages_d362();
+        html_renders_as_a_page_and_shows_source_d362();
+        mpg_counts_as_video_and_shows_a_frame_d362();
+        new_image_formats_preview_as_pictures_d362();
+        stale_work_never_replaces_the_current_preview_d362();
+        rle_bmp_previews_and_corrupt_picture_ends_in_a_message_d362();
+    }
+
     /// Runs only under a virtual display (see the env guard), so it can never
     /// open a window on the owner's screen.
     /// All GTK tests share one thread (GTK initializes once) and run only under
@@ -24780,6 +25060,11 @@ Broken: Either state is wrong.\n";
             bottom_row_click_keeps_place_d350();
             split_same_folder_move_into_subfolder_keeps_place_d343();
             eprintln!("wf-test place-only run done");
+            return;
+        }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d362") {
+            d362_all();
+            eprintln!("wf-test d362-only run done");
             return;
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d360") {
@@ -24850,6 +25135,7 @@ Broken: Either state is wrong.\n";
         // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
         folder_change_waits_for_open_rename_d338();
         rename_from_menu_renames_the_clicked_file_d360();
+        d362_all();
         rename_onto_taken_name_offers_numbered_name_d340();
         pin_keeps_item_on_top_d359();
         pinned_row_unbind_frees_size_groups_d359();

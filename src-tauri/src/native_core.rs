@@ -55,8 +55,10 @@ const AUDIO_EXT: &[&str] = &[
     "dsf", "dff", "mpc",
     // MIDI (played through the fluidsynth GStreamer plugin, D-327)
     "mid", "midi", "kar", "rmi",
-    // D-362: protected AAC, tracker modules and a few more containers.
-    "m4p", "xm", "mod", "s3m", "it", "mp4a", "ofr", "mlp", "wvc",
+    // D-362: AAC in an MP4 container (protected ones say so in the pane).
+    // Tracker modules (xm, mod, s3m, it) are NOT listed: audio_preview plays
+    // through playbin and this machine has no modplug or openmpt plugin.
+    "m4p",
 ];
 const VIDEO_EXT: &[&str] = &[
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "ts", "3gp", "ogv", "mpeg",
@@ -11748,6 +11750,43 @@ mod list_thumbnail_tests {
         // A ZIP member has no real path to decode from (D-188).
         let member = EntrySource::zip_member("/tmp/a.zip", "inside.png", 10, 0, 100, 0);
         assert!(!wants_image_thumbnail(&row("inside.png", true, false, member)));
+    }
+}
+
+#[cfg(test)]
+mod viewer_lists_d362 {
+    use super::*;
+
+    #[test]
+    fn every_kind_has_one_list_and_no_extension_is_in_two_d362() {
+        for ext in VIDEO_EXT {
+            assert!(!IMG_EXT.contains(ext), "{ext} is in both the video and image lists");
+            assert!(!AUDIO_EXT.contains(ext), "{ext} is in both the video and audio lists");
+        }
+        for ext in AUDIO_EXT {
+            assert!(!IMG_EXT.contains(ext), "{ext} is in both the audio and image lists");
+        }
+        for list in [IMG_EXT, VIDEO_EXT, AUDIO_EXT, TRANSCODE_THUMB_EXT] {
+            let mut seen = HashSet::new();
+            for ext in list {
+                assert!(seen.insert(*ext), "{ext} is listed twice");
+            }
+        }
+        // Every extension the outside decoders handle is still an image.
+        for ext in TRANSCODE_THUMB_EXT {
+            assert!(IMG_EXT.contains(ext), "{ext} is transcoded but not an image");
+        }
+        for name in ["a.mpg", "a.mpe", "a.m2ts", "a.vob", "a.rmvb", "a.mxf", "a.h264"] {
+            assert!(is_video_path(name), "{name}");
+        }
+        for name in ["a.cr2", "a.nef", "a.psd", "a.tga", "a.pnm", "a.exr", "a.jp2", "a.dds", "a.xcf"] {
+            assert!(is_image_path(name) && needs_transcoded_thumbnail(name) == TRANSCODE_THUMB_EXT.contains(&name.rsplit('.').next().unwrap()), "{name}");
+        }
+        for name in ["a.m4p"] {
+            assert!(is_audio_path(name), "{name}");
+        }
+        // A document is neither.
+        assert!(!is_image_path("a.pdf") && !is_video_path("a.pdf") && !is_audio_path("a.pdf"));
     }
 }
 
