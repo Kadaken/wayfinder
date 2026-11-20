@@ -2839,6 +2839,25 @@ pub fn free_sibling_name(parent: &Path, name: &str, is_dir: bool) -> String {
         .expect("a free name exists")
 }
 
+/// D-359: a path that Wayfinder itself renamed, moved or trashed. `(from, Some(to))`
+/// is a rename or move, `(from, None)` a removal. The app installs one hook so
+/// settings that name paths (pins) can follow the item; with none installed this
+/// does nothing, so the core stays usable and testable without the app.
+pub type PathChangeHook = fn(&[(String, Option<String>)]);
+static PATH_CHANGE_HOOK: std::sync::OnceLock<PathChangeHook> = std::sync::OnceLock::new();
+
+pub fn set_path_change_hook(hook: PathChangeHook) {
+    let _ = PATH_CHANGE_HOOK.set(hook);
+}
+
+fn notify_path_changes(changes: &[(String, Option<String>)]) {
+    if let Some(hook) = PATH_CHANGE_HOOK.get() {
+        if !changes.is_empty() {
+            hook(changes);
+        }
+    }
+}
+
 pub fn rename_path(path: &str, new_name: &str) -> Result<String, String> {
     validate_name(new_name)?;
     let parent = Path::new(path).parent().ok_or("no parent")?;
@@ -2851,6 +2870,7 @@ pub fn rename_path(path: &str, new_name: &str) -> Result<String, String> {
         return Err(format!("\"{new_name}\" already exists"));
     }
     fs::rename(path, &dest).map_err(|err| err.to_string())?;
+    notify_path_changes(&[(path.to_string(), Some(dest.to_string_lossy().to_string()))]);
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -2964,13 +2984,15 @@ pub fn batch_rename_with(
         });
     }
 
-    Ok(operations
+    let resolved: Vec<ResolvedItem> = operations
         .into_iter()
         .map(|(from, dest)| ResolvedItem {
             from: from.to_string_lossy().to_string(),
             to: dest.to_string_lossy().to_string(),
         })
-        .collect())
+        .collect();
+    notify_path_changes(&resolved.iter().map(|i| (i.from.clone(), Some(i.to.clone()))).collect::<Vec<_>>());
+    Ok(resolved)
 }
 
 /// Build an RFC 2483 `text/uri-list` payload (CRLF-separated `file://` URIs) for
@@ -2993,6 +3015,7 @@ pub fn trash_paths(paths: &[String]) -> Result<(), String> {
         gio::File::for_path(path)
             .trash(gio::Cancellable::NONE)
             .map_err(|err| format!("{path}: {err}"))?;
+        notify_path_changes(&[(path.clone(), None)]);
     }
     Ok(())
 }
@@ -3294,8 +3317,15 @@ pub fn trash_paths_exact(paths: &[String]) -> TrashBatch {
     let mut batch = TrashBatch { done: Vec::with_capacity(paths.len()), stopped: None, not_attempted: Vec::new() };
     for (index, path) in paths.iter().enumerate() {
         match trash_one_exact(path) {
-            Ok(item) => batch.done.push(item),
+            Ok(item) => {
+                notify_path_changes(&[(path.clone(), None)]);
+                batch.done.push(item)
+            }
             Err(stop) => {
+                // A move that happened but could not be identified still left the path.
+                if let TrashStop::MovedUnidentified { path, .. } = &stop {
+                    notify_path_changes(&[(path.clone(), None)]);
+                }
                 batch.stopped = Some(stop);
                 batch.not_attempted = paths[index + 1..].to_vec();
                 break;
@@ -4511,11 +4541,14 @@ pub fn transfer_batch_ctl(
     for stage in &stages {
         let _ = remove_any(stage);
     }
-    let items = plan
+    let items: Vec<ResolvedItem> = plan
         .iter()
         .map(|i| ResolvedItem { from: i.src.clone(), to: i.dest.to_string_lossy().to_string() })
         .collect();
     let report = report_cell.into_inner();
+    if !is_copy {
+        notify_path_changes(&items.iter().map(|i| (i.from.clone(), Some(i.to.clone()))).collect::<Vec<_>>());
+    }
     Ok(TransferResult { items, warnings, report })
 }
 
@@ -4533,6 +4566,7 @@ pub fn restore_moved_items(items: &[ResolvedItem]) -> Result<Vec<ResolvedItem>, 
     }
     for item in items {
         run_cmd_capture("mv", &["-T", "--", &item.to, &item.from])?;
+        notify_path_changes(&[(item.to.clone(), Some(item.from.clone()))]);
     }
     Ok(items
         .iter()

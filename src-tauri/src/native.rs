@@ -1282,6 +1282,11 @@ struct AppConfig {
     /// Folders that keep their own placement instead of the default.
     #[serde(default)]
     folder_placement_overrides: Vec<(String, FolderPlacement)>,
+    /// D-359: absolute paths of pinned files and folders. A pinned item sorts at
+    /// the top of its folder under every sort. Paths that no longer exist are
+    /// dropped when the config is read.
+    #[serde(default)]
+    pins: Vec<String>,
     /// Days an item may sit in the Trash before it is deleted for good.
     /// 0 is "never delete automatically", and is the default, so an upgrade
     /// never starts deleting anybody's Trash without being asked.
@@ -2030,6 +2035,7 @@ impl Default for AppConfig {
             sort_ascending: true,
             folder_placement: FolderPlacement::Top,
             folder_placement_overrides: Vec::new(),
+            pins: Vec::new(),
             columns: ColumnVisibility::default(),
             remembered_networks: Vec::new(),
             trash_keep_days: 0,
@@ -2132,6 +2138,9 @@ fn read_config_at(path: &Path) -> AppConfig {
     // them from the file as well, so nothing has to be cleaned up by hand.
     config.recents.retain(|b| !native_core::is_vault_content(&b.path));
     config.recent_files.retain(|b| !native_core::is_vault_content(&b.path));
+    // D-359: a pin for something that is gone is ignored, and the next write
+    // removes it from the file.
+    config.pins.retain(|p| Path::new(p).symlink_metadata().is_ok());
     config
 }
 
@@ -2519,6 +2528,8 @@ struct AppState {
     folder_overrides: Vec<(String, FolderPlacement)>,
     /// The first row of the second section, so its row can carry the divider.
     group_boundary: Option<native_core::EntrySource>,
+    /// D-359: the pinned paths as of the last row rebuild; rows read it to draw the pin.
+    pins: HashSet<String>,
     columns_visible: ColumnVisibility,
     sidebar_active_key: Option<String>,
     /// Mirror of `AppConfig::trash_keep_days`, so the Trash menu can show
@@ -4434,6 +4445,7 @@ fn build_picker_filter_and_choice_controls(
 }
 
 fn build_ui(app: &adw::Application, initial_path: Option<String>, select_path: Option<String>) {
+    native_core::set_path_change_hook(pins_follow_paths);
     build_ui_in(app, initial_path, select_path, None);
 }
 
@@ -4487,6 +4499,7 @@ fn build_ui_in(
         folder_placement: config.folder_placement,
         folder_overrides: config.folder_placement_overrides.clone(),
         group_boundary: None,
+        pins: config.pins.iter().cloned().collect(),
         columns_visible: config.columns,
         sidebar_active_key: None,
         trash_keep_days: config.trash_keep_days,
@@ -10952,6 +10965,9 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
         line.append(&icon);
         line.append(&name);
+        if entry_is_pinned(&entry, &state.borrow().pins) {
+            line.append(&pin_badge());
+        }
         line.append(&size);
         line.append(&kind);
         line.append(&modified);
@@ -11221,6 +11237,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     if let Some(held) = state.borrow().held_order.as_ref() {
         apply_held_order(&mut visible_entries, held);
     }
+    // D-359: pinned items go above everything else, under every sort.
+    let pins = load_pins();
+    let pinned_count = pin_to_top(&mut visible_entries, &pins);
+    state.borrow_mut().pins = pins;
 
     // No row is forced out of its sorted place. A file the window was opened
     // on is selected (see navigation), not moved: it sits where the chosen sort
@@ -11231,8 +11251,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         && !(cfg!(test) && std::env::var_os("WF_TEST_FULL_SPLICE").is_some());
     let mut rebind: Vec<native_core::EntrySource> = Vec::new();
     {
-        let boundary = group_boundary_index(&visible_entries, placement)
-            .map(|index| visible_entries[index].source.clone());
+        // D-359: the pinned run is its own group; the divider belongs to the rest.
+        let boundary = group_boundary_index(&visible_entries[pinned_count..], placement)
+            .map(|index| visible_entries[pinned_count + index].source.clone());
         // D-347: a kept row is not rebound, so the rows that gain or lose the
         // group divider are replaced on purpose.
         rebind.extend(boundary.clone());
@@ -11330,6 +11351,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         return;
     }
 
+    let pins_for_tiles = state.borrow().pins.clone();
     for (index, entry) in visible_entries.into_iter().enumerate() {
         let entry_display_path = entry.source.display_string();
         let tooltip = entry.metadata_error.as_ref().map_or_else(
@@ -11378,7 +11400,18 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             name.set_lines(((2.0 * name_text_scale(icon_zoom)).ceil() as i32).clamp(2, 4));
             name.set_size_request(tile_px, -1);
             grid_item.set_size_request(tile_px, -1);
-            grid_item.append(&icon);
+            if entry_is_pinned(&entry, &pins_for_tiles) {
+                let overlay = gtk::Overlay::new();
+                overlay.set_halign(gtk::Align::Center);
+                overlay.set_child(Some(&icon));
+                let badge = pin_badge();
+                badge.set_halign(gtk::Align::Start);
+                badge.set_valign(gtk::Align::Start);
+                overlay.add_overlay(&badge);
+                grid_item.append(&overlay);
+            } else {
+                grid_item.append(&icon);
+            }
             let editing = state
                 .borrow()
                 .inline_rename
@@ -11545,6 +11578,136 @@ fn apply_held_order(entries: &mut Vec<Entry>, held: &[native_core::EntrySource])
     let rank: HashMap<&native_core::EntrySource, usize> = held.iter().enumerate().map(|(i, s)| (s, i)).collect();
     // Stable sort: held rows by their held index, unheld rows after, unchanged.
     entries.sort_by_key(|e| rank.get(&e.source).copied().unwrap_or(usize::MAX));
+}
+
+/// D-359: the pinned paths, read from the shared config as it is now, so every
+/// window and pane agrees without a copy that can go stale.
+fn load_pins() -> HashSet<String> {
+    config_path().map(|path| read_config_at(&path).pins.into_iter().collect()).unwrap_or_default()
+}
+
+fn entry_is_pinned(entry: &Entry, pins: &HashSet<String>) -> bool {
+    !pins.is_empty() && entry.source.real_path().is_some_and(|p| pins.contains(p.to_string_lossy().as_ref()))
+}
+
+/// D-359: moves pinned entries to the front, keeping the order they already
+/// have (and the order of the rest). Returns how many are pinned. Run after the
+/// sort, so pinned items follow the current sort among themselves.
+fn pin_to_top(entries: &mut Vec<Entry>, pins: &HashSet<String>) -> usize {
+    if pins.is_empty() {
+        return 0;
+    }
+    let (mut pinned, rest): (Vec<Entry>, Vec<Entry>) =
+        std::mem::take(entries).into_iter().partition(|e| entry_is_pinned(e, pins));
+    let count = pinned.len();
+    pinned.extend(rest);
+    *entries = pinned;
+    count
+}
+
+/// D-359: pin or unpin `paths` in a pin list. Pure so it can be tested.
+fn apply_pin_change(pins: &mut Vec<String>, paths: &[String], pin: bool) {
+    if pin {
+        for path in paths {
+            if !pins.contains(path) {
+                pins.push(path.clone());
+            }
+        }
+    } else {
+        pins.retain(|p| !paths.contains(p));
+    }
+}
+
+/// D-359: makes a pin list follow renames and moves (`Some(to)`) and drop
+/// removals (`None`). A folder carries the pins of what is inside it. Returns
+/// true when the list changed.
+fn apply_path_changes(pins: &mut Vec<String>, changes: &[(String, Option<String>)]) -> bool {
+    let before = pins.clone();
+    for (from, to) in changes {
+        let prefix = format!("{}/", from.trim_end_matches('/'));
+        let mut next: Vec<String> = Vec::with_capacity(pins.len());
+        for pin in pins.iter() {
+            let inside = pin == from || pin.starts_with(&prefix);
+            if !inside {
+                next.push(pin.clone());
+                continue;
+            }
+            if let Some(to) = to {
+                let moved = format!("{}{}", to.trim_end_matches('/'), &pin[from.trim_end_matches('/').len()..]);
+                if !next.contains(&moved) {
+                    next.push(moved);
+                }
+            }
+        }
+        *pins = next;
+    }
+    *pins != before
+}
+
+/// D-359: the hook the file operations call, so a pin follows its item.
+fn pins_follow_paths(changes: &[(String, Option<String>)]) {
+    // Read first: most renames touch no pin, and those must not rewrite the config.
+    let current = load_pins();
+    if current.is_empty() {
+        return;
+    }
+    let touches = changes.iter().any(|(from, _)| {
+        let prefix = format!("{}/", from.trim_end_matches('/'));
+        current.iter().any(|p| p == from || p.starts_with(&prefix))
+    });
+    if touches {
+        update_config(|config| {
+            apply_path_changes(&mut config.pins, changes);
+        });
+    }
+}
+
+/// D-359: Pin when any selected item is unpinned, otherwise Unpin.
+fn selection_would_pin(entries: &[Entry], pins: &HashSet<String>) -> bool {
+    entries.iter().any(|e| e.source.real_path().is_some() && !entry_is_pinned(e, pins))
+}
+
+/// D-359: pins or unpins the selection, then rebuilds the rows of every window
+/// and pane. The selection and the scroll position stay as they were; the
+/// existing refresh hold in the list is used, not a new one.
+fn toggle_pin_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let entries = selected_entries(state, ui);
+    let paths: Vec<String> = entries.iter().filter_map(|e| e.source.real_path_string()).collect();
+    if paths.is_empty() {
+        return;
+    }
+    let pin = selection_would_pin(&entries, &load_pins());
+    update_config(|config| apply_pin_change(&mut config.pins, &paths, pin));
+    refresh_all_for_pins(state, ui);
+    ui.status.set_label(&format!(
+        "{} {} item{}",
+        if pin { "Pinned" } else { "Unpinned" },
+        paths.len(),
+        plural(paths.len())
+    ));
+}
+
+fn refresh_all_for_pins(origin_state: &Rc<RefCell<AppState>>, origin_ui: &Ui) {
+    let mut windows = WINDOWS.with(|w| w.try_borrow().map(|w| w.windows()).unwrap_or_default());
+    if !windows.iter().any(|(s, _)| Rc::ptr_eq(s, origin_state)) {
+        windows.push((origin_state.clone(), origin_ui.clone()));
+    }
+    for (state, ui) in windows {
+        // A window with a rename editor open is never rebuilt under it (D-338).
+        let Ok(st) = state.try_borrow() else { continue };
+        if st.inline_rename.is_some() {
+            continue;
+        }
+        drop(st);
+        mark_scroll_cause("pin change");
+        let selected = selected_sources(&state, &ui);
+        let scroller = view_scroller(&state, &ui);
+        let saved_scroll = scroller.vadjustment().value();
+        repopulate_rows(&state, &ui);
+        restore_selection(&state, &ui, &selected);
+        update_selection(&state, &ui);
+        reapply_scroll(&scroller, saved_scroll);
+    }
 }
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, ascending: bool, placement: FolderPlacement) {
@@ -11735,6 +11898,16 @@ fn name_zoom_attrs(zoom: f64) -> gtk::pango::AttrList {
 
 fn grid_tile_px(zoom: f64) -> i32 {
     ((GRID_TILE_SIZE * zoom).round() as i32).max(1)
+}
+
+/// D-359: the small pin that shows why a row or tile sits at the top.
+fn pin_badge() -> gtk::Image {
+    let image = gtk::Image::from_icon_name("view-pin-symbolic");
+    image.set_pixel_size(14);
+    image.set_valign(gtk::Align::Center);
+    image.add_css_class("wf-pin-badge");
+    image.set_widget_name("wf-pin-badge");
+    image
 }
 
 fn grid_file_icon(
@@ -16642,6 +16815,16 @@ fn show_item_context_menu(
             menu.append(&context_item("package-symbolic", "Compress to ZIP", "", &popover, move || {
                 compress_selection(state.clone(), ui.clone())
             }));
+        }
+        {
+            let state = state.clone();
+            let ui = ui.clone();
+            let label = if selection_would_pin(&selected_entries(&state, &ui), &load_pins()) { "Pin" } else { "Unpin" };
+            let button = context_item("view-pin-symbolic", label, "", &popover, move || {
+                toggle_pin_selection(&state, &ui)
+            });
+            button.set_widget_name("wf-pin-option");
+            menu.append(&button);
         }
     }
     if let Some(path) = entry.source.real_path_string().filter(|p| native_core::is_archive_path(p)) {
@@ -23574,6 +23757,7 @@ Broken: Either state is wrong.\n";
         // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
         folder_change_waits_for_open_rename_d338();
         rename_onto_taken_name_offers_numbered_name_d340();
+        pin_keeps_item_on_top_d359();
         new_folder_naming_stays_put_d341();
         // bottom_row_press_does_not_run_away_d339();
         metadata_refresh_keeps_row_identity_and_structure_rebuilds_d22();
@@ -26753,6 +26937,139 @@ Broken: Either state is wrong.\n";
         assert_eq!(std::fs::read_to_string(dir.join("b (2).txt")).unwrap(), "a", "D-340: the renamed file is a.txt's");
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b", "D-340: the taken name is never overwritten");
         wait_for("listing shows it", || state.borrow().visible_entries.iter().any(|e| e.name == "b (2).txt"));
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-359 (20 Nov 2026, the owner): "a pin file or pin folder option on the right
+    /// click menu ... it should bring it to the top", "pin and unpin". Through the
+    /// real item menu: the item that sorts last goes first under every sort, keeps
+    /// its selection, shows a pin, comes back on Unpin, and the pin survives a
+    /// config reload, follows a rename and is ignored once the item is gone.
+    fn pin_keeps_item_on_top_d359() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d359-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        // Size and date both grow with the name, so name, size and date all put z.txt last.
+        for (i, (name, len)) in [("a.txt", 1usize), ("b.txt", 2), ("c.txt", 3), ("z.txt", 9)].iter().enumerate() {
+            let file = dir.join(name);
+            std::fs::write(&file, "x".repeat(*len)).unwrap();
+            let when = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + 1000 * i as u64);
+            std::fs::File::options().write(true).open(&file).unwrap().set_modified(when).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d359test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == 5);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+        let names = || state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        let selected_names = || selected_entries(&state, &ui).into_iter().map(|e| e.name).collect::<Vec<_>>();
+        let badges = || all_widgets(ui.list.upcast_ref()).into_iter().filter(|w| w.widget_name() == "wf-pin-badge").count();
+        let config_pins = || read_config_at(&config_path().unwrap()).pins;
+
+        // Pins the item in the last place through the real menu, or unpins the selected one.
+        let click_pin_menu = |expect_label: &str| {
+            let entry = selected_entries(&state, &ui).remove(0);
+            show_item_context_menu(&ui.list, state.clone(), ui.clone(), entry, 5.0, 5.0);
+            pump();
+            pump();
+            let popover = popovers_of(ui.list.upcast_ref()).pop().expect("the item menu popover");
+            let button = all_widgets(popover.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == "wf-pin-option")
+                .and_then(|w| w.downcast::<gtk::Button>().ok())
+                .expect("the menu has a pin item");
+            assert!(
+                button_labelled(popover.upcast_ref(), expect_label).is_some(),
+                "D-359: the menu says {expect_label}"
+            );
+            button.emit_clicked();
+            pump();
+            pump();
+        };
+
+        for (key, ascending) in [
+            (SortKey::Name, true),
+            (SortKey::Name, false),
+            (SortKey::Size, true),
+            (SortKey::Size, false),
+            (SortKey::Modified, true),
+            (SortKey::Modified, false),
+            (SortKey::Kind, true),
+        ] {
+            {
+                let mut st = state.borrow_mut();
+                st.sort_key = key;
+                st.sort_ascending = ascending;
+            }
+            repopulate_rows(&state, &ui);
+            pump();
+            let before = names();
+            let last = before.last().cloned().unwrap();
+            let ix = before.len() as u32 - 1;
+            ui.list_selection.select_item(ix, true);
+            update_selection(&state, &ui);
+            click_pin_menu("Pin");
+            let after = names();
+            assert_eq!(after[0], last, "D-359: {last} is first under {key:?} ascending={ascending}: {after:?}");
+            assert_eq!(selected_names(), vec![last.clone()], "D-359: the pinned item stays selected");
+            assert_eq!(badges(), 1, "D-359: one pin icon shows on the pinned row");
+            assert_eq!(config_pins().len(), 1, "D-359: the pin is in the config");
+            // Pinned stays above the folder, which Top placement would otherwise put first.
+            assert!(after.iter().position(|n| n == "sub") > Some(0), "D-359: the folder is below the pinned file");
+            click_pin_menu("Unpin");
+            assert_eq!(names(), before, "D-359: Unpin puts it back under {key:?} ascending={ascending}");
+            assert_eq!(badges(), 0, "D-359: the pin icon is gone after Unpin");
+            assert!(config_pins().is_empty(), "D-359: Unpin removes it from the config");
+        }
+
+        // Grid shows the pin too, and puts the item first.
+        {
+            let mut st = state.borrow_mut();
+            st.sort_key = SortKey::Name;
+            st.sort_ascending = true;
+        }
+        let z = dir.join("z.txt").to_string_lossy().to_string();
+        update_config(|c| apply_pin_change(&mut c.pins, std::slice::from_ref(&z), true));
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        pump();
+        assert_eq!(names()[0], "z.txt", "D-359: pinned first in the grid");
+        assert_eq!(
+            all_widgets(ui.grid.upcast_ref()).into_iter().filter(|w| w.widget_name() == "wf-pin-badge").count(),
+            1,
+            "D-359: the grid tile shows one pin"
+        );
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+
+        // It persists: a fresh read of the config holds the absolute path.
+        assert_eq!(config_pins(), vec![z.clone()], "D-359: the pin persists in the config file");
+        // It follows a rename made inside Wayfinder.
+        let renamed = crate::native_core::rename_path(&z, "y.txt").unwrap();
+        assert_eq!(config_pins(), vec![renamed.clone()], "D-359: the pin follows a rename");
+        // A pin for something gone is ignored and pruned.
+        std::fs::remove_file(&renamed).unwrap();
+        assert!(config_pins().is_empty(), "D-359: a pin for a missing path is ignored on load");
+        update_config(|_| {});
+        assert!(!std::fs::read_to_string(config_path().unwrap()).unwrap().contains("y.txt"), "D-359: and pruned from the file");
 
         ui.window.destroy();
         pump();
@@ -40930,6 +41247,60 @@ Broken: Either state is wrong.\n";
                 );
             }
         }
+    }
+
+    #[test]
+    fn pinned_entries_sort_above_everything_under_every_sort_d359() {
+        let mut base = vec![
+            placement_entry("sub", true, 0, 5),
+            placement_entry("a.txt", false, 1, 10),
+            placement_entry("b.txt", false, 2, 20),
+            placement_entry("z.txt", false, 9, 30),
+            placement_entry("m", true, 0, 1),
+        ];
+        let pins: HashSet<String> = ["/t/z.txt".to_string(), "/t/m".to_string()].into_iter().collect();
+        for (key, asc) in [
+            (SortKey::Name, true), (SortKey::Name, false), (SortKey::Size, true), (SortKey::Size, false),
+            (SortKey::Modified, true), (SortKey::Modified, false), (SortKey::Kind, true), (SortKey::Kind, false),
+        ] {
+            for placement in [FolderPlacement::Top, FolderPlacement::Bottom, FolderPlacement::Mixed] {
+                let mut plain = base.clone();
+                sort_entries(&mut plain, key, asc, placement);
+                let mut pinned = base.clone();
+                sort_entries(&mut pinned, key, asc, placement);
+                let n = pin_to_top(&mut pinned, &pins);
+                assert_eq!(n, 2);
+                let head: Vec<&str> = pinned.iter().take(2).map(|e| e.name.as_str()).collect();
+                assert!(head.contains(&"z.txt") && head.contains(&"m"), "{key:?} {asc} {placement:?}: {head:?}");
+                // Pinned items follow the current sort among themselves; the rest keep their order.
+                let order = |v: &[Entry], keep: &dyn Fn(&str) -> bool| v.iter().filter(|e| keep(&e.name)).map(|e| e.name.clone()).collect::<Vec<_>>();
+                let is_pin = |n: &str| n == "z.txt" || n == "m";
+                assert_eq!(order(&pinned[..2], &|_| true), order(&plain, &is_pin));
+                assert_eq!(order(&pinned[2..], &|_| true), order(&plain, &|n| !is_pin(n)));
+            }
+        }
+        // Nothing pinned: untouched.
+        let before = placement_names(&base).join(",");
+        assert_eq!(pin_to_top(&mut base, &HashSet::new()), 0);
+        assert_eq!(placement_names(&base).join(","), before);
+    }
+
+    #[test]
+    fn pin_list_changes_follow_moves_and_drop_removals_d359() {
+        let s = |v: &str| v.to_string();
+        let mut pins = vec![s("/a/x.txt"), s("/a/dir"), s("/a/dir/in.txt"), s("/b/keep")];
+        apply_pin_change(&mut pins, &[s("/a/x.txt"), s("/c/new")], true);
+        assert_eq!(pins.len(), 5, "a pinned path is not added twice");
+        apply_pin_change(&mut pins, &[s("/c/new")], false);
+        assert!(!pins.contains(&s("/c/new")));
+        // A rename moves the pin; a folder carries the pins inside it; a sibling with the same prefix is untouched.
+        assert!(apply_path_changes(&mut pins, &[(s("/a/dir"), Some(s("/a/dir2")))]));
+        assert!(pins.contains(&s("/a/dir2")) && pins.contains(&s("/a/dir2/in.txt")) && !pins.contains(&s("/a/dir")));
+        assert!(!apply_path_changes(&mut pins, &[(s("/a/di"), Some(s("/a/zz")))]), "/a/di is not a parent of /a/dir2");
+        // A removal drops the pin and what is inside.
+        assert!(apply_path_changes(&mut pins, &[(s("/a/dir2"), None)]));
+        assert_eq!(pins, vec![s("/a/x.txt"), s("/b/keep")]);
+        assert!(!apply_path_changes(&mut pins, &[(s("/nowhere"), None)]));
     }
 
     #[test]
