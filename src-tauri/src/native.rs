@@ -4809,6 +4809,11 @@ fn build_ui_in(
         .hscrollbar_policy(gtk::PolicyType::External)
         .propagate_natural_height(true)
         .build();
+    // D-375 (21 Nov 2026): keep the current folder (right end) in view. `changed`
+    // fires when the content or the width changes, not on a user's wheel scroll.
+    if !d375_old() {
+        path_label.hadjustment().connect_changed(pin_crumbs_right_d375);
+    }
     let path_entry = gtk::Entry::builder()
         .hexpand(true)
         .activates_default(true)
@@ -6358,6 +6363,19 @@ fn title_button(icon_name: &str, tooltip: &str) -> gtk::Button {
 /// bounds, so our compute-size handler must keep that size.
 fn keep_size_past_bounds(state_floating: bool, cur_w: i32, cur_h: i32, bounds_w: i32, bounds_h: i32) -> bool {
     state_floating && cur_w > 0 && cur_h > 0 && (cur_w > bounds_w || cur_h > bounds_h)
+}
+
+/// D-375: scroll the address crumbs to their right end (GTK clamps; fits = 0).
+fn pin_crumbs_right_d375(adj: &gtk::Adjustment) {
+    let target = adj.upper() - adj.page_size();
+    if (adj.value() - target).abs() > 0.5 {
+        adj.set_value(target);
+    }
+}
+
+/// Test-only gate: D-375 pin off, to show the old behaviour failing.
+fn d375_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D375_OLD").is_some()
 }
 
 /// Test-only gate: D-374 override off, to show the old behaviour failing.
@@ -11708,6 +11726,12 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::L
         let state = state.clone();
         button.connect_clicked(move |_| navigate(&state, target.clone()));
         ui.path_crumbs.append(&button);
+    }
+    // D-375: the new buttons are measured after this call; pin once they are.
+    if !d375_old() {
+        if let Some(sw) = ui.path_crumbs.ancestor(gtk::ScrolledWindow::static_type()).and_downcast::<gtk::ScrolledWindow>() {
+            glib::idle_add_local_once(move || pin_crumbs_right_d375(&sw.hadjustment()));
+        }
     }
 }
 
@@ -30561,6 +30585,104 @@ Broken: Either state is wrong.\n";
         settle(200);
         match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
         println!("wf-test D-374 OK");
+    }
+
+    /// D-375 alone, on the private display.
+    #[test]
+    fn address_scrolled_right_d375_alone() { gtk_thread::run(address_scrolled_right_d375_alone_on_gtk_thread); }
+
+    fn address_scrolled_right_d375_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D375_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        address_scrolled_right_d375();
+    }
+
+    /// D-375 (21 Nov 2026): in a narrow window, a deep path with long folder
+    /// names must show its right end (the current folder) in the address bar:
+    /// adjustment value >= upper - page_size - 1, content really overflowing,
+    /// and the wf-crumb-current button inside the scroller's width. Checked
+    /// after opening the deep folder, after going to its parent, and after the
+    /// window is made wider then narrower again. Fails with WF_TEST_D375_OLD=1.
+    fn address_scrolled_right_d375() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-375 resizes real X windows and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d375-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut deep = root.join("deep");
+        for i in 0..8 {
+            deep.push(format!("a-rather-long-folder-name-{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d375test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d375-proof"));
+        ui.window.set_default_size(700, 700);
+        ui.window.present();
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        wait_for("window mapped", || ui.window.is_mapped() && ui.window.width() > 0);
+        settle(500);
+        let ids: Vec<String> = xdo(&["search", "--name", "wf-d375-proof"]).split_whitespace().map(str::to_string).collect();
+        assert!(!ids.is_empty(), "no X window named wf-d375-proof");
+        let scroller: gtk::ScrolledWindow = ui.path_crumbs.ancestor(gtk::ScrolledWindow::static_type()).and_downcast().expect("the crumb scroller");
+        let check = |step: &str| {
+            let adj = scroller.hadjustment();
+            let (v, u, p) = (adj.value(), adj.upper(), adj.page_size());
+            eprintln!("wf-test D-375 {step} value={v} upper={u} page={p}");
+            assert!(u > p + 50.0, "D-375 {step}: the crumbs do not overflow (upper={u} page={p}); the test is not exercising the bug");
+            assert!(v >= u - p - 1.0, "D-375 {step}: address not at its right end: value={v} upper={u} page={p}");
+            let mut cur = None;
+            let mut child = ui.path_crumbs.first_child();
+            while let Some(c) = child {
+                if c.has_css_class("wf-crumb-current") { cur = Some(c.clone()); }
+                child = c.next_sibling();
+            }
+            let cur = cur.expect("a wf-crumb-current button");
+            let b = cur.compute_bounds(&scroller).expect("current crumb bounds");
+            let w = scroller.width() as f32;
+            assert!(b.x() >= -1.0 && b.x() + b.width() <= w + 1.0, "D-375 {step}: current folder outside the address bar: x={} w={} bar={w}", b.x(), b.width());
+        };
+        navigate(&state, crate::native_core::Location::real(deep.clone()));
+        settle(800);
+        check("deep");
+        navigate(&state, crate::native_core::Location::real(deep.parent().unwrap().to_path_buf()));
+        settle(800);
+        check("parent");
+        for id in &ids { xdo(&["windowsize", id, "1300", "700"]); }
+        settle(800);
+        for id in &ids { xdo(&["windowsize", id, "700", "700"]); }
+        settle(800);
+        check("resized");
+        ui.window.destroy();
+        settle(200);
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        println!("wf-test D-375 OK");
     }
 
     /// D-371 (21 Nov 2026, the owner's screencast): in a compact list sorted
