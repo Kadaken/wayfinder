@@ -5042,7 +5042,13 @@ fn build_ui_in(
     preview_stack.set_hhomogeneous(false);
     // Spacing lives in CSS padding so the status bar's background runs the full
     // width of the window. With margins it stopped short on both sides.
-    let status = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+    // D-375: "Loading <full path>" must never set the window's minimum width;
+    // unshortened, a deep path grew the window past the screen for those frames.
+    let status = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
     // The row carries the status background so the bar and Cancel sit inside it.
     let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     status_row.add_css_class("wf-status");
@@ -30679,13 +30685,30 @@ Broken: Either state is wrong.\n";
             let cur = cur.expect("a wf-crumb-current button");
             let b = cur.compute_bounds(&scroller).expect("current crumb bounds");
             let w = scroller.width() as f32;
+            let (wmin, wnat, _, _) = ui.window.measure(gtk::Orientation::Horizontal, -1);
+            eprintln!("wf-test D-375 {step} window min={wmin} nat={wnat} default={:?} surface_w={:?}", ui.window.default_size(), ui.window.surface().map(|s| s.width()));
             let inner = cur.compute_bounds(&ui.path_crumbs).map(|r| (r.x(), r.width()));
             let crumbs_in = ui.path_crumbs.compute_bounds(&scroller).map(|r| (r.x(), r.width()));
             eprintln!("wf-test D-375 {step} diag: cur_in_crumbs={inner:?} crumbs_in_scroller={crumbs_in:?} crumbs_w={} scroller_w={} win_w={}", ui.path_crumbs.width(), scroller.width(), ui.window.width());
-            assert!(b.x() >= -1.0 && b.x() + b.width() <= w + 1.0, "D-375 {step}: current folder outside the address bar: x={} w={} bar={w}", b.x(), b.width());
+            let right = b.x() + b.width();
+            assert!((right - w).abs() <= 2.0, "D-375 {step}: the current folder's right edge is not at the bar's right edge: x={} w={} right={right} bar={w}", b.x(), b.width());
         };
+        let max_min = std::rc::Rc::new(std::cell::Cell::new(0i32));
+        {
+            // D-375: no frame while a folder loads may ask for a wider window
+            // (the unshortened "Loading <path>" status label grew it past the screen).
+            let worst = max_min.clone();
+            ui.window.add_tick_callback(move |w, _| {
+                let (min, _, _, _) = w.measure(gtk::Orientation::Horizontal, -1);
+                if min > worst.get() { worst.set(min); }
+                glib::ControlFlow::Continue
+            });
+        }
         navigate(&state, crate::native_core::Location::real(deep.clone()));
         settle(800);
+        eprintln!("wf-test D-375 widest window minimum while loading={} window now={}", max_min.get(), ui.window.width());
+        assert!(max_min.get() < 900, "D-375: a frame asked for a {} px wide window while the deep folder loaded", max_min.get());
+        assert!(ui.window.width() < 900, "D-375: the window grew to {} px when the deep folder opened", ui.window.width());
         check("deep");
         navigate(&state, crate::native_core::Location::real(deep.parent().unwrap().to_path_buf()));
         settle(800);
