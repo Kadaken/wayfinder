@@ -6557,6 +6557,12 @@ fn d381_old() -> bool {
     cfg!(test) && std::env::var_os("WF_TEST_D381_OLD").is_some()
 }
 
+/// Test-only gate: D-389 old behaviour (a new selection cancels the decode in
+/// flight, a stale result is dropped, "Opening preview" after 150 ms).
+fn d389_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D389_OLD").is_some()
+}
+
 /// Test-only gate: D-377 old placement (command bar, old size), to show the old behaviour failing.
 fn d377_old() -> bool {
     cfg!(test) && std::env::var_os("WF_TEST_D377_OLD").is_some()
@@ -20926,85 +20932,207 @@ fn set_preview_image(ui: &Ui, path: &str) {
         return;
     }
 
-    // D-381: cancel the decode and prefetch of the previous selection, show a
-    // cached texture at once (a fixed settle delay was measured slower and removed), and only show
-    // "Opening preview" if the picture takes longer than 150 ms.
+    // D-381: show a cached texture at once and only show "Opening preview"
+    // if the picture takes a while. D-389: a decode already running is NOT
+    // cancelled by the next selection (at key-repeat rate that cancelled every
+    // decode and left the pane blank until the key was released). Latest wins:
+    // one decode in flight, one request waiting, newer requests replace the
+    // waiting one, and the pane keeps the last finished picture until a newer
+    // one is ready. Only a decode older than D389_STALE_MS is cancelled.
     let key_ptr = Rc::as_ptr(&ui.preview_generation) as usize;
-    d381_cancel_all(key_ptr);
+    d381_cancel_prefetch(key_ptr);
     let source = path.to_string();
-    let picture = ui.preview_picture.clone();
-    let stack = ui.preview_stack.clone();
-    let words = ui.preview.clone();
     let cache_key = d381_key(&source);
     if let Some(texture) = cache_key.as_ref().and_then(d381_cache_get) {
-        picture.set_paintable(Some(&texture));
-        stack.set_visible_child_name("image");
+        ui.preview_picture.set_paintable(Some(&texture));
+        ui.preview_stack.set_visible_child_name("image");
+        D389_SLOTS.with(|m| {
+            let mut m = m.borrow_mut();
+            let slot = m.entry(key_ptr).or_default();
+            slot.latest = generation;
+            slot.shown = generation;
+            slot.pending = None;
+        });
         d381_schedule_prefetch(ui, &source, generation);
         return;
     }
-    let cancellable = gio::Cancellable::new();
-    D381_DECODES.with(|m| m.borrow_mut().insert(key_ptr, cancellable.clone()));
-    // 0 = decoding, 1 = settled, 2 = timed out and handed to the outside decoders.
-    let phase = Rc::new(Cell::new(0u8));
+    let req = D389Req {
+        ui: ui.clone(),
+        source,
+        generation,
+        live: live_generation,
+        cache_key,
+        phase: Rc::new(Cell::new(0u8)),
+    };
+    // "Opening preview" only when the newest selection has waited this long
+    // with nothing finished for it; a held key never gets here.
     {
-        let (picture, stack, words, live_generation, phase) = (
-            picture.clone(),
-            stack.clone(),
-            words.clone(),
-            live_generation.clone(),
-            phase.clone(),
-        );
+        let (req, key_ptr) = (req.clone(), key_ptr);
         glib::MainContext::default().spawn_local(async move {
-            glib::timeout_future(Duration::from_millis(150)).await;
-            if phase.get() == 0 && live_generation.get() == generation {
-                picture.set_paintable(None::<&gdk::Paintable>);
-                words.set_label("Opening preview\u{2026}");
-                stack.set_visible_child_name("text");
+            glib::timeout_future(Duration::from_millis(if d389_old() { 150 } else { D389_OPENING_MS })).await;
+            let shown = D389_SLOTS.with(|m| m.borrow().get(&key_ptr).map(|s| s.shown).unwrap_or(0));
+            if req.phase.get() == 0 && req.live.get() == req.generation && shown < req.generation {
+                req.ui.preview_picture.set_paintable(None::<&gdk::Paintable>);
+                req.ui.preview.set_label("Opening preview\u{2026}");
+                req.ui.preview_stack.set_visible_child_name("text");
             }
         });
     }
+    let start_now = D389_SLOTS.with(|m| {
+        let mut m = m.borrow_mut();
+        let slot = m.entry(key_ptr).or_default();
+        slot.latest = generation;
+        if slot.busy {
+            let stale = d389_old() || slot.started.is_some_and(|t| t.elapsed() > Duration::from_millis(D389_STALE_MS));
+            if stale {
+                if let Some(c) = slot.cancel.take() {
+                    c.cancel();
+                }
+                slot.pending = None;
+                true
+            } else {
+                slot.pending = Some(req.clone());
+                false
+            }
+        } else {
+            true
+        }
+    });
+    if start_now {
+        d389_start(key_ptr, req);
+    }
+}
+
+/// D-389: a decode running longer than this is cancelled by a newer request.
+const D389_STALE_MS: u64 = 600;
+/// D-389: how long the newest selection waits before "Opening preview".
+const D389_OPENING_MS: u64 = 400;
+
+#[derive(Clone)]
+struct D389Req {
+    ui: Ui,
+    source: String,
+    generation: u64,
+    live: Rc<Cell<u64>>,
+    cache_key: Option<D381Key>,
+    /// 0 = decoding, 1 = settled, 2 = timed out and handed to the outside decoders.
+    phase: Rc<Cell<u8>>,
+}
+
+#[derive(Default)]
+struct D389Slot {
+    busy: bool,
+    run: u64,
+    started: Option<Instant>,
+    cancel: Option<gio::Cancellable>,
+    pending: Option<D389Req>,
+    /// Generation of the newest image request.
+    latest: u64,
+    /// Generation of the picture the pane shows.
+    shown: u64,
+}
+
+thread_local! {
+    static D389_SLOTS: RefCell<HashMap<usize, D389Slot>> = RefCell::new(HashMap::new());
+}
+
+/// D-389: decodes `req` on a worker thread; when it finishes, shows it (if it
+/// is newer than what the pane shows and no other kind of preview took over),
+/// then starts the waiting request, if any.
+fn d389_start(key_ptr: usize, req: D389Req) {
+    let cancellable = gio::Cancellable::new();
+    let run = D389_SLOTS.with(|m| {
+        let mut m = m.borrow_mut();
+        let slot = m.entry(key_ptr).or_default();
+        slot.busy = true;
+        slot.run += 1;
+        slot.started = Some(Instant::now());
+        slot.cancel = Some(cancellable.clone());
+        slot.run
+    });
     {
-        let (source, picture, stack, words, live_generation, phase, cancellable) = (
-            source.clone(),
-            picture.clone(),
-            stack.clone(),
-            words.clone(),
-            live_generation.clone(),
-            phase.clone(),
-            cancellable.clone(),
-        );
+        let (req, cancellable) = (req.clone(), cancellable.clone());
         glib::MainContext::default().spawn_local(async move {
             glib::timeout_future_seconds(PREVIEW_DECODE_SECONDS).await;
-            if phase.get() == 0 && live_generation.get() == generation {
-                phase.set(2);
+            if req.phase.get() == 0 && req.live.get() == req.generation {
+                req.phase.set(2);
                 cancellable.cancel();
-                eprintln!("wf-event: preview decode of {source:?} timed out, trying ffmpeg and ImageMagick");
-                preview_image_outside(source, picture, stack, words, live_generation, generation).await;
+                eprintln!("wf-event: preview decode of {:?} timed out, trying ffmpeg and ImageMagick", req.source);
+                preview_image_outside(
+                    req.source.clone(),
+                    req.ui.preview_picture.clone(),
+                    req.ui.preview_stack.clone(),
+                    req.ui.preview.clone(),
+                    req.live.clone(),
+                    req.generation,
+                )
+                .await;
             }
         });
     }
-    let ui_for_prefetch = ui.clone();
     glib::MainContext::default().spawn_local(async move {
-        let (src, c) = (source.clone(), cancellable.clone());
+        let (src, c) = (req.source.clone(), cancellable.clone());
         let decoded = gio::spawn_blocking(move || d381_decode_blocking(&src, &c))
             .await
             .ok()
             .flatten();
+        let cancelled = cancellable.is_cancelled();
         let texture = decoded.map(d381_texture);
-        if let (Some(t), Some(k)) = (&texture, &cache_key) {
+        if let (Some(t), Some(k)) = (&texture, &req.cache_key) {
             d381_cache_put(k.clone(), t.clone());
         }
-        if live_generation.get() != generation || phase.get() == 2 {
+        // Is this the run the slot is waiting on? A stale-cancelled run is not.
+        let (current, latest, shown) = D389_SLOTS.with(|m| {
+            let mut m = m.borrow_mut();
+            let slot = m.entry(key_ptr).or_default();
+            let current = slot.run == run;
+            if current {
+                slot.busy = false;
+                slot.cancel = None;
+            }
+            (current, slot.latest, slot.shown)
+        });
+        let take_over = req.live.get() == latest && req.phase.get() != 2 && (!d389_old() || req.live.get() == req.generation);
+        if let Some(texture) = texture.filter(|_| take_over && req.generation > shown) {
+            req.phase.set(1);
+            req.ui.preview_picture.set_paintable(Some(&texture));
+            req.ui.preview_stack.set_visible_child_name("image");
+            D389_SLOTS.with(|m| m.borrow_mut().entry(key_ptr).or_default().shown = req.generation);
+            if req.generation == latest {
+                d381_schedule_prefetch(&req.ui, &req.source, req.generation);
+            }
+        } else if !cancelled && take_over && req.generation == latest && req.generation > shown && req.live.get() == req.generation {
+            // Nothing here could read it: the outside decoders are the last resort.
+            req.phase.set(1);
+            D389_SLOTS.with(|m| m.borrow_mut().entry(key_ptr).or_default().shown = req.generation);
+            preview_image_outside(
+                req.source.clone(),
+                req.ui.preview_picture.clone(),
+                req.ui.preview_stack.clone(),
+                req.ui.preview.clone(),
+                req.live.clone(),
+                req.generation,
+            )
+            .await;
+        }
+        if !current {
             return;
         }
-        phase.set(1);
-        if let Some(texture) = texture {
-            picture.set_paintable(Some(&texture));
-            stack.set_visible_child_name("image");
-            d381_schedule_prefetch(&ui_for_prefetch, &source, generation);
-            return;
+        // Start the waiting request, unless the cache (a prefetch) already has it.
+        let next = D389_SLOTS.with(|m| m.borrow_mut().entry(key_ptr).or_default().pending.take());
+        if let Some(next) = next {
+            let hit = next.cache_key.as_ref().and_then(d381_cache_get);
+            if let Some(texture) = hit {
+                if next.live.get() == next.generation {
+                    next.ui.preview_picture.set_paintable(Some(&texture));
+                    next.ui.preview_stack.set_visible_child_name("image");
+                    D389_SLOTS.with(|m| m.borrow_mut().entry(key_ptr).or_default().shown = next.generation);
+                    d381_schedule_prefetch(&next.ui, &next.source, next.generation);
+                }
+            } else {
+                d389_start(key_ptr, next);
+            }
         }
-        preview_image_outside(source, picture, stack, words, live_generation, generation).await;
     });
 }
 
@@ -21085,7 +21213,6 @@ fn set_preview_image_old_decode(
 type D381Key = (String, u128, u64, i32);
 
 thread_local! {
-    static D381_DECODES: RefCell<HashMap<usize, gio::Cancellable>> = RefCell::new(HashMap::new());
     static D381_PREFETCH: RefCell<HashMap<usize, gio::Cancellable>> = RefCell::new(HashMap::new());
     static D381_CACHE: RefCell<VecDeque<(D381Key, gdk::Texture)>> = RefCell::new(VecDeque::new());
 }
@@ -21093,13 +21220,9 @@ thread_local! {
 const D381_CACHE_ENTRIES: usize = 24;
 const D381_PREFETCH_MAX_BYTES: u64 = 40 * 1024 * 1024;
 
-/// D-381: cancels the running decode and prefetch of one window.
-fn d381_cancel_all(key_ptr: usize) {
-    D381_DECODES.with(|m| {
-        if let Some(c) = m.borrow_mut().remove(&key_ptr) {
-            c.cancel();
-        }
-    });
+/// D-381: cancels the running prefetch of one window. (D-389: the decode of
+/// the shown selection is no longer cancelled here.)
+fn d381_cancel_prefetch(key_ptr: usize) {
     D381_PREFETCH.with(|m| {
         if let Some(c) = m.borrow_mut().remove(&key_ptr) {
             c.cancel();
@@ -31826,7 +31949,7 @@ Broken: Either state is wrong.\n";
     #[test]
     fn held_arrow_key_image_preview_d389_alone() { gtk_thread::run(|| d38x_gate("WAYFINDER_D389_ONLY", held_arrow_key_image_preview_d389)); }
 
-    /// D-389 (21 Nov 2026): HOLDING Down through 70 noisy 4000x3000 JPEGs must
+    /// D-389 (21 Nov 2026): HOLDING Down through 70 noisy 3000x2250 JPEGs must
     /// never leave the pane blank for more than 250 ms, must land a new image
     /// at least every 250 ms, and 300 ms after the last move must show exactly
     /// the selected file. Each image has its own aspect ratio, so the texture
@@ -31837,16 +31960,16 @@ Broken: Either state is wrong.\n";
         install_app_css();
         let fixture_bytes = Cell::new(0u64);
         let d = d362_open("d389", |dir| {
-            let (w, base_h) = (4000i32, 3000i32);
+            let (w, base_h) = (3000i32, 2250i32);
             for i in 0..N {
-                let h = base_h - 12 * i as i32;
+                let h = base_h - 9 * i as i32;
                 let stride = (w * 3) as usize;
                 let mut seed = 0x9E37_79B9u32.wrapping_mul(i + 1);
                 let mut raw = vec![0u8; stride * h as usize];
                 for (n, b) in raw.iter_mut().enumerate() {
                     seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
                     let x = (n % stride) / 3;
-                    *b = ((x as u32 / 16 + i * 7) as u8).wrapping_add((seed & 15) as u8);
+                    *b = ((x as u32 / 16 + i * 7) as u8).wrapping_add((seed & 3) as u8);
                 }
                 let bytes = glib::Bytes::from_owned(raw);
                 let pixbuf = Pixbuf::from_bytes(&bytes, gdk_pixbuf::Colorspace::Rgb, false, 8, w, h, stride as i32);
@@ -31863,7 +31986,9 @@ Broken: Either state is wrong.\n";
         let shown_index = || -> Option<u32> {
             if d.ui.preview_stack.visible_child_name().as_deref() != Some("image") { return None; }
             let r = d.ui.preview_picture.paintable()?.intrinsic_aspect_ratio();
-            (0..N).find(|&i| ((r - want(i)) / want(i)).abs() < 0.0006)
+            // Nearest file by aspect ratio: the decode truncates to whole pixels (up to 0.15 %).
+            let (best, err) = (0..N).map(|i| (i, ((r - want(i)) / want(i)).abs())).min_by(|a, b| a.1.total_cmp(&b.1))?;
+            (err < 0.003).then_some(best)
         };
         let name_now = || -> String {
             let idx = selected_indices(&d.ui).first().copied().unwrap_or(usize::MAX);

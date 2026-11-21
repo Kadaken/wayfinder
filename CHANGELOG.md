@@ -36,6 +36,8 @@ change between releases.
   status line never widens the window.
 - A file-chooser filter name or a typed save name containing control or
   direction-override characters is refused.
+- Holding an arrow key through images keeps the preview showing pictures
+  instead of going blank.
 
 ### Changed
 
