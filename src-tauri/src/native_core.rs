@@ -5749,6 +5749,79 @@ pub fn sniff_content(path: &str) -> Option<Sniffed> {
     sniff_content_bytes(&head[..n])
 }
 
+/// D-383: test-only switch, old behaviour (no way to fix a lying extension).
+pub fn d383_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D383_OLD").is_some()
+}
+
+/// D-383: a file whose extension lies about its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Misnamed {
+    /// What the bytes are: "GIF", "JPEG", "PNG", "BMP", "WebP", "MPEG".
+    pub kind: &'static str,
+    /// The extension as it is now, without the dot (case kept).
+    pub old_ext: String,
+    /// The real extension, lowercase: gif, jpg, png, bmp, webp, mpg.
+    pub new_ext: &'static str,
+    /// Stem plus the real extension.
+    pub new_name: String,
+}
+
+/// D-383: says whether `path` is misnamed (D-379 sniff says image or MPEG,
+/// the extension disagrees). Reads at most 32 bytes. A file with no extension
+/// is left alone.
+pub fn misnamed_file(path: &str) -> Option<Misnamed> {
+    if d383_old() || is_image_path(path) || is_audio_path(path) || is_video_path(path) {
+        return None;
+    }
+    let p = Path::new(path);
+    let old_ext = p.extension()?.to_string_lossy().into_owned();
+    let stem = p.file_stem()?.to_string_lossy().into_owned();
+    let (kind, new_ext) = match sniff_content(path)? {
+        Sniffed::Image("GIF") => ("GIF", "gif"),
+        Sniffed::Image("JPEG") => ("JPEG", "jpg"),
+        Sniffed::Image("PNG") => ("PNG", "png"),
+        Sniffed::Image("BMP") => ("BMP", "bmp"),
+        Sniffed::Image("WebP") => ("WebP", "webp"),
+        Sniffed::Image(_) => return None,
+        Sniffed::MpegPs => ("MPEG", "mpg"),
+    };
+    Some(Misnamed { kind, old_ext, new_ext, new_name: format!("{stem}.{new_ext}") })
+}
+
+/// D-383: the folder-wide fix. Returns the (path, new name) renames to make and
+/// how many misnamed files were skipped because the new name is already taken
+/// (by a file there or by another rename in this plan). Reads at most 32 bytes
+/// per file; meant for a worker thread.
+pub fn plan_extension_fixes(dir: &Path) -> (Vec<(String, String)>, usize) {
+    let mut names: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            names.push((entry.file_name().to_string_lossy().into_owned(), entry.path()));
+        }
+    }
+    names.sort();
+    // Lowercased: the drives he recovers from (exFAT, FAT) ignore case.
+    let mut taken: std::collections::HashSet<String> = names.iter().map(|(n, _)| n.to_lowercase()).collect();
+    let mut requests = Vec::new();
+    let mut skipped = 0usize;
+    for (_, path) in &names {
+        let is_file = fs::symlink_metadata(path).map(|m| m.file_type().is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        let Some(m) = misnamed_file(&path_str) else { continue };
+        if taken.contains(&m.new_name.to_lowercase()) {
+            skipped += 1;
+            continue;
+        }
+        taken.insert(m.new_name.to_lowercase());
+        requests.push((path_str, m.new_name));
+    }
+    (requests, skipped)
+}
+
 /// D-362: containers shown as one frame and a length rather than handed to
 /// GStreamer: raw elementary streams and formats it plays unreliably.
 pub fn video_frame_only(path: &str) -> bool {

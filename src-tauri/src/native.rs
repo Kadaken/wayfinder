@@ -3033,6 +3033,12 @@ struct Ui {
     /// without leaving the folder you are in.
     preview_folder: gtk::Box,
     preview_scroll: gtk::ScrolledWindow,
+    /// D-383: the bar under the preview of a misnamed file, its line, its
+    /// button, and the (path, new name) the button renames.
+    d383_bar: gtk::Box,
+    d383_label: gtk::Label,
+    d383_button: gtk::Button,
+    d383_target: Rc<RefCell<Option<(String, String)>>>,
     file_preview: gtk::Paned,
     preview_toggle: gtk::ToggleButton,
     /// Divider position remembered while the preview pane is hidden.
@@ -5410,8 +5416,35 @@ fn build_ui_in(
     files_pane.append(&recent_files_strip);
     files_pane.append(&column_header);
     files_pane.append(&files_overlay);
+    // D-383: one line and one button under the preview of a misnamed file.
+    // The label wraps and the button ellipsizes, so the bar never sets the
+    // pane's minimum width (D-380).
+    let d383_label = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .max_width_chars(1)
+        .hexpand(false)
+        .build();
+    let d383_button = gtk::Button::builder().halign(gtk::Align::Start).hexpand(false).build();
+    if let Some(inner) = d383_button.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+        inner.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    }
+    let d383_bar = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    d383_bar.set_margin_top(6);
+    d383_bar.set_margin_bottom(6);
+    d383_bar.set_margin_start(6);
+    d383_bar.set_margin_end(6);
+    d383_bar.set_hexpand(false);
+    d383_bar.append(&d383_label);
+    d383_bar.append(&d383_button);
+    d383_bar.set_visible(false);
+    let preview_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    preview_stack.set_vexpand(true);
+    preview_body.append(&preview_stack);
+    preview_body.append(&d383_bar);
     let preview_scroll = gtk::ScrolledWindow::builder()
-        .child(&preview_stack)
+        .child(&preview_body)
         .min_content_width(0)
         .min_content_height(0)
         .propagate_natural_width(false)
@@ -5690,6 +5723,10 @@ fn build_ui_in(
         preview_stack,
         preview_folder,
         preview_scroll: preview_scroll.clone(),
+        d383_bar: d383_bar.clone(),
+        d383_label: d383_label.clone(),
+        d383_button: d383_button.clone(),
+        d383_target: Rc::new(RefCell::new(None)),
         file_preview: file_preview.clone(),
         preview_toggle: preview_toggle.clone(),
         preview_saved_position: Rc::new(std::cell::Cell::new(0)),
@@ -8797,6 +8834,11 @@ fn connect_actions(
             show_options_popover(&options_for_popover, state.clone(), ui.clone());
         });
     }
+    {
+        let state = state.clone();
+        let ui_for_fix = ui.clone();
+        ui.d383_button.connect_clicked(move |_| d383_fix_shown_file(state.clone(), ui_for_fix.clone()));
+    }
 }
 
 /// D-352: the first left-sidebar icon the theme has, or None for the glyph.
@@ -9521,6 +9563,13 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             let cwd = state.borrow().cwd.clone();
             rebuild_sidebar(&state, &ui);
             navigate_without_history(&state, cwd);
+        }));
+    }
+    if !native_core::d383_old() && state.borrow().cwd.real_path().is_some() && !viewing_trash(&state) {
+        let state = state.clone();
+        let ui = ui.clone();
+        menu.append(&context_item("document-edit-symbolic", "Fix file extensions in this folder", "", &popover, move || {
+            d383_fix_folder(state.clone(), ui.clone())
         }));
     }
     {
@@ -20073,6 +20122,80 @@ fn release_preview_focus(ui: &Ui) {
     }
 }
 
+/// D-383: hides the bar under the preview (every file but a misnamed one).
+fn d383_hide_bar(ui: &Ui) {
+    ui.d383_bar.set_visible(false);
+    *ui.d383_target.borrow_mut() = None;
+}
+
+/// D-383: "This is a GIF named .JS" and the Rename button, for a misnamed file.
+fn d383_show_bar(ui: &Ui, path: &str) {
+    let Some(m) = native_core::misnamed_file(path) else {
+        d383_hide_bar(ui);
+        return;
+    };
+    let article = if m.kind == "MPEG" { "an" } else { "a" };
+    ui.d383_label.set_label(&format!("This is {article} {} named .{}", m.kind, m.old_ext));
+    let text = format!("Rename to {}", m.new_name);
+    ui.d383_button.set_label(&text);
+    ui.d383_button.set_tooltip_text(Some(&text));
+    if let Some(inner) = ui.d383_button.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+        inner.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    }
+    *ui.d383_target.borrow_mut() = Some((path.to_string(), m.new_name));
+    ui.d383_bar.set_visible(true);
+}
+
+/// D-383: the bar's button. One Renamed history entry, so Ctrl+Z undoes it.
+fn d383_fix_shown_file(state: Rc<RefCell<AppState>>, ui: Ui) {
+    let Some((path, new_name)) = ui.d383_target.borrow().clone() else { return };
+    let label = format!("Renaming to {new_name}");
+    run_job(
+        state,
+        ui,
+        label,
+        move || {
+            let to = native_core::rename_path(&path, &new_name)?;
+            let fp = native_core::fingerprint(&to)?;
+            let old = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            Ok(JobOutcome::undo(
+                format!("Renamed {old} to {new_name}"),
+                UndoAction::Renamed { from: path, to, fp },
+            ))
+        },
+        |_, _, _| {},
+    );
+}
+
+/// D-383: "Fix file extensions in this folder". Scans off the main thread,
+/// renames every misnamed file in one all-or-nothing batch (one BatchRenamed
+/// history entry, so one Ctrl+Z reverts all), skips names already taken, then
+/// the folder reloads with "Fixed N extensions (M skipped)".
+fn d383_fix_folder(state: Rc<RefCell<AppState>>, ui: Ui) {
+    let Some(dir) = state.borrow().cwd.real_path().map(Path::to_path_buf) else { return };
+    run_job(
+        state,
+        ui,
+        "Looking for misnamed files".to_string(),
+        move || {
+            let (requests, skipped) = native_core::plan_extension_fixes(&dir);
+            if requests.is_empty() {
+                return Ok(JobOutcome::message(format!("Fixed 0 extensions ({skipped} skipped)")));
+            }
+            let items = native_core::batch_rename(&requests)?;
+            let fps = items
+                .iter()
+                .map(|item| native_core::fingerprint(&item.to))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(JobOutcome::undo(
+                format!("Fixed {} extension{} ({skipped} skipped)", items.len(), plural(items.len())),
+                UndoAction::BatchRenamed { items, fps },
+            ))
+        },
+        |_, _, _| {},
+    );
+}
+
 fn update_preview(ui: &Ui, entry: &Entry) {
     if !ui.preview_scroll.is_visible() {
         return;
@@ -20081,6 +20204,7 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     // comes back from its worker after the user has selected something else is
     // dropped instead of painting over the newer preview.
     let generation = next_preview_generation(ui);
+    d383_hide_bar(ui);
 
     // D-325: the pane is about to swap pages and rebuild or empty children
     // (the folder rows, the audio and video controls). Focus left inside it
@@ -20136,6 +20260,7 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     match native_core::sniff_content(&path_str) {
         Some(native_core::Sniffed::Image(_)) => {
             set_preview_image(ui, &path_str);
+            d383_show_bar(ui, &path_str);
             return;
         }
         Some(native_core::Sniffed::MpegPs) => {
@@ -20153,6 +20278,7 @@ fn update_preview(ui: &Ui, entry: &Entry) {
             } else {
                 set_preview_media(ui, &path_str);
             }
+            d383_show_bar(ui, &path_str);
             return;
         }
         None => {}
@@ -20445,6 +20571,7 @@ fn show_preview_volume(ui: &Ui, volume: f64, muted: bool) {
 }
 
 fn set_preview_text(ui: &Ui, text: &str) {
+    d383_hide_bar(ui);
     if !ui.preview_scroll.is_visible() {
         return;
     }
@@ -31312,6 +31439,80 @@ Broken: Either state is wrong.\n";
         }
         assert!(failures.is_empty(), "D-379 failures:\n{}", failures.join("\n"));
         println!("wf-test D-379 OK");
+    }
+
+    /// D-383 alone, on the private display.
+    #[test]
+    fn fix_extension_d383_alone() { gtk_thread::run(|| d38x_gate("WAYFINDER_D383_ONLY", fix_extension_d383)); }
+
+    /// D-383 (21 Nov 2026): a misnamed file gets a bar with "Rename to <stem>.gif"
+    /// and the folder gets "Fix file extensions in this folder"; both go through
+    /// the history, so Ctrl+Z (undo_action) puts the old names back, the folder
+    /// fix as ONE step. Fixtures are copied out of the read-only Web fragments
+    /// folder. Fails with WF_TEST_D383_OLD=1 (no bar, no menu item).
+    fn fix_extension_d383() {
+        let source = Path::new("/run/media/user/Disk1/System and program files/Web fragments");
+        assert!(source.is_dir(), "D-383 needs the Web fragments folder at {}", source.display());
+        let gifs = ["INSITE~1.JS", "FOOTER~1.CSS", "CATALO~1.XML"];
+        let dir_holder = Rc::new(RefCell::new(PathBuf::new()));
+        let holder = dir_holder.clone();
+        install_app_css();
+        let d = d362_open("d383", |dir| {
+            for n in gifs { std::fs::copy(source.join(n), dir.join(n)).unwrap(); }
+            std::fs::write(dir.join("real.js"), "console.log(1)").unwrap();
+            *holder.borrow_mut() = dir.to_path_buf();
+        }, 4);
+        let dir = dir_holder.borrow().clone();
+        d38x_preview_on(&d);
+        let exists = |n: &str| dir.join(n).exists();
+        let mut failures: Vec<String> = Vec::new();
+        let mut check = |ok: bool, what: String| { eprintln!("wf-test D-383 {} {what}", if ok { "ok  " } else { "FAIL" }); if !ok { failures.push(what); } };
+
+        // 1. The bar for one misnamed file.
+        d38x_select(&d, "INSITE~1.JS");
+        let shown = d38x_wait_ms(3000, || d.ui.d383_bar.is_visible()).is_some();
+        let button_text = d.ui.d383_button.label().map(|s| s.to_string()).unwrap_or_default();
+        eprintln!("wf-test D-383 line={:?} button={button_text:?}", d.ui.d383_label.label());
+        check(shown, "the bar shows for INSITE~1.JS".into());
+        check(button_text.contains("INSITE~1.gif"), format!("button text {button_text:?} names INSITE~1.gif"));
+        check(d.ui.d383_label.label().contains("GIF") && d.ui.d383_label.label().contains(".JS"), "the line says GIF named .JS".into());
+        // Narrow-pane rule (D-380): the bar must not be wider than the pane.
+        let total = d.ui.file_preview.width();
+        d.ui.file_preview.set_position(total - 220);
+        d38x_spin_for(400);
+        let (pane_w, bar_w) = (d.ui.preview_scroll.width(), d.ui.d383_bar.width());
+        check(bar_w <= pane_w, format!("bar width {bar_w} fits pane width {pane_w}"));
+        d38x_select(&d, "real.js");
+        d38x_spin_for(300);
+        check(!d.ui.d383_bar.is_visible(), "the bar is hidden for real.js".into());
+        d38x_select(&d, "INSITE~1.JS");
+        d38x_wait_ms(3000, || d.ui.d383_bar.is_visible());
+
+        d.ui.d383_button.emit_clicked();
+        d362_wait("the single rename", 20, || exists("INSITE~1.gif"));
+        d362_wait("the reload", 20, || d.state.borrow().visible_entries.iter().any(|e| e.name == "INSITE~1.gif"));
+        check(exists("INSITE~1.gif") && !exists("INSITE~1.JS"), "INSITE~1.gif exists, INSITE~1.JS is gone".into());
+        undo_action(d.state.clone(), d.ui.clone());
+        d362_wait("the undo", 20, || exists("INSITE~1.JS"));
+        check(exists("INSITE~1.JS") && !exists("INSITE~1.gif"), "undo brings INSITE~1.JS back".into());
+        d362_wait("the reload after undo", 20, || d.state.borrow().visible_entries.iter().any(|e| e.name == "INSITE~1.JS"));
+
+        // 2. The folder-wide action, from the Options menu.
+        let options = all_widgets(d.ui.window.upcast_ref()).into_iter().filter_map(|w| w.downcast::<gtk::Button>().ok()).find(|b| b.tooltip_text().as_deref() == Some("View and folder options")).expect("the Options button");
+        options.emit_clicked();
+        let popover = popovers_of(options.upcast_ref()).pop().expect("options popover");
+        let item = button_labelled(popover.upcast_ref(), "Fix file extensions in this folder");
+        check(item.is_some(), "Options has Fix file extensions in this folder".into());
+        if let Some(item) = item { item.emit_clicked(); }
+        d362_wait("the folder fix", 20, || exists("FOOTER~1.gif") && exists("CATALO~1.gif") && exists("INSITE~1.gif"));
+        d362_wait("the status line", 20, || d.ui.status.label().contains("Fixed 3 extensions (0 skipped)"));
+        check(!exists("FOOTER~1.CSS") && !exists("CATALO~1.XML") && !exists("INSITE~1.JS"), "old names are gone".into());
+        check(std::fs::read_to_string(dir.join("real.js")).is_ok_and(|t| t == "console.log(1)") && exists("real.js"), "real.js untouched".into());
+        undo_action(d.state.clone(), d.ui.clone());
+        d362_wait("the one undo step", 20, || gifs.iter().all(|n| exists(n)));
+        check(gifs.iter().all(|n| exists(n)) && !exists("FOOTER~1.gif") && !exists("CATALO~1.gif") && !exists("INSITE~1.gif"), "one undo restores all three names".into());
+        assert!(failures.is_empty(), "D-383 failures:\n{}", failures.join("\n"));
+        println!("wf-test D-383 OK");
     }
 
     /// D-380 alone, on the private display.
