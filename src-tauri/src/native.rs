@@ -26165,6 +26165,18 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-20 focus test alone, on the private display.
+    #[test]
+    fn emptied_folder_focus_d20_alone() { gtk_thread::run(emptied_folder_focus_d20_alone_on_gtk_thread); }
+
+    fn emptied_folder_focus_d20_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D20_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        gtk::init().expect("gtk init on the virtual display");
+        emptied_folder_keeps_focus_on_the_view_root_d20();
+    }
+
     /// D-368 alone, on the private display.
     #[test]
     fn grid_thumbnails_past_60_d368_alone() { gtk_thread::run(grid_thumbnails_past_60_d368_alone_on_gtk_thread); }
@@ -39544,7 +39556,10 @@ Broken: Either state is wrong.\n";
         // Grid: the GridView is the root. A GridView nobody has focused yet
         // has no focus item, so grab_focus lands on the root
         // (gtklistbase.c:658-668); focus the tile itself, as a click does.
+        // scroll_to(FOCUS) sets GTK's focus item; grab_focus then moves to it
+        // (gtklistbase.c:2405-2424, 658-668).
         grid.scroll_to(0, gtk::ListScrollFlags::FOCUS, None);
+        grid.grab_focus();
         pump();
         assert!(
             focus_within(&win, &grid) && focus().as_ref() != Some(grid.upcast_ref()),
