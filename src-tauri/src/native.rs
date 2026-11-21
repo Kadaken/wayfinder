@@ -5255,6 +5255,8 @@ fn build_ui_in(
     files_stack.add_named(&list_overlay, Some("list"));
     files_stack.add_named(&grid_scroll, Some("grid"));
     files_stack.set_visible_child_name("list");
+    count_his_scroll_input(&files_scroll);
+    count_his_scroll_input(&grid_scroll);
     watch_scroll_jumps(&files_scroll, "list");
     watch_scroll_jumps(&grid_scroll, "grid");
     hold_list_at_edges(&files_scroll);
@@ -10423,12 +10425,26 @@ fn reload_preview_if_changed(state: &Rc<RefCell<AppState>>, ui: &Ui, changed: &[
 
 /// True once the adjustment is where it was asked to go. An offset past the
 /// end does NOT count as settled: a half-built list and a genuinely shorter one
-/// look identical at that moment, so the try cap ends the former and the latter
-/// simply reapplies a value that clamps to the same place, costing nothing.
+/// look identical at that moment, so the hold's deadline ends the former and the
+/// latter simply reapplies a value that clamps to the same place, costing nothing.
 fn scroll_target_reached(value: f64, target: f64) -> bool {
     (value - target).abs() < 0.5
 }
 
+// WHO MOVES THE LIST (D-355/D-358: every list row is one height, so GTK has
+// nothing to re-estimate and no hold exists to fight a re-measure):
+//  - `reapply_scroll`: puts the place back after the rows are rebuilt (refresh,
+//    pin change, navigate back). GTK scrolls a focused row into view or
+//    recomputes the offset from a forgotten row after a rebuild (D-226/D-233/D-349).
+//  - `hold_list_at_edges`: stops GTK's own edge scroll between a press and its
+//    release, and while a file drag is over the view (D-350).
+//  - `mark_scroll_cause`: every deliberate move by Wayfinder calls it first. It
+//    bumps SCROLL_GENERATION; both holds above stand down when it changes, so
+//    they never fight each other or his own wheel, press or key
+//    (`count_his_scroll_input`).
+//  - `watch_scroll_jumps` only writes the jump log. It moves nothing.
+// `hold_new_item_on_screen` does not scroll: it picks where a new item sits in
+// the held order.
 thread_local! {
     /// D-345: the last thing Wayfinder itself did that can move the list, and when.
     static SCROLL_CAUSE: RefCell<(&'static str, Option<Instant>)> = const { RefCell::new(("", None)) };
@@ -10558,7 +10574,7 @@ fn tag_scroll_cause(cause: &'static str) {
 /// D-345: append every list jump of more than 200px to
 /// ~/.cache/wayfinder/scroll-jumps.log with the last cause marked in the past
 /// two seconds. A jump with no cause is the user's wheel or GTK itself.
-fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
+fn count_his_scroll_input(scroller: &gtk::ScrolledWindow) {
     // D-349: any wheel, press or key inside the view is his own doing, and
     // takes the place guard off at once. A plain listener, never claims anything.
     let input = gtk::EventControllerLegacy::new();
@@ -10573,6 +10589,10 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
         glib::Propagation::Proceed
     });
     scroller.add_controller(input);
+}
+
+/// D-345: the jump log only; it moves nothing.
+fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
     let last = Rc::new(Cell::new(scroller.vadjustment().value()));
     scroller.vadjustment().connect_value_changed(move |adj| {
         let (from, to) = (last.get(), adj.value());
@@ -10637,9 +10657,14 @@ fn view_scroller(state: &Rc<RefCell<AppState>>, ui: &Ui) -> gtk::ScrolledWindow 
 /// what dragged the view to the top. The old code then corrected it on a 16ms
 /// timer, and that correction is the jump he could see. A tick callback runs
 /// before each frame is painted, so reasserting the offset there means the list
-/// is never drawn anywhere but where it was. It stops as soon as the offset has
-/// held for 1.5 seconds (the deadline below), and it comes off the moment he
-/// scrolls, clicks or types, so it never fights his own scrolling.
+/// is never drawn anywhere but where it was. It runs for at most 1.5 seconds
+/// (the deadline below), and it comes off the moment he scrolls, clicks or
+/// types, so it never fights his own scrolling.
+///
+/// The target is a pixel. That is the same as a row index plus an offset
+/// because every list row is one height (D-355/D-358), so GTK's
+/// estimate of the list height cannot change under the hold and the pixel cannot
+/// land on another row.
 fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     mark_scroll_cause("restore after refresh");
     let started = scroll_generation();
@@ -10662,7 +10687,7 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     // holds for 1.5s and comes off the moment he scrolls, clicks or types, so it
     // never fights his own scrolling.
     let deadline = Instant::now() + Duration::from_millis(1500);
-    // His input (counted by watch_scroll_jumps) or any deliberate scroll by
+    // His input (counted by count_his_scroll_input) or any deliberate scroll by
     // Wayfinder after this one.
     let stand_down = move || scroll_generation() != started;
     let snapping_check = snapping;
@@ -12035,7 +12060,8 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 /// D-342 (19 Nov 2026, the owner): a new folder appears at the top of what he is
 /// looking at, so naming it never scrolls him anywhere. It used to land at
 /// the very bottom (after a rename held the order) or wherever its name
-/// sorted, and the view followed it there.
+/// sorted, and the view followed it there. It never moves the scroll offset;
+/// it only chooses the new item's place in the held order, reading the offset.
 fn hold_new_item_on_screen(state: &Rc<RefCell<AppState>>, ui: &Ui, source: native_core::EntrySource) {
     let scroller = view_scroller(state, ui);
     let adj = scroller.vadjustment();
