@@ -4812,7 +4812,14 @@ fn build_ui_in(
     // D-375 (21 Nov 2026): keep the current folder (right end) in view. `changed`
     // fires when the content or the width changes, not on a user's wheel scroll.
     if !d375_old() {
-        path_label.hadjustment().connect_changed(pin_crumbs_right_d375);
+        let weak = path_label.downgrade();
+        path_label.hadjustment().connect_changed(move |_| {
+            // Not synchronous: `changed` fires inside the viewport's size_allocate.
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(sw) = weak.upgrade() { pin_crumbs_right_d375(&sw); }
+            });
+        });
     }
     let path_entry = gtk::Entry::builder()
         .hexpand(true)
@@ -6366,10 +6373,15 @@ fn keep_size_past_bounds(state_floating: bool, cur_w: i32, cur_h: i32, bounds_w:
 }
 
 /// D-375: scroll the address crumbs to their right end (GTK clamps; fits = 0).
-fn pin_crumbs_right_d375(adj: &gtk::Adjustment) {
+fn pin_crumbs_right_d375(sw: &gtk::ScrolledWindow) {
+    let adj = sw.hadjustment();
     let target = adj.upper() - adj.page_size();
     if (adj.value() - target).abs() > 0.5 {
         adj.set_value(target);
+    }
+    // Always re-allocate the viewport so the child is placed at the new offset.
+    if let Some(child) = sw.child() {
+        child.queue_allocate();
     }
 }
 
@@ -11730,7 +11742,7 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::L
     // D-375: the new buttons are measured after this call; pin once they are.
     if !d375_old() {
         if let Some(sw) = ui.path_crumbs.ancestor(gtk::ScrolledWindow::static_type()).and_downcast::<gtk::ScrolledWindow>() {
-            glib::idle_add_local_once(move || pin_crumbs_right_d375(&sw.hadjustment()));
+            glib::idle_add_local_once(move || pin_crumbs_right_d375(&sw));
         }
     }
 }
@@ -30648,9 +30660,10 @@ Broken: Either state is wrong.\n";
         };
         wait_for("window mapped", || ui.window.is_mapped() && ui.window.width() > 0);
         settle(500);
+        let scroller: gtk::ScrolledWindow = ui.path_crumbs.ancestor(gtk::ScrolledWindow::static_type()).and_downcast().expect("the crumb scroller");
+        eprintln!("wf-test D-375 mapped win_w={} scroller_w={}", ui.window.width(), scroller.width());
         let ids: Vec<String> = xdo(&["search", "--name", "wf-d375-proof"]).split_whitespace().map(str::to_string).collect();
         assert!(!ids.is_empty(), "no X window named wf-d375-proof");
-        let scroller: gtk::ScrolledWindow = ui.path_crumbs.ancestor(gtk::ScrolledWindow::static_type()).and_downcast().expect("the crumb scroller");
         let check = |step: &str| {
             let adj = scroller.hadjustment();
             let (v, u, p) = (adj.value(), adj.upper(), adj.page_size());
@@ -30666,6 +30679,9 @@ Broken: Either state is wrong.\n";
             let cur = cur.expect("a wf-crumb-current button");
             let b = cur.compute_bounds(&scroller).expect("current crumb bounds");
             let w = scroller.width() as f32;
+            let inner = cur.compute_bounds(&ui.path_crumbs).map(|r| (r.x(), r.width()));
+            let crumbs_in = ui.path_crumbs.compute_bounds(&scroller).map(|r| (r.x(), r.width()));
+            eprintln!("wf-test D-375 {step} diag: cur_in_crumbs={inner:?} crumbs_in_scroller={crumbs_in:?} crumbs_w={} scroller_w={} win_w={}", ui.path_crumbs.width(), scroller.width(), ui.window.width());
             assert!(b.x() >= -1.0 && b.x() + b.width() <= w + 1.0, "D-375 {step}: current folder outside the address bar: x={} w={} bar={w}", b.x(), b.width());
         };
         navigate(&state, crate::native_core::Location::real(deep.clone()));
