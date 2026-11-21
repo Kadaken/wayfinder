@@ -25155,6 +25155,7 @@ Broken: Either state is wrong.\n";
             pin_keeps_item_on_top_d359();
             bottom_row_click_keeps_place_d350();
             split_wrapped_names_click_keeps_place_d358();
+            refresh_keeps_scroll_place_d349();
             eprintln!("wf-test scroll-only run done");
             return;
         }
@@ -25233,6 +25234,7 @@ Broken: Either state is wrong.\n";
         compare_window_shows_both_files_d351();
         sidebar_button_not_divider_d352();
         split_wrapped_names_click_keeps_place_d358();
+        refresh_keeps_scroll_place_d349();
         // D-336 real-drag and D-339 pointer tests: off until the Xvfb pointer reaches the window.
         // split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details-drag", true);
         folder_change_waits_for_open_rename_d338();
@@ -29135,6 +29137,114 @@ Broken: Either state is wrong.\n";
             None => std::env::remove_var("HOME"),
         }
         assert!(problems.is_empty(), "D-358: clicking moved the list or flipped its height: {problems:?}");
+    }
+
+    /// D-349 (and D-226/D-233): after the rows are rebuilt, the list shows the
+    /// same top row. His conditions: split view, narrow left pane, wrapping
+    /// names, 900 rows, scrolled mid-list and near the bottom. Each trigger is
+    /// one of reapply_scroll's three callers:
+    ///  - navigate_to_with_message on the same folder (a delete or a reload),
+    ///  - apply_monitor_scan (the folder watcher saw a file arrive),
+    ///  - refresh_all_for_pins (Pin / Unpin).
+    /// Fails if `reapply_scroll` starts with `return;`. The files that arrive
+    /// sort last and the pinned row is already first, so the rows above the
+    /// view never change and the top row must stay the same.
+    fn refresh_keeps_scroll_place_d349() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d349-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 900usize;
+        for i in 0..total {
+            std::fs::write(dir.join(wrapped_fixture_name(i)), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d349test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1300, 800);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        open_narrow_split(&state, &ui, total);
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        // The first row that shows any part of the view, by its path.
+        let top_row = |ui: &Ui| -> (String, f32) {
+            let scroll_b = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
+            let mut rows: Vec<(String, f32)> = all_widgets(ui.list.upcast_ref()).into_iter()
+                .filter(|w| w.has_css_class("wf-file-row") && w.is_mapped())
+                .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w.tooltip_text().map(|t| t.to_string()).unwrap_or_default(), b)))
+                .filter(|(_, b)| b.y() + b.height() > scroll_b.y() + 1.0 && b.y() < scroll_b.y() + scroll_b.height())
+                .map(|(p, b)| (p, b.y() - scroll_b.y()))
+                .collect();
+            rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            rows.into_iter().next().expect("a row shows in the view")
+        };
+        let mut added = 0usize;
+        let mut problems: Vec<String> = Vec::new();
+        for (stage, frac) in [("mid", 0.5f64), ("bottom", 0.97f64)] {
+            for trigger in ["same-folder reload", "folder watcher", "pin"] {
+                mark_scroll_cause("test: his own scroll");
+                adj.set_value((adj.upper() - adj.page_size()) * frac);
+                settle(600);
+                if trigger == "pin" {
+                    // Row 0 is above the view and already first: pinning it
+                    // rebuilds every row and changes none above the view.
+                    ui.list_selection.select_item(0, true);
+                    update_selection(&state, &ui);
+                    settle(600);
+                }
+                let (top_before, y_before) = top_row(&ui);
+                let (value_before, upper_before) = (adj.value(), adj.upper());
+                match trigger {
+                    "same-folder reload" | "folder watcher" => {
+                        added += 1;
+                        std::fs::write(dir.join(format!("zz-arrived-{added}.txt")), "new").unwrap();
+                        if trigger == "same-folder reload" {
+                            let cwd = state.borrow().cwd.clone();
+                            navigate_to_with_message(&state, cwd, NavMode::Record, None);
+                        } else {
+                            let listing = crate::native_core::list_dir_cancellable(&dir, false, &AtomicBool::new(false)).expect("relist");
+                            apply_monitor_scan(&state, &ui, listing);
+                        }
+                        wait_for("the new file is listed", || {
+                            pump();
+                            state.borrow().visible_entries.len() >= total + added
+                        });
+                    }
+                    _ => toggle_pin_selection(&state, &ui),
+                }
+                // Past reapply_scroll's 1.5 s hold, and GTK's relayout 120-190ms after a refresh.
+                settle(1700);
+                let (top_after, y_after) = top_row(&ui);
+                let (value_after, upper_after) = (adj.value(), adj.upper());
+                eprintln!("wf-test D-349 {stage} {trigger}: top row {top_before} -> {top_after}, y {y_before:.0} -> {y_after:.0}, value {value_before:.0} -> {value_after:.0}, upper {upper_before:.0} -> {upper_after:.0}");
+                if top_after != top_before || (y_after - y_before).abs() > 3.0 {
+                    problems.push(format!("{stage} {trigger}: top row {top_before} -> {top_after}, value {value_before:.0} -> {value_after:.0}"));
+                }
+            }
+        }
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(problems.is_empty(), "D-349: a refresh moved the list: {problems:?}");
     }
 
     fn sidebar_button_not_divider_d352() {
@@ -39082,9 +39192,12 @@ Broken: Either state is wrong.\n";
             "#!/bin/sh\nsrc=$4; stage=$5; i=0; : > \"$stage\"\n\
              while [ $i -lt 6 ]; do\n\
              dd if=\"$src\" of=\"$stage\" bs=1048576 skip=$i seek=$i count=1 conv=notrunc 2>/dev/null\n\
-             i=$((i+1)); sleep 0.15; done\n",
+             i=$((i+1)); sleep 0.4; done\n",
         )
         .unwrap();
+        // 0.4 s a step (2.4 s for 6 MB): `pump` blocks for at least 200 ms a call, so
+        // the test samples the label about every 200-300 ms, more on a busy machine.
+        // At 0.15 s a step the whole copy took under 1 s and could end between two samples.
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
