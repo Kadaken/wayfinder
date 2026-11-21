@@ -2636,7 +2636,39 @@ fn spawn_reaped(mut command: Command) -> std::io::Result<u32> {
     }
 }
 
+/// D-379: the MIME type of a file whose extension lies, or `None` when the
+/// extension is already an image, audio or video type or the bytes say
+/// nothing. Reads at most 64 bytes, and only at open time.
+pub fn lying_extension_mime(path: &str) -> Option<&'static str> {
+    if is_image_path(path) || is_audio_path(path) || is_video_path(path) {
+        return None;
+    }
+    let mut head = [0u8; 64];
+    let n = fs::File::open(path).and_then(|mut f| f.read(&mut head)).ok()?;
+    match sniff_content_bytes(&head[..n])? {
+        Sniffed::Image("GIF") => Some("image/gif"),
+        Sniffed::Image("JPEG") => Some("image/jpeg"),
+        Sniffed::Image("PNG") => Some("image/png"),
+        Sniffed::Image("BMP") => Some("image/bmp"),
+        Sniffed::Image("WebP") => Some("image/webp"),
+        Sniffed::Image(_) => None,
+        Sniffed::MpegPs => Some("video/mpeg"),
+    }
+}
+
 pub fn open_path(path: &str) -> Result<(), String> {
+    // D-379: a GIF named .XML opens in the image viewer, not a text editor.
+    if let Some(mime) = lying_extension_mime(path) {
+        use gio::prelude::AppInfoExt;
+        if let Some(app) = gio::AppInfo::default_for_type(mime, false) {
+            if app
+                .launch(&[gio::File::for_path(path)], gio::AppLaunchContext::NONE)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
     let mut command = Command::new("xdg-open");
     command.arg(path);
     spawn_reaped(command)
@@ -2645,12 +2677,15 @@ pub fn open_path(path: &str) -> Result<(), String> {
 }
 
 pub fn open_with_apps(path: &str) -> Vec<AppEntry> {
-    let mime = Command::new("xdg-mime")
-        .args(["query", "filetype", path])
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_default();
+    let mime = match lying_extension_mime(path) {
+        Some(real) => real.to_string(),
+        None => Command::new("xdg-mime")
+            .args(["query", "filetype", path])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default(),
+    };
     if mime.is_empty() {
         return vec![];
     }
@@ -5656,6 +5691,62 @@ pub fn not_audio_reason(path: &str) -> Option<String> {
         None => false,
     };
     plainly_wrong.then(|| damaged_file_reason(path, "audio file"))
+}
+
+/// D-379: what a file's first bytes say it is, for files whose extension lies
+/// (recovered web-cache files named .JS, .HTM or .CSS that are really GIFs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sniffed {
+    Image(&'static str),
+    /// MPEG-1/2 program stream (00 00 01 BA).
+    MpegPs,
+}
+
+/// D-379: test-only switch, old behaviour (no content sniffing).
+fn d379_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D379_OLD").is_some()
+}
+
+/// D-379: the byte-level half of [`sniff_content`]. Pure; HTML and text
+/// starts return `None` so they are never overridden.
+pub fn sniff_content_bytes(head: &[u8]) -> Option<Sniffed> {
+    if d379_old() {
+        return None;
+    }
+    let starts = |prefix: &[u8]| head.starts_with(prefix);
+    if starts(b"GIF87a") || starts(b"GIF89a") {
+        return Some(Sniffed::Image("GIF"));
+    }
+    if starts(&[0xFF, 0xD8, 0xFF]) {
+        return Some(Sniffed::Image("JPEG"));
+    }
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        return Some(Sniffed::Image("PNG"));
+    }
+    if starts(b"BM") && head.len() >= 18 {
+        // BITMAPFILEHEADER: reserved fields (bytes 6..10) are zero and the
+        // info-header size (bytes 14..18) is one of the known sizes.
+        let reserved_zero = head[6..10].iter().all(|b| *b == 0);
+        let dib = u32::from_le_bytes([head[14], head[15], head[16], head[17]]);
+        if reserved_zero && matches!(dib, 12 | 40 | 52 | 56 | 64 | 108 | 124) {
+            return Some(Sniffed::Image("BMP"));
+        }
+    }
+    if starts(b"RIFF") && head.len() >= 12 && &head[8..12] == b"WEBP" {
+        return Some(Sniffed::Image("WebP"));
+    }
+    if starts(&[0x00, 0x00, 0x01, 0xBA]) {
+        return Some(Sniffed::MpegPs);
+    }
+    None
+}
+
+/// D-379: reads at most 32 bytes of `path` and says what they are.
+pub fn sniff_content(path: &str) -> Option<Sniffed> {
+    use std::io::Read;
+    let mut head = [0u8; 32];
+    let n = fs::File::open(path).and_then(|mut f| f.read(&mut head)).ok()?;
+    sniff_content_bytes(&head[..n])
 }
 
 /// D-362: containers shown as one frame and a length rather than handed to
@@ -12698,5 +12789,51 @@ mod audit_log_cap_tests {
         assert!(text.ends_with("line 01999 padding padding\n"));
         assert!(text.starts_with("line "), "cut must fall on a line start");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sniff_content_finds_lying_extensions_d379() {
+        assert_eq!(sniff_content_bytes(b"GIF89a\x01\x00\x01\x00"), Some(Sniffed::Image("GIF")));
+        assert_eq!(sniff_content_bytes(b"GIF87a\x01\x00"), Some(Sniffed::Image("GIF")));
+        assert_eq!(sniff_content_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Sniffed::Image("JPEG")));
+        assert_eq!(sniff_content_bytes(b"\x89PNG\r\n\x1a\n\0\0"), Some(Sniffed::Image("PNG")));
+        let mut bmp = vec![0u8; 30];
+        bmp[0] = b'B';
+        bmp[1] = b'M';
+        bmp[14] = 40;
+        assert_eq!(sniff_content_bytes(&bmp), Some(Sniffed::Image("BMP")));
+        // "BM" at the start of ordinary text is not a bitmap.
+        assert_eq!(sniff_content_bytes(b"BMW is a car maker, said the text file"), None);
+        assert_eq!(sniff_content_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some(Sniffed::Image("WebP")));
+        assert_eq!(sniff_content_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt "), None);
+        assert_eq!(sniff_content_bytes(&[0, 0, 1, 0xBA, 0x44]), Some(Sniffed::MpegPs));
+        // Real HTML and text starts are never overridden.
+        assert_eq!(sniff_content_bytes(b"<!DOCTYPE html><html>"), None);
+        assert_eq!(sniff_content_bytes(b"function f() { return 1; }"), None);
+        assert_eq!(sniff_content_bytes(b""), None);
+        // Real text .xml stays text; a GIF named .XML is an image.
+        assert_eq!(sniff_content_bytes(b"<?xml version=\"1.0\"?><a/>"), None);
+        assert_eq!(sniff_content_bytes(b"<catalog><item/></catalog>"), None);
+        let dir = scratch_root().join(format!("wf-d379-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("INSITE~1.JS");
+        fs::write(&f, b"GIF89a\x9f\x00\x01\x00").unwrap();
+        assert_eq!(sniff_content(f.to_str().unwrap()), Some(Sniffed::Image("GIF")));
+        for name in ["CATALO~1.XML", "_ATALO~1.XML", "THIRD~1.XML"] {
+            let x = dir.join(name);
+            fs::write(&x, b"GIF89a\x2d\x00\x12\x00").unwrap();
+            assert_eq!(sniff_content(x.to_str().unwrap()), Some(Sniffed::Image("GIF")), "{name}");
+            assert_eq!(lying_extension_mime(x.to_str().unwrap()), Some("image/gif"), "{name}");
+        }
+        let real_xml = dir.join("real.xml");
+        fs::write(&real_xml, b"<?xml version=\"1.0\"?><a/>").unwrap();
+        assert_eq!(sniff_content(real_xml.to_str().unwrap()), None);
+        assert_eq!(lying_extension_mime(real_xml.to_str().unwrap()), None);
+        let real_png = dir.join("p.png");
+        fs::write(&real_png, b"\x89PNG\r\n\x1a\n").unwrap();
+        assert_eq!(lying_extension_mime(real_png.to_str().unwrap()), None);
+        assert_eq!(sniff_content(dir.join("missing.js").to_str().unwrap()), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

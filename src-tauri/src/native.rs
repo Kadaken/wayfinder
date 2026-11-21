@@ -2846,14 +2846,41 @@ fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
     doc_picture.set_hexpand(true);
     doc_picture.set_vexpand(true);
     doc_picture.set_widget_name("wf-doc-page");
-    let doc_prev = gtk::Button::with_label("Previous");
+    // D-380: the bar must fit any pane width. Previous, Next and Show source
+    // are icon buttons with tooltips, and the page label ellipsizes, so the
+    // bar's natural width never pushes a button off the right edge.
+    let doc_prev = if d380_old() {
+        gtk::Button::with_label("Previous")
+    } else {
+        let b = gtk::Button::from_icon_name("go-previous-symbolic");
+        b.set_tooltip_text(Some("Previous page"));
+        b
+    };
     doc_prev.set_widget_name("wf-doc-prev");
-    let doc_next = gtk::Button::with_label("Next");
+    let doc_next = if d380_old() {
+        gtk::Button::with_label("Next")
+    } else {
+        let b = gtk::Button::from_icon_name("go-next-symbolic");
+        b.set_tooltip_text(Some("Next page"));
+        b
+    };
     doc_next.set_widget_name("wf-doc-next");
     let doc_label = gtk::Label::new(Some("Page 1 of 1"));
     doc_label.set_widget_name("wf-doc-pages");
     doc_label.set_hexpand(true);
-    let doc_source_toggle = gtk::ToggleButton::with_label("Show source");
+    if !d380_old() {
+        doc_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        doc_label.set_width_chars(0);
+        doc_label.set_max_width_chars(1);
+    }
+    let doc_source_toggle = if d380_old() {
+        gtk::ToggleButton::with_label("Show source")
+    } else {
+        let b = gtk::ToggleButton::new();
+        b.set_icon_name("format-text-plaintext-symbolic");
+        b.set_tooltip_text(Some("Show source"));
+        b
+    };
     doc_source_toggle.set_widget_name("wf-doc-source");
     doc_source_toggle.set_visible(false);
     let nav = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -2934,6 +2961,9 @@ fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
         panes.doc_source_toggle.connect_toggled(move |t| {
             p.doc_source_scroll.set_visible(t.is_active());
             p.doc_picture.set_visible(!t.is_active());
+            if !d380_old() {
+                t.set_tooltip_text(Some(if t.is_active() { "Show page" } else { "Show source" }));
+            }
         });
     }
     {
@@ -6462,6 +6492,16 @@ fn pin_crumbs_right_d375(sw: &gtk::ScrolledWindow) {
     if let Some(child) = sw.child() {
         child.queue_allocate();
     }
+}
+
+/// Test-only gate: D-380 old text-button viewer bar, to show the old behaviour failing.
+fn d380_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D380_OLD").is_some()
+}
+
+/// Test-only gate: D-381 old image loading (no cancel, settle, cache or prefetch).
+fn d381_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D381_OLD").is_some()
 }
 
 /// Test-only gate: D-377 old placement (command bar, old size), to show the old behaviour failing.
@@ -20090,6 +20130,34 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
+    // D-379: a recovered file whose extension lies (a GIF named .JS or .HTM)
+    // is shown as what its first bytes say it is, before the document, SWF
+    // and text paths get it. Real HTML and text starts are not overridden.
+    match native_core::sniff_content(&path_str) {
+        Some(native_core::Sniffed::Image(_)) => {
+            set_preview_image(ui, &path_str);
+            return;
+        }
+        Some(native_core::Sniffed::MpegPs) => {
+            // A few-KB piece of an MPEG stream (web-cache leftovers) has no
+            // whole frame; the video page would only report a failure.
+            let bytes = fs::metadata(&path_str).map(|m| m.len()).unwrap_or(0);
+            if bytes < 256 * 1024 {
+                set_preview_text(
+                    ui,
+                    &format!(
+                        "Part of an MPEG video, {}, saved under the wrong extension.\nToo short to play on its own.",
+                        native_core::fmt_size(bytes)
+                    ),
+                );
+            } else {
+                set_preview_media(ui, &path_str);
+            }
+            return;
+        }
+        None => {}
+    }
+
     if let Some(kind) = native_viewers::doc_kind(&path_str) {
         set_preview_document(ui, &path_str, kind);
         return;
@@ -20627,6 +20695,101 @@ fn set_preview_image(ui: &Ui, path: &str) {
     // left the pane on "Opening preview..." for good) is given
     // PREVIEW_DECODE_SECONDS, then the outside decoders take over. Whatever
     // happens, the pane ends on a picture or on a sentence saying what failed.
+    if d381_old() {
+        set_preview_image_old_decode(ui, path, generation, live_generation);
+        return;
+    }
+
+    // D-381: cancel the decode and prefetch of the previous selection, show a
+    // cached texture at once (a fixed settle delay was measured slower and removed), and only show
+    // "Opening preview" if the picture takes longer than 150 ms.
+    let key_ptr = Rc::as_ptr(&ui.preview_generation) as usize;
+    d381_cancel_all(key_ptr);
+    let source = path.to_string();
+    let picture = ui.preview_picture.clone();
+    let stack = ui.preview_stack.clone();
+    let words = ui.preview.clone();
+    let cache_key = d381_key(&source);
+    if let Some(texture) = cache_key.as_ref().and_then(d381_cache_get) {
+        picture.set_paintable(Some(&texture));
+        stack.set_visible_child_name("image");
+        d381_schedule_prefetch(ui, &source, generation);
+        return;
+    }
+    let cancellable = gio::Cancellable::new();
+    D381_DECODES.with(|m| m.borrow_mut().insert(key_ptr, cancellable.clone()));
+    // 0 = decoding, 1 = settled, 2 = timed out and handed to the outside decoders.
+    let phase = Rc::new(Cell::new(0u8));
+    {
+        let (picture, stack, words, live_generation, phase) = (
+            picture.clone(),
+            stack.clone(),
+            words.clone(),
+            live_generation.clone(),
+            phase.clone(),
+        );
+        glib::MainContext::default().spawn_local(async move {
+            glib::timeout_future(Duration::from_millis(150)).await;
+            if phase.get() == 0 && live_generation.get() == generation {
+                picture.set_paintable(None::<&gdk::Paintable>);
+                words.set_label("Opening preview\u{2026}");
+                stack.set_visible_child_name("text");
+            }
+        });
+    }
+    {
+        let (source, picture, stack, words, live_generation, phase, cancellable) = (
+            source.clone(),
+            picture.clone(),
+            stack.clone(),
+            words.clone(),
+            live_generation.clone(),
+            phase.clone(),
+            cancellable.clone(),
+        );
+        glib::MainContext::default().spawn_local(async move {
+            glib::timeout_future_seconds(PREVIEW_DECODE_SECONDS).await;
+            if phase.get() == 0 && live_generation.get() == generation {
+                phase.set(2);
+                cancellable.cancel();
+                eprintln!("wf-event: preview decode of {source:?} timed out, trying ffmpeg and ImageMagick");
+                preview_image_outside(source, picture, stack, words, live_generation, generation).await;
+            }
+        });
+    }
+    let ui_for_prefetch = ui.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let (src, c) = (source.clone(), cancellable.clone());
+        let decoded = gio::spawn_blocking(move || d381_decode_blocking(&src, &c))
+            .await
+            .ok()
+            .flatten();
+        let texture = decoded.map(d381_texture);
+        if let (Some(t), Some(k)) = (&texture, &cache_key) {
+            d381_cache_put(k.clone(), t.clone());
+        }
+        if live_generation.get() != generation || phase.get() == 2 {
+            return;
+        }
+        phase.set(1);
+        if let Some(texture) = texture {
+            picture.set_paintable(Some(&texture));
+            stack.set_visible_child_name("image");
+            d381_schedule_prefetch(&ui_for_prefetch, &source, generation);
+            return;
+        }
+        preview_image_outside(source, picture, stack, words, live_generation, generation).await;
+    });
+}
+
+/// D-381: the pre-fix decode path (no cancel, settle, cache or prefetch),
+/// kept only so a test can switch it on with `WF_TEST_D381_OLD`.
+fn set_preview_image_old_decode(
+    ui: &Ui,
+    path: &str,
+    generation: u64,
+    live_generation: Rc<Cell<u64>>,
+) {
     let source = path.to_string();
     let picture = ui.preview_picture.clone();
     let stack = ui.preview_stack.clone();
@@ -20690,6 +20853,166 @@ fn set_preview_image(ui: &Ui, path: &str) {
         // Nothing here could read it. The outside decoders are the last
         // resort, the same ones AVIF and HEIC take.
         preview_image_outside(source, picture, stack, words, live_generation, generation).await;
+    });
+}
+
+type D381Key = (String, u128, u64, i32);
+
+thread_local! {
+    static D381_DECODES: RefCell<HashMap<usize, gio::Cancellable>> = RefCell::new(HashMap::new());
+    static D381_PREFETCH: RefCell<HashMap<usize, gio::Cancellable>> = RefCell::new(HashMap::new());
+    static D381_CACHE: RefCell<VecDeque<(D381Key, gdk::Texture)>> = RefCell::new(VecDeque::new());
+}
+
+const D381_CACHE_ENTRIES: usize = 24;
+const D381_PREFETCH_MAX_BYTES: u64 = 40 * 1024 * 1024;
+
+/// D-381: cancels the running decode and prefetch of one window.
+fn d381_cancel_all(key_ptr: usize) {
+    D381_DECODES.with(|m| {
+        if let Some(c) = m.borrow_mut().remove(&key_ptr) {
+            c.cancel();
+        }
+    });
+    D381_PREFETCH.with(|m| {
+        if let Some(c) = m.borrow_mut().remove(&key_ptr) {
+            c.cancel();
+        }
+    });
+}
+
+/// D-381: path + mtime + size + decode width. One stat, no file read.
+fn d381_key(path: &str) -> Option<D381Key> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((path.to_string(), mtime, meta.len(), PREVIEW_DECODE_WIDTH))
+}
+
+fn d381_cache_get(key: &D381Key) -> Option<gdk::Texture> {
+    D381_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let at = c.iter().position(|(k, _)| k == key)?;
+        let hit = c.remove(at)?;
+        let texture = hit.1.clone();
+        c.push_back(hit);
+        Some(texture)
+    })
+}
+
+fn d381_cache_put(key: D381Key, texture: gdk::Texture) {
+    D381_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(k, _)| *k != key);
+        c.push_back((key, texture));
+        while c.len() > D381_CACHE_ENTRIES {
+            c.pop_front();
+        }
+    });
+}
+
+type D381Pixels = (glib::Bytes, i32, i32, i32, bool);
+
+/// D-381: the decode, run on a worker thread. Every blocking call takes the
+/// cancellable, so a skipped image frees its thread at once.
+fn d381_decode_blocking(source: &str, cancel: &gio::Cancellable) -> Option<D381Pixels> {
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let too_big = matches!(
+        Pixbuf::file_info(source),
+        Some((_, w, h)) if w > PREVIEW_DECODE_WIDTH || h > PREVIEW_DECODE_WIDTH
+    );
+    let width = if too_big { PREVIEW_DECODE_WIDTH } else { -1 };
+    let stream = gio::File::for_path(source).read(Some(cancel)).ok()?;
+    let pixbuf = Pixbuf::from_stream_at_scale(&stream, width, -1, true, Some(cancel)).ok()?;
+    Some((
+        pixbuf.read_pixel_bytes(),
+        pixbuf.width(),
+        pixbuf.height(),
+        pixbuf.rowstride(),
+        pixbuf.has_alpha(),
+    ))
+}
+
+fn d381_texture(pixels: D381Pixels) -> gdk::Texture {
+    let (bytes, w, h, stride, alpha) = pixels;
+    let pixbuf = Pixbuf::from_bytes(&bytes, gdk_pixbuf::Colorspace::Rgb, alpha, 8, w, h, stride);
+    #[allow(deprecated)]
+    gdk::Texture::for_pixbuf(&pixbuf)
+}
+
+/// D-381: the nearest image before and after `path` in the shown list.
+fn d381_neighbours(ui: &Ui, path: &str) -> Vec<String> {
+    let Some(state) = state_for_ui(ui) else {
+        return Vec::new();
+    };
+    let Ok(st) = state.try_borrow() else {
+        return Vec::new();
+    };
+    let real = |e: &Entry| match &e.source {
+        native_core::EntrySource::Real(p) => Some(p.to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let list = &st.visible_entries;
+    let Some(at) = list.iter().position(|e| real(e).as_deref() == Some(path)) else {
+        return Vec::new();
+    };
+    let usable = |e: &Entry| {
+        !e.is_dir
+            && e.is_image
+            && real(e).is_some_and(|p| !native_core::needs_transcoded_thumbnail(&p))
+    };
+    let mut out = Vec::new();
+    if let Some(e) = list[at + 1..].iter().find(|e| usable(e)) {
+        out.extend(real(e));
+    }
+    if let Some(e) = list[..at].iter().rev().find(|e| usable(e)) {
+        out.extend(real(e));
+    }
+    out
+}
+
+/// D-381: once the shown image has settled for 250 ms, decode the next and
+/// previous image into the cache, one at a time, cancellable, skipping
+/// anything over 40 MB.
+fn d381_schedule_prefetch(ui: &Ui, path: &str, generation: u64) {
+    let neighbours = d381_neighbours(ui, path);
+    if neighbours.is_empty() {
+        return;
+    }
+    let key_ptr = Rc::as_ptr(&ui.preview_generation) as usize;
+    let cancellable = gio::Cancellable::new();
+    D381_PREFETCH.with(|m| {
+        if let Some(old) = m.borrow_mut().insert(key_ptr, cancellable.clone()) {
+            old.cancel();
+        }
+    });
+    let live = ui.preview_generation.clone();
+    glib::MainContext::default().spawn_local(async move {
+        glib::timeout_future(Duration::from_millis(250)).await;
+        for next in neighbours {
+            if cancellable.is_cancelled() || live.get() != generation {
+                return;
+            }
+            let Some(key) = d381_key(&next) else { continue };
+            if key.2 > D381_PREFETCH_MAX_BYTES || d381_cache_get(&key).is_some() {
+                continue;
+            }
+            let c = cancellable.clone();
+            let src = next.clone();
+            let made = gio::spawn_blocking(move || d381_decode_blocking(&src, &c))
+                .await
+                .ok()
+                .flatten();
+            if let Some(pixels) = made {
+                d381_cache_put(key, d381_texture(pixels));
+            }
+        }
     });
 }
 
@@ -30857,6 +31180,259 @@ Broken: Either state is wrong.\n";
             assert!(*active && *mapped && *focused, "D-378 [{tag}]: a click inside the rename field must keep the rename open, mapped and focused (active={active} mapped={mapped} focused={focused})");
         }
         println!("wf-test D-378 OK");
+    }
+
+    // ---- D-379 / D-380 / D-381: preview gates, each alone on the private display ----
+
+    /// Drains the main loop for `ms` milliseconds without the 200 ms steps of `pump`.
+    fn d38x_spin_for(ms: u64) {
+        let ctx = glib::MainContext::default();
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            while ctx.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Spins the main loop until `cond` holds; the milliseconds it took, or None after `max_ms`.
+    fn d38x_wait_ms(max_ms: u64, cond: impl Fn() -> bool) -> Option<u128> {
+        let ctx = glib::MainContext::default();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(max_ms) {
+            while ctx.iteration(false) {}
+            if cond() {
+                return Some(start.elapsed().as_millis());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if cond() { Some(start.elapsed().as_millis()) } else { None }
+    }
+
+    fn d38x_preview_on(d: &D362) {
+        if !d.ui.preview_toggle.is_active() {
+            d.ui.preview_toggle.set_active(true);
+        }
+        d38x_spin_for(300);
+        assert!(d.ui.preview_scroll.is_visible(), "the preview pane is visible");
+    }
+
+    fn d38x_select(d: &D362, name: &str) {
+        let idx = d.state.borrow().visible_entries.iter().position(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        select_index(&d.state, &d.ui, idx);
+    }
+
+    fn d38x_gate(env: &str, body: fn()) {
+        if std::env::var(env).as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        body();
+    }
+
+    /// D-379 alone, on the private display.
+    #[test]
+    fn lying_extension_preview_d379_alone() { gtk_thread::run(|| d38x_gate("WAYFINDER_D379_ONLY", lying_extension_preview_d379)); }
+
+    /// D-379 (21 Nov 2026): recovered files whose extension lies. GIFs named
+    /// .JS .CSS .XML .TXT .HTM must preview as pictures, an MPEG program stream
+    /// named .HTM must go to the media page, and genuine .xml / .js text must
+    /// stay text. Fixtures are copied out of the read-only Web fragments folder.
+    /// Fails with WF_TEST_D379_OLD=1 (no content sniffing).
+    fn lying_extension_preview_d379() {
+        use std::io::Read as _;
+        let source = Path::new("/run/media/user/Disk1/System and program files/Web fragments");
+        assert!(source.is_dir(), "D-379 needs the Web fragments folder at {}", source.display());
+        let gifs = ["INSITE~1.JS", "FOOTER~1.CSS", "CATALO~1.XML", "STOPBU~1.TXT", "PHOTO_~1.HTM"];
+        let mpeg = std::fs::read_dir(source).expect("read Web fragments").filter_map(|e| e.ok()).map(|e| e.path())
+            .find(|p| {
+                p.extension().is_some_and(|x| x.eq_ignore_ascii_case("htm"))
+                    && std::fs::File::open(p).and_then(|mut f| { let mut b = [0u8; 4]; f.read_exact(&mut b).map(|_| b) }).is_ok_and(|b| b == [0x00, 0x00, 0x01, 0xBA])
+            })
+            .expect("an .HTM starting 00 00 01 BA exists in Web fragments");
+        let mpeg_name = mpeg.file_name().unwrap().to_string_lossy().into_owned();
+        eprintln!("wf-test D-379 mpeg fixture: {mpeg_name}");
+        let dir_holder = Rc::new(RefCell::new(PathBuf::new()));
+        let holder = dir_holder.clone();
+        install_app_css();
+        let d = d362_open("d379", |dir| {
+            for n in gifs { std::fs::copy(source.join(n), dir.join(n)).unwrap(); }
+            std::fs::copy(&mpeg, dir.join(&mpeg_name)).unwrap();
+            std::fs::write(dir.join("real.xml"), "<?xml version=\"1.0\"?><a>hi</a>").unwrap();
+            std::fs::write(dir.join("real.js"), "console.log(1)").unwrap();
+            *holder.borrow_mut() = dir.to_path_buf();
+        }, 8);
+        let dir = dir_holder.borrow().clone();
+        d38x_preview_on(&d);
+
+        let mut failures: Vec<String> = Vec::new();
+        // lying_extension_mime: what Open uses.
+        let mime = |n: &str| crate::native_core::lying_extension_mime(&dir.join(n).to_string_lossy());
+        for n in gifs {
+            let m = mime(n);
+            eprintln!("wf-test D-379 lying_extension_mime({n}) = {m:?}");
+            if m != Some("image/gif") { failures.push(format!("lying_extension_mime({n}) = {m:?}, want image/gif")); }
+        }
+        for n in ["real.js", "real.xml"] {
+            let m = mime(n);
+            eprintln!("wf-test D-379 lying_extension_mime({n}) = {m:?}");
+            if m.is_some_and(|m| m.starts_with("image/")) { failures.push(format!("lying_extension_mime({n}) = {m:?}, want None")); }
+        }
+
+        enum Want { Image, Text(&'static str), Media }
+        let mut cases: Vec<(String, Want)> = vec![
+            ("real.xml".into(), Want::Text("hi")),
+            ("real.js".into(), Want::Text("console.log")),
+        ];
+        for n in gifs { cases.push((n.to_string(), Want::Image)); }
+        cases.push((mpeg_name.clone(), Want::Media));
+        for (name, want) in &cases {
+            set_preview_text(&d.ui, "Select a file");
+            d38x_spin_for(100);
+            d38x_select(&d, name);
+            let ok = d38x_wait_ms(3000, || {
+                let stack = d.ui.preview_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_default();
+                match want {
+                    Want::Image => stack == "image" && d.ui.preview_picture.paintable().is_some(),
+                    Want::Text(t) => stack == "text" && d.ui.preview.text().contains(t),
+                    // A cache fragment too short to play still went to the
+                    // video page; its failure line names it as a video.
+                    Want::Media => stack == "media" || (stack == "text" && d.ui.preview.text().to_lowercase().contains("video")),
+                }
+            });
+            if matches!(want, Want::Media) { eprintln!("wf-test D-379 {name} text: {:?}", d.ui.preview.text().chars().take(160).collect::<String>()); }
+            let stack = d.ui.preview_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_default();
+            let kind = match want { Want::Image => "image", Want::Text(_) => "text", Want::Media => "media" };
+            eprintln!("wf-test D-379 {name}: want {kind}, got stack={stack:?} paintable={} ok={}", d.ui.preview_picture.paintable().is_some(), ok.is_some());
+            if ok.is_none() { failures.push(format!("{name}: wanted the {kind} page, the stack shows {stack:?}")); }
+        }
+        assert!(failures.is_empty(), "D-379 failures:\n{}", failures.join("\n"));
+        println!("wf-test D-379 OK");
+    }
+
+    /// D-380 alone, on the private display.
+    #[test]
+    fn doc_bar_narrow_pane_d380_alone() { gtk_thread::run(|| d38x_gate("WAYFINDER_D380_ONLY", doc_bar_narrow_pane_d380)); }
+
+    /// D-380 (21 Nov 2026): the document bar (Previous, page label, Next, Show
+    /// source) must fit a preview pane about 220 px wide: Next inside the pane,
+    /// icon buttons with tooltips, ellipsizing label. Uses the same 2-page PDF
+    /// as the D-362 viewer test. Fails with WF_TEST_D380_OLD=1.
+    fn doc_bar_narrow_pane_d380() {
+        install_app_css();
+        let d = d362_open("d380", |dir| {
+            assert!(
+                d362_run("magick", &["-size", "300x200", "xc:white", "-size", "300x200", "xc:gray", "two.pdf"], dir),
+                "magick makes the 2-page PDF"
+            );
+        }, 1);
+        d38x_preview_on(&d);
+        d38x_wait_ms(5000, || d.ui.file_preview.width() > 500);
+        d38x_spin_for(500);
+        let total = d.ui.file_preview.width();
+        d.ui.file_preview.set_position(total - 220);
+        d38x_spin_for(500);
+        d362_show(&d, "two.pdf");
+        d362_wait("the PDF page", 60, || d362_stack(&d) == "doc" && d.ui.viewers.doc_picture.file().is_some());
+        d38x_spin_for(800);
+        let v = &d.ui.viewers;
+        let pane_w = d.ui.preview_scroll.width();
+        let root_w = v.doc_root.width();
+        let rect = |w: &gtk::Widget, to: &gtk::Widget| w.compute_bounds(to).map(|r| (r.x(), r.x() + r.width()));
+        let prev_w: gtk::Widget = v.doc_prev.clone().upcast();
+        let next_w: gtk::Widget = v.doc_next.clone().upcast();
+        let label_w: gtk::Widget = v.doc_label.clone().upcast();
+        let src_w: gtk::Widget = v.doc_source_toggle.clone().upcast();
+        let root_ref: gtk::Widget = v.doc_root.clone().upcast();
+        let pane_ref: gtk::Widget = d.ui.preview_scroll.clone().upcast();
+        let next_root = rect(&next_w, &root_ref);
+        let next_pane = rect(&next_w, &pane_ref);
+        eprintln!("wf-test D-380 file_preview width={total} position={} preview_scroll width={pane_w} doc_root width={root_w}", d.ui.file_preview.position());
+        eprintln!("wf-test D-380 widths: prev={} next={} label={} source={} (source visible={})", v.doc_prev.width(), v.doc_next.width(), v.doc_label.width(), v.doc_source_toggle.width(), v.doc_source_toggle.is_visible());
+        eprintln!("wf-test D-380 prev x={:?} next x(root)={next_root:?} next x(pane)={next_pane:?} label x={:?} source x={:?}", rect(&prev_w, &root_ref), rect(&label_w, &root_ref), rect(&src_w, &root_ref));
+        eprintln!("wf-test D-380 text={:?} ellipsize={:?} next icon={:?} prev icon={:?} tooltips: prev={:?} next={:?} source={:?}", v.doc_label.text(), v.doc_label.ellipsize(), v.doc_next.icon_name(), v.doc_prev.icon_name(), v.doc_prev.tooltip_text(), v.doc_next.tooltip_text(), v.doc_source_toggle.tooltip_text());
+        let mut failures: Vec<String> = Vec::new();
+        if pane_w > 260 { failures.push(format!("the preview pane is {pane_w} px, not narrow (wanted about 220)")); }
+        match (next_root, next_pane) {
+            (Some((_, r1)), Some((_, r2))) => {
+                if r1 > root_w as f32 + 0.5 { failures.push(format!("Next right edge {r1:.0} is past the document pane width {root_w}")); }
+                if r2 > pane_w as f32 + 0.5 { failures.push(format!("Next right edge {r2:.0} is past the preview pane width {pane_w}")); }
+            }
+            _ => failures.push("Next has no bounds".into()),
+        }
+        for (what, tip) in [("Previous", v.doc_prev.tooltip_text()), ("Next", v.doc_next.tooltip_text()), ("Show source", v.doc_source_toggle.tooltip_text())] {
+            if tip.as_deref().unwrap_or("").is_empty() { failures.push(format!("{what} has no tooltip")); }
+        }
+        for (what, icon) in [("Previous", v.doc_prev.icon_name()), ("Next", v.doc_next.icon_name())] {
+            if icon.as_deref().unwrap_or("").is_empty() { failures.push(format!("{what} has no icon")); }
+        }
+        if v.doc_label.ellipsize() != gtk::pango::EllipsizeMode::End { failures.push(format!("the page label does not ellipsize ({:?})", v.doc_label.ellipsize())); }
+        assert!(failures.is_empty(), "D-380 failures:\n{}", failures.join("\n"));
+        println!("wf-test D-380 OK");
+    }
+
+    /// D-381 alone, on the private display.
+    #[test]
+    fn arrow_key_image_preview_d381_alone() { gtk_thread::run(|| d38x_gate("WAYFINDER_D381_ONLY", arrow_key_image_preview_d381)); }
+
+    /// D-381 (21 Nov 2026): holding Down over a folder of 4000x3000 JPEGs.
+    /// The preview must reach the last image fast, a step back must hit the
+    /// cache and a step forward must hit the prefetch. Each image has its own
+    /// aspect ratio (4000 x (3000 - 20 i)) so the texture says which file it is.
+    /// Fails (back/next) with WF_TEST_D381_OLD=1.
+    fn arrow_key_image_preview_d381() {
+        install_app_css();
+        let d = d362_open("d381", |dir| {
+            for i in 0..30u32 {
+                let h = 3000 - 20 * i as i32;
+                let pixbuf = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 4000, h).expect("pixbuf");
+                let c = (((i * 37) % 256) << 24) | (((i * 91) % 256) << 16) | (((i * 53) % 256) << 8) | 0xff;
+                pixbuf.fill(c);
+                pixbuf.savev(dir.join(format!("img-{i:02}.jpg")), "jpeg", &[("quality", "90")]).expect("write jpeg");
+            }
+        }, 30);
+        d38x_preview_on(&d);
+        set_view_mode(&d.state, &d.ui, ViewMode::Details);
+        d38x_spin_for(300);
+        let shown = |i: u32| -> bool {
+            let want = 4000.0 / (3000 - 20 * i as i32) as f64;
+            d.ui.preview_stack.visible_child_name().as_deref() == Some("image")
+                && d.ui.preview_picture.paintable().is_some_and(|p| ((p.intrinsic_aspect_ratio() - want) / want).abs() < 0.002)
+        };
+        let name_now = || -> String {
+            let idx = selected_indices(&d.ui).first().copied().unwrap_or(usize::MAX);
+            d.state.borrow().visible_entries.get(idx).map(|e| e.name.clone()).unwrap_or_default()
+        };
+        d38x_select(&d, "img-00.jpg");
+        assert!(d38x_wait_ms(15000, || shown(0)).is_some(), "D-381: img-00 never showed");
+        d38x_spin_for(700);
+        // A held Down key: one row every 33 ms, through the Down key's own function.
+        for k in 1..=25 {
+            if k > 1 { d38x_spin_for(33); }
+            move_selection(&d.state, &d.ui, 1);
+        }
+        assert_eq!(name_now(), "img-25.jpg", "25 moves down from img-00");
+        let last = d38x_wait_ms(5000, || shown(25)).unwrap_or(5000);
+        d38x_spin_for(600);
+        move_selection(&d.state, &d.ui, -1);
+        assert_eq!(name_now(), "img-24.jpg");
+        let back = d38x_wait_ms(5000, || shown(24)).unwrap_or(5000);
+        move_selection(&d.state, &d.ui, 1);
+        assert_eq!(name_now(), "img-25.jpg");
+        d38x_wait_ms(5000, || shown(25));
+        d38x_spin_for(600);
+        move_selection(&d.state, &d.ui, 1);
+        assert_eq!(name_now(), "img-26.jpg");
+        let next = d38x_wait_ms(5000, || shown(26)).unwrap_or(5000);
+        eprintln!("wf-test D-381 ms: last={last} back={back} next={next}");
+        assert!(last <= 600, "D-381: the last image took {last} ms (limit 600)");
+        assert!(back <= 100, "D-381: stepping back took {back} ms (limit 100, cache hit expected)");
+        assert!(next <= 100, "D-381: stepping forward took {next} ms (limit 100, prefetch hit expected)");
+        println!("wf-test D-381 OK");
     }
 
     /// D-375 alone, on the private display.
