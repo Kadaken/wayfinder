@@ -26251,17 +26251,19 @@ Broken: Either state is wrong.\n";
             bytes
         };
         let (gif_still, gif_anim) = (tiny_gif_d368(1, false), tiny_gif_d368(3, true));
-        let total_pictures = 300usize;
+        // His real folder: ~1500 GIFs. GridView keeps max_columns x 30 rows of
+        // tiles built (GTK_GRID_VIEW_MAX_VISIBLE_ROWS), so 1500 is past that.
+        let total_pictures = 1500usize;
         for i in 0..total_pictures {
             let (name, bytes) = match i % 3 {
-                0 => (format!("f{i:03}.jpg"), &jpeg),
-                1 => (format!("f{i:03}.gif"), &gif_still),
-                _ => (format!("f{i:03}.GIF"), &gif_anim),
+                0 => (format!("f{i:04}.jpg"), &jpeg),
+                1 => (format!("f{i:04}.gif"), &gif_still),
+                _ => (format!("f{i:04}.GIF"), &gif_anim),
             };
             std::fs::write(dir.join(name), bytes).unwrap();
         }
-        // Sorts after f250.* and well past tile 60.
-        std::fs::write(dir.join("f250z.bmp"), tall_bmp_d368(400, 3300)).unwrap();
+        // Sorts after f0250.* and well past tile 60.
+        std::fs::write(dir.join("f0250z.bmp"), tall_bmp_d368(400, 3300)).unwrap();
         let total = total_pictures + 1;
         std::env::set_var("HOME", &home);
 
@@ -26339,15 +26341,19 @@ Broken: Either state is wrong.\n";
             assert!(!of_kind.is_empty(), "d368: no {kind} tile past 60 is on screen at the end");
             assert!(of_kind.iter().all(|(_, _, p)| *p), "d368: a {kind} tile past 60 has no real thumbnail");
         }
-        assert!(r.len() < total / 2, "d368: GridView built {} tiles of {total}; it must build only what is visible", r.len());
+        // GTK's own budget: max_columns x 30 rows around the anchor plus a row
+        // above and below (gtkgridview.c:1236), plus the few single items GTK's
+        // focus and selection trackers hold. The old FlowBox built every tile.
+        let budget = ui.grid.max_columns() as usize * 32 + 4;
+        assert!(r.len() <= budget && r.len() < total, "d368: GridView built {} tiles of {total}; GTK's budget is {budget}", r.len());
 
         // Scroll back up and to the tall BMP: it gets a real picture too.
-        let bmp_index = state.borrow().visible_entries.iter().position(|e| e.name == "f250z.bmp").expect("the bmp is listed");
+        let bmp_index = state.borrow().visible_entries.iter().position(|e| e.name == "f0250z.bmp").expect("the bmp is listed");
         assert!(bmp_index > 60);
         scroll_files_to(&state, &ui, 0, gtk::ListScrollFlags::FOCUS);
         settle_until("top tiles", &|| realized().iter().any(|(i, _, _)| *i == 0));
         scroll_files_to(&state, &ui, bmp_index as u32, gtk::ListScrollFlags::FOCUS);
-        settle_until("the bmp tile has a picture", &|| realized().iter().any(|(_, n, p)| n == "f250z.bmp" && *p));
+        settle_until("the bmp tile has a picture", &|| realized().iter().any(|(_, n, p)| n == "f0250z.bmp" && *p));
         eprintln!("wf-test D-368 PROVED: jpg, .gif, .GIF and a 400x3300 BMP past tile 60 all got real thumbnails");
 
         ui.window.destroy();
