@@ -39541,8 +39541,10 @@ Broken: Either state is wrong.\n";
         keep_focus_on_empty_view(&list, true, false);
         assert_eq!(focus(), before);
 
-        // Grid: the GridView is the root.
-        grid.grab_focus();
+        // Grid: the GridView is the root. A GridView nobody has focused yet
+        // has no focus item, so grab_focus lands on the root
+        // (gtklistbase.c:658-668); focus the tile itself, as a click does.
+        grid.scroll_to(0, gtk::ListScrollFlags::FOCUS, None);
         pump();
         assert!(
             focus_within(&win, &grid) && focus().as_ref() != Some(grid.upcast_ref()),
