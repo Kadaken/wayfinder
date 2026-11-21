@@ -31822,6 +31822,110 @@ Broken: Either state is wrong.\n";
         println!("wf-test D-381 OK");
     }
 
+    /// D-389 alone, on the private display.
+    #[test]
+    fn held_arrow_key_image_preview_d389_alone() { gtk_thread::run(|| d38x_gate("WAYFINDER_D389_ONLY", held_arrow_key_image_preview_d389)); }
+
+    /// D-389 (21 Nov 2026): HOLDING Down through 70 noisy 4000x3000 JPEGs must
+    /// never leave the pane blank for more than 250 ms, must land a new image
+    /// at least every 250 ms, and 300 ms after the last move must show exactly
+    /// the selected file. Each image has its own aspect ratio, so the texture
+    /// says which file it is. Fails on the D-381 code (every move cancelled
+    /// the decode in flight, so none ever finished until the key was released).
+    fn held_arrow_key_image_preview_d389() {
+        const N: u32 = 70;
+        install_app_css();
+        let fixture_bytes = Cell::new(0u64);
+        let d = d362_open("d389", |dir| {
+            let (w, base_h) = (4000i32, 3000i32);
+            for i in 0..N {
+                let h = base_h - 12 * i as i32;
+                let stride = (w * 3) as usize;
+                let mut seed = 0x9E37_79B9u32.wrapping_mul(i + 1);
+                let mut raw = vec![0u8; stride * h as usize];
+                for (n, b) in raw.iter_mut().enumerate() {
+                    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+                    let x = (n % stride) / 3;
+                    *b = ((x as u32 / 16 + i * 7) as u8).wrapping_add((seed & 15) as u8);
+                }
+                let bytes = glib::Bytes::from_owned(raw);
+                let pixbuf = Pixbuf::from_bytes(&bytes, gdk_pixbuf::Colorspace::Rgb, false, 8, w, h, stride as i32);
+                pixbuf.savev(dir.join(format!("img-{i:02}.jpg")), "jpeg", &[("quality", "85")]).expect("write jpeg");
+                if i == 0 { fixture_bytes.set(std::fs::metadata(dir.join("img-00.jpg")).map(|m| m.len()).unwrap_or(0)); }
+            }
+        }, N as usize);
+        eprintln!("wf-test D-389 fixture bytes per image (img-00): {}", fixture_bytes.get());
+        d38x_preview_on(&d);
+        set_view_mode(&d.state, &d.ui, ViewMode::Details);
+        d38x_spin_for(300);
+        let want = |i: u32| 4000.0 / (3000 - 12 * i as i32) as f64;
+        // Which image the pane shows: Some(i), or None when blank or not a picture.
+        let shown_index = || -> Option<u32> {
+            if d.ui.preview_stack.visible_child_name().as_deref() != Some("image") { return None; }
+            let r = d.ui.preview_picture.paintable()?.intrinsic_aspect_ratio();
+            (0..N).find(|&i| ((r - want(i)) / want(i)).abs() < 0.0006)
+        };
+        let name_now = || -> String {
+            let idx = selected_indices(&d.ui).first().copied().unwrap_or(usize::MAX);
+            d.state.borrow().visible_entries.get(idx).map(|e| e.name.clone()).unwrap_or_default()
+        };
+        d38x_select(&d, "img-00.jpg");
+        assert!(d38x_wait_ms(15000, || shown_index() == Some(0)).is_some(), "D-389: img-00 never showed");
+        d38x_spin_for(700);
+        // A held Down key: one row every 33 ms, through the Down key's own function.
+        let ctx = glib::MainContext::default();
+        let start = Instant::now();
+        let (mut max_blank, mut blank_since, mut max_gap) = (0u128, None::<Instant>, 0u128);
+        let mut last_change = Instant::now();
+        let mut last_shown: Option<u32> = Some(0);
+        let mut landed = 0u32;
+        let mut sample_once = |now: Instant, blank_since: &mut Option<Instant>, last_change: &mut Instant, last_shown: &mut Option<u32>| {
+            let cur = shown_index();
+            match cur {
+                None => { blank_since.get_or_insert(now); }
+                Some(i) => {
+                    if let Some(b) = blank_since.take() { max_blank = max_blank.max(now.duration_since(b).as_millis()); }
+                    if *last_shown != Some(i) {
+                        max_gap = max_gap.max(now.duration_since(*last_change).as_millis());
+                        *last_change = now;
+                        *last_shown = Some(i);
+                        landed += 1;
+                    }
+                }
+            }
+        };
+        for k in 1..N {
+            let due = start + Duration::from_millis(33 * (k as u64 - 1));
+            while Instant::now() < due {
+                while ctx.iteration(false) {}
+                sample_once(Instant::now(), &mut blank_since, &mut last_change, &mut last_shown);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            move_selection(&d.state, &d.ui, 1);
+        }
+        assert_eq!(name_now(), format!("img-{:02}.jpg", N - 1), "N-1 moves down from img-00");
+        let released = Instant::now();
+        let mut at_release = shown_index();
+        // The pane must reach exactly the selected file within 300 ms of the last move.
+        let mut final_ms = None;
+        while released.elapsed() < Duration::from_millis(3000) {
+            while ctx.iteration(false) {}
+            sample_once(Instant::now(), &mut blank_since, &mut last_change, &mut last_shown);
+            if final_ms.is_none() && shown_index() == Some(N - 1) { final_ms = Some(released.elapsed().as_millis()); }
+            if final_ms.is_some() && released.elapsed() > Duration::from_millis(400) { break; }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(b) = blank_since { max_blank = max_blank.max(Instant::now().duration_since(b).as_millis()); }
+        let held_ms = released.duration_since(start).as_millis();
+        at_release = at_release.or(last_shown);
+        eprintln!("wf-test D-389 hold_ms={held_ms} moves={} images_landed={landed} max_blank_ms={max_blank} max_gap_between_images_ms={max_gap} shown_at_release={at_release:?} final_ms_after_last_move={final_ms:?}", N - 1);
+        assert!(max_blank <= 250, "D-389: the pane was blank for {max_blank} ms while the key was held (limit 250)");
+        assert!(max_gap <= 250, "D-389: {max_gap} ms passed with no new image while the key was held (limit 250)");
+        assert!(landed >= 5, "D-389: only {landed} images landed during the hold");
+        assert!(final_ms.is_some_and(|m| m <= 300), "D-389: the selected image showed {final_ms:?} ms after the last move (limit 300)");
+        println!("wf-test D-389 OK");
+    }
+
     /// D-375 alone, on the private display.
     #[test]
     fn address_scrolled_right_d375_alone() { gtk_thread::run(address_scrolled_right_d375_alone_on_gtk_thread); }
