@@ -215,16 +215,41 @@ button.wf-icon-button {
 }
 
 /* D-377: the sidebar toggle, a quarter of the old 26x24: 16x16 in all
-   (1px border + 1px padding + 12px icon). */
-button.wf-icon-button.wf-sidebar-corner {
-    min-height: 0;
-    min-width: 0;
-    padding: 1px;
+   (2px padding + a 12px icon, no border). Not a wf-icon-button, whose rule
+   carries min sizes; the doubled class and `button.toggle` out-rank the
+   theme's `button` / `button.image-button` minimums (24px). */
+button.toggle.wf-sidebar-corner.wf-sidebar-corner {
+    min-width: 12px;
+    min-height: 12px;
+    padding: 2px;
+    margin: 0;
+    border: 0;
     border-radius: 3px;
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    color: @wf_text_dim;
     font-size: 11px;
+}
+button.toggle.wf-sidebar-corner.wf-sidebar-corner:hover {
+    background-color: @wf_control_hover;
+    color: @wf_text;
+}
+button.toggle.wf-sidebar-corner.wf-sidebar-corner:checked {
+    background-color: alpha(@wf_accent, 0.20);
+    background-image: none;
+    color: @wf_accent_hover;
 }
 button.wf-sidebar-corner image {
     -gtk-icon-size: 12px;
+}
+
+/* D-377: "a verticle sliver there so the button is on the sliver and thats the
+   drawer sliver". Its own column left of the sidebar; only the button inside
+   it is clickable. */
+.wf-drawer-sliver {
+    background: @wf_raised;
+    border-right: 1px solid @wf_line;
 }
 
 button.wf-icon-button:hover {
@@ -367,7 +392,7 @@ entry.wf-search,
 
 .wf-sidebar {
     background: @wf_raised;
-    padding: 24px 7px 7px 7px; /* D-377: room for the corner toggle above FAVORITES */
+    padding: 7px 7px;
 }
 
 .wf-sidebar row {
@@ -5209,22 +5234,33 @@ fn build_ui_in(
         Some(name) => sidebar_toggle.set_icon_name(name),
         None => sidebar_toggle.set_label("\u{25E7}"),
     }
-    sidebar_toggle.add_css_class("wf-icon-button");
+    let drawer_sliver = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if d377_old() {
+        sidebar_toggle.add_css_class("wf-icon-button");
         size_toolbar_button(&sidebar_toggle);
         command_bar.append(&sidebar_toggle);
         command_bar.append(&command_divider());
     } else {
         // D-377 (21 Nov 2026): "I want it to be about a quarter of that size and
-        // relocated" to the top-left corner under the command bar, and "it should
-        // stay there". It is an overlay on the main split, so it is at the same
-        // spot open (above FAVORITES) or shut (left of the Name header).
+        // relocated"; then "maybe we make a verticle sliver there so the button
+        // is on the sliver and thats the drawer sliver". The sliver is its own
+        // column left of the main split, so the button stays at the same spot
+        // open or shut and covers nothing. Only the button toggles.
         sidebar_toggle.add_css_class("wf-sidebar-corner");
+        if let Some(name) = sidebar_toggle_icon() {
+            let icon = gtk::Image::from_icon_name(name);
+            icon.set_pixel_size(12);
+            sidebar_toggle.set_child(Some(&icon));
+        }
         sidebar_toggle.set_size_request(16, 16);
-        sidebar_toggle.set_halign(gtk::Align::Start);
+        sidebar_toggle.set_halign(gtk::Align::Center);
         sidebar_toggle.set_valign(gtk::Align::Start);
         sidebar_toggle.set_margin_top(3);
-        sidebar_toggle.set_margin_start(4);
+        drawer_sliver.add_css_class("wf-drawer-sliver");
+        drawer_sliver.set_size_request(20, -1);
+        drawer_sliver.set_hexpand(false);
+        drawer_sliver.set_vexpand(true);
+        drawer_sliver.append(&sidebar_toggle);
     }
     command_bar.append(&new_folder);
     command_bar.append(&new_file);
@@ -5427,13 +5463,13 @@ fn build_ui_in(
     if d377_old() {
         body.append(&main);
     } else {
-        // D-377: the toggle floats over the top-left corner of the main split.
-        let main_overlay = gtk::Overlay::new();
-        main_overlay.set_hexpand(true);
-        main_overlay.set_vexpand(true);
-        main_overlay.set_child(Some(&main));
-        main_overlay.add_overlay(&sidebar_toggle);
-        body.append(&main_overlay);
+        // D-377: the drawer sliver, then the main split.
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.set_hexpand(true);
+        row.set_vexpand(true);
+        row.append(&drawer_sliver);
+        row.append(&main);
+        body.append(&row);
     }
 
     #[cfg(feature = "picker-test-driver")]
@@ -5559,6 +5595,7 @@ fn build_ui_in(
             main.set_position(0);
             // The left pane's button owns the one sidebar.
             sidebar_toggle.set_visible(false);
+            drawer_sliver.set_visible(false);
             host.window
         }
         None => {
@@ -31962,8 +31999,8 @@ Broken: Either state is wrong.\n";
     }
 
     /// D-377 (21 Nov 2026): the sidebar toggle is a quarter of its old size, in the
-    /// top-left corner under the command bar, the same place open or shut, and
-    /// covers no text or icon. Fails with WF_TEST_D377_OLD=1 (old: command bar, 26px).
+    /// drawer sliver left of the main split, the same place open or shut, and
+    /// covers no row, text or icon. Fails with WF_TEST_D377_OLD=1 (old: command bar, 26px).
     fn sidebar_corner_toggle_d377() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d377-{}", std::process::id()));
@@ -32006,13 +32043,20 @@ Broken: Either state is wrong.\n";
             })();
             eprintln!("wf-test D-377 snapshot {path} saved={}", result.is_some());
         };
-        let check = |state: &str, area: gtk::Widget, want_images: bool| -> (f32, f32) {
+        let check = |state: &str, area: gtk::Widget, want_images: bool, blockers: Vec<gtk::Widget>| -> (f32, f32) {
             let tb = bounds(toggle.upcast_ref());
             let mb = bounds(main.upcast_ref());
-            let (dx, dy) = (tb.x() - mb.x(), tb.y() - mb.y());
-            eprintln!("wf-test D-377 {state} toggle={}x{} at ({},{}) main_origin=({},{}) offset=({dx},{dy})", toggle.width(), toggle.height(), tb.x(), tb.y(), mb.x(), mb.y());
+            eprintln!("wf-test D-377 {state} toggle={}x{} at ({},{}) main_origin=({},{})", toggle.width(), toggle.height(), tb.x(), tb.y(), mb.x(), mb.y());
             assert!(toggle.width() <= 18 && toggle.height() <= 18, "D-377 {state}: the toggle is {}x{}, over 18x18", toggle.width(), toggle.height());
-            assert!((0.0..=8.0).contains(&dx) && (0.0..=8.0).contains(&dy), "D-377 {state}: the toggle is not in the top-left corner of the main area: offset=({dx},{dy})");
+            // The sliver is a column of its own, left of main: the button cannot touch main.
+            let sliver_parent = toggle.parent().expect("toggle has a parent");
+            let sb = bounds(&sliver_parent);
+            eprintln!("wf-test D-377 {state} sliver class_ok={} width={} right_edge={} main_left={}", sliver_parent.has_css_class("wf-drawer-sliver"), sb.width(), sb.x() + sb.width(), mb.x());
+            assert!(sliver_parent.has_css_class("wf-drawer-sliver"), "D-377 {state}: the toggle is not a child of the wf-drawer-sliver");
+            assert!(sb.width() <= 24.0, "D-377 {state}: the sliver is {}px wide, over 24", sb.width());
+            assert!(sb.x() + sb.width() <= mb.x() + 0.5, "D-377 {state}: the sliver overlaps main (right edge {} > main left {})", sb.x() + sb.width(), mb.x());
+            assert!(tb.intersection(&mb).is_none(), "D-377 {state}: the toggle's bounds intersect main's");
+            let (dx, dy) = (tb.x(), tb.y());
             let mut hits = Vec::new();
             for w in all_widgets(&area) {
                 if !w.is_mapped() || w.width() <= 0 || w.height() <= 0 { continue; }
@@ -32022,6 +32066,13 @@ Broken: Either state is wrong.\n";
                 if text.is_empty() { continue; }
                 if let Some(b) = w.compute_bounds(&window_w) {
                     if b.intersection(&tb).is_some() { hits.push((text, b.x(), b.y(), b.width(), b.height())); }
+                }
+            }
+            // D-377: clickable things (rows, sort headers) must not be covered either.
+            for w in blockers {
+                if !w.is_mapped() || w.width() <= 0 || w.height() <= 0 { continue; }
+                if let Some(b) = w.compute_bounds(&window_w) {
+                    if b.intersection(&tb).is_some() { hits.push((format!("<{}>", w.css_name()), b.x(), b.y(), b.width(), b.height())); }
                 }
             }
             eprintln!("wf-test D-377 {state} overlaps={hits:?}");
@@ -32036,15 +32087,26 @@ Broken: Either state is wrong.\n";
         assert!(!in_bar, "D-377: the toggle is still in the command bar");
         // Open.
         assert!(ui.sidebar_scroll.is_visible(), "D-377: the test starts with the sidebar open");
-        let open = check("open", ui.sidebar_scroll.clone().upcast(), false);
+        let sidebar_rows: Vec<gtk::Widget> = all_widgets(ui.sidebar.upcast_ref()).into_iter().filter(|w| w.is::<gtk::ListBoxRow>()).collect();
+        assert!(!sidebar_rows.is_empty(), "D-377: no sidebar rows found");
+        let first_top = sidebar_rows.iter().filter(|w| w.is_mapped()).filter_map(|w| w.compute_bounds(&window_w)).map(|b| b.y()).fold(f32::MAX, f32::min);
+        let tb_open = bounds(toggle.upcast_ref());
+        let main_left = bounds(main.upcast_ref()).x();
+        let gap = main_left - (tb_open.x() + tb_open.width());
+        eprintln!("wf-test D-377 gap={gap} (button right edge {} to main left {main_left}; first sidebar row top {first_top})", tb_open.x() + tb_open.width());
+        assert!(gap >= 2.0, "D-377: the sidebar starts {gap}px right of the button, need 2px or more");
+        let open = check("open", ui.sidebar_scroll.clone().upcast(), false, sidebar_rows);
         snap("d377-open.png");
         // Shut: by the button.
         toggle.set_active(false);
         settle();
         assert!(!ui.sidebar_scroll.is_visible(), "D-377: the button shuts the sidebar");
         let files_area = main.end_child().expect("file list area");
-        let shut = check("shut", files_area, true);
+        let mut file_blockers: Vec<gtk::Widget> = all_widgets(ui.column_header.upcast_ref()).into_iter().filter(|w| w.is::<gtk::Button>()).collect();
+        file_blockers.extend(all_widgets(&files_area).into_iter().filter(|w| w.is::<gtk::ListBoxRow>() || matches!(w.css_name().as_str(), "row" | "listitem" | "button")));
+        let shut = check("shut", files_area, true, file_blockers);
         snap("d377-shut.png");
+        eprintln!("wf-test D-377 position open={open:?} shut={shut:?}");
         assert_eq!(open, shut, "D-377: the toggle stays at the same place open and shut");
         // Open again.
         toggle.set_active(true);
