@@ -846,3 +846,4 @@ FIXED, TESTED (headless); the exact live trigger is UNPROVEN. Core `wf-freeze.59
 - D-381 (21 Nov 2026): slow image preview when arrow-keying fast. Cancel stale decodes, 24-image cache, prefetch neighbours. TESTED (d381 pass, d381old fail): last 103-112 ms vs 117-130, back 31-35 vs 121-128, next 8-10 vs 114-123.
 - D-382 (21 Nov 2026): Samsung .smsbackup files read as a conversation in the preview; open writes the full text to ~/.cache/wayfinder/sms/. TESTED (d382 pass, d382old fail; 138 real files, 45,020 messages, 0 failures).
 - D-383 (21 Nov 2026): Rename to real extension (preview bar) and Options > Fix file extensions in this folder, both undoable. TESTED (d383 pass, d383old fail).
+- D-384 (21 Nov 2026): the sidebar drawer arrow points the way the sidebar will go (left open, right shut), hover Hide/Show the sidebar. TESTED (d377 pass, d384old fail).

@@ -12178,16 +12178,9 @@ fn wire_inline_editor(field: &gtk::Entry, window: &gtk::Window, host: InlineHost
     {
         let cancel = host.cancel.clone();
         // Clicking away cancels (owner decision); Enter is the only commit.
-        focus.connect_leave(move |c| {
+        focus.connect_leave(move |_| {
             debug_assert!(!inline_event_commits(InlineEvent::FocusLoss));
             eprintln!("wf-event: inline editor focus loss");
-            // D-378 diagnostics: who has focus once the leave has settled.
-            let Some(field) = c.widget() else { cancel(); return };
-            glib::idle_add_local_once(move || {
-                let now = gtk::prelude::WidgetExt::root(&field).and_downcast::<gtk::Window>().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
-                let desc = now.map(|w| format!("{} css={:?} mapped={}", w.type_().name(), w.css_classes(), w.is_mapped()));
-                eprintln!("wf-event: inline editor focus loss, focus now {desc:?} field_mapped={}", gtk::prelude::WidgetExt::is_mapped(&field));
-            });
             cancel();
         });
     }
@@ -12231,9 +12224,6 @@ fn wire_inline_editor(field: &gtk::Entry, window: &gtk::Window, host: InlineHost
                 .is_some_and(|w| is_self_or_descendant(&w, field.upcast_ref()));
             if !inside {
                 eprintln!("wf-event: inline editor outside press");
-                let picked = window.pick(x, y, gtk::PickFlags::DEFAULT);
-                let desc = picked.map(|w| format!("{} css={:?}", w.type_().name(), w.css_classes()));
-                eprintln!("wf-event: inline editor outside press at ({x:.0},{y:.0}) picked {desc:?} field_mapped={}", field.is_mapped());
                 remove_later();
                 host_cancel();
             }
