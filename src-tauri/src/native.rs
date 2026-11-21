@@ -17147,6 +17147,9 @@ fn mount_outcome(result: Result<native_core::Mounted, String>) -> Result<JobOutc
 }
 
 fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
+    if !native_core::drive_can_unmount(&drive) {
+        return; // D-386: the PS2 row has no unmount; the system service owns it
+    }
     let device = drive.path.clone();
     run_job(
         state,
@@ -17161,6 +17164,9 @@ fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
 }
 
 fn eject_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
+    if !native_core::drive_can_eject(&drive) {
+        return; // D-386: the PS2 row has no eject; the system service owns it
+    }
     let device = drive.path.clone();
     run_job(
         state,
@@ -18623,7 +18629,7 @@ fn show_drive_context_menu(
         }));
     }
 
-    if drive.kind == "drive" && !drive.mountpoint.is_empty() {
+    if native_core::drive_can_unmount(&drive) {
         let state = state.clone();
         let ui = ui.clone();
         let drive = drive.clone();
@@ -18636,7 +18642,7 @@ fn show_drive_context_menu(
         menu.append(&button);
     }
 
-    if drive.removable {
+    if native_core::drive_can_eject(&drive) {
         let state = state.clone();
         let ui = ui.clone();
         let drive = drive.clone();

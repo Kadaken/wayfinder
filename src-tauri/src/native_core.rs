@@ -2345,6 +2345,65 @@ pub fn network_drives(
     rows
 }
 
+/// Filesystem type of a PS2 hard drive area mounted through `pfsfuse` (D-386).
+pub const PS2_FSTYPE: &str = "fuse.pfsfuse";
+
+/// D-386: one "PS2 HDD" row from the live `/proc/mounts` text when at least one
+/// `fuse.pfsfuse` mount exists. Path and mountpoint are the folder that holds the
+/// mounts (their common parent, computed, never hardcoded). A parent already in
+/// `taken` is not repeated; no mount lines means no row, whatever folders exist.
+pub fn ps2_drives(mounts: &str, taken: &std::collections::HashSet<String>) -> Vec<Drive> {
+    let mut common: Option<Vec<String>> = None;
+    for line in mounts.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[2] != PS2_FSTYPE {
+            continue;
+        }
+        let mountpoint = decode_mount_field(fields[1]);
+        if !mountpoint.starts_with('/') || mountpoint.contains('\0') || mountpoint.contains('\n') {
+            continue;
+        }
+        let mut parts: Vec<String> = mountpoint
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        parts.pop();
+        common = Some(match common {
+            None => parts,
+            Some(prev) => {
+                let n = prev.iter().zip(parts.iter()).take_while(|(a, b)| a == b).count();
+                prev[..n].to_vec()
+            }
+        });
+    }
+    let Some(parts) = common.filter(|p| !p.is_empty()) else { return Vec::new() };
+    let path = format!("/{}", parts.join("/"));
+    if taken.contains(&path) {
+        return Vec::new();
+    }
+    vec![Drive {
+        name: "PS2 HDD".to_string(),
+        path: path.clone(),
+        mountpoint: path,
+        size: 0,
+        fstype: PS2_FSTYPE.to_string(),
+        kind: "ps2".to_string(),
+        removable: false,
+        space: None,
+    }]
+}
+
+/// D-386: unmount and eject need root and belong to the system service; only a
+/// real block-device row offers them, never the PS2 row.
+pub fn drive_can_unmount(drive: &Drive) -> bool {
+    drive.kind == "drive" && !drive.mountpoint.is_empty()
+}
+
+pub fn drive_can_eject(drive: &Drive) -> bool {
+    drive.kind != "ps2" && drive.removable
+}
+
 pub fn list_drives() -> Vec<Drive> {
     list_drives_with(&probe_space)
 }
@@ -2431,6 +2490,7 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
         let taken: std::collections::HashSet<String> =
             out.iter().map(|d| d.mountpoint.clone()).filter(|m| !m.is_empty()).collect();
         out.extend(network_drives(&mounts, &taken, &gvfs_children));
+        out.extend(ps2_drives(&mounts, &taken));
     }
 
     probe_local_space(&mut out, probe);
@@ -2439,8 +2499,9 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
 
 /// One space probe per mounted drive, except network rows: a dead remote share
 /// can block `statvfs`, so discovery never touches one and leaves its space unknown.
+/// The PS2 row's folder is plain tmpfs, so its space would mean nothing (D-386).
 fn probe_local_space(drives: &mut [Drive], probe: &dyn Fn(&str) -> Option<Space>) {
-    for drive in drives.iter_mut().filter(|d| !d.mountpoint.is_empty() && d.kind != "network") {
+    for drive in drives.iter_mut().filter(|d| !d.mountpoint.is_empty() && d.kind != "network" && d.kind != "ps2") {
         drive.space = probe(&drive.mountpoint);
     }
 }
@@ -9800,6 +9861,59 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
     }
 
     // ---- D-156: already-mounted network shares ----
+
+    const D386_MOUNTS: &str = "\
+/dev/nvme0n1p3 / btrfs rw 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/Common fuse.pfsfuse ro,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/FFXI fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/Network\\040config fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/POLVIEWER fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/System fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/System\\040config fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
+
+    #[test]
+    fn ps2_seven_mounts_give_one_row_d386() {
+        let rows = ps2_drives(D386_MOUNTS, &Default::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "PS2 HDD");
+        assert_eq!(rows[0].path, "/run/media/user/Driftwood PS2");
+        assert_eq!(rows[0].mountpoint, "/run/media/user/Driftwood PS2");
+        assert_eq!(rows[0].kind, "ps2");
+        assert!(!rows[0].removable);
+    }
+
+    #[test]
+    fn ps2_no_pfsfuse_mounts_give_no_row_d386() {
+        let other = "/dev/sda1 /mnt/x ext4 rw 0 0\ntmpfs /run/media/user/PS2\\040HDD tmpfs rw 0 0\n";
+        assert!(ps2_drives(other, &Default::default()).is_empty());
+        assert!(ps2_drives("", &Default::default()).is_empty());
+    }
+
+    #[test]
+    fn ps2_parent_already_taken_is_not_duplicated_d386() {
+        let taken: std::collections::HashSet<String> = ["/run/media/user/Driftwood PS2".to_string()].into();
+        assert!(ps2_drives(D386_MOUNTS, &taken).is_empty());
+    }
+
+    #[test]
+    fn ps2_parent_is_computed_not_hardcoded_d386() {
+        let m = "pfsfuse /mnt/other/a fuse.pfsfuse ro 0 0\npfsfuse /mnt/other/b fuse.pfsfuse ro 0 0\n";
+        assert_eq!(ps2_drives(m, &Default::default())[0].path, "/mnt/other");
+        let one = "pfsfuse /srv/ps2/System fuse.pfsfuse ro 0 0\n";
+        assert_eq!(ps2_drives(one, &Default::default())[0].path, "/srv/ps2");
+    }
+
+    #[test]
+    fn ps2_row_is_not_space_probed_and_has_no_unmount_or_eject_d386() {
+        let mut rows = ps2_drives(D386_MOUNTS, &Default::default());
+        probe_local_space(&mut rows, &|_| Some(Space { total: 1, available: 1 }));
+        assert!(rows[0].space.is_none());
+        assert!(!drive_can_unmount(&rows[0]));
+        let mut forced = rows[0].clone();
+        forced.removable = true;
+        assert!(!drive_can_eject(&forced), "even if flagged removable");
+    }
 
     const D156_MOUNTS: &str = "\
 /dev/nvme0n1p2 / ext4 rw 0 0
