@@ -5645,6 +5645,14 @@ fn build_ui_in(
     let available = (picker_window.width - 200).max(670);
     let files_pos = (available - 300).max(480);
     file_preview.set_position(files_pos);
+    if !d385_old() {
+        // D-385: the divider above is placed for the saved window width. A
+        // window that opens or is tiled narrower would leave the preview a
+        // sliver, so whenever a resize squeezes it under 120 px, give it
+        // 300 px again (or half the split on a very narrow window). Dragging
+        // the handle does not change max-position, so his own drags stand.
+        file_preview.connect_max_position_notify(unsqueeze_preview_d385);
+    }
 
     // One window per pane pair. The first pane builds it; a second pane takes
     // the one it was handed and hangs its body off the split's Paned.
@@ -6552,6 +6560,23 @@ fn d381_old() -> bool {
 /// Test-only gate: D-377 old placement (command bar, old size), to show the old behaviour failing.
 fn d377_old() -> bool {
     cfg!(test) && std::env::var_os("WF_TEST_D377_OLD").is_some()
+}
+
+fn d385_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D385_OLD").is_some()
+}
+
+/// D-385: if the preview side of the split is under 120 px, give it 300 px,
+/// or half the split when the window is too narrow for that.
+fn unsqueeze_preview_d385(paned: &gtk::Paned) {
+    let Some(end) = paned.end_child() else { return };
+    let max = paned.max_position();
+    if !end.is_visible() || max <= 0 || max > 100_000 {
+        return;
+    }
+    if max - paned.position() < 120 {
+        paned.set_position((max - 300).max(max / 2));
+    }
 }
 
 fn d384_old() -> bool {
@@ -8902,6 +8927,9 @@ fn set_preview_visible(state: &Rc<RefCell<AppState>>, ui: &Ui, visible: bool) {
         let saved = ui.preview_saved_position.get();
         if saved > 0 {
             ui.file_preview.set_position(saved);
+        }
+        if !d385_old() {
+            unsqueeze_preview_d385(&ui.file_preview);
         }
     } else {
         ui.preview_saved_position.set(ui.file_preview.position());
