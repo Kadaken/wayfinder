@@ -4891,8 +4891,9 @@ fn build_ui_in(
     // them can ask for a real thumbnail as it scrolls into view. (It was a
     // GtkFlowBox that built a tile for every file and could decode only 60.)
     let grid_factory = gtk::SignalListItemFactory::new();
+    // Only the SHOWN view holds the model (set_view_mode swaps it), so the
+    // hidden view never binds tiles, queues thumbnails or names guide widgets.
     let grid = gtk::GridView::builder()
-        .model(&list_selection)
         .factory(&grid_factory)
         .single_click_activate(false)
         .min_columns(1)
@@ -9060,6 +9061,27 @@ fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
         let mut state_ref = state.borrow_mut();
         state_ref.view_mode = mode;
         update_config(|config| config_view_mode(config, mode));
+    }
+    // D-368: only the shown view holds the model. Focus leaves the view that
+    // is about to lose it first, so GTK never removes the focus widget.
+    {
+        let (shown, hidden): (gtk::Widget, gtk::Widget) = if mode == ViewMode::Grid {
+            (ui.grid.clone().upcast(), ui.list.clone().upcast())
+        } else {
+            (ui.list.clone().upcast(), ui.grid.clone().upcast())
+        };
+        let focus_in_hidden = gtk::prelude::GtkWindowExt::focus(&ui.window)
+            .is_some_and(|f| f == hidden || f.is_ancestor(&hidden));
+        if focus_in_hidden {
+            shown.grab_focus();
+        }
+        if mode == ViewMode::Grid {
+            ui.grid.set_model(Some(&ui.list_selection));
+            ui.list.set_model(None::<&gtk::SelectionModel>);
+        } else {
+            ui.list.set_model(Some(&ui.list_selection));
+            ui.grid.set_model(None::<&gtk::SelectionModel>);
+        }
     }
     match mode {
         ViewMode::Details => {
@@ -26285,8 +26307,17 @@ Broken: Either state is wrong.\n";
             st.sort_ascending = true;
         }
         repopulate_rows(&state, &ui);
+        // Only the shown view holds the model: in Details the GridView binds
+        // no tile (no thumbnails queued, no guide names), in Grid the ListView
+        // binds no row.
+        set_view_mode(&state, &ui, ViewMode::Details);
+        wait_for("d368 list rows", || ui.list.first_child().is_some());
+        pump();
+        assert!(ui.grid.model().is_none() && ui.grid.first_child().is_none(), "d368: the hidden GridView has no model or tiles in Details view");
         set_view_mode(&state, &ui, ViewMode::Grid);
         wait_for("d368 grid tiles", || grid_child_at(&ui, 0).is_some());
+        pump();
+        assert!(ui.list.model().is_none() && ui.list.first_child().is_none(), "d368: the hidden ListView has no model or rows in Grid view");
 
         // (index, name, has a real picture) for each tile GridView has built.
         let realized = || -> Vec<(usize, String, bool)> {
