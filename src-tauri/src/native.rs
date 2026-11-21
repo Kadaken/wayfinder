@@ -10418,6 +10418,12 @@ fn reload_preview_if_changed(state: &Rc<RefCell<AppState>>, ui: &Ui, changed: &[
 /// end does NOT count as settled: a half-built list and a genuinely shorter one
 /// look identical at that moment, so the hold's deadline ends the former and the
 /// latter simply reapplies a value that clamps to the same place, costing nothing.
+/// Test-only gate (like WF_TEST_FULL_SPLICE): D-371 behaviour off, to prove
+/// the D-371 test fails without the fix in the same binary.
+fn d371_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D371_OLD").is_some()
+}
+
 fn scroll_target_reached(value: f64, target: f64) -> bool {
     (value - target).abs() < 0.5
 }
@@ -10769,6 +10775,21 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     // anything is drawn. The tick callback below stays as the backstop and is
     // what takes the guard off again.
     let snapping = Rc::new(Cell::new(false));
+    // D-371: set when the hold put the offset back from INSIDE GTK's layout.
+    // There GtkListBase has its own value-changed handler blocked
+    // (gtklistbase.c:2111-2121, around gtk_adjustment_configure), so the
+    // set_value below reaches the adjustment but never GTK's anchor: the rows
+    // stay laid out for the offset GTK computed while the scrollbar says the
+    // held one, and allocate_children (gtklistbase.c:1584-1590) subtracts that
+    // offset from rows built for the other one, which puts every row outside
+    // the viewport (a blank list until the next wheel step re-anchors it).
+    // The tick callback therefore re-emits value-changed once, outside the
+    // layout, so GTK anchors on the row at the held offset.
+    // The same-folder refresh no longer reaches this: it keeps GTK focus on the
+    // row that takes a deleted row's place (`keep_place_after_removal`), so GTK
+    // never moves the offset during that layout. It stays for any other path
+    // where GTK moves the offset while the hold is on.
+    let resync = Rc::new(Cell::new(false));
     // D-349: the guard used to come off after two steady frames (~33ms). GTK
     // lays the rows out again ~120-190ms after a refresh and recomputes the
     // offset from its remembered row; that recompute landed on 0 and threw him
@@ -10783,6 +10804,7 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     let snapping_check = snapping;
     let handler = adj.connect_value_changed({
         let stand_down = stand_down.clone();
+        let resync = resync.clone();
         move |adj| {
             // Only GTK's own moves are put back; his are left alone.
             if stand_down() || snapping_check.get() || scroll_target_reached(adj.value(), target) {
@@ -10792,12 +10814,17 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
             snapping_check.set(true);
             adj.set_value(target);
             snapping_check.set(false);
+            resync.set(!d371_old());
         }
     });
     let handler = RefCell::new(Some(handler));
     scroller.add_tick_callback(move |scroller, _| {
         let adj = scroller.vadjustment();
         let off = stand_down();
+        if !off && resync.replace(false) && scroll_target_reached(adj.value(), target) {
+            tag_scroll_cause("restore hold: re-anchor");
+            adj.emit_by_name::<()>("value-changed", &[]);
+        }
         if !off && !scroll_target_reached(adj.value(), target) {
             tag_scroll_cause("restore hold: put back");
             adj.set_value(target);
@@ -12009,6 +12036,11 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         }
     }
     let focus_was_in_files = focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid);
+    // D-371: the first selected row's index before the refresh (see below).
+    let selected_before = {
+        let bits = ui.list_selection.selection();
+        (bits.size() > 0).then(|| bits.minimum())
+    };
     // The model is NOT emptied here. Emptying it collapsed the list to nothing,
     // which clamped the scroll offset and made the view jump (D-226); the
     // splice below replaces its contents in one change instead. The icon view
@@ -12125,6 +12157,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             .collect();
         if diff {
             update_list_model(&ui.list_store, &visible_entries, &rebind);
+            if !d371_old() {
+                keep_place_after_removal(ui, view_mode, focus_was_in_files, selected_before);
+            }
         } else {
             // One splice: the old rows out and the new rows in, in a single
             // change, so the view is never momentarily empty (D-226).
@@ -15022,6 +15057,44 @@ fn focus_within(window: &impl IsA<gtk::Window>, root: &impl IsA<gtk::Widget>) ->
 /// next-frame focus search skips the empty view and lands on the selectable
 /// preview label, which raises a critical. An empty view holds no rows, so
 /// focusing its root keeps focus in the file pane and on a widget that survives.
+/// D-371 (root of "I trash one file in a deep list and the list goes blank,
+/// a row off screen is selected, and the next wheel step jumps").
+/// When the row that has GTK focus is removed, GtkListItemManager keeps its
+/// focus tracker at the same index but drops the destroyed widget
+/// (gtklistitemmanager.c:1560-1577), and the window records the lost focus
+/// (gtkwindow.c:5372, `move_focus`). After the next paint the window moves
+/// focus by itself (maybe_unset_focus_and_default, gtkwindow.c:4899), which
+/// ends in gtk_list_base_focus picking item 0 and selecting and scrolling to
+/// it (gtklistbase.c:576-584, 648-652): the view leaps to the top and the
+/// selection lands on the first file. Here, right after the splice and before
+/// that paint, the view takes focus itself: gtk_list_base_grab_focus builds the
+/// row at the tracker's index (the row that took the deleted one's place) and
+/// focuses it without scrolling, because that row IS the tracker's row
+/// (gtklistbase.c:658-668 and set_focus_child 949-970). Focusing a visible
+/// widget clears the pending move (gtkwindow.c:2263-2267). One mechanism for
+/// Trash, Delete, a file removed by another program, and a move.
+/// Selection: when the refresh removed every selected row, the row now at the
+/// first removed row's index (or the last row) is selected, by index in the
+/// new model, so nothing scrolls.
+fn keep_place_after_removal(ui: &Ui, view_mode: ViewMode, focus_was_in_files: bool, selected_before: Option<u32>) {
+    let count = ui.list_store.n_items();
+    if count == 0 {
+        return;
+    }
+    if focus_was_in_files {
+        if view_mode == ViewMode::Grid {
+            ui.grid.grab_focus();
+        } else {
+            ui.list.grab_focus();
+        }
+    }
+    if let Some(before) = selected_before {
+        if ui.list_selection.selection().size() == 0 {
+            ui.list_selection.select_item(before.min(count - 1), true);
+        }
+    }
+}
+
 fn keep_focus_on_empty_view(root: &impl IsA<gtk::Widget>, focus_was_in_view: bool, is_empty: bool) {
     if focus_was_in_view && is_empty {
         // An empty view is not focusable by default and would pass focus on.
@@ -25385,6 +25458,7 @@ Broken: Either state is wrong.\n";
             bottom_row_click_keeps_place_d350();
             split_wrapped_names_click_keeps_place_d358();
             pointer_click_keeps_scroll_d364();
+            delete_keeps_view_d371();
             refresh_keeps_scroll_place_d349();
             eprintln!("wf-test scroll-only run done");
             return;
@@ -29451,6 +29525,227 @@ Broken: Either state is wrong.\n";
         let display = gdk::Display::default().expect("display");
         private_display_check_d232(&display);
         pointer_click_keeps_scroll_d364();
+    }
+
+    /// D-371 alone, on the private display, with real X input.
+    #[test]
+    fn delete_keeps_view_d371_alone() { gtk_thread::run(delete_keeps_view_d371_alone_on_gtk_thread); }
+
+    fn delete_keeps_view_d371_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D371_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        delete_keeps_view_d371();
+    }
+
+    /// D-371 (21 Nov 2026, the owner's screencast): in a compact list sorted
+    /// Modified newest first, 7,525 files, scrolled deep, he trashed one file.
+    /// The list went blank (header only) with the scrollbar unmoved, the status
+    /// said "1 selected" for a row that was not on screen, and the next wheel
+    /// step made rows appear somewhere else. Conditions here: 3,500 files named
+    /// like f32328852.gif, compact, Modified newest first, scrolled past 20,000
+    /// px, one whole row in the middle selected by a real click, then deleted
+    /// through the same call as the Delete key and the Trash button
+    /// (`trash_or_delete_selection`), into a private Trash. After the refresh
+    /// settles (past the 1.5s hold):
+    ///  (a) the adjustment value is where it was (within 1px);
+    ///  (b) mapped row widgets cover the whole viewport: one at the top edge,
+    ///      one at the bottom edge, and as many as fit;
+    ///  (c) exactly one row is selected, the one that took the deleted row's
+    ///      place, inside the viewport, and the offset never went to 0 on the way;
+    ///  (d) one real wheel step moves the offset by the same amount one step
+    ///      moved it BEFORE the delete (no jump) and the rows still cover the view.
+    /// Fails without the D-371 re-anchor in `reapply_scroll` (blank list, (b))
+    /// and without `keep_place_after_removal` (GTK picks item 0: offset 30000 -> 0, first row selected, (c)).
+    fn delete_keeps_view_d371() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-371 sends real X input and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d371-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(home.join(".local/share/Trash/files")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/Trash/info")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 3500usize;
+        for i in 0..total {
+            let file = std::fs::File::create(dir.join(format!("f{:08}.gif", 32_328_852 + i * 7))).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000 + i as u64 * 3600)).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d371test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d371-proof"));
+        ui.window.set_default_size(1300, 900);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        {
+            let mut st = state.borrow_mut();
+            st.sort_key = SortKey::Modified;
+            st.sort_ascending = false;
+        }
+        repopulate_rows(&state, &ui);
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        settle(600);
+        let scroller = view_scroller(&state, &ui);
+        let adj = scroller.vadjustment();
+        wait_for("list scrollable", || adj.upper() > 30_000.0 + adj.page_size());
+        let mut geo = String::new();
+        for _ in 0..50 {
+            if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d371-proof", "getwindowgeometry", "--shell"]).output() {
+                if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+        let (wx, wy) = (num("X="), num("Y="));
+        let _ = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d371-proof", "windowfocus"]).output();
+        settle(200);
+        let rows = |ui: &Ui| -> Vec<(gtk::Widget, gtk::graphene::Rect)> {
+            let view = scroller.child().expect("view");
+            let mut v: Vec<(gtk::Widget, gtk::graphene::Rect)> = all_widgets(&view).into_iter()
+                .filter(|w| w.has_css_class("wf-file-row") && w.is_mapped())
+                .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w, b)))
+                .collect();
+            v.sort_by(|a, b| a.1.y().partial_cmp(&b.1.y()).unwrap());
+            v
+        };
+        let path_of = |w: &gtk::Widget| -> String { w.tooltip_text().map(|t| t.to_string()).unwrap_or_default() };
+        let view_box = |ui: &Ui| { let b = scroller.compute_bounds(&ui.window).expect("scroller bounds"); (b.y(), b.y() + b.height(), b.x() + b.width() / 2.0) };
+        // The rows that really show inside the viewport: (count, top edge gap, bottom edge gap, row height).
+        let coverage = |ui: &Ui| -> (usize, f32, f32, f32) {
+            let (top, bottom, _) = view_box(ui);
+            let inside: Vec<_> = rows(ui).into_iter().filter(|(_, b)| b.y() + b.height() > top + 1.0 && b.y() < bottom - 1.0).collect();
+            let row_h = inside.first().map(|(_, b)| b.height()).unwrap_or(0.0);
+            let first_gap = inside.first().map(|(_, b)| b.y() - top).unwrap_or(f32::MAX);
+            let last_gap = inside.last().map(|(_, b)| bottom - (b.y() + b.height())).unwrap_or(f32::MAX);
+            (inside.len(), first_gap, last_gap, row_h)
+        };
+        let mut problems: Vec<String> = Vec::new();
+        let (top0, bottom0, cx) = view_box(&ui);
+        let (mx, my) = (wx + cx as i32, wy + ((top0 + bottom0) / 2.0) as i32);
+        let wheel_step = |what: &str| -> f64 {
+            let before = adj.value();
+            xdo(&["mousemove", &mx.to_string(), &my.to_string()]);
+            settle(100);
+            xdo(&["click", "5"]);
+            settle(700);
+            let moved = adj.value() - before;
+            eprintln!("wf-test D-371 wheel {what}: value {before:.1} -> {:.1} (moved {moved:.1})", adj.value());
+            moved
+        };
+        mark_scroll_cause("test: his own scroll");
+        adj.set_value(30_000.0);
+        settle(600);
+        let step_before = wheel_step("baseline");
+        mark_scroll_cause("test: his own scroll");
+        adj.set_value(30_000.0);
+        settle(600);
+        let (n0, g0, b0, row_h) = coverage(&ui);
+        eprintln!("wf-test D-371 before: value {:.1} upper {:.1} page {:.1} rows in view {n0} top gap {g0:.1} bottom gap {b0:.1} row {row_h:.1}", adj.value(), adj.upper(), adj.page_size());
+        if n0 == 0 || g0 > row_h || b0 > row_h { problems.push(format!("setup: the list does not cover the view before the delete ({n0} rows)")); }
+        // A real click on a whole row in the middle of the view.
+        let (top, bottom, _) = view_box(&ui);
+        let centre = (top + bottom) / 2.0;
+        let mid = rows(&ui).into_iter()
+            .filter(|(_, b)| b.y() > top + 5.0 && b.y() + b.height() < bottom - 5.0)
+            .min_by(|a, b| ((a.1.y() + a.1.height() / 2.0) - centre).abs().partial_cmp(&((b.1.y() + b.1.height() / 2.0) - centre).abs()).unwrap())
+            .expect("a whole row in the middle");
+        let victim = path_of(&mid.0);
+        xdo(&["mousemove", &(wx + (mid.1.x() + mid.1.width() / 2.0) as i32).to_string(), &(wy + (mid.1.y() + mid.1.height() / 2.0) as i32).to_string()]);
+        settle(100);
+        xdo(&["click", "1"]);
+        settle(800);
+        let value_before = adj.value();
+        let (idx, successor, total_before) = {
+            let st = state.borrow();
+            let idx = st.visible_entries.iter().position(|e| e.source.real_path_string().as_deref() == Some(victim.as_str())).expect("victim listed");
+            (idx, st.visible_entries[idx + 1].source.real_path_string().unwrap(), st.visible_entries.len())
+        };
+        eprintln!("wf-test D-371 victim {victim} index {idx} of {total_before}, selected {:?}, value {value_before:.1}", selected_paths(&state, &ui));
+        if selected_paths(&state, &ui) != vec![victim.clone()] { problems.push(format!("setup: the click did not select the victim, got {:?}", selected_paths(&state, &ui))); }
+        // Every change of the offset from the delete on, with the time since it.
+        let t0 = Instant::now();
+        let logged = Rc::new(Cell::new(0usize));
+        let last_value = Rc::new(Cell::new(adj.value()));
+        let lowest = Rc::new(Cell::new(adj.value()));
+        let adj_handler = adj.connect_value_changed({
+            let (logged, last_value, lowest) = (logged.clone(), last_value.clone(), lowest.clone());
+            move |a| {
+                lowest.set(lowest.get().min(a.value()));
+                let old = last_value.replace(a.value());
+                if logged.get() < 60 {
+                    logged.set(logged.get() + 1);
+                    eprintln!("wf-test D-371 adj {} {old:.1} -> {:.1} upper={:.1}", t0.elapsed().as_millis(), a.value(), a.upper());
+                }
+            }
+        });
+        let mapped_report = |what: &str| {
+            let r = rows(&ui);
+            let (n, _, _, _) = coverage(&ui);
+            eprintln!("wf-test D-371 {what}: ms since delete {} value {:.1} mapped rows {} (in view {n}) first y {:?} last y {:?}", t0.elapsed().as_millis(), adj.value(), r.len(), r.first().map(|(_, b)| b.y()), r.last().map(|(_, b)| b.y()));
+        };
+        // The Delete key and the Trash button both call this.
+        trash_or_delete_selection(state.clone(), ui.clone());
+        wait_for("the file to be trashed", || { pump(); !std::path::Path::new(&victim).exists() });
+        wait_for("the refresh to list one file fewer", || { pump(); state.borrow().visible_entries.len() == total_before - 1 });
+        let t1 = Instant::now();
+        for at in [0u64, 100, 300, 1000, 2500] {
+            while t1.elapsed() < Duration::from_millis(at) { pump(); std::thread::sleep(Duration::from_millis(5)); }
+            mapped_report(&format!("sample +{at}ms after the refresh"));
+        }
+        adj.disconnect(adj_handler);
+        let value_after = adj.value();
+        let (n1, g1, b1, _) = coverage(&ui);
+        eprintln!("wf-test D-371 after: value {value_before:.1} -> {value_after:.1} rows in view {n1} top gap {g1:.1} bottom gap {b1:.1}");
+        // (a)
+        if (value_after - value_before).abs() > 1.0 { problems.push(format!("(a) the view moved {value_before:.1} -> {value_after:.1}")); }
+        // (b)
+        if n1 == 0 || g1 > row_h || b1 > row_h || (n1 as i64) < (n0 as i64) - 1 {
+            problems.push(format!("(b) the list is blank or short: {n1} rows in view (was {n0}), top gap {g1:.1}, bottom gap {b1:.1}, row {row_h:.1}"));
+        }
+        // (c)
+        let selected = selected_paths(&state, &ui);
+        eprintln!("wf-test D-371 selected after {selected:?}, expected {successor}");
+        if lowest.get() < value_before - 500.0 { problems.push(format!("(a) the offset went down to {:.1} on the way (was {value_before:.1}): GTK moved the view", lowest.get())); }
+        eprintln!("wf-test D-371 selected positions {:?}", selected_indices(&ui));
+        if selected_indices(&ui).len() != 1 { problems.push(format!("(c) {} items selected, exactly one wanted: {:?}", selected_indices(&ui).len(), selected_indices(&ui))); }
+        if selected != vec![successor.clone()] { problems.push(format!("(c) selected {selected:?}, wanted the row that took the place, {successor}")); }
+        let (top, bottom, _) = view_box(&ui);
+        let on_screen = rows(&ui).iter().any(|(w, b)| path_of(w) == successor && b.y() >= top - 1.0 && b.y() + b.height() <= bottom + 1.0);
+        if !on_screen { problems.push(format!("(c) the selected row {successor} is not inside the viewport")); }
+        // (d)
+        let step_after = wheel_step("after delete");
+        if (step_after - step_before).abs() > 2.0 { problems.push(format!("(d) one wheel step moved {step_after:.1}, before the delete it moved {step_before:.1}")); }
+        let (n2, g2, b2, _) = coverage(&ui);
+        eprintln!("wf-test D-371 after wheel: rows in view {n2} top gap {g2:.1} bottom gap {b2:.1}");
+        if n2 == 0 || g2 > row_h || b2 > row_h { problems.push(format!("(d) the rows do not cover the view after the wheel step ({n2} rows)")); }
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        assert!(problems.is_empty(), "D-371: {problems:#?}");
+        eprintln!("wf-test D-371 passed");
     }
 
     /// D-364: a pointer press on a row cut by the bottom edge must not move the
