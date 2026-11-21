@@ -19734,17 +19734,24 @@ fn set_preview_media(ui: &Ui, path: &str) {
     // Moving to any other kind of file silences a song; see
     // `stop_preview_audio`.
     stop_preview_audio(ui);
-    // D-362: containers GStreamer here is not trusted with show one frame and
-    // the length, the same as a video it fails to play.
+    // D-362/D-369: containers GStreamer here is not trusted with go straight
+    // to the ffmpeg conversion, the same as a video it fails to play.
     if native_core::video_frame_only(path) {
         ui.preview_media_controls
             .set_media_stream(None::<&gtk::MediaStream>);
         ui.preview_media_picture
             .set_paintable(None::<&gdk::Paintable>);
-        set_preview_video_frame(ui, path, "This video format is not played in the pane.");
+        convert_and_play_video(ui, path);
         return;
     }
-    let file = gio::File::for_path(PathBuf::from(path));
+    attach_preview_media(ui, path, path, true);
+}
+
+/// Plays `play_path` in the pane. When GStreamer refuses it and `may_convert`
+/// is set, the original video is converted with ffmpeg and played instead
+/// (D-369); a refusal of the converted copy shows the frame fallback.
+fn attach_preview_media(ui: &Ui, play_path: &str, original: &str, may_convert: bool) {
+    let file = gio::File::for_path(PathBuf::from(play_path));
     let media = gtk::MediaFile::for_file(&file);
     let zoom = preview_zoom_for(ui);
     let size = if zoom <= 1.0 {
@@ -19758,10 +19765,11 @@ fn set_preview_media(ui: &Ui, path: &str) {
     ui.preview_media_controls.set_media_stream(Some(&media));
     ui.preview_stack.set_visible_child_name("media");
     // D-362: a video GStreamer cannot play used to sit as a black box. It now
-    // falls back to a frame from ffmpeg and the duration.
+    // falls back to a frame from ffmpeg and the duration; D-369 converts it
+    // first so it plays.
     let generation = ui.preview_generation.get();
     let ui_for_error = ui.clone();
-    let path_for_error = path.to_string();
+    let path_for_error = original.to_string();
     media.connect_error_notify(move |m| {
         if m.error().is_none() || ui_for_error.preview_generation.get() != generation {
             return;
@@ -19773,7 +19781,62 @@ fn set_preview_media(ui: &Ui, path: &str) {
         ui_for_error
             .preview_media_picture
             .set_paintable(None::<&gdk::Paintable>);
-        set_preview_video_frame(&ui_for_error, &path_for_error, "This video cannot be played in the pane.");
+        if may_convert && native_core::is_video_path(&path_for_error) {
+            convert_and_play_video(&ui_for_error, &path_for_error);
+        } else {
+            set_preview_video_frame(&ui_for_error, &path_for_error, "This video cannot be played in the pane.");
+        }
+    });
+}
+
+/// D-369: a video GStreamer cannot decode is converted by ffmpeg (off the main
+/// loop, killed when the selection moves on) to a cached WebM and played in
+/// the same pane. Meanwhile the D-362 frame and length stay up, saying it is
+/// converting; if ffmpeg fails the frame stays with ffmpeg's last error line.
+fn convert_and_play_video(ui: &Ui, path: &str) {
+    if let Some(hit) = native_viewers::video_play_cached(Path::new(path)) {
+        attach_preview_media(ui, &hit.to_string_lossy(), path, false);
+        return;
+    }
+    if !native_viewers::tool_in_path("ffmpeg") {
+        set_preview_video_frame(
+            ui,
+            path,
+            "This video cannot be played in the pane: ffmpeg is not installed, so it cannot be converted.",
+        );
+        return;
+    }
+    let cancel = {
+        let mut st = ui.viewers.doc.borrow_mut();
+        st.cancel = Arc::new(AtomicBool::new(false));
+        st.cancel.clone()
+    };
+    set_preview_video_frame(ui, path, "Converting to play here\u{2026}");
+    let generation = ui.preview_generation.get();
+    let ui = ui.clone();
+    let source = path.to_string();
+    glib::MainContext::default().spawn_local(async move {
+        let src = PathBuf::from(&source);
+        let made = gio::spawn_blocking(move || native_viewers::video_play_copy(&src, &cancel)).await;
+        if ui.preview_generation.get() != generation {
+            return;
+        }
+        // A new generation here also stops the frame task still in flight
+        // from landing after the result and overwriting it.
+        next_preview_generation(&ui);
+        match made {
+            Ok(Ok(converted)) => attach_preview_media(&ui, &converted.to_string_lossy(), &source, false),
+            Ok(Err(why)) => set_preview_video_frame(
+                &ui,
+                &source,
+                &format!("This video cannot be played in the pane: {why}"),
+            ),
+            Err(_) => set_preview_video_frame(
+                &ui,
+                &source,
+                "This video cannot be played in the pane: the converter stopped.",
+            ),
+        }
     });
 }
 
@@ -25121,6 +25184,47 @@ Broken: Either state is wrong.\n";
         assert!(d.ui.viewers.frame_info.text().contains("Length 0:02"), "{}", d.ui.viewers.frame_info.text());
     }
 
+    /// D-369: a video GStreamer cannot decode (raw 16-bit DIB RGB in AVI) is
+    /// converted by ffmpeg to a cached WebM and played in the pane. Without
+    /// the conversion the stack stays on "frame".
+    fn unplayable_video_converts_and_plays_d369() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("dib", |dir| {
+            assert!(
+                d362_run(
+                    "ffmpeg",
+                    &["-v", "error", "-f", "lavfi", "-i", "testsrc=d=2:s=123x159:r=15", "-c:v", "rawvideo", "-pix_fmt", "rgb555le", "-y", "clip.avi"],
+                    dir
+                ),
+                "ffmpeg makes the DIB rgb555 .avi"
+            );
+        }, 1);
+        let path = d.state.borrow().visible_entries[0].source.real_path_string().unwrap();
+        // The premise: GStreamer alone refuses this file.
+        let plain = gtk::MediaFile::for_file(&gio::File::for_path(&path));
+        d362_wait("GStreamer to refuse the raw file", 40, || plain.error().is_some() || plain.is_prepared());
+        assert!(plain.error().is_some(), "GStreamer alone must fail on this file, or the test proves nothing");
+        d362_show(&d, "clip.avi");
+        d362_wait("the converted video", 60, || {
+            d362_stack(&d) == "media" && d.ui.preview_media_picture.paintable().is_some()
+        });
+        let stream = d.ui.preview_media_controls.media_stream().expect("the controls hold the converted stream");
+        d362_wait("the converted stream to prepare", 40, || stream.is_prepared() || stream.error().is_some());
+        assert!(stream.error().is_none(), "converted stream error: {:?}", stream.error());
+        assert!(stream.is_prepared(), "the converted stream is prepared");
+        let cache = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/wayfinder/video-play");
+        let count = |ext: &str| {
+            std::fs::read_dir(&cache)
+                .map(|r| r.flatten().filter(|e| e.path().to_string_lossy().ends_with(ext)).count())
+                .unwrap_or(0)
+        };
+        assert_eq!(count(".webm"), 1, "one converted file is cached");
+        assert_eq!(count(".part.webm"), 0, "no half file is left");
+        // A second selection reuses the cache and plays at once, with no conversion.
+        d362_show(&d, "clip.avi");
+        assert!(native_viewers::video_play_cached(Path::new(&path)).is_some(), "cache hit");
+    }
+
     /// D-362: new picture formats preview as pictures: tga, pnm, psd and dds,
     /// converted to a cached PNG when GTK cannot load them itself.
     fn new_image_formats_preview_as_pictures_d362() {
@@ -25218,6 +25322,7 @@ Broken: Either state is wrong.\n";
         docx_previews_as_rendered_pages_d362();
         html_renders_as_a_page_and_shows_source_d362();
         mpg_counts_as_video_and_shows_a_frame_d362();
+        unplayable_video_converts_and_plays_d369();
         new_image_formats_preview_as_pictures_d362();
         stale_work_never_replaces_the_current_preview_d362();
         rle_bmp_previews_and_corrupt_picture_ends_in_a_message_d362();
@@ -29041,6 +29146,19 @@ Broken: Either state is wrong.\n";
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// D-369 alone, on the private display, without the full suite.
+    #[test]
+    fn unplayable_video_alone_d369() { gtk_thread::run(unplayable_video_alone_d369_on_gtk_thread); }
+
+    fn unplayable_video_alone_d369_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D369_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        unplayable_video_converts_and_plays_d369();
     }
 
     /// D-364 alone, on the private display, with real X input.

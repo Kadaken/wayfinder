@@ -11,6 +11,7 @@
 #   headless-gtk-test.sh d187        the carried round-187 undo/redo regression selector
 #   headless-gtk-test.sh d226        the standalone no-scroll-flick-on-refresh gate
 #   headless-gtk-test.sh d364        the standalone real-click-keeps-scroll gate (XTEST input, list and icon view)
+#   headless-gtk-test.sh d369        the standalone unplayable-video-converts-and-plays gate
 #   headless-gtk-test.sh d233        the standalone no-flick-on-permanent-delete gate
 #   headless-gtk-test.sh d234        the standalone trash-safety + Trash-row-menu gate
 #   headless-gtk-test.sh d235        the standalone Save-picker name-box gate
@@ -88,6 +89,8 @@ case "$mode" in
         cmd=("${cargo_t[@]}" scroll_flick_d226_alone -- --nocapture);;
   d364) export WAYFINDER_D364_ONLY=1
         cmd=("${cargo_t[@]}" pointer_click_keeps_scroll_d364_alone -- --nocapture);;
+  d369) export WAYFINDER_D369_ONLY=1
+        cmd=("${cargo_t[@]}" unplayable_video_alone_d369 -- --nocapture);;
   d233) export WAYFINDER_D233_ONLY=1
         cmd=("${cargo_t[@]}" scroll_flick_d233_alone -- --nocapture);;
   d234) export WAYFINDER_D234_ONLY=1
@@ -127,7 +130,7 @@ case "$mode" in
              bash -c 'set -e; ip link set lo up; exec dbus-run-session -- "$@"' bash "${inner_test[@]}")
         host_mounts_before="$(cat /proc/self/mountinfo)";;
   --) shift; cmd=("$@");;
-  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
+  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
 esac
 
 setsid timeout -k 5 "$t" xvfb-run -a -s "-screen 0 1920x1080x24" "${cmd[@]}" &

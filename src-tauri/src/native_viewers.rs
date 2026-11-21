@@ -122,8 +122,14 @@ pub fn cache_key(path: &Path, extra: &str) -> Option<u64> {
 /// Runs `cmd` to the end, killing its whole process group when `cancel` is
 /// set or `limit` passes. LibreOffice starts helper processes, so killing only
 /// the one we spawned would leave them running.
-pub fn run_cancellable(mut cmd: Command, cancel: &AtomicBool, limit: Duration) -> Result<(), String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+pub fn run_cancellable(cmd: Command, cancel: &AtomicBool, limit: Duration) -> Result<(), String> {
+    run_cancellable_with(cmd, cancel, limit, Stdio::null())
+}
+
+/// `run_cancellable` with the error output sent to `stderr` (a log file, so
+/// the caller can say why the tool failed).
+pub fn run_cancellable_with(mut cmd: Command, cancel: &AtomicBool, limit: Duration, stderr: Stdio) -> Result<(), String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
     cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| format!("could not start: {e}"))?;
     let pid = child.id() as i32;
@@ -192,6 +198,91 @@ pub fn pdf_for(source: &Path, kind: DocKind, cancel: &AtomicBool) -> Result<Path
     })();
     let _ = std::fs::remove_dir_all(&work);
     result.map(|_| cached)
+}
+
+/// D-369: the most the converted-video cache may hold (2 GB). Past it the
+/// oldest converted files are deleted until it fits again.
+const VIDEO_PLAY_CACHE_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// D-369: the converted copy of `source` if one is already cached.
+pub fn video_play_cached(source: &Path) -> Option<PathBuf> {
+    let dir = cache_dir("video-play")?;
+    let key = cache_key(source, "play1")?;
+    let cached = dir.join(format!("{key:016x}.webm"));
+    cached.is_file().then_some(cached)
+}
+
+/// D-369: GStreamer here cannot play every video (raw RGB in AVI, odd
+/// containers), so ffmpeg makes a copy it can: VP9 video (+ Opus audio when
+/// there is any) in WebM, even-sized, yuv420p, realtime settings so a short
+/// clip takes about a second, never wider than 1280. Cached by path + size +
+/// mtime; written as `.part` and renamed, so a half file is never played.
+/// Killed (whole process group) when `cancel` is set. `Err` carries ffmpeg's
+/// last error line.
+pub fn video_play_copy(source: &Path, cancel: &AtomicBool) -> Result<PathBuf, String> {
+    if let Some(hit) = video_play_cached(source) {
+        return Ok(hit);
+    }
+    let dir = cache_dir("video-play").ok_or("no cache folder")?;
+    let key = cache_key(source, "play1").ok_or("cannot read the file")?;
+    let cached = dir.join(format!("{key:016x}.webm"));
+    // ffmpeg picks the format from the extension, so the half file still ends .webm.
+    let part = dir.join(format!("{key:016x}.part.webm"));
+    let log = dir.join(format!("{key:016x}.log"));
+    let _ = std::fs::remove_file(&part);
+    let errfile = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"])
+        .args(["-vf", "scale='min(1280,trunc(iw/2)*2)':-2", "-pix_fmt", "yuv420p"])
+        .args(["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1"])
+        .args(["-b:v", "0", "-crf", "34", "-c:a", "libopus", "-b:a", "96k", "-f", "webm"])
+        .arg(&part);
+    let result = run_cancellable_with(cmd, cancel, Duration::from_secs(1200), Stdio::from(errfile));
+    let last_line = std::fs::read_to_string(&log)
+        .ok()
+        .and_then(|t| t.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()));
+    let _ = std::fs::remove_file(&log);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&part);
+        return Err(match (e.as_str(), last_line) {
+            ("cancelled", _) => e,
+            (_, Some(line)) => line,
+            _ => e,
+        });
+    }
+    if !part.is_file() {
+        return Err(last_line.unwrap_or_else(|| "ffmpeg made no file".to_string()));
+    }
+    std::fs::rename(&part, &cached).map_err(|e| e.to_string())?;
+    prune_video_play_cache(&dir, &cached);
+    Ok(cached)
+}
+
+/// Deletes the oldest converted files until the folder is under the cap.
+fn prune_video_play_cache(dir: &Path, keep: &Path) {
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            let p = e.path();
+            (m.is_file() && p.extension().is_some_and(|x| x == "webm") && !p.to_string_lossy().ends_with(".part.webm"))
+                .then(|| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), p))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    files.sort_by_key(|f| f.0);
+    for (_, len, path) in files {
+        if total <= VIDEO_PLAY_CACHE_CAP {
+            break;
+        }
+        if path != keep && std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 pub fn pdf_page_count(pdf: &Path) -> Result<u32, String> {
