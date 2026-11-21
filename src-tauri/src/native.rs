@@ -28913,9 +28913,35 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-358 fixture, shared with D-350: names of mixed length so some wrap to
+    /// two lines in a narrow pane. The number leads, so short and long names
+    /// sort side by side.
+    fn wrapped_fixture_name(i: usize) -> String {
+        match i % 4 {
+            0 => format!("{i:04}.jpg"),
+            1 => format!("{i:04} Holiday photos - Lisbon trip with the whole family and friends, day {}.jpg", i % 9),
+            2 => format!("{i:04}-notes.txt"),
+            _ => format!("{i:04} Quarterly report draft (final) reviewed by accounting and legal before sending.pdf"),
+        }
+    }
+
+    /// His layout: split view with the left pane narrow (names wrap there).
+    fn open_narrow_split(state: &Rc<RefCell<AppState>>, ui: &Ui, total: usize) {
+        toggle_split(state, ui);
+        pump();
+        let pane_state = ui.split.borrow().clone().expect("split pane").state;
+        wait_for("right pane lists the folder", || pane_state.borrow().visible_entries.len() == total);
+        let paned = ui.split.borrow().clone().expect("split pane").paned;
+        paned.set_position(900);
+        for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+    }
+
     /// D-350 (20 Nov 2026, the owner's screencast 10:04): clicking one of the
-    /// bottom two or three rows jolted the list up about four rows. A click
-    /// goes through the row's "list.select-item" action, exactly as here.
+    /// bottom two or three rows jolted the list up about four rows. The list
+    /// is held while a press or a file drag sits at its edge,
+    /// in the D-358 conditions (split view, narrow left pane, wrapping names).
+    /// The click path itself (mid-list and bottom rows, no movement, no height
+    /// flips) is split_wrapped_names_click_keeps_place_d358; it is not repeated here.
     fn bottom_row_click_keeps_place_d350() {
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d350-{}", std::process::id()));
@@ -28924,8 +28950,9 @@ Broken: Either state is wrong.\n";
         let (home, dir) = (root.join("home"), root.join("dir"));
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        for i in 0..300 {
-            std::fs::write(dir.join(format!("f-{i:03}.txt")), "x").unwrap();
+        let total = 900usize;
+        for i in 0..total {
+            std::fs::write(dir.join(wrapped_fixture_name(i)), "x").unwrap();
         }
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
@@ -28937,46 +28964,16 @@ Broken: Either state is wrong.\n";
         let (state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("the test window is registered");
-        ui.window.set_default_size(900, 600);
+        ui.window.set_default_size(1300, 800);
         ui.window.present();
-        wait_for("listing", || state.borrow().visible_entries.len() == 300);
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
         set_view_mode(&state, &ui, ViewMode::Details);
-        for _ in 0..30 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        open_narrow_split(&state, &ui, total);
         let adj = ui.list_scroll.vadjustment();
         wait_for("scrollable", || adj.upper() > adj.page_size() * 3.0);
         mark_scroll_cause("test: his own scroll");
         adj.set_value((adj.upper() - adj.page_size()) / 2.0);
         for _ in 0..40 { pump(); std::thread::sleep(Duration::from_millis(10)); }
-        for from_bottom in [1usize, 2, 3] {
-            let scroll_b = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
-            let bottom = scroll_b.y() + scroll_b.height();
-            let mut rows: Vec<(gtk::Widget, gtk::graphene::Rect)> = all_widgets(ui.list.upcast_ref())
-                .into_iter()
-                .filter(|w| w.has_css_class("wf-file-row"))
-                .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w, b)))
-                .filter(|(_, b)| b.y() + b.height() <= bottom - 1.0 && b.y() >= scroll_b.y())
-                .collect();
-            rows.sort_by(|a, b| a.1.y().partial_cmp(&b.1.y()).unwrap());
-            let (row, _) = rows[rows.len() - from_bottom].clone();
-            let path = row.tooltip_text().map(|t| t.to_string()).unwrap_or_default();
-            let pos = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().as_deref() == Some(path.as_str())).expect("row in the listing");
-            let item = row.ancestor(gtk::Widget::static_type()).and_then(|_| {
-                let mut w = row.parent();
-                while let Some(p) = w.clone() {
-                    if p.type_().name() == "GtkListItemWidget" { return Some(p); }
-                    w = p.parent();
-                }
-                None
-            }).expect("list item widget");
-            let before = adj.value();
-            item.activate_action("list.select-item", Some(&(pos as u32, false, false).to_variant())).expect("select-item");
-            for _ in 0..80 { pump(); std::thread::sleep(Duration::from_millis(10)); }
-            let after = adj.value();
-            let sel = selected_paths(&state, &ui);
-            eprintln!("wf-test D-350 row {from_bottom} from bottom: {before} -> {after}, selected={}", sel.len());
-            assert_eq!(sel, vec![path.clone()], "D-350: the clicked row is selected");
-            assert!((after - before).abs() < 2.0, "D-350: clicking row {from_bottom} from the bottom kept the list still ({before} -> {after})");
-        }
         // GTK's edge-scroll, as gtklistbase.c autoscroll_cb does it: add a step
         // each frame and stop once a step no longer moves the list.
         let edge_scroll = |adj: &gtk::Adjustment| -> f64 {
@@ -29038,14 +29035,7 @@ Broken: Either state is wrong.\n";
         std::fs::create_dir_all(&dir).unwrap();
         let total = 900usize;
         for i in 0..total {
-            // The number leads, so short and long names sort side by side.
-            let name = match i % 4 {
-                0 => format!("{i:04}.jpg"),
-                1 => format!("{i:04} Holiday photos - Lisbon trip with the whole family and friends, day {}.jpg", i % 9),
-                2 => format!("{i:04}-notes.txt"),
-                _ => format!("{i:04} Quarterly report draft (final) reviewed by accounting and legal before sending.pdf"),
-            };
-            std::fs::write(dir.join(name), "x").unwrap();
+            std::fs::write(dir.join(wrapped_fixture_name(i)), "x").unwrap();
         }
         std::env::set_var("HOME", &home);
         let app = adw::Application::builder()
@@ -29061,15 +29051,9 @@ Broken: Either state is wrong.\n";
         ui.window.present();
         wait_for("listing", || state.borrow().visible_entries.len() == total);
         set_view_mode(&state, &ui, ViewMode::Details);
-        toggle_split(&state, &ui);
-        pump();
-        let pane_state = ui.split.borrow().clone().expect("split pane").state;
-        wait_for("right pane lists the folder", || pane_state.borrow().visible_entries.len() == total);
         // The left pane narrow, as in his window.
-        let paned = ui.split.borrow().clone().expect("split pane").paned;
-        paned.set_position(900);
-        for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
-        eprintln!("wf-test D-358 left pane width={} paned position={}", ui.list_scroll.width(), paned.position());
+        open_narrow_split(&state, &ui, total);
+        eprintln!("wf-test D-358 left pane width={}", ui.list_scroll.width());
         let adj = ui.list_scroll.vadjustment();
         wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
         mark_scroll_cause("test: his own scroll");
