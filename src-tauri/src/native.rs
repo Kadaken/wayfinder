@@ -963,7 +963,7 @@ popover contents {
    the sidebar and the listing all sat on the same plane. Each rule below adds
    a soft dark shadow under or beside an edge that is already there, so the
    toolbars read as sitting above the files and the sidebar as sitting beside
-   them (7 Nov 2026, the owner: "add any shadowing effects around the app that may
+   them (7 Nov 2026, Owner: "add any shadowing effects around the app that may
    give it more dynamics"). Kept small on purpose: a wide shadow smears when a
    long listing scrolls under it. */
 .wf-titlebar {
@@ -981,7 +981,7 @@ popover contents {
 /* D-257: no side shadow and no inset edge on the sidebar or the preview.
    Both drew a second line inside the panel, a hairline away from the divider
    that was already there, and the strip between the two read as a grey gap
-   (7 Nov 2026, the owner: "there should not be a slight gray space between them
+   (7 Nov 2026, Owner: "there should not be a slight gray space between them
    and their adjacent sections"). The vertical joins are one flat line, flush
    on both sides. Depth is done with the horizontal edges only. */
 
@@ -6285,7 +6285,7 @@ fn set_sidebar_shown(main: &gtk::Paned, sidebar: &gtk::ScrolledWindow, shown: bo
 
 /// Hold the sidebar at one width. The divider used to be draggable, and a
 /// stray drag squashed the names or shut the sidebar altogether with nothing
-/// to say it had happened (7 Nov 2026, the owner: "remove the resize feature for
+/// to say it had happened (7 Nov 2026, Owner: "remove the resize feature for
 /// the side bar so I can't accidentally collapse it"). Position 0 is left
 /// alone: that is a second pane deliberately hiding its own copy of the list,
 /// not a drag.
@@ -8103,7 +8103,7 @@ fn dir_has_subdirs(path: &str, show_hidden: bool) -> bool {
 /// Explorer and Dolphin both let any folder in the sidebar open into its own
 /// subfolders at any depth. This used to stop after one level, and the row
 /// carried a text arrow inside its own words, so clicking the folder toggled
-/// it instead of opening it (7 Nov 2026, the owner: "Windows explorer and dolphin
+/// it instead of opening it (7 Nov 2026, Owner: "Windows explorer and dolphin
 /// appear to have file trees under their devices and other folders in the
 /// side bar"). The arrow is now a real button: the arrow opens the branch,
 /// the name opens the folder.
@@ -8480,14 +8480,14 @@ fn prepend_sidebar_arrow(row: &gtk::ListBoxRow, arrow: &gtk::Button) {
         // The row keeps its ordinary left margin, so the twisty pushes Home in
         // from the panel edge the way Explorer does. Pulling the margin back
         // to the edge made Home sit flush and the nesting did not read
-        // (7 Nov 2026, the owner: "should not be flush but offset").
+        // (7 Nov 2026, Owner: "should not be flush but offset").
         line.prepend(arrow);
     }
 }
 
 /// The twisty plus the gap after it. A Places row with no twisty of its own
 /// takes this as blank space, so Root and Trash line up with Home instead of
-/// starting further left than it (7 Nov 2026, the owner: "home is not offset, it
+/// starting further left than it (7 Nov 2026, Owner: "home is not offset, it
 /// has only received an arrow" -- the arrow had pushed Home's icon right and
 /// left every other row where it was).
 const SIDEBAR_TWISTY_GUTTER: i32 = 20;
@@ -8561,7 +8561,7 @@ fn sidebar_row_with_bar(
     // "Downloads" read as "Doc...nts" and "Do...ads" no matter how wide the
     // sidebar was. The sidebar now has a fixed width, so the label simply
     // takes what is there and only shortens a name that genuinely will not
-    // fit (7 Nov 2026, the owner: "untruncate the side bar").
+    // fit (7 Nov 2026, Owner: "untruncate the side bar").
     name.set_max_width_chars(-1);
     name.set_width_chars(-1);
     name.add_css_class("wf-sidebar-title");
@@ -8678,7 +8678,7 @@ fn sidebar_icon(icon_name: &str) -> gtk::Box {
 /// copies were being stretched past their own size, and handing the window
 /// the 96px original let the graphics card shrink it by plain averaging,
 /// which rounds every edge. The script shrinks with Lanczos and a light
-/// sharpen instead, so the edges stay hard (7 Nov 2026, the owner: "they need to
+/// sharpen instead, so the edges stay hard (7 Nov 2026, Owner: "they need to
 /// look crisp"). Change `SIDEBAR_ICON_SLOT` and you must run that script
 /// again with the new number.
 const SIDEBAR_ICON_BYTES: &[(&str, &[u8])] = &[
@@ -13796,7 +13796,7 @@ fn start_thumbnail_jobs(queue: Rc<RefCell<ThumbnailQueue>>) {
 }
 
 /// D-263: a picture that no decoder on this machine could read is written to
-/// a small log, with the reason and the time. the owner reported pictures that
+/// a small log, with the reason and the time. The owner reported pictures that
 /// would not preview and then moved the files, and nothing had been kept, so
 /// there was nothing left to look at. The log is appended to, capped, and
 /// never contains anything but paths and decoder messages.
@@ -14586,7 +14586,12 @@ fn picker_save_typed_name(ui: &Ui) -> String {
         return String::new();
     };
     let text = entry.text().trim().to_string();
-    if text.is_empty() || text.contains('/') || text.contains('\0') || text == "." || text == ".." {
+    if text.is_empty()
+        || text.contains('/')
+        || native_core::has_hostile_chars(&text)
+        || text == "."
+        || text == ".."
+    {
         return String::new();
     }
     text
@@ -14628,7 +14633,12 @@ fn picker_save_confirmation(target: &Path, name: &str) -> Option<(String, String
 fn picker_save_submit(state: &Rc<RefCell<AppState>>, ui: &Ui, picker: &PickerState) {
     let name = picker_save_typed_name(ui);
     if name.is_empty() {
-        ui.status.set_label("Type a file name to save as");
+        let typed = ui.picker_name.as_ref().map(|e| e.text().to_string()).unwrap_or_default();
+        ui.status.set_label(if native_core::has_hostile_chars(&typed) {
+            "That name has control or direction characters. Use plain letters and numbers."
+        } else {
+            "Type a file name to save as"
+        });
         return;
     }
     let Some(dir) = state.borrow().cwd.real_path().map(|path| path.to_path_buf()) else {
@@ -17146,9 +17156,24 @@ fn mount_outcome(result: Result<native_core::Mounted, String>) -> Result<JobOutc
     })
 }
 
+/// Finding 9: a drive is never unmounted or ejected under a running transfer.
+/// The app tracks only "a transfer is running", not which drive it touches, so
+/// any running transfer refuses.
+fn drive_removal_refusal(transfer_running: bool, ejecting: bool) -> Option<&'static str> {
+    match (transfer_running, ejecting) {
+        (false, _) => None,
+        (true, true) => Some("Wait for the transfer to finish before ejecting."),
+        (true, false) => Some("Wait for the transfer to finish before unmounting."),
+    }
+}
+
 fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
     if !native_core::drive_can_unmount(&drive) {
         return; // D-386: the PS2 row has no unmount; the system service owns it
+    }
+    if let Some(message) = drive_removal_refusal(transfer_running_anywhere(), false) {
+        ui.status.set_label(message);
+        return;
     }
     let device = drive.path.clone();
     run_job(
@@ -17166,6 +17191,10 @@ fn unmount_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
 fn eject_drive_action(state: Rc<RefCell<AppState>>, ui: Ui, drive: Drive) {
     if !native_core::drive_can_eject(&drive) {
         return; // D-386: the PS2 row has no eject; the system service owns it
+    }
+    if let Some(message) = drive_removal_refusal(transfer_running_anywhere(), true) {
+        ui.status.set_label(message);
+        return;
     }
     let device = drive.path.clone();
     run_job(
@@ -20722,7 +20751,7 @@ fn set_preview_folder(ui: &Ui, entry: &Entry, path: std::path::PathBuf, generati
     // D-269: the pane is built from the file list's own parts -- Wayfinder's
     // icon art through `file_icon`, the same row padding and the same name
     // font -- so a folder's contents read as this program and not as the
-    // stock GTK picker (14 Nov 2026, the owner: "does not look like wayfinder, it
+    // stock GTK picker (14 Nov 2026, Owner: "does not look like wayfinder, it
     // looks like the basic file picker").
     let header_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header_row.add_css_class("wf-file-row");
@@ -27363,7 +27392,7 @@ Broken: Either state is wrong.\n";
     /// height unchanged, and loses both the picture and the queue when the
     /// setting goes off. The direct queue check at the end is the scroll-away
     /// half: it needs no pointer input, which this suite refuses to fake on
-    /// the owner's desktop.
+    /// The owner's desktop.
     fn details_thumbnails_in_list_rows_d260() {
         gtk::init().expect("gtk init on the virtual display");
         let old_home = std::env::var("HOME").ok();
@@ -28337,7 +28366,7 @@ Broken: Either state is wrong.\n";
 
     /// D-268: selecting a folder shows what is inside it in the preview pane,
     /// and every row there opens. Before this the pane said only "Folder" and
-    /// its path (14 Nov 2026, the owner: "when you select a folder down here, its
+    /// its path (14 Nov 2026, Owner: "when you select a folder down here, its
     /// contents appear in the viewer to the right, and you could click them if
     /// you want or open the folder so it's centered").
     fn folder_preview_lists_and_opens_d268() {
@@ -31339,8 +31368,12 @@ Broken: Either state is wrong.\n";
     fn rename_click_inside_keeps_editing_d378() {
         let display_name = std::env::var("DISPLAY").unwrap_or_default();
         assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-378 moves the real X pointer and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
-        let source = Path::new("/home/user/Videos/Screencasts/Screencast_20261121_105958.webm");
-        assert!(source.exists(), "D-378 needs the owner's screencast at {}", source.display());
+        let Some(source) = std::env::var_os("WF_TEST_SCREENCAST").map(PathBuf::from) else {
+            eprintln!("skipped: set WF_TEST_SCREENCAST to a screencast .webm to run D-378");
+            return;
+        };
+        let source = source.as_path();
+        assert!(source.exists(), "D-378 needs the screencast at {}", source.display());
         let old_home = std::env::var("HOME").ok();
         let root = crate::native_core::scratch_root().join(format!("wf-d378-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -31517,7 +31550,11 @@ Broken: Either state is wrong.\n";
     /// Fails with WF_TEST_D379_OLD=1 (no content sniffing).
     fn lying_extension_preview_d379() {
         use std::io::Read as _;
-        let source = Path::new("/run/media/user/Disk1/System and program files/Web fragments");
+        let Some(source) = std::env::var_os("WF_TEST_WEB_FRAGMENTS").map(PathBuf::from) else {
+            eprintln!("skipped: set WF_TEST_WEB_FRAGMENTS to the Web fragments folder to run D-379");
+            return;
+        };
+        let source = source.as_path();
         assert!(source.is_dir(), "D-379 needs the Web fragments folder at {}", source.display());
         let gifs = ["INSITE~1.JS", "FOOTER~1.CSS", "CATALO~1.XML", "STOPBU~1.TXT", "PHOTO_~1.HTM"];
         let mpeg = std::fs::read_dir(source).expect("read Web fragments").filter_map(|e| e.ok()).map(|e| e.path())
@@ -31596,7 +31633,11 @@ Broken: Either state is wrong.\n";
     /// fix as ONE step. Fixtures are copied out of the read-only Web fragments
     /// folder. Fails with WF_TEST_D383_OLD=1 (no bar, no menu item).
     fn fix_extension_d383() {
-        let source = Path::new("/run/media/user/Disk1/System and program files/Web fragments");
+        let Some(source) = std::env::var_os("WF_TEST_WEB_FRAGMENTS").map(PathBuf::from) else {
+            eprintln!("skipped: set WF_TEST_WEB_FRAGMENTS to the Web fragments folder to run D-383");
+            return;
+        };
+        let source = source.as_path();
         assert!(source.is_dir(), "D-383 needs the Web fragments folder at {}", source.display());
         let gifs = ["INSITE~1.JS", "FOOTER~1.CSS", "CATALO~1.XML"];
         let dir_holder = Rc::new(RefCell::new(PathBuf::new()));
@@ -33130,7 +33171,8 @@ Broken: Either state is wrong.\n";
         let bounds = |w: &gtk::Widget| w.compute_bounds(&window_w).expect("bounds");
         let settle = || for _ in 0..20 { pump(); std::thread::sleep(Duration::from_millis(10)); };
         let snap = |name: &str| {
-            let path = format!("/home/user/Projects/Scratch/d368-logs/{name}");
+            let Some(log_dir) = std::env::var_os("WF_TEST_D368_LOGS") else { return };
+            let path = format!("{}/{name}", log_dir.to_string_lossy());
             let result = (|| -> Option<()> {
                 let (w, h) = (ui.window.width(), ui.window.height());
                 let paintable = gtk::WidgetPaintable::new(Some(&window_w));
@@ -35115,7 +35157,7 @@ Broken: Either state is wrong.\n";
             (drive(crucial, false, true), vec!["drive-open-crucial", "drive-unmount-crucial"]),
             (drive(crucial, false, false), vec!["drive-remount-crucial"]),
             (drive("Stick", true, true), vec!["drive-eject-stick", "drive-open-stick", "drive-unmount-stick"]),
-            (drive("Stick", true, false), vec!["drive-eject-stick", "drive-remount-stick"]),
+            (drive("Stick", true, false), vec!["drive-remount-stick"]),
         ];
         let seven = [
             "drive-open-crucial", "drive-unmount-crucial", "drive-remount-crucial",
@@ -35149,16 +35191,15 @@ Broken: Either state is wrong.\n";
             }
         }
 
-        // Removable but not kind "drive": the pre-existing Eject row still follows `removable`,
-        // but it carries no guide name, so the pending request never binds or paints.
+        // Removable but not kind "drive": D-387 gives it no Eject row at all,
+        // so the pending request never binds or paints.
         let want = put("drive-eject-stick");
         let mut odd = drive("Stick", true, true);
         odd.kind = "network".into();
         show_drive_context_menu(&sidebar_row, state.clone(), ui.clone(), odd, 5.0, 5.0);
         pump();
         let odd_menu = popovers_of(sidebar_row.upcast_ref()).into_iter().find(|p| !p.has_css_class("wf-guide-label")).expect("wrong-kind menu");
-        let odd_eject = button_labelled(odd_menu.upcast_ref(), "Eject").expect("Eject follows removable");
-        assert_ne!(odd_eject.widget_name(), "drive-eject-stick", "no guide name on a wrong-kind Eject row");
+        assert!(button_labelled(odd_menu.upcast_ref(), "Eject").is_none(), "D-387: no Eject row on a wrong-kind row");
         assert!(target().is_none(), "the wrong-kind menu never binds the request");
         assert!(by_name("drive-eject-stick").is_empty());
         assert!(
@@ -35166,7 +35207,7 @@ Broken: Either state is wrong.\n";
             "nothing painted for a wrong-kind Eject row"
         );
         assert_eq!(pending(), want, "still pending");
-        drop((odd_eject, odd_menu));
+        drop(odd_menu);
         for pop in popovers_of(sidebar_row.upcast_ref()) {
             pop.popdown();
             pop.unparent();
@@ -35448,7 +35489,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: kind.into(),
             removable,
-            hotplug: true,
+            // D-387: an internal drive is not hotplug; only the removable stick is.
+            hotplug: removable,
             read_only: false,
             space: None,
         };
@@ -35461,10 +35503,10 @@ Broken: Either state is wrong.\n";
         };
         let crucial = "Launch Box SSD 2TB";
         let cases: Vec<(Drive, Vec<&str>, Option<(&str, &str)>)> = vec![
-            (drive(crucial, "drive", false, true), vec!["drive-open-crucial", "drive-unmount-crucial"], Some(("Open", "drive-open-crucial"))),
+            (drive(crucial, "drive", false, true), vec!["drive-open-crucial"], Some(("Open", "drive-open-crucial"))),
             (drive(crucial, "drive", false, false), vec!["drive-remount-crucial"], Some(("Mount & Open", "drive-remount-crucial"))),
             (drive("Stick", "drive", true, true), vec!["drive-eject-stick", "drive-open-stick", "drive-unmount-stick"], Some(("Open", "drive-open-stick"))),
-            (drive("Stick", "drive", true, false), vec!["drive-eject-stick", "drive-remount-stick"], Some(("Mount & Open", "drive-remount-stick"))),
+            (drive("Stick", "drive", true, false), vec!["drive-remount-stick"], Some(("Mount & Open", "drive-remount-stick"))),
             (drive("Network", "network", false, true), vec![], None),
             (drive("Removable Network", "network", true, true), vec![], None),
             (drive("Google Drive", "google", false, true), vec![], None),
@@ -35481,7 +35523,7 @@ Broken: Either state is wrong.\n";
             if let Some((text, key)) = label {
                 assert_eq!(button_labelled(pop.upcast_ref(), text).unwrap().widget_name(), key, "{title}");
             }
-            // Eject exists only on a removable drive; there it is the one real row, named, never duplicated.
+            // D-387: Eject exists only on a mounted, plugged-in, read-write `drive` row; there it is the one real row, named, never duplicated.
             let ejects: Vec<gtk::Widget> = all_widgets(pop.upcast_ref())
                 .into_iter()
                 .filter(|w| {
@@ -35489,14 +35531,10 @@ Broken: Either state is wrong.\n";
                         && all_widgets(w).iter().any(|c| c.downcast_ref::<gtk::Label>().is_some_and(|l| l.label() == "Eject"))
                 })
                 .collect();
-            if title.starts_with("Stick") {
+            if title == "Stick mounted=true" {
                 assert_eq!(ejects.len(), 1, "{title}: exactly one Eject row");
                 assert_eq!(ejects[0].widget_name(), "drive-eject-stick", "{title}");
                 assert_eq!(names.iter().filter(|n| *n == "drive-eject-stick").count(), 1, "{title}: one named row");
-            } else if title.starts_with("Removable Network") {
-                // The pre-existing Eject row follows `removable`; only the guide name follows kind too.
-                assert_eq!(ejects.len(), 1, "{title}: the ordinary Eject row is still there");
-                assert_ne!(ejects[0].widget_name(), "drive-eject-stick", "{title}: but never named");
             } else {
                 assert!(ejects.is_empty(), "{title}: no Eject row");
             }
@@ -35510,6 +35548,9 @@ Broken: Either state is wrong.\n";
         seen.insert("open-file-other-app".to_string());
         seen.insert("drive-space-bars".to_string());
         seen.insert("drive-mounted-again-crucial".to_string());
+        // D-387: the internal crucial drive has no Unmount row any more, so this key is
+        // reachable only from the hotplug fixtures of the focused guide tests.
+        seen.insert("drive-unmount-crucial".to_string());
         // "delete-speed" is alias-only (Round 152): it has no widget of its
         // own named "delete-speed" -- it resolves through the registry's
         // "alias" field to the real "trash-and-restore-file" button, which
@@ -44515,6 +44556,13 @@ Broken: Either state is wrong.\n";
         );
         assert!(!button.is_sensitive());
 
+        for bad in ["a\nb.png", "inv\u{202e}gnp.exe", "a\u{7f}b"] {
+            entry.set_text(bad);
+            pump();
+            assert_eq!(picker_save_typed_name(&ui), "", "{bad:?}: control and bidi characters are refused");
+            assert!(!button.is_sensitive());
+        }
+
         match old_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
@@ -46067,14 +46115,14 @@ Broken: Either state is wrong.\n";
     fn drop_confirmation_names_the_destination_d317() {
         let txn = DropTxn {
             to_row: false,
-            dest: PathBuf::from("/run/media/user/Disk1"),
+            dest: PathBuf::from("/run/media/user/Orchard"),
             srcs: vec![PathBuf::from("/run/media/user/Untitled/Movies.zip")],
             is_copy: false,
             modified: false,
         };
         let (heading, detail, verb) = drop_confirm_text(&txn);
         assert_eq!(heading, "Move \"Movies.zip\" to \"Storage\"?");
-        assert_eq!(detail, "From: /run/media/user/Untitled\nTo: /run/media/user/Disk1");
+        assert_eq!(detail, "From: /run/media/user/Untitled\nTo: /run/media/user/Orchard");
         assert_eq!(verb, "Move");
         let many = DropTxn { srcs: vec![PathBuf::from("/a/x"), PathBuf::from("/a/y")], is_copy: true, ..txn };
         assert_eq!(drop_confirm_text(&many).0, "Copy 2 items to \"Storage\"?");
@@ -46111,9 +46159,17 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
+    fn drive_removal_is_refused_during_a_transfer_finding9() {
+        assert_eq!(drive_removal_refusal(false, true), None);
+        assert_eq!(drive_removal_refusal(false, false), None);
+        assert_eq!(drive_removal_refusal(true, true), Some("Wait for the transfer to finish before ejecting."));
+        assert_eq!(drive_removal_refusal(true, false), Some("Wait for the transfer to finish before unmounting."));
+    }
+
+    #[test]
     fn transfer_route_names_both_folders_d317() {
         let srcs = [PathBuf::from("/run/media/user/Untitled/DCIM/a.mp4")];
-        assert_eq!(transfer_route(&srcs, Path::new("/run/media/user/Disk1/Clips")), "from DCIM to Clips");
+        assert_eq!(transfer_route(&srcs, Path::new("/run/media/user/Orchard/Clips")), "from DCIM to Clips");
         assert_eq!(transfer_route(&[], Path::new("/x/Clips")), "to Clips");
     }
 
@@ -46328,7 +46384,11 @@ Broken: Either state is wrong.\n";
 
     fn real_mov_files_preview_and_get_a_poster_on_gtk_thread() {
         gst::init().expect("gstreamer init");
-        let base = "/run/media/user/Disk1/Old Hard Drives/Videos";
+        let Some(base) = std::env::var("WF_TEST_MOV_BASE").ok() else {
+            eprintln!("skipped: set WF_TEST_MOV_BASE to a folder holding the real .MOV samples");
+            return;
+        };
+        let base = base.as_str();
         let mut files = vec![format!("{base}/Recovered - to sort/101_0823.MOV")];
         let misc = format!("{base}/MISC/Wii SD card - saved stuff/2015-03-07");
         if let Ok(rd) = std::fs::read_dir(&misc) {
@@ -47773,7 +47833,7 @@ Broken: Either state is wrong.\n";
     }
 
     /// LOCKED 12 Sep 2026: dragging a file from anywhere on its row must beat the
-    /// list's selection box. the owner confirmed it works. If this fails, a change
+    /// list's selection box. The owner confirmed it works. If this fails, a change
     /// removed part of that fix — put it back, do not edit this test.
     #[test]
     fn row_drag_beats_selection_box_locked() {

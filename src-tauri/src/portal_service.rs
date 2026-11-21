@@ -816,7 +816,9 @@ fn decode_filters(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireFilte
     };
     let raw: Vec<(String, Vec<(u32, String)>)> =
         Vec::try_from(value.clone()).map_err(|_| ())?;
-    if raw.len() > MAX_FILTERS || raw.iter().any(|(_, rules)| rules.len() > MAX_FILTER_RULES) {
+    if raw.len() > MAX_FILTERS
+        || raw.iter().any(|(name, rules)| rules.len() > MAX_FILTER_RULES || has_hostile_chars(name))
+    {
         return Err(());
     }
     Ok(raw
@@ -4553,7 +4555,7 @@ mod tests {
     impl PrivateXvfb {
         /// High, round-owned display range, well above any display a
         /// live interactive session would use, so a collision with
-        /// the owner's own session is not plausible.
+        /// The owner's own session is not plausible.
         fn pick_display_num() -> u32 {
             60000 + (next_unique_id() % 1000) as u32
         }
@@ -5747,7 +5749,7 @@ mod tests {
         ];
 
         /// A standalone private env with its own exact fresh root. D-208:
-        /// the owner exists, and its unwind-safe `Drop` fallback is live,
+        /// The owner exists, and its unwind-safe `Drop` fallback is live,
         /// before the root itself is created, so no panic interval in
         /// between can leave either the files or the process-wide vars
         /// unowned.
@@ -5855,7 +5857,7 @@ mod tests {
         /// process inherits -- most importantly the activation
         /// `dbus-daemon`, which hands this same environment to whatever it
         /// cold-activates -- can only ever reach the private display, never
-        /// the owner's real one. Must be called after the private Xvfb is up and
+        /// The owner's real one. Must be called after the private Xvfb is up and
         /// before the private activation bus (or anything else) starts; the
         /// prior real value was already captured by `start()`'s own save,
         /// so `finish()`/`Drop` restore it like every other private var.
@@ -7129,6 +7131,18 @@ mod hostile_w2 {
         assert!(decode_choices(&opt("choices", Value::from(choices))).is_err(), "a choice label with a newline");
         let choices = vec![("id1", "Format", vec![("opt1", "Yes\r\n")], "opt1")];
         assert!(decode_choices(&opt("choices", Value::from(choices))).is_err(), "an option label with CRLF");
+    }
+
+    /// W2: a filter name from the caller is shown in the chooser, so it gets
+    /// the same control-character and bidi check as every other caller string.
+    #[test]
+    fn w2_filter_names_with_control_or_bidi_characters_are_refused() {
+        for name in ["Images\n(all)", "Img\u{202e}gnp", "a\u{7f}", "a\u{85}", "a\u{2066}", "a\0"] {
+            let filter = vec![(name.to_string(), vec![(0u32, "*.png".to_string())])];
+            assert!(decode_filters(&opt("filters", Value::from(filter))).is_err(), "{name:?}");
+        }
+        let filter = vec![("Images".to_string(), vec![(0u32, "*.png".to_string())])];
+        assert!(decode_filters(&opt("filters", Value::from(filter))).is_ok());
     }
 
     /// Attack 6: absurd sizes are refused at the boundary, not allocated.

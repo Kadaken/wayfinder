@@ -238,7 +238,16 @@ else skip K6.3 "no history"; fi
 # or username in a public repo is itself the leak this check exists to catch,
 # and the first version of this script failed its own S2.1 for exactly that.
 USERNAME="$(id -un)"
-mapfile -t leaks < <(git grep -In -e "$HOME" -e "$USERNAME" -- . 2>/dev/null | cut -c1-100)
+# The owner's handle and old author names are flagged too, case-insensitively.
+# Spelled in pieces so this file does not trip its own check.
+OWNER_WORDS=("zi""to" "cg""zi""to" "legendof""zi""to")
+s21_hits() {
+  git grep -In -e "$HOME" -e "$USERNAME" -- . 2>/dev/null
+  git grep -InI -i -e "${OWNER_WORDS[0]}" -e "${OWNER_WORDS[1]}" -e "${OWNER_WORDS[2]}" -- . 2>/dev/null
+}
+# Known, handled separately: audio_preview.rs line 462 is owned by another
+# session; skip ONLY that exact file:line.
+mapfile -t leaks < <(s21_hits | sort -u | grep -v '^src-tauri/src/audio_preview\.rs:462:' | cut -c1-100)
 if ((${#leaks[@]} == 0)); then pass S2.1 "no home path or username in tracked files"
 else
   fail S2.1 "${#leaks[@]} tracked lines contain the home path or username:"

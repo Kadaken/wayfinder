@@ -240,7 +240,7 @@ if [ ! -x "$bin_src/wayfinder-native" ] || [ ! -x "$bin_src/wayfinder-portal" ];
 fi
 
 # Announced before anything is copied, so nobody finds out weeks later that
-# previews were silently doing nothing (7 Nov 2026, the owner: "it should be
+# previews were silently doing nothing (7 Nov 2026, Owner: "it should be
 # announced upon install").
 wf_dep_report || true
 if [ -n "${WF_DEPS_MISSING:-}" ] && [ "$with_codecs" = 1 ] && [ "$dry" != 1 ] && [ -z "$destdir" ]; then

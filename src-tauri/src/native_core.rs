@@ -2668,24 +2668,53 @@ pub fn unmount_drive(device: &str) -> Result<(), String> {
     run_cmd_capture("udisksctl", &["unmount", "-b", device])
 }
 
-pub fn eject_drive(device: &str) -> Result<(), String> {
-    let disk = whole_disk_of(device);
-    if let Ok(output) = Command::new("lsblk")
-        .args(["-nro", "PATH,MOUNTPOINT", &disk])
-        .output()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+/// The partitions of an `lsblk -nro PATH,MOUNTPOINT` listing that are mounted.
+fn mounted_partitions(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
             let mut parts = line.split_whitespace();
             let part = parts.next().unwrap_or("");
             let mountpoint = parts.next().unwrap_or("");
-            if !part.is_empty() && !mountpoint.is_empty() {
-                let _ = Command::new("udisksctl")
-                    .args(["unmount", "-b", part])
-                    .output();
-            }
-        }
+            (!part.is_empty() && !mountpoint.is_empty()).then(|| part.to_string())
+        })
+        .collect()
+}
+
+/// The eject decision, with the commands passed in so it can be tested. Every
+/// mounted partition must unmount first; the first failure is returned and the
+/// drive is never powered off, so a drive still in use is not cut off.
+fn eject_steps(
+    mounted: &[String],
+    mut unmount: impl FnMut(&str) -> Result<(), String>,
+    power_off: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    for part in mounted {
+        unmount(part).map_err(|err| format!("Could not unmount {part}: {err}"))?;
     }
-    run_cmd_capture("udisksctl", &["power-off", "-b", &disk])
+    power_off()
+}
+
+pub fn eject_drive(device: &str) -> Result<(), String> {
+    let disk = whole_disk_of(device);
+    let mounted = match Command::new("lsblk").args(["-nro", "PATH,MOUNTPOINT", &disk]).output() {
+        Ok(output) => mounted_partitions(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => Vec::new(),
+    };
+    eject_steps(
+        &mounted,
+        |part| run_cmd_capture("udisksctl", &["unmount", "-b", part]),
+        || run_cmd_capture("udisksctl", &["power-off", "-b", &disk]),
+    )
+}
+
+/// True when `text` holds a control character (C0, DEL, C1) or a Unicode
+/// bidirectional control that can make a file name read as something else.
+pub fn has_hostile_chars(text: &str) -> bool {
+    text.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    })
 }
 
 /// Starts an external program without waiting for it to finish and reaps it
@@ -3464,7 +3493,7 @@ fn trash_dir() -> Result<PathBuf, String> {
 /// volume into that volume's own `.Trash-1000`, never into the home Trash, so
 /// listing the home Trash before and after the move saw no new entry and the
 /// delete was reported as failed although the item had moved (16 November 2026,
-/// the owner: "am not able to delete from the g drive on way finder" — the files
+/// Owner: "am not able to delete from the g drive on way finder" — the files
 /// were in `GoogleDrive/.Trash-1000` the whole time). This resolves the Trash
 /// that will actually receive `path`.
 fn trash_dir_for(path: &str) -> Result<PathBuf, String> {
@@ -9956,6 +9985,56 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
         assert!(!drive_can_eject(&forced), "even if flagged removable");
     }
 
+    #[test]
+    fn eject_does_not_power_off_when_an_unmount_fails_finding9() {
+        let listing = "/dev/sdb\n/dev/sdb1 /run/media/user/Disk1\n/dev/sdb2 /run/media/user/Disk2\n/dev/sdb3\n";
+        assert_eq!(mounted_partitions(listing), vec!["/dev/sdb1", "/dev/sdb2"]);
+        let mounted = mounted_partitions(listing);
+
+        let mut tried = Vec::new();
+        let mut powered = false;
+        let result = eject_steps(
+            &mounted,
+            |p| {
+                tried.push(p.to_string());
+                if p == "/dev/sdb2" { Err("target is busy".to_string()) } else { Ok(()) }
+            },
+            || {
+                powered = true;
+                Ok(())
+            },
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("/dev/sdb2") && err.contains("busy"), "{err}");
+        assert!(!powered, "a drive that did not fully unmount is never powered off");
+        assert_eq!(tried, vec!["/dev/sdb1", "/dev/sdb2"]);
+
+        let mut powered = false;
+        let ok = eject_steps(&mounted, |_| Ok(()), || {
+            powered = true;
+            Ok(())
+        });
+        assert!(ok.is_ok() && powered, "every partition unmounted: power off runs");
+
+        let mut powered = false;
+        assert!(eject_steps(&[], |_| Err("unused".into()), || {
+            powered = true;
+            Err("power-off failed".to_string())
+        })
+        .is_err());
+        assert!(powered, "nothing mounted: power off still runs and its error is returned");
+    }
+
+    #[test]
+    fn hostile_chars_are_found_finding_w2() {
+        for bad in ["a\nb", "a\rb", "a\x1bb", "a\u{7f}b", "a\u{85}b", "a\u{202e}b", "a\u{2066}b", "a\u{2069}b", "a\0b"] {
+            assert!(has_hostile_chars(bad), "{bad:?}");
+        }
+        for fine in ["notes.txt", "Report 2026 (final).pdf", "caf\u{e9}.md", ""] {
+            assert!(!has_hostile_chars(fine), "{fine:?}");
+        }
+    }
+
     fn d387_rows(json: &str) -> Vec<Drive> {
         // Same walk as list_drives_with, fed a fixed lsblk document.
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -9979,7 +10058,7 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
       {"name":"sdb","type":"disk","rm":true,"hotplug":true,"fstype":"vfat","label":"CARD","mountpoint":"/run/media/user/CARD","path":"/dev/sdb","size":1000},
       {"name":"sdc","type":"disk","rm":true,"hotplug":false,"fstype":"vfat","label":"ODD","mountpoint":"","path":"/dev/sdc","size":1000},
       {"name":"nvme1n1","type":"disk","rm":false,"hotplug":false,"children":[
-        {"name":"nvme1n1p1","type":"part","rm":false,"hotplug":false,"fstype":"ntfs","label":"Storage","mountpoint":"/run/media/user/Disk1","path":"/dev/nvme1n1p1","size":1000}]},
+        {"name":"nvme1n1p1","type":"part","rm":false,"hotplug":false,"fstype":"ntfs","label":"Storage","mountpoint":"/run/media/user/Orchard","path":"/dev/nvme1n1p1","size":1000}]},
       {"name":"nvme0n1","type":"disk","rm":false,"hotplug":false,"children":[
         {"name":"nvme0n1p3","type":"part","rm":false,"hotplug":false,"fstype":"crypto_LUKS","children":[
           {"name":"luks-x","type":"crypt","rm":false,"hotplug":false,"fstype":"btrfs","label":"fedora","mountpoint":"/home","path":"/dev/mapper/luks-x","size":1000}]}]}
@@ -10027,7 +10106,7 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
     const D387_MOUNTS: &str = "\
 /dev/sda1 /run/media/user/Pebble exfat rw,nosuid 0 0
 /dev/sdd1 /run/media/user/Old\\040Disk ntfs3 ro,nosuid 0 0
-/dev/nvme1n1p1 /run/media/user/Disk1 fuseblk rw 0 0
+/dev/nvme1n1p1 /run/media/user/Orchard fuseblk rw 0 0
 ";
 
     fn d387_plugged(mp: &str, mounts: &str) -> Drive {
@@ -12627,7 +12706,7 @@ mod transcoded_thumbnail_tests {
 
 /// D-262: what the address bar does with whatever was typed or pasted into it.
 ///
-/// the owner, 11 November 2026: he pasted `example-project/art/anim/comet/`
+/// The owner, 11 November 2026: he pasted `example-project/art/anim/comet/`
 /// and nothing happened, then `example-project/art/anim/` and nothing
 /// happened again. Both are real folders; neither is an absolute path. The bar
 /// handed the text straight to the lister, which can only open an absolute
@@ -12939,24 +13018,24 @@ mod typed_path_tests {
     #[test]
     fn a_project_relative_fragment_resolves_up_the_tree_d262() {
         let kind = kind_from(
-            &["/home/user/Projects/demo/art/anim/comet", "/home/user/Projects/demo/art/anim"],
+            &["/home/user/Projects/np/art/anim/comet", "/home/user/Projects/np/art/anim"],
             &[],
         );
-        let cwd = "/home/user/Projects/demo/art/sprites";
+        let cwd = "/home/user/Projects/np/art/sprites";
         assert_eq!(
             resolve_typed_path("art/anim/comet/", cwd, HOME, &[], &kind).as_deref(),
-            Some("/home/user/Projects/demo/art/anim/comet")
+            Some("/home/user/Projects/np/art/anim/comet")
         );
         assert_eq!(
             resolve_typed_path("art/anim/", cwd, HOME, &[], &kind).as_deref(),
-            Some("/home/user/Projects/demo/art/anim")
+            Some("/home/user/Projects/np/art/anim")
         );
         // Nearest ancestor wins: standing in the folder itself, the plain name
         // of a child resolves to the child, not to a cousin higher up.
-        let kind = kind_from(&["/home/user/Projects/demo/art/anim", "/home/user/anim"], &[]);
+        let kind = kind_from(&["/home/user/Projects/np/art/anim", "/home/user/anim"], &[]);
         assert_eq!(
-            resolve_typed_path("anim", "/home/user/Projects/demo/art", HOME, &[], &kind).as_deref(),
-            Some("/home/user/Projects/demo/art/anim")
+            resolve_typed_path("anim", "/home/user/Projects/np/art", HOME, &[], &kind).as_deref(),
+            Some("/home/user/Projects/np/art/anim")
         );
     }
 
@@ -13491,7 +13570,11 @@ mod sms_backup_tests {
         if std::env::var("WAYFINDER_D382_REAL").as_deref() != Ok("1") {
             return;
         }
-        let dir = "/run/media/user/Disk1/Old Hard Drives/Samsung S20 FE/3_29_26/Backup_3_29_26_9_57_PM";
+        let Ok(dir) = std::env::var("WF_TEST_SMS_BACKUP_DIR") else {
+            eprintln!("skipped: set WF_TEST_SMS_BACKUP_DIR to a folder of SMS backups");
+            return;
+        };
+        let dir = dir.as_str();
         let (mut files, mut failed, mut lines, mut pictures, mut empty) = (0, 0, 0usize, 0usize, 0usize);
         for e in fs::read_dir(dir).expect("backup folder") {
             let p = e.unwrap().path();

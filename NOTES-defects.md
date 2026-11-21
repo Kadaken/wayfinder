@@ -1,7 +1,7 @@
 
 ## D-272 — the window freezes on a cold network mount — FIXED 16 November 2026
 
-16 November 2026, the owner: "it freezes when i ry to select the new drive".
+16 November 2026, Owner: "it freezes when i ry to select the new drive".
 Selecting a newly mounted rclone Google Drive folder locks the window.
 Measured on a mounted rclone Google Drive remote: the first directory read took
 **7.8 seconds**, the second 0.24 s once the FUSE dir cache was warm. The read
@@ -10,7 +10,7 @@ as long as the network takes instead of showing progress and staying usable.
 Not a hang — it does come back. Reproduce by mounting any rclone remote and
 selecting it before anything has cached.
 
-**16 November 2026, second hit, far worse.** the owner: "wayfinders fucked ass is
+**16 November 2026, second hit, far worse.** Owner: "wayfinders fucked ass is
 stuck again." This time it did not come back: the single GUI thread sat in
 `getdents64` on the Drive mount in uninterruptible disk sleep
 (`State: D`, wchan `request_wait_answer` — a FUSE request rclone never
@@ -127,7 +127,7 @@ dependent rather than wrong. Not yet fixed; it has been seen once.
 16 November 2026. Fixing D-275 by shrinking `static/icons/*.png` was wrong:
 those were the first 96px drawings, and 0.9.22 had replaced the sidebar art
 with a new 256px set in `static/icons/sidebar` without touching them. So
-0.9.25 put the old drawings back, at the right size. the owner: "they are the old
+0.9.25 put the old drawings back, at the right size. Owner: "they are the old
 icons not the new ones."
 
 The 256px masters are now `static/icons/sidebar-src`, recovered from commit
@@ -139,7 +139,7 @@ which `native.rs` already asserts the app must never read.
 
 ## D-279 — an update leaves the old file picker running — FIXED 16 November 2026
 
-16 November 2026, the owner: "why is wayfinder greyed out now?" An install at 16:35
+16 November 2026, Owner: "why is wayfinder greyed out now?" An install at 16:35
 replaced both binaries. The app came up on the new build, but the picker
 backend kept running from 14:03: `/proc/749707/exe` pointed at
 `~/.local/bin/wayfinder-portal (deleted)`. Every file dialog on the
@@ -422,7 +422,7 @@ ports -- "Wayfinder is open source", naming GPL-3.0-or-later, stating that its
 own licence governs it and that the restrictions on that page do not apply to
 it, linking the source. The page's opening line now reads "For Crews and other
 Kadaken software that is not released under an open-source licence" and is
-dated 16 November 2026. the owner changed his position on 16 November 2026: his
+dated 16 November 2026. The owner changed his position on 16 November 2026: his
 software can be open source. Not published yet.
 
 ## D-295 — two caches added in 0.9.28 never let go
@@ -451,7 +451,7 @@ Status: FIXED 17 Nov 2026 -- TESTED. fsync of file and parent, per-process temp 
 
 `update_config_at` (native.rs:1899) writes `native-config.json.tmp` and renames
 it over the real file. There is no `sync_all` or `sync_data` anywhere in the
-product -- zero hits across `native.rs` and `native_core.rs`. the owner's `/home` is
+product -- zero hits across `native.rs` and `native_core.rs`. The owner's `/home` is
 btrfs.
 
 Write-then-rename is only atomic once the data is on disk. ext4 has flushed
