@@ -45,7 +45,9 @@ and say why rather than leave you waiting.
 As of 0.9.29: `cargo audit` reports no vulnerable dependency, and the refusals
 above all have tests behind them. What follows is everything in the release
 audit that is reasoned about but **not measured**. It is here, in the file that
-ships, because a gap nobody wrote down is a gap nobody fixes.
+ships, because a gap nobody wrote down is a gap nobody fixes. One item that
+used to be on this list is now measured: two clean builds of the 0.9.29
+source produce byte-identical programs.
 
 1. **A hostile run at the file dialog has never been written.** The portal
    backend takes its input from other applications, not from the person at the
@@ -62,21 +64,21 @@ ships, because a gap nobody wrote down is a gap nobody fixes.
 3. **Disk full and a volume unplugged mid-operation are not staged.** Both need
    a filesystem this audit cannot create without root. Permission denied and a
    folder of 100,000 entries are tested; these two are not.
-4. **Durability of the settings file is not proven.** Settings are written to a
-   temporary file and renamed, with no `fsync` of either the file or its
-   folder, so what survives a power cut depends on the filesystem. No crash has
-   been staged. Two processes can also race on that one temporary name.
-5. **The freeze this release exists to fix has no test.** The sidebar no longer
-   waits on a blocked drive, which was fixed by hand and confirmed by hand. A
-   test that deliberately hangs the background read, and proves the window
-   still answers, is not written.
-6. **Contrast is computed, not measured.** The ratios come from the WCAG
+4. **Contrast is computed, not measured.** The ratios come from the WCAG
    formula applied to the stylesheet's own colours, against the darkest
    background. They have not been measured on a screen, and lighter surfaces
    -- a hovered or selected row -- are not covered.
-7. **The build is not yet proven reproducible.** Building the shipped tag twice
-   in a clean clone and comparing the bytes happens after the tag is published,
-   so it is not a claim this file makes.
+5. **Eject and unmount are tested with stand-in commands only.** The decision
+   is tested: a failed unmount or a failed partition listing never powers the
+   drive off, and both are refused while a transfer runs. The real `udisksctl`
+   calls against a real USB drive are not part of any automated run.
+6. **Previews hand files you did not make to outside tools.** LibreOffice,
+   Ghostscript, ImageMagick, `pdftoppm` and Ruffle read the file to draw a
+   preview. Ghostscript runs with `-dSAFER`; none of them is otherwise
+   sandboxed, and no hostile document has been fired at them.
+7. **The PS2 drive row is proven on one machine only.** Reading a PS2-format
+   hard drive was checked against one real drive. Other drives, and damaged
+   ones, are not covered.
 8. **Filenames that are not valid UTF-8 are not tested end to end.** Linux
    allows them; the program converts paths to text for display in hundreds of
    places. Whether every one of those survives the round trip is unknown.
