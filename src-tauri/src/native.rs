@@ -13056,13 +13056,13 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
         let uri = match gst::glib::filename_to_uri(&job.path, None) {
             Ok(uri) => uri.to_string(),
             Err(_) => {
-                finish_video_poster_job(&queue, None);
+                finish_video_poster_job(&queue, None, None, "no-uri");
                 continue;
             }
         };
         let Ok(pipeline_elem) = gst::ElementFactory::make("playbin").property("uri", &uri).build()
         else {
-            finish_video_poster_job(&queue, None);
+            finish_video_poster_job(&queue, None, None, "no-playbin");
             continue;
         };
         let pipeline = pipeline_elem
@@ -13073,7 +13073,7 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                 p
             });
         let Ok(appsink) = gst::ElementFactory::make("appsink").build() else {
-            finish_video_poster_job(&queue, Some(pipeline));
+            finish_video_poster_job(&queue, None, Some(&pipeline), "no-appsink");
             continue;
         };
         let caps = gst::Caps::builder("video/x-raw").field("format", "RGB").build();
@@ -13084,6 +13084,10 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
         // 0 = awaiting first preroll (paused at position 0); 1 = seek issued,
         // awaiting the preroll that follows it.
         let stage = Rc::new(RefCell::new(0u8));
+        // D-372: one flag per job, shared by the bus watch, the timeout and the
+        // synchronous failure paths, so a job is finished exactly once.
+        let done = Rc::new(std::cell::Cell::new(false));
+        let done_for_bus = done.clone();
         let bus = pipeline.bus().expect("playbin always has a bus");
         let picture = job.picture.clone();
         let queue_for_bus = queue.clone();
@@ -13093,8 +13097,7 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
         let watch_guard = bus.add_watch_local(move |_bus, msg| {
             use gst::MessageView;
             if cancelled_for_bus.is_cancelled() {
-                pipeline_for_bus.set_state(gst::State::Null).ok();
-                finish_video_poster_job(&queue_for_bus, None);
+                finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "cancelled");
                 return glib::ControlFlow::Break;
             }
             match msg.view() {
@@ -13118,45 +13121,83 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                                     .is_ok();
                                 if !ok {
                                     paint_poster_frame(&appsink_for_bus, &picture);
-                                    pipeline_for_bus.set_state(gst::State::Null).ok();
-                                    finish_video_poster_job(&queue_for_bus, None);
+                                    finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "seek-failed");
                                     return glib::ControlFlow::Break;
                                 }
                             }
                             None => {
                                 paint_poster_frame(&appsink_for_bus, &picture);
-                                pipeline_for_bus.set_state(gst::State::Null).ok();
-                                finish_video_poster_job(&queue_for_bus, None);
+                                finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "no-duration");
                                 return glib::ControlFlow::Break;
                             }
                         }
                         glib::ControlFlow::Continue
                     } else {
                         paint_poster_frame(&appsink_for_bus, &picture);
-                        pipeline_for_bus.set_state(gst::State::Null).ok();
-                        finish_video_poster_job(&queue_for_bus, None);
+                        finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "second-preroll");
                         glib::ControlFlow::Break
                     }
                 }
                 MessageView::Error(_) | MessageView::Eos(_) => {
-                    pipeline_for_bus.set_state(gst::State::Null).ok();
-                    finish_video_poster_job(&queue_for_bus, None);
+                    let why = if matches!(msg.view(), MessageView::Error(_)) { "bus-error" } else { "bus-eos" };
+                    finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), why);
                     glib::ControlFlow::Break
                 }
                 _ => glib::ControlFlow::Continue,
             }
         });
-        if pipeline.set_state(gst::State::Paused).is_err() {
-            pipeline.set_state(gst::State::Null).ok();
-            finish_video_poster_job(&queue, None);
-            continue;
-        }
-        match watch_guard {
-            Ok(guard) => queue.borrow_mut().live.push((pipeline, guard)),
+        let guard = match watch_guard {
+            Ok(guard) => guard,
             Err(_) => {
-                pipeline.set_state(gst::State::Null).ok();
-                finish_video_poster_job(&queue, None);
+                finish_video_poster_job(&queue, Some(&done), Some(&pipeline), "no-bus-watch");
+                continue;
             }
+        };
+        // Registered BEFORE set_state so the finish paths below can always find
+        // and remove this job's own entry by identity.
+        queue.borrow_mut().live.push((pipeline.clone(), guard));
+        // D-372 FIX: playbin on a truncated mp4 sometimes stalls in the async
+        // READY->PAUSED change and posts NOTHING (measured at timeout: state
+        // Ready, pending Paused, bus empty, our watch still attached). That is
+        // a GStreamer-side stall, so no bus message can finish the job; this
+        // bounded timer is what does. Without it the job held a slot forever
+        // (old code hung 3 of 5 runs; new code takes this path in about 3 of 9
+        // runs at ~8,000 ms and never sticks).
+        {
+            let queue_for_timeout = queue.clone();
+            let done_for_timeout = done.clone();
+            let pipeline_for_timeout = pipeline.clone();
+            glib::timeout_add_local_once(VIDEO_POSTER_TIMEOUT, move || {
+                if !done_for_timeout.get() {
+                    // D-372 diagnostic, taken BEFORE the finish tears the
+                    // pipeline down: what state is it stuck in, is an
+                    // undelivered message sitting on its bus, and is this
+                    // job's bus watch still registered?
+                    let (ret, cur, pend) = pipeline_for_timeout.state(gst::ClockTime::ZERO);
+                    let (have_pending, peeked) = match pipeline_for_timeout.bus() {
+                        Some(bus) => (
+                            bus.have_pending(),
+                            bus.peek().map(|m| format!("{:?}", m.type_())),
+                        ),
+                        None => (false, None),
+                    };
+                    let watch_attached = queue_for_timeout
+                        .borrow()
+                        .live
+                        .iter()
+                        .any(|(p, _)| p == &pipeline_for_timeout);
+                    let line = format!(
+                        "state_ret={ret:?} current={cur:?} pending={pend:?} bus_have_pending={have_pending} bus_peek={peeked:?} watch_attached={watch_attached}"
+                    );
+                    eprintln!("wf-event video-poster-timeout {line}");
+                    VIDEO_POSTER_TIMEOUT_DIAG.with(|d| d.borrow_mut().push(line));
+                }
+                finish_video_poster_job(&queue_for_timeout, Some(&done_for_timeout), Some(&pipeline_for_timeout), "timeout");
+            });
+        }
+        if pipeline.set_state(gst::State::Paused).is_err() {
+            finish_video_poster_job(&queue, Some(&done), Some(&pipeline), "set-state-failed");
+            continue;
         }
     }
 }
@@ -13194,23 +13235,61 @@ fn paint_poster_frame(appsink: &gst::Element, picture: &gtk::Picture) {
     picture.set_paintable(Some(&texture));
 }
 
-fn finish_video_poster_job(queue: &Rc<RefCell<VideoPosterQueue>>, leave_live: Option<gst::Pipeline>) {
-    {
-        let mut queue_ref = queue.borrow_mut();
-        queue_ref.active = queue_ref.active.saturating_sub(1);
-        if let Some(pipeline) = leave_live {
-            pipeline.set_state(gst::State::Null).ok();
-        }
-        queue_ref.live.retain(|(p, _watch)| {
-            matches!(
-                p.current_state(),
-                gst::State::Playing | gst::State::Paused | gst::State::Ready
-            )
-        });
-        if queue_ref.cancelled.is_cancelled() {
-            queue_ref.pending.clear();
+/// D-372: longest a single poster job may run before it is finished anyway.
+/// Open question: whether 8 s is the right bound (a stalled corrupt file costs
+/// one poster slot for this long).
+const VIDEO_POSTER_TIMEOUT: Duration = Duration::from_secs(8);
+
+thread_local! {
+    /// D-372: one line per job finished by the timeout (see its closure).
+    static VIDEO_POSTER_TIMEOUT_DIAG: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    /// D-372: (path-less) reason each poster job finished, newest last. Read by
+    /// the D-85 test to show which finish path a corrupt file took.
+    static VIDEO_POSTER_FINISH_LOG: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+}
+
+/// Finishes one poster job EXACTLY ONCE. `done` is the job's own flag (shared by
+/// the bus watch, the timeout and the synchronous failure paths); a second call
+/// for the same job returns immediately, so `active` cannot underflow or free a
+/// slot belonging to another job. The job's own pipeline is removed from `live`
+/// by identity (D-372: it used to be pruned by pipeline state, which could drop
+/// the bus watch of a DIFFERENT job whose pipeline had not yet left Null).
+fn finish_video_poster_job(
+    queue: &Rc<RefCell<VideoPosterQueue>>,
+    done: Option<&Rc<std::cell::Cell<bool>>>,
+    pipeline: Option<&gst::Pipeline>,
+    why: &'static str,
+) {
+    if let Some(done) = done {
+        if done.replace(true) {
             return;
         }
+    }
+    VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow_mut().push(why));
+    let removed = {
+        let mut queue_ref = queue.borrow_mut();
+        queue_ref.active = queue_ref.active.saturating_sub(1);
+        let mut removed = Vec::new();
+        if let Some(pipeline) = pipeline {
+            pipeline.set_state(gst::State::Null).ok();
+            let mut i = 0;
+            while i < queue_ref.live.len() {
+                if &queue_ref.live[i].0 == pipeline {
+                    removed.push(queue_ref.live.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        removed
+    };
+    if !removed.is_empty() {
+        // The bus watch may be the caller; drop its guard after it returns.
+        glib::idle_add_local_once(move || drop(removed));
+    }
+    if queue.borrow().cancelled.is_cancelled() {
+        queue.borrow_mut().pending.clear();
+        return;
     }
     start_video_poster_jobs(queue.clone());
 }
@@ -25389,6 +25468,18 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test scroll-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d85") {
+            video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
+            video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
+            eprintln!("wf-test d85-only run done");
+            return;
+        }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d85") {
+            video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
+            video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
+            eprintln!("wf-test d85-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d86") {
             selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
             mpg_counts_as_video_and_shows_a_frame_d362();
@@ -26944,6 +27035,7 @@ Broken: Either state is wrong.\n";
     fn video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85() {
         gtk::init().expect("gtk init on the virtual display");
         gst::init().expect("gstreamer init");
+        eprintln!("wf-test D-372 gstreamer version: {}", gst::version_string());
         let root = crate::native_core::scratch_root().join(format!("wf-d85-frame-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let _cleanup = ScratchCleanup(root.clone());
@@ -27418,15 +27510,33 @@ Broken: Either state is wrong.\n";
                 active: 0,
                 live: Vec::new(),
             }));
+            VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow_mut().clear());
             start_video_poster_jobs(queue.clone());
-            for _ in 0..400 {
+            // D-372: a wall-clock limit that prints the time used. With the old
+            // 400 x 5 ms count it was unclear whether the job was slow or stuck.
+            let began = std::time::Instant::now();
+            while began.elapsed() < Duration::from_secs(20) {
                 while ctx.iteration(false) {}
                 if queue.borrow().active == 0 && queue.borrow().pending.is_empty() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
+            eprintln!(
+                "wf-test D-372 poster job for {} finished in {} ms (limit 20000)",
+                path.display(),
+                began.elapsed().as_millis()
+            );
+            let finish_paths = VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().clone());
+            eprintln!("wf-test D-372 finish path for {}: {:?}", path.display(), finish_paths);
+            VIDEO_POSTER_TIMEOUT_DIAG.with(|d| {
+                for line in d.borrow_mut().drain(..) {
+                    eprintln!("wf-test D-372 timeout diagnostic: {line}");
+                }
+            });
+            assert_eq!(finish_paths.len(), 1, "a job must finish exactly once, got {finish_paths:?}");
             assert_eq!(queue.borrow().active, 0, "job left active after completion");
+            assert!(queue.borrow().live.is_empty(), "finished job left a pipeline in live");
             picture
         };
 
