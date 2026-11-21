@@ -45974,6 +45974,73 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-386: activating the "PS2 HDD" row in Devices opens its folder. Kind
+    /// "ps2" must navigate to the mountpoint the way the network and gdrive rows
+    /// do, with no lsblk check (the raw disk has no FSTYPE there).
+    #[test]
+    fn activating_the_ps2_row_opens_its_folder_d386() { gtk_thread::run(activating_the_ps2_row_opens_its_folder_d386_on_gtk_thread); }
+
+    fn activating_the_ps2_row_opens_its_folder_d386_on_gtk_thread() {
+        let root = crate::native_core::scratch_root().join(format!("wf-d386-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir, mount) = (root.join("home"), root.join("dir"), root.join("ps2mnt"));
+        for d in [&home, &dir, &mount] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d386test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("window");
+        ui.window.present();
+        wait_for("the first scan to land", || !state.borrow().drive_refresh_in_flight);
+        let mount_str = mount.to_string_lossy().to_string();
+        let test_drives = vec![native_core::Drive {
+            name: "PS2 HDD".to_string(),
+            path: mount_str.clone(),
+            mountpoint: mount_str.clone(),
+            size: 0,
+            fstype: String::new(),
+            kind: "ps2".to_string(),
+            removable: false,
+            space: None,
+        }];
+        {
+            let scanned = test_drives.clone();
+            let mut st = state.borrow_mut();
+            st.drive_scan = Arc::new(move || scanned.clone());
+            st.drives = test_drives;
+        }
+        rebuild_sidebar(&state, &ui);
+        for _ in 0..40 {
+            pump();
+        }
+        assert!(
+            state.borrow().cwd.display_string() != mount_str,
+            "the window starts outside the PS2 folder"
+        );
+        let row = all_widgets(ui.sidebar.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .find(|r| r.tooltip_text().as_deref() == Some(mount_str.as_str()))
+            .expect("the PS2 HDD row");
+        row.emit_by_name::<()>("activate", &[]);
+        wait_for("the PS2 row opened its folder", || state.borrow().cwd.display_string() == mount_str);
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[test]
     fn drop_confirmation_names_the_destination_d317() {
         let txn = DropTxn {
