@@ -5283,10 +5283,18 @@ fn build_ui_in(
         // column left of the main split, so the button stays at the same spot
         // open or shut and covers nothing. Only the button toggles.
         sidebar_toggle.add_css_class("wf-sidebar-corner");
-        if let Some(name) = sidebar_toggle_icon() {
-            let icon = gtk::Image::from_icon_name(name);
-            icon.set_pixel_size(12);
-            sidebar_toggle.set_child(Some(&icon));
+        if d384_old() {
+            if let Some(name) = sidebar_toggle_icon() {
+                let icon = gtk::Image::from_icon_name(name);
+                icon.set_pixel_size(12);
+                sidebar_toggle.set_child(Some(&icon));
+            }
+        } else {
+            // D-384 (21 Nov 2026, owner): "make the side bar arrow change
+            // directions when toggling". The arrow points the way the sidebar
+            // will go: left to hide it, right to bring it back.
+            sidebar_arrow_d384(&sidebar_toggle);
+            sidebar_toggle.connect_toggled(sidebar_arrow_d384);
         }
         sidebar_toggle.set_size_request(16, 16);
         sidebar_toggle.set_halign(gtk::Align::Center);
@@ -6544,6 +6552,19 @@ fn d381_old() -> bool {
 /// Test-only gate: D-377 old placement (command bar, old size), to show the old behaviour failing.
 fn d377_old() -> bool {
     cfg!(test) && std::env::var_os("WF_TEST_D377_OLD").is_some()
+}
+
+fn d384_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D384_OLD").is_some()
+}
+
+/// D-384: the drawer button's arrow and hover text follow the sidebar.
+fn sidebar_arrow_d384(button: &gtk::ToggleButton) {
+    let shown = button.is_active();
+    let icon = gtk::Image::from_icon_name(if shown { "pan-start-symbolic" } else { "pan-end-symbolic" });
+    icon.set_pixel_size(12);
+    button.set_child(Some(&icon));
+    button.set_tooltip_text(Some(if shown { "Hide the sidebar" } else { "Show the sidebar" }));
 }
 
 /// Test-only gate: D-375 pin off, to show the old behaviour failing.
@@ -33151,9 +33172,13 @@ Broken: Either state is wrong.\n";
         let open = check("open", ui.sidebar_scroll.clone().upcast(), false, sidebar_rows);
         snap("d377-open.png");
         // Shut: by the button.
+        let arrow_d384 = |t: &gtk::ToggleButton| t.child().and_then(|c| c.downcast::<gtk::Image>().ok()).and_then(|im| im.icon_name()).map(|n| n.to_string());
         toggle.set_active(false);
         settle();
         assert!(!ui.sidebar_scroll.is_visible(), "D-377: the button shuts the sidebar");
+        eprintln!("wf-test D-384 shut: icon={:?} tip={:?}", arrow_d384(&toggle), toggle.tooltip_text());
+        assert_eq!(arrow_d384(&toggle).as_deref(), Some("pan-end-symbolic"), "D-384: shut, the arrow points right");
+        assert_eq!(toggle.tooltip_text().as_deref(), Some("Show the sidebar"), "D-384: shut, the hover says Show");
         let files_area = main.end_child().expect("file list area");
         let mut file_blockers: Vec<gtk::Widget> = all_widgets(ui.column_header.upcast_ref()).into_iter().filter(|w| w.is::<gtk::Button>()).collect();
         file_blockers.extend(all_widgets(&files_area).into_iter().filter(|w| w.is::<gtk::ListBoxRow>() || matches!(w.css_name().as_str(), "row" | "listitem" | "button")));
@@ -33165,6 +33190,9 @@ Broken: Either state is wrong.\n";
         toggle.set_active(true);
         settle();
         assert!(ui.sidebar_scroll.is_visible(), "D-377: the button opens it again");
+        eprintln!("wf-test D-384 open: icon={:?} tip={:?}", arrow_d384(&toggle), toggle.tooltip_text());
+        assert_eq!(arrow_d384(&toggle).as_deref(), Some("pan-start-symbolic"), "D-384: open, the arrow points left");
+        assert_eq!(toggle.tooltip_text().as_deref(), Some("Hide the sidebar"), "D-384: open, the hover says Hide");
         toggle.emit_clicked();
         settle();
         assert!(!ui.sidebar_scroll.is_visible(), "D-377: a click shuts it");
