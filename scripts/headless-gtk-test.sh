@@ -89,6 +89,8 @@ case "$mode" in
         cmd=("${cargo_t[@]}" scroll_flick_d226_alone -- --nocapture);;
   d364) export WAYFINDER_D364_ONLY=1
         cmd=("${cargo_t[@]}" pointer_click_keeps_scroll_d364_alone -- --nocapture);;
+  d368) export WAYFINDER_D368_ONLY=1
+        cmd=("${cargo_t[@]}" grid_thumbnails_past_60_d368_alone -- --nocapture);;
   d369) export WAYFINDER_D369_ONLY=1
         cmd=("${cargo_t[@]}" unplayable_video_alone_d369 -- --nocapture);;
   d233) export WAYFINDER_D233_ONLY=1
@@ -130,7 +132,7 @@ case "$mode" in
              bash -c 'set -e; ip link set lo up; exec dbus-run-session -- "$@"' bash "${inner_test[@]}")
         host_mounts_before="$(cat /proc/self/mountinfo)";;
   --) shift; cmd=("$@");;
-  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
+  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d368|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
 esac
 
 setsid timeout -k 5 "$t" xvfb-run -a -s "-screen 0 1920x1080x24" "${cmd[@]}" &
