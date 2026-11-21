@@ -20293,6 +20293,31 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
+    // D-382: a Samsung message backup reads as a conversation. Parsed off the
+    // main thread (files reach 7 MB); a failure falls back to the raw text.
+    if native_core::is_sms_backup_path(&path_str) && !native_core::d382_old() {
+        set_preview_text(ui, "Reading messages\u{2026}");
+        let generation = ui.preview_generation.get();
+        let live = ui.preview_generation.clone();
+        let words = ui.preview.clone();
+        let source = path_str.clone();
+        let summary = native_core::entry_summary(entry);
+        glib::MainContext::default().spawn_local(async move {
+            let made = gio::spawn_blocking(move || {
+                native_core::sms_backup_preview(&source).or_else(|_| native_core::read_text_preview(&source))
+            })
+            .await;
+            if live.get() != generation {
+                return;
+            }
+            match made {
+                Ok(Ok(text)) => words.set_label(&text),
+                _ => words.set_label(&summary),
+            }
+        });
+        return;
+    }
+
     if !native_viewers::is_archive_path(&path_str) {
         if let Ok(text) = native_core::read_text_preview(&path_str) {
             set_preview_text(ui, &text);
@@ -31168,6 +31193,77 @@ Broken: Either state is wrong.\n";
         settle(200);
         match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
         println!("wf-test D-374 OK");
+    }
+
+    /// D-382 alone, on the private display.
+    #[test]
+    fn sms_backup_preview_reads_as_conversation_d382_alone() { gtk_thread::run(sms_backup_preview_reads_as_conversation_d382_alone_on_gtk_thread); }
+
+    fn sms_backup_preview_reads_as_conversation_d382_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D382_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        sms_backup_preview_reads_as_conversation_d382();
+    }
+
+    /// D-382 (21 Nov 2026, owner): a Samsung .smsbackup showed raw JSON in the
+    /// preview. Synthetic backup only (invented numbers and text). With
+    /// WF_TEST_D382_OLD=1 the old behaviour returns and this must fail.
+    fn sms_backup_preview_reads_as_conversation_d382() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d382-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let backup = serde_json::json!([
+            {"type": 1, "data": {"body": "invented hello from them", "address": "5550100", "date": 1_754_136_000_000i64, "type": 1}},
+            {"type": 1, "data": {"body": "invented reply from me", "address": "5550100", "date": 1_754_136_060_000i64, "type": 2}}
+        ]);
+        std::fs::write(dir.join("Me_Test_Person.smsbackup"), backup.to_string()).unwrap();
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d382test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        install_app_css();
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1000, 640);
+        ui.window.present();
+        ui.preview_scroll.set_visible(true);
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        settle(300);
+        let idx = state.borrow().visible_entries.iter().position(|e| e.name == "Me_Test_Person.smsbackup").expect("entry present") as u32;
+        ui.list_selection.select_item(idx, true);
+        update_selection(&state, &ui);
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end && !ui.preview.label().contains("Test Person") {
+            pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let label = ui.preview.label().to_string();
+        eprintln!("wf-test D-382 preview label: {} chars", label.len());
+        assert!(label.contains("Test Person"), "D-382: the contact name is missing from the preview");
+        assert!(label.contains("Me:"), "D-382: sent messages must read 'Me:'");
+        assert!(label.contains("invented hello from them") && label.contains("invented reply from me"), "D-382: message text missing");
+        assert!(!label.contains("{\"type\""), "D-382: the preview still shows raw JSON");
+        ui.window.destroy();
+        settle(200);
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        println!("wf-test D-382 OK");
     }
 
     /// D-378 alone, on the private display.
