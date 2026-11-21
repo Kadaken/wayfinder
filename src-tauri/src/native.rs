@@ -25365,6 +25365,12 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d86-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("tail") {
+            selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
+            suite_tail_after_d86();
+            eprintln!("wf-test tail-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d362") {
             d362_all();
             eprintln!("wf-test d362-only run done");
@@ -25479,21 +25485,37 @@ Broken: Either state is wrong.\n";
         video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
+        suite_tail_after_d86();
+    }
+
+    /// The suite's last stretch, after the D-86 video test. Also runs alone as
+    /// WAYFINDER_SUITE_ONLY=tail, so a stall here reproduces in minutes.
+    fn suite_tail_after_d86() {
+        eprintln!("wf-test tail: d48");
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
+        eprintln!("wf-test tail: guide_unknown_response_is_atomic_d58");
         #[cfg(feature = "guide")]
         guide_unknown_response_is_atomic_d58();
+        eprintln!("wf-test tail: guide_target_names_are_exact_d50");
         #[cfg(feature = "guide")]
         guide_target_names_are_exact_d50();
+        eprintln!("wf-test tail: guide_pending_targets_resolve_d51");
         #[cfg(feature = "guide")]
         guide_pending_targets_resolve_d51();
+        eprintln!("wf-test tail: guide_rename_target_and_delete_speed_alias_d152");
         #[cfg(feature = "guide")]
         guide_rename_target_and_delete_speed_alias_d152();
+        eprintln!("wf-test tail: guide_sitting_attached_card_d154");
         #[cfg(feature = "guide")]
         guide_sitting_attached_card_d154();
+        eprintln!("wf-test tail: transfer_progress_and_cancel_d155");
         transfer_progress_and_cancel_d155();
+        eprintln!("wf-test tail: transfer_progress_and_cancel_d185");
         transfer_progress_and_cancel_d185();
+        eprintln!("wf-test tail: zip_read_only_browse_open_copy_out_d188");
         zip_read_only_browse_open_copy_out_d188();
+        eprintln!("wf-test tail: zip_bad_oracles_d188");
         zip_bad_oracles_d188();
     }
 
