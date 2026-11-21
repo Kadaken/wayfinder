@@ -12056,9 +12056,16 @@ fn wire_inline_editor(field: &gtk::Entry, window: &gtk::Window, host: InlineHost
     {
         let cancel = host.cancel.clone();
         // Clicking away cancels (owner decision); Enter is the only commit.
-        focus.connect_leave(move |_| {
+        focus.connect_leave(move |c| {
             debug_assert!(!inline_event_commits(InlineEvent::FocusLoss));
             eprintln!("wf-event: inline editor focus loss");
+            // D-378 diagnostics: who has focus once the leave has settled.
+            let Some(field) = c.widget() else { cancel(); return };
+            glib::idle_add_local_once(move || {
+                let now = gtk::prelude::WidgetExt::root(&field).and_downcast::<gtk::Window>().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
+                let desc = now.map(|w| format!("{} css={:?} mapped={}", w.type_().name(), w.css_classes(), w.is_mapped()));
+                eprintln!("wf-event: inline editor focus loss, focus now {desc:?} field_mapped={}", gtk::prelude::WidgetExt::is_mapped(&field));
+            });
             cancel();
         });
     }
@@ -12102,6 +12109,9 @@ fn wire_inline_editor(field: &gtk::Entry, window: &gtk::Window, host: InlineHost
                 .is_some_and(|w| is_self_or_descendant(&w, field.upcast_ref()));
             if !inside {
                 eprintln!("wf-event: inline editor outside press");
+                let picked = window.pick(x, y, gtk::PickFlags::DEFAULT);
+                let desc = picked.map(|w| format!("{} css={:?}", w.type_().name(), w.css_classes()));
+                eprintln!("wf-event: inline editor outside press at ({x:.0},{y:.0}) picked {desc:?} field_mapped={}", field.is_mapped());
                 remove_later();
                 host_cancel();
             }
@@ -30682,6 +30692,145 @@ Broken: Either state is wrong.\n";
         settle(200);
         match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
         println!("wf-test D-374 OK");
+    }
+
+    /// D-378 alone, on the private display.
+    #[test]
+    fn rename_click_inside_keeps_editing_d378_alone() { gtk_thread::run(rename_click_inside_keeps_editing_d378_alone_on_gtk_thread); }
+
+    fn rename_click_inside_keeps_editing_d378_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D378_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        rename_click_inside_keeps_editing_d378();
+    }
+
+    /// D-378 (21 Nov 2026, owner): with inline rename open on a .webm screencast,
+    /// a real mouse click inside the text field (to place the caret) ended the
+    /// rename. A .txt file is the control. Real X pointer on run232's private Xvfb.
+    /// Prints field bounds, click point, what window.pick returns there, focus
+    /// before and after, whether the field widget was replaced, and wf-event lines.
+    fn rename_click_inside_keeps_editing_d378() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-378 moves the real X pointer and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let source = Path::new("/home/user/Videos/Screencasts/Screencast_20261121_105958.webm");
+        assert!(source.exists(), "D-378 needs the owner's screencast at {}", source.display());
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d378-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(source, dir.join("Screencast_20261121_105958.webm")).unwrap();
+        for n in ["notes-alpha-20261121.txt", "notes-beta-20261121.txt"] { std::fs::write(dir.join(n), n).unwrap(); }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d378test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        install_app_css();
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d378-proof"));
+        ui.window.set_default_size(1000, 640);
+        ui.window.present();
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        wait_for("window mapped", || ui.window.is_mapped() && ui.window.width() > 0);
+        wait_for("listing", || state.borrow().visible_entries.len() == 3);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        settle(500);
+        let mut geo = String::new();
+        for _ in 0..50 {
+            if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d378-proof", "getwindowgeometry", "--shell"]).output() {
+                if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+        let (wx, wy) = (num("X="), num("Y="));
+        let _ = xdo(&["search", "--name", "wf-d378-proof", "windowraise"]);
+        settle(300);
+        let (sx, sy) = ui.window.surface_transform();
+        eprintln!("wf-test D-378 window=({wx},{wy}) surface_transform=({sx:.1},{sy:.1}) win={}x{}", ui.window.width(), ui.window.height());
+        let window_w: gtk::Widget = ui.window.clone().upcast();
+        let list_w: gtk::Widget = ui.list.clone().upcast();
+
+        let mut results: Vec<(String, bool, bool, bool)> = Vec::new();
+        for name in ["Screencast_20261121_105958.webm", "notes-alpha-20261121.txt"] {
+            let tag = if name.ends_with(".webm") { "webm" } else { "txt" };
+            let idx = state.borrow().visible_entries.iter().position(|e| e.name == name).expect("entry present") as u32;
+            ui.list_selection.select_item(idx, true);
+            update_selection(&state, &ui);
+            eprintln!("wf-test D-378 [{tag}] selected {name}; waiting 2 s for preview and thumbnail");
+            settle(2000);
+            rename_action(state.clone(), ui.clone());
+            wait_for("inline editor", || inline_field(&list_w).is_some());
+            settle(1500);
+            let Some(field) = inline_field(&list_w) else {
+                eprintln!("wf-test D-378 [{tag}] the editor vanished by itself before any click (rename_active={})", state.borrow().inline_rename.is_some());
+                results.push((tag.to_string(), false, false, false));
+                continue;
+            };
+            let fptr = glib::object::ObjectType::as_ptr(&field) as usize;
+            let b = field.compute_bounds(&window_w).expect("field bounds");
+            let text_w = field.delegate().and_then(|d| d.downcast::<gtk::Text>().ok()).expect("entry text child");
+            let tb = text_w.compute_bounds(&window_w).expect("text bounds");
+            let (tw, _) = text_w.create_pango_layout(Some(field.text().as_str())).pixel_size();
+            let lx = tb.x() - b.x();
+            let fx = (tb.x() + 0.75 * tw as f32).min(b.x() + b.width() - 4.0);
+            let fy = b.y() + b.height() / 2.0;
+            let (px, py) = (wx + (sx + fx as f64) as i32, wy + (sy + fy as f64) as i32);
+            let picked = ui.window.pick(fx as f64, fy as f64, gtk::PickFlags::DEFAULT);
+            let picked_desc = picked.as_ref().map(|w| format!("{} css={:?} descendant_of_field={}", w.type_().name(), w.css_classes(), is_self_or_descendant(w, field.upcast_ref())));
+            let focus_desc = |w: Option<gtk::Widget>| w.map(|w| format!("{} css={:?} in_field={}", w.type_().name(), w.css_classes(), is_self_or_descendant(&w, field.upcast_ref())));
+            eprintln!("wf-test D-378 [{tag}] field bounds=({:.0},{:.0},{:.0},{:.0}) text_w={tw} text_x={lx} text='{}' pos={} click_win=({fx:.0},{fy:.0}) click_screen=({px},{py}) mapped={}", b.x(), b.y(), b.width(), b.height(), field.text(), field.position(), field.is_mapped());
+            eprintln!("wf-test D-378 [{tag}] pick at click point: {picked_desc:?}");
+            eprintln!("wf-test D-378 [{tag}] focus before: {:?}", focus_desc(gtk::prelude::GtkWindowExt::focus(&ui.window)));
+            xdo(&["mousemove", &px.to_string(), &py.to_string()]);
+            settle(200);
+            xdo(&["click", "1"]);
+            settle(1000);
+            let active = state.borrow().inline_rename.is_some();
+            let after = inline_field(&list_w);
+            let same = after.as_ref().is_some_and(|f| glib::object::ObjectType::as_ptr(f) as usize == fptr);
+            let still_mapped = after.as_ref().is_some_and(|f| f.is_mapped());
+            let focused = after.as_ref().is_some_and(|f| gtk::prelude::GtkWindowExt::focus(&ui.window).is_some_and(|w| is_self_or_descendant(&w, f.upcast_ref())));
+            eprintln!("wf-test D-378 [{tag}] focus after: {:?}", focus_desc(gtk::prelude::GtkWindowExt::focus(&ui.window)));
+            eprintln!("wf-test D-378 [{tag}] after click: rename_active={active} field_present={} same_field_widget={same} mapped={still_mapped} focused={focused} caret={:?}", after.is_some(), after.as_ref().map(|f| f.position()));
+            results.push((tag.to_string(), active, still_mapped, focused));
+            if state.borrow().inline_rename.is_some() {
+                cancel_inline_rename(&state, &ui);
+            }
+            settle(500);
+        }
+        ui.window.destroy();
+        settle(200);
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        for (tag, active, mapped, focused) in &results {
+            eprintln!("wf-test D-378 RESULT [{tag}] rename_active={active} mapped={mapped} focused={focused}");
+        }
+        for (tag, active, mapped, focused) in &results {
+            assert!(*active && *mapped && *focused, "D-378 [{tag}]: a click inside the rename field must keep the rename open, mapped and focused (active={active} mapped={mapped} focused={focused})");
+        }
+        println!("wf-test D-378 OK");
     }
 
     /// D-375 alone, on the private display.
