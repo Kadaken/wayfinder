@@ -16,7 +16,7 @@
 #   headless-gtk-test.sh d234        the standalone trash-safety + Trash-row-menu gate
 #   headless-gtk-test.sh d235        the standalone Save-picker name-box gate
 #   headless-gtk-test.sh -- CMD...   any command (used by the self-check)
-# Env: WF_HEADLESS_TIMEOUT seconds (default 900).
+# Env: WF_HEADLESS_TIMEOUT seconds (default 1800; the full suite took 971 s on 21 Nov 2026).
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 scratch="$HOME/Projects/Scratch"
@@ -68,7 +68,7 @@ trap 'exit 143' TERM
 export WF_TEST_SCRATCH_ROOT="$root"
 export GDK_BACKEND=x11 GTK_A11Y=none G_DEBUG=fatal-criticals WAYFINDER_HEADLESS_GTK_TEST=1
 unset WAYLAND_DISPLAY
-t="${WF_HEADLESS_TIMEOUT:-900}"
+t="${WF_HEADLESS_TIMEOUT:-1800}"
 mode="${1:-full}"
 cargo_t=(cargo test --quiet --features guide --manifest-path "$here/src-tauri/Cargo.toml")
 case "$mode" in
