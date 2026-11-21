@@ -2637,8 +2637,10 @@ fn spawn_reaped(mut command: Command) -> std::io::Result<u32> {
 }
 
 pub fn open_path(path: &str) -> Result<(), String> {
+    // D-382: a message backup opens as its readable text, not as raw JSON.
+    let converted = if is_sms_backup_path(path) && !d382_old() { sms_backup_text_file(path).ok() } else { None };
     let mut command = Command::new("xdg-open");
-    command.arg(path);
+    command.arg(converted.as_deref().unwrap_or(Path::new(path)));
     spawn_reaped(command)
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -2890,8 +2892,8 @@ pub fn decode_text_bytes(bytes: &[u8], cut: bool) -> Option<String> {
 /// `PREVIEW_SHOW_LINES` lines and `PREVIEW_SHOW_BYTES` bytes, always ending on
 /// a character boundary so the string stays valid UTF-8.
 fn preview_cut(text: &str) -> &str {
-    const PREVIEW_SHOW_BYTES: usize = 16 * 1024;
-    const PREVIEW_SHOW_LINES: usize = 300;
+    const PREVIEW_SHOW_BYTES: usize = SMS_PREVIEW_BYTES;
+    const PREVIEW_SHOW_LINES: usize = SMS_PREVIEW_LINES;
 
     let mut end = text.len().min(PREVIEW_SHOW_BYTES);
     while end < text.len() && !text.is_char_boundary(end) {
@@ -6263,6 +6265,9 @@ fn type_label(name: &str) -> String {
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_uppercase();
+    if ext == "SMSBACKUP" && !d382_old() {
+        return "Message backup".to_string();
+    }
     if ext.is_empty() {
         "File".to_string()
     } else {
@@ -6534,6 +6539,278 @@ pub fn scratch_root() -> PathBuf {
     };
     fs::create_dir_all(&root).expect("create the scratch test root");
     root
+}
+
+// ---- D-382: Samsung message backups (*.smsbackup) --------------------------
+
+/// D-382: old behaviour switch for tests (raw JSON preview, no conversion).
+pub fn d382_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D382_OLD").is_some()
+}
+
+/// D-240 preview cap, shared with `preview_cut`: the most the preview label is
+/// handed, in bytes and in lines.
+pub const SMS_PREVIEW_BYTES: usize = 16 * 1024;
+pub const SMS_PREVIEW_LINES: usize = 300;
+
+/// D-382: one message of a Samsung backup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmsLine {
+    /// Milliseconds since the epoch.
+    pub time_ms: i64,
+    pub from_me: bool,
+    /// The other party's number (empty when the backup has none).
+    pub who: String,
+    pub text: String,
+}
+
+pub fn is_sms_backup_path(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".smsbackup")
+}
+
+fn sms_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+/// Seconds (10 digits) or milliseconds (13 digits) to milliseconds.
+fn sms_ms(v: &serde_json::Value, seconds: bool) -> Option<i64> {
+    let n = v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))?;
+    if n <= 0 {
+        return None;
+    }
+    Some(if seconds && n < 100_000_000_000 { n.saturating_mul(1000) } else { n })
+}
+
+fn sms_attachment_line(att: &serde_json::Value) -> Option<String> {
+    let parsed;
+    let raw = att.get("data").unwrap_or(att);
+    let obj = if let Some(s) = raw.as_str() {
+        parsed = serde_json::from_str::<serde_json::Value>(s).ok()?;
+        &parsed
+    } else {
+        raw
+    };
+    let ct = sms_str(obj, "ct").to_ascii_lowercase();
+    if ct.starts_with("text/plain") {
+        let t = sms_str(obj, "text");
+        return if t.trim().is_empty() { None } else { Some(t) };
+    }
+    let mut name = ["fn", "name", "cl"].iter().map(|k| sms_str(obj, k)).find(|s| !s.is_empty()).unwrap_or_default();
+    if name.is_empty() {
+        name = sms_str(att, "filename");
+    }
+    if name.is_empty() {
+        name = sms_str(obj, "_data").rsplit('/').next().unwrap_or("").to_string();
+    }
+    if ct == "application/smil" || ct.is_empty() && name.is_empty() {
+        return None;
+    }
+    let label = if ct.starts_with("image/") {
+        "Picture"
+    } else if ct.starts_with("video/") {
+        "Video"
+    } else if ct.starts_with("audio/") {
+        "Voice or audio"
+    } else if ct.contains("vcard") {
+        "Contact card"
+    } else {
+        "Attachment"
+    };
+    let shown = if name.is_empty() { ct } else { name };
+    Some(format!("[{label}: {shown} \u{2014} not in this backup]"))
+}
+
+/// D-382: reads a Samsung `.smsbackup` (a JSON array of `{"type", "data"}`),
+/// oldest first. Unknown types and malformed entries are skipped.
+pub fn parse_sms_backup(bytes: &[u8]) -> Result<Vec<SmsLine>, String> {
+    let root: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let items = root.as_array().ok_or_else(|| "not a message backup".to_string())?;
+    let mut out = Vec::new();
+    for item in items {
+        let Some(kind) = item.get("type").and_then(|t| t.as_i64()) else { continue };
+        let Some(data) = item.get("data").filter(|d| d.is_object()) else { continue };
+        let line = match kind {
+            1 | 3 => {
+                let text = sms_str(data, "body").replace('\r', "");
+                let Some(time_ms) = data.get("date").and_then(|d| sms_ms(d, false)) else { continue };
+                let from_me = data.get("type").and_then(|t| t.as_i64()) == Some(2);
+                SmsLine { time_ms, from_me, who: sms_str(data, "address"), text }
+            }
+            2 => {
+                let Some(time_ms) = data.get("date").and_then(|d| sms_ms(d, true)) else { continue };
+                let from_me = data.get("msg_box").and_then(|t| t.as_i64()) == Some(2);
+                let mut who = sms_str(item, "address");
+                if !from_me {
+                    if let Some(list) = item.get("addresses").and_then(|a| a.as_array()) {
+                        let sender = list.iter().find(|a| a.get("type").and_then(|t| t.as_i64()) == Some(137));
+                        if let Some(sender) = sender {
+                            who = sms_str(sender, "address");
+                        } else if who.is_empty() {
+                            who = list.first().map(|a| sms_str(a, "address")).unwrap_or_default();
+                        }
+                    }
+                }
+                let mut parts = Vec::new();
+                if let Some(atts) = item.get("attachments").and_then(|a| a.as_array()) {
+                    for att in atts {
+                        if let Some(p) = sms_attachment_line(att) {
+                            parts.push(p.replace('\r', ""));
+                        }
+                    }
+                }
+                SmsLine { time_ms, from_me, who, text: parts.join("\n") }
+            }
+            4 => {
+                let Some(time_ms) = data.get("date").and_then(|d| sms_ms(d, false)) else { continue };
+                let name = sms_str(data, "file_name");
+                let name = name.rsplit('/').next().unwrap_or("").to_string();
+                let label = if sms_str(data, "content_type").starts_with("image/") { "Picture" } else { "File" };
+                let text = if name.is_empty() { format!("[{label} \u{2014} not in this backup]") } else { format!("[{label}: {name} \u{2014} not in this backup]") };
+                SmsLine { time_ms, from_me: data.get("type").and_then(|t| t.as_i64()) == Some(2), who: sms_str(data, "address"), text }
+            }
+            _ => continue,
+        };
+        if line.text.trim().is_empty() {
+            continue;
+        }
+        out.push(line);
+    }
+    out.sort_by_key(|l| l.time_ms);
+    Ok(out)
+}
+
+/// "Me_Test_Person.smsbackup" -> "Test Person".
+pub fn sms_contact_name(file_name: &str) -> String {
+    let stem = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+    let stem = stem.strip_prefix("Me_").unwrap_or(stem);
+    stem.replace('_', " ")
+}
+
+fn sms_local(ms: i64) -> Option<glib::DateTime> {
+    glib::DateTime::from_unix_local(ms.div_euclid(1000)).ok()
+}
+
+fn sms_day(dt: &glib::DateTime) -> String {
+    let weekday = dt.format("%A").map(|s| s.to_string()).unwrap_or_default();
+    let month = dt.format("%B").map(|s| s.to_string()).unwrap_or_default();
+    format!("{weekday} {} {month} {}", dt.day_of_month(), dt.year())
+}
+
+/// D-382: the conversation as plain text. With `cap` (bytes, lines) only the
+/// newest messages that fit are shown and the top says how many older ones
+/// are not.
+pub fn format_sms_conversation(file_name: &str, lines: &[SmsLine], cap: Option<(usize, usize)>) -> String {
+    let contact = sms_contact_name(file_name);
+    let mut senders: Vec<&str> = lines.iter().filter(|l| !l.from_me && !l.who.is_empty()).map(|l| l.who.as_str()).collect();
+    senders.sort_unstable();
+    senders.dedup();
+    let group = senders.len() > 1;
+    // One block per message: (day text, rendered lines).
+    let blocks: Vec<(String, Vec<String>)> = lines
+        .iter()
+        .map(|l| {
+            let dt = sms_local(l.time_ms);
+            let day = dt.as_ref().map(sms_day).unwrap_or_else(|| "Unknown date".to_string());
+            let clock = dt.as_ref().map(clock_of).unwrap_or_default();
+            let name = if l.from_me {
+                "Me".to_string()
+            } else if group && !l.who.is_empty() {
+                l.who.clone()
+            } else {
+                contact.clone()
+            };
+            let prefix = format!("{clock}  {name}: ");
+            let pad = " ".repeat(clock.chars().count() + 2);
+            let mut out = Vec::new();
+            for (i, part) in l.text.lines().enumerate() {
+                out.push(if i == 0 { format!("{prefix}{part}") } else { format!("{pad}{part}") });
+            }
+            (day, out)
+        })
+        .collect();
+    let range = match (lines.first().and_then(|l| sms_local(l.time_ms)), lines.last().and_then(|l| sms_local(l.time_ms))) {
+        (Some(a), Some(b)) => {
+            let (a, b) = (sms_day(&a), sms_day(&b));
+            // Drop the weekday in the header range.
+            let cut = |s: &str| s.split_once(' ').map(|x| x.1.to_string()).unwrap_or_default();
+            format!(", {} to {}", cut(&a), cut(&b))
+        }
+        _ => String::new(),
+    };
+    let n = lines.len();
+    let mut head = format!("{contact} \u{2014} {n} message{}{range}", if n == 1 { "" } else { "s" });
+    // Walk back from the newest until the cap is reached.
+    let mut start = 0;
+    if let Some((max_bytes, max_lines)) = cap {
+        let budget_bytes = max_bytes.saturating_sub(head.len() + 200);
+        let budget_lines = max_lines.saturating_sub(5);
+        let (mut bytes, mut count) = (0usize, 0usize);
+        start = n;
+        while start > 0 {
+            let (day, out) = &blocks[start - 1];
+            let extra_day = if start == 1 || blocks[start - 2].0 != *day { 2 } else { 0 };
+            let b: usize = out.iter().map(|s| s.len() + 1).sum::<usize>() + extra_day * 24;
+            let c = out.len() + extra_day;
+            if start < n && (bytes + b > budget_bytes || count + c > budget_lines) {
+                break;
+            }
+            bytes += b;
+            count += c;
+            start -= 1;
+        }
+        if start > 0 {
+            head.push_str(&format!("\nShowing the newest {} of {n}; {start} older not shown. Open the file to read all of it.", n - start));
+        }
+    }
+    let mut text = head;
+    let mut day_now = "";
+    for (day, out) in &blocks[start..] {
+        if day != day_now {
+            text.push_str(&format!("\n\n{day}"));
+            day_now = day;
+        }
+        for l in out {
+            text.push('\n');
+            text.push_str(l);
+        }
+    }
+    text.push('\n');
+    text
+}
+
+/// D-382: the preview text for a backup file (newest messages that fit).
+pub fn sms_backup_preview(path: &str) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let lines = parse_sms_backup(&bytes)?;
+    if lines.is_empty() {
+        return Err("no messages".into());
+    }
+    let name = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    Ok(format_sms_conversation(name, &lines, Some((SMS_PREVIEW_BYTES, SMS_PREVIEW_LINES))))
+}
+
+/// D-382: the whole conversation written to ~/.cache/wayfinder/sms/<stem>.txt
+/// (rewritten only when the source is newer) and that path returned.
+pub fn sms_backup_text_file(path: &str) -> Result<PathBuf, String> {
+    let src = Path::new(path);
+    let home = std::env::var_os("HOME").ok_or_else(|| "no home".to_string())?;
+    let stem = src.file_stem().and_then(|s| s.to_str()).ok_or_else(|| "bad name".to_string())?;
+    let out = PathBuf::from(home).join(".cache/wayfinder/sms").join(format!("{stem}.txt"));
+    let src_time = fs::metadata(src).and_then(|m| m.modified()).map_err(|e| e.to_string())?;
+    let fresh = fs::metadata(&out).and_then(|m| m.modified()).is_ok_and(|t| t >= src_time);
+    if fresh {
+        return Ok(out);
+    }
+    let bytes = fs::read(src).map_err(|e| e.to_string())?;
+    let lines = parse_sms_backup(&bytes)?;
+    if lines.is_empty() {
+        return Err("no messages".into());
+    }
+    let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let text = format_sms_conversation(name, &lines, None);
+    fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&out, text).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -12698,5 +12975,102 @@ mod audit_log_cap_tests {
         assert!(text.ends_with("line 01999 padding padding\n"));
         assert!(text.starts_with("line "), "cut must fall on a line start");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sms_backup_tests {
+    use super::*;
+
+    const T0: i64 = 1_754_136_000; // Sat 2 Aug 2025 12:00:00 UTC
+
+    fn synthetic() -> String {
+        let att_obj = serde_json::json!([
+            {"data": {"ct": "text/plain", "text": "Look at this"}},
+            {"data": {"ct": "image/jpeg", "fn": "IMG_0001.jpg", "_data": "/storage/emulated/0/x/IMG_0001.jpg"}},
+        ]);
+        let att_str = serde_json::json!([
+            {"data": serde_json::json!({"ct": "text/plain", "text": "String text"}).to_string()},
+            {"data": serde_json::json!({"ct": "image/png", "cl": "pic2.png"}).to_string(), "filename": "ignored.png"},
+        ]);
+        serde_json::json!([
+            {"type": 1, "data": {"body": "hello from them", "address": "5550100", "date": (T0 - 600) * 1000, "type": 1}},
+            {"type": 1, "data": {"body": "hi from me", "address": "5550100", "date": (T0 + 600) * 1000, "type": 2}},
+            {"type": 2, "address": "5550100", "data": {"date": T0, "msg_box": 1}, "attachments": att_obj},
+            {"type": 2, "address": "5550100", "data": {"date": T0 + 900, "msg_box": 2}, "attachments": att_str},
+            {"type": 3, "data": {"body": "rcs line", "address": "5550100", "date": (T0 + 1200) * 1000, "type": 1, "content_type": "text/plain"}},
+            {"type": 1, "data": "broken"},
+            {"type": 2},
+            {"type": 99, "data": {"body": "unknown"}},
+            5
+        ])
+        .to_string()
+    }
+
+    /// D-382: the owner's real backups, counts only (no message text is
+    /// printed). Runs only with WAYFINDER_D382_REAL=1.
+    #[test]
+    fn sms_backup_real_folder_counts_d382() {
+        if std::env::var("WAYFINDER_D382_REAL").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = "/run/media/user/Disk1/Old Hard Drives/Samsung S20 FE/3_29_26/Backup_3_29_26_9_57_PM";
+        let (mut files, mut failed, mut lines, mut pictures, mut empty) = (0, 0, 0usize, 0usize, 0usize);
+        for e in fs::read_dir(dir).expect("backup folder") {
+            let p = e.unwrap().path();
+            if !is_sms_backup_path(&p.to_string_lossy()) { continue; }
+            files += 1;
+            match parse_sms_backup(&fs::read(&p).unwrap()) {
+                Ok(v) => {
+                    lines += v.len();
+                    pictures += v.iter().filter(|l| l.text.contains("[Picture:")).count();
+                    empty += v.iter().filter(|l| l.text.trim().is_empty()).count();
+                    let _ = format_sms_conversation(&p.file_name().unwrap().to_string_lossy(), &v, Some((16 * 1024, 300)));
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        eprintln!("wf-test D-382 real: files={files} failed={failed} messages={lines} with_picture={pictures} empty_text={empty}");
+        assert_eq!(failed, 0);
+    }
+    #[test]
+    fn sms_backup_parses_and_renders_d382() {
+        let lines = parse_sms_backup(synthetic().as_bytes()).expect("parses");
+        assert_eq!(lines.len(), 5, "malformed and unknown entries are skipped");
+        let times: Vec<i64> = lines.iter().map(|l| l.time_ms / 1000).collect();
+        assert_eq!(times, vec![T0 - 600, T0, T0 + 600, T0 + 900, T0 + 1200], "seconds and ms sort together");
+        assert_eq!(lines[1].text, "Look at this\n[Picture: IMG_0001.jpg \u{2014} not in this backup]");
+        assert_eq!(lines[3].text, "String text\n[Picture: pic2.png \u{2014} not in this backup]");
+        assert!(lines[2].from_me && lines[3].from_me && !lines[1].from_me);
+
+        let text = format_sms_conversation("Me_Test_Person.smsbackup", &lines, None);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[0].starts_with("Test Person \u{2014} 5 messages, "), "{}", rows[0]);
+        assert!(rows[0].contains("2025"), "{}", rows[0]);
+        assert!(text.contains("Saturday 2 August 2025"), "{text}");
+        let pos = |needle: &str| rows.iter().position(|r| r.ends_with(needle)).unwrap_or_else(|| panic!("missing {needle}: {text}"));
+        assert!(rows[pos("Test Person: hello from them")].contains("  Test Person: "));
+        assert!(rows[pos("Me: hi from me")].contains("  Me: "));
+        assert!(pos("Test Person: hello from them") < pos("Test Person: Look at this"));
+        assert!(pos("Test Person: Look at this") < pos("Me: hi from me"));
+        assert!(pos("Me: hi from me") < pos("Me: String text"));
+        assert!(pos("Me: String text") < pos("Test Person: rcs line"));
+        assert!(text.contains("[Picture: IMG_0001.jpg \u{2014} not in this backup]"));
+        assert!(!text.contains("{\"type\""));
+    }
+
+    #[test]
+    fn sms_backup_preview_keeps_newest_within_cap_d382() {
+        let many: Vec<serde_json::Value> = (0..2000)
+            .map(|i| serde_json::json!({"type": 1, "data": {"body": format!("invented message number {i}"), "address": "5550100", "date": (T0 + i * 60) * 1000, "type": 1}}))
+            .collect();
+        let lines = parse_sms_backup(serde_json::Value::Array(many).to_string().as_bytes()).unwrap();
+        let text = format_sms_conversation("Me_Test_Person.smsbackup", &lines, Some((SMS_PREVIEW_BYTES, SMS_PREVIEW_LINES)));
+        assert!(text.len() <= SMS_PREVIEW_BYTES && text.lines().count() <= SMS_PREVIEW_LINES, "{} bytes", text.len());
+        assert!(text.contains("invented message number 1999"));
+        assert!(!text.contains("invented message number 0\n"));
+        assert!(text.contains("older not shown"), "{text}");
+        assert!(parse_sms_backup(b"not json").is_err());
+        assert!(parse_sms_backup(b"{}").is_err());
     }
 }
