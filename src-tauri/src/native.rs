@@ -23100,6 +23100,8 @@ mod tests {
                 fstype: String::new(),
                 kind: kind.into(),
                 removable: false,
+                hotplug: false,
+                read_only: false,
                 space: None,
             };
             used.push(drive_icon(&drive));
@@ -29659,6 +29661,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: kind.into(),
             removable,
+            hotplug: true,
+            read_only: false,
             space: None,
         };
         let mp = mount.to_string_lossy().to_string();
@@ -34405,6 +34409,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable,
+            hotplug: true,
+            read_only: false,
             space: None,
         };
         for (key, d) in [
@@ -34829,6 +34835,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable,
+            hotplug: true,
+            read_only: false,
             space: None,
         };
         let crucial = |mounted| drive("Launch Box SSD 2TB", false, mounted);
@@ -35098,6 +35106,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable,
+            hotplug: true,
+            read_only: false,
             space: None,
         };
         let crucial = "Launch Box SSD 2TB";
@@ -35438,6 +35448,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: kind.into(),
             removable,
+            hotplug: true,
+            read_only: false,
             space: None,
         };
         let menu_for = |d: Drive| -> (gtk::Popover, Vec<String>) {
@@ -36466,6 +36478,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable: true,
+            hotplug: true,
+            read_only: false,
             space: None,
         };
 
@@ -37152,6 +37166,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space,
         };
         let space = |total_gb: u64, free_gb: u64| Some(native_core::Space { total: total_gb * gb, available: free_gb * gb });
@@ -37685,6 +37701,8 @@ Broken: Either state is wrong.\n";
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space,
         };
         let space = |total_gb: u64, free_gb: u64| Some(native_core::Space { total: total_gb * gb, available: free_gb * gb });
@@ -45930,6 +45948,8 @@ Broken: Either state is wrong.\n";
             fstype: "ntfs".to_string(),
             kind: "part".to_string(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space: None,
         }];
         // The window's own scan (empty under test) would land during a later
@@ -46010,6 +46030,8 @@ Broken: Either state is wrong.\n";
             fstype: String::new(),
             kind: "ps2".to_string(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space: None,
         }];
         {

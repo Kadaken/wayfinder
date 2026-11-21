@@ -141,6 +141,10 @@ pub struct Drive {
     pub fstype: String,
     pub kind: String,
     pub removable: bool,
+    /// D-387: lsblk HOTPLUG (plugged in, e.g. USB); internal drives are false.
+    pub hotplug: bool,
+    /// D-387: the mount options in /proc/mounts include `ro` (read-only mount, not lsblk RO).
+    pub read_only: bool,
     /// Filesystem total and user-available bytes; `None` when unmounted or unreadable.
     pub space: Option<Space>,
 }
@@ -2309,6 +2313,8 @@ pub fn network_drives(
                 fstype: fstype.to_string(),
                 kind: "network".to_string(),
                 removable: false,
+                hotplug: false,
+                read_only: false,
                 space: None,
             });
         }
@@ -2390,6 +2396,8 @@ pub fn ps2_drives(mounts: &str, taken: &std::collections::HashSet<String>) -> Ve
         fstype: PS2_FSTYPE.to_string(),
         kind: "ps2".to_string(),
         removable: false,
+        hotplug: false,
+        read_only: false,
         space: None,
     }]
 }
@@ -2397,11 +2405,61 @@ pub fn ps2_drives(mounts: &str, taken: &std::collections::HashSet<String>) -> Ve
 /// D-386: unmount and eject need root and belong to the system service; only a
 /// real block-device row offers them, never the PS2 row.
 pub fn drive_can_unmount(drive: &Drive) -> bool {
-    drive.kind == "drive" && !drive.mountpoint.is_empty()
+    drive.kind == "drive"
+        && !drive.mountpoint.is_empty()
+        && !drive.read_only
+        && (drive.hotplug || drive.removable)
 }
 
 pub fn drive_can_eject(drive: &Drive) -> bool {
-    drive.kind != "ps2" && drive.removable
+    drive_can_unmount(drive)
+}
+
+/// D-387: true when /proc/mounts lists `mountpoint` with the `ro` option.
+/// The last matching line wins (a later mount shadows an earlier one).
+pub fn mount_is_read_only(mounts: &str, mountpoint: &str) -> bool {
+    if mountpoint.is_empty() {
+        return false;
+    }
+    let mut ro = false;
+    for line in mounts.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 4 && decode_mount_field(f[1]) == mountpoint {
+            ro = f[3].split(',').any(|o| o == "ro");
+        }
+    }
+    ro
+}
+
+/// One lsblk node to a `drive` row, or `None` for rows we never show.
+fn drive_from_lsblk_node(node: &serde_json::Value) -> Option<Drive> {
+    let fstype = node["fstype"].as_str().unwrap_or("");
+    let kind = node["type"].as_str().unwrap_or("");
+    let mountpoint = node["mountpoint"].as_str().unwrap_or("");
+    let boring = fstype.is_empty()
+        || fstype == "swap"
+        || mountpoint == "/"
+        || mountpoint == "/boot"
+        || mountpoint == "/boot/efi"
+        || fstype == "crypto_LUKS";
+    if !matches!(kind, "part" | "disk" | "crypt") || boring {
+        return None;
+    }
+    let label = node["label"].as_str().filter(|value| !value.is_empty());
+    let name = node["name"].as_str().unwrap_or("?");
+    let flag = |k: &str| node[k].as_bool().unwrap_or(false) || node[k].as_str() == Some("1");
+    Some(Drive {
+        name: label.map(ToString::to_string).unwrap_or_else(|| name.to_string()),
+        path: node["path"].as_str().unwrap_or("").to_string(),
+        mountpoint: mountpoint.to_string(),
+        size: node["size"].as_u64().unwrap_or(0),
+        fstype: fstype.to_string(),
+        kind: "drive".to_string(),
+        removable: flag("rm"),
+        hotplug: flag("hotplug"),
+        read_only: false,
+        space: None,
+    })
 }
 
 pub fn list_drives() -> Vec<Drive> {
@@ -2417,41 +2475,15 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
             "-J",
             "-b",
             "-o",
-            "NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,PATH,TYPE,RM",
+            "NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,PATH,TYPE,RM,HOTPLUG",
         ])
         .output()
     {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
             fn walk(node: &serde_json::Value, out: &mut Vec<Drive>) {
-                let fstype = node["fstype"].as_str().unwrap_or("");
-                let kind = node["type"].as_str().unwrap_or("");
-                let mountpoint = node["mountpoint"].as_str().unwrap_or("");
-                let boring = fstype.is_empty()
-                    || fstype == "swap"
-                    || mountpoint == "/"
-                    || mountpoint == "/boot"
-                    || mountpoint == "/boot/efi"
-                    || fstype == "crypto_LUKS";
-
-                if matches!(kind, "part" | "disk" | "crypt") && !boring {
-                    let label = node["label"].as_str().filter(|value| !value.is_empty());
-                    let name = node["name"].as_str().unwrap_or("?");
-                    let removable =
-                        node["rm"].as_bool().unwrap_or(false) || node["rm"].as_str() == Some("1");
-                    out.push(Drive {
-                        name: label
-                            .map(ToString::to_string)
-                            .unwrap_or_else(|| name.to_string()),
-                        path: node["path"].as_str().unwrap_or("").to_string(),
-                        mountpoint: mountpoint.to_string(),
-                        size: node["size"].as_u64().unwrap_or(0),
-                        fstype: fstype.to_string(),
-                        kind: "drive".to_string(),
-                        removable,
-                        space: None,
-                    });
+                if let Some(drive) = drive_from_lsblk_node(node) {
+                    out.push(drive);
                 }
-
                 if let Some(children) = node["children"].as_array() {
                     for child in children {
                         walk(child, out);
@@ -2483,6 +2515,8 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
                     fstype: "rclone".to_string(),
                     kind: "gdrive".to_string(),
                     removable: false,
+                    hotplug: false,
+                    read_only: false,
                     space: None,
                 });
             }
@@ -2493,6 +2527,11 @@ pub fn list_drives_with(probe: &dyn Fn(&str) -> Option<Space>) -> Vec<Drive> {
         out.extend(ps2_drives(&mounts, &taken));
     }
 
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for d in out.iter_mut().filter(|d| d.kind == "drive") {
+            d.read_only = mount_is_read_only(&mounts, &d.mountpoint);
+        }
+    }
     probe_local_space(&mut out, probe);
     out
 }
@@ -9852,6 +9891,8 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space: Some(Space { total: 100 * gb, available: 25 * gb }),
         };
         let unmounted = drive.space_view();
@@ -9913,6 +9954,114 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
         let mut forced = rows[0].clone();
         forced.removable = true;
         assert!(!drive_can_eject(&forced), "even if flagged removable");
+    }
+
+    fn d387_rows(json: &str) -> Vec<Drive> {
+        // Same walk as list_drives_with, fed a fixed lsblk document.
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        d387_walk(&v["blockdevices"])
+    }
+
+    fn d387_walk(list: &serde_json::Value) -> Vec<Drive> {
+        let mut out = Vec::new();
+        for n in list.as_array().into_iter().flatten() {
+            if let Some(d) = drive_from_lsblk_node(n) {
+                out.push(d);
+            }
+            out.extend(d387_walk(&n["children"]));
+        }
+        out
+    }
+
+    const D387_LSBLK: &str = r#"{"blockdevices":[
+      {"name":"sda","type":"disk","rm":false,"hotplug":true,"size":1000,"children":[
+        {"name":"sda1","type":"part","rm":false,"hotplug":true,"fstype":"exfat","label":"Backup","mountpoint":"/run/media/user/Pebble","path":"/dev/sda1","size":1000}]},
+      {"name":"sdb","type":"disk","rm":true,"hotplug":true,"fstype":"vfat","label":"CARD","mountpoint":"/run/media/user/CARD","path":"/dev/sdb","size":1000},
+      {"name":"sdc","type":"disk","rm":true,"hotplug":false,"fstype":"vfat","label":"ODD","mountpoint":"","path":"/dev/sdc","size":1000},
+      {"name":"nvme1n1","type":"disk","rm":false,"hotplug":false,"children":[
+        {"name":"nvme1n1p1","type":"part","rm":false,"hotplug":false,"fstype":"ntfs","label":"Storage","mountpoint":"/run/media/user/Disk1","path":"/dev/nvme1n1p1","size":1000}]},
+      {"name":"nvme0n1","type":"disk","rm":false,"hotplug":false,"children":[
+        {"name":"nvme0n1p3","type":"part","rm":false,"hotplug":false,"fstype":"crypto_LUKS","children":[
+          {"name":"luks-x","type":"crypt","rm":false,"hotplug":false,"fstype":"btrfs","label":"fedora","mountpoint":"/home","path":"/dev/mapper/luks-x","size":1000}]}]}
+    ]}"#;
+
+    fn d387_by(name: &str) -> Drive {
+        d387_rows(D387_LSBLK).into_iter().find(|d| d.name == name).unwrap_or_else(|| panic!("no row {name}"))
+    }
+
+    #[test]
+    fn internal_ntfs_storage_has_no_unmount_or_eject_d387() {
+        let d = d387_by("Storage");
+        assert!(!d.hotplug && !d.removable);
+        assert!(!drive_can_unmount(&d));
+        assert!(!drive_can_eject(&d));
+    }
+
+    #[test]
+    fn home_crypt_row_has_no_unmount_or_eject_d387() {
+        let d = d387_by("fedora");
+        assert_eq!(d.mountpoint, "/home");
+        assert!(!drive_can_unmount(&d));
+        assert!(!drive_can_eject(&d));
+    }
+
+    #[test]
+    fn usb_partition_hotplug_not_rm_gets_both_d387() {
+        let d = d387_by("Backup");
+        assert!(d.hotplug && !d.removable);
+        assert!(drive_can_unmount(&d));
+        assert!(drive_can_eject(&d));
+    }
+
+    #[test]
+    fn rm_card_reader_gets_eject_d387() {
+        let d = d387_by("CARD");
+        assert!(d.removable);
+        assert!(drive_can_eject(&d));
+        // RM without hotplug and unmounted (an empty reader): neither.
+        let o = d387_by("ODD");
+        assert!(o.removable && !o.hotplug);
+        assert!(!drive_can_eject(&o) && !drive_can_unmount(&o));
+    }
+
+    const D387_MOUNTS: &str = "\
+/dev/sda1 /run/media/user/Pebble exfat rw,nosuid 0 0
+/dev/sdd1 /run/media/user/Old\\040Disk ntfs3 ro,nosuid 0 0
+/dev/nvme1n1p1 /run/media/user/Disk1 fuseblk rw 0 0
+";
+
+    fn d387_plugged(mp: &str, mounts: &str) -> Drive {
+        let mut d = d387_by("Backup");
+        d.mountpoint = mp.to_string();
+        d.read_only = mount_is_read_only(mounts, mp);
+        d
+    }
+
+    #[test]
+    fn hotplug_rw_mounted_gets_both_d387() {
+        let d = d387_plugged("/run/media/user/Pebble", D387_MOUNTS);
+        assert!(!d.read_only);
+        assert!(drive_can_unmount(&d) && drive_can_eject(&d));
+    }
+
+    #[test]
+    fn hotplug_ro_mounted_gets_neither_d387() {
+        let d = d387_plugged("/run/media/user/Old Disk", D387_MOUNTS);
+        assert!(d.read_only, "\\040 decoded and ro read");
+        assert!(!drive_can_unmount(&d) && !drive_can_eject(&d));
+    }
+
+    #[test]
+    fn hotplug_unmounted_gets_neither_d387() {
+        let d = d387_plugged("", D387_MOUNTS);
+        assert!(!drive_can_unmount(&d) && !drive_can_eject(&d));
+    }
+
+    #[test]
+    fn ps2_ro_row_gets_neither_d387() {
+        let mut rows = ps2_drives(D386_MOUNTS, &Default::default());
+        rows[0].hotplug = true;
+        assert!(!drive_can_unmount(&rows[0]) && !drive_can_eject(&rows[0]));
     }
 
     const D156_MOUNTS: &str = "\
@@ -10057,6 +10206,8 @@ rclone: /home/user/GoogleDrive fuse.rclone rw 0 0
             fstype: "x".into(),
             kind: kind.into(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space: None,
         };
         let mut drives = vec![
@@ -10695,6 +10846,8 @@ mod drive_change_tests_d229 {
             fstype: "ext4".into(),
             kind: "drive".into(),
             removable: false,
+            hotplug: false,
+            read_only: false,
             space,
         }
     }
