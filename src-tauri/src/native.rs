@@ -25540,7 +25540,9 @@ Broken: Either state is wrong.\n";
             .get_or_init(|| PathBuf::from(std::env::var_os("HOME").expect("HOME is set at suite start")))
             .clone();
         let (home, data, config, cache) =
-            (glib::home_dir(), glib::user_data_dir(), glib::user_config_dir(), glib::user_cache_dir());
+            // wayfinder_cache_dir() is the one place that reads the GLib cache dir;
+            // audit-25 allows only that call site in the source.
+            (glib::home_dir(), glib::user_data_dir(), glib::user_config_dir(), wayfinder_cache_dir());
         if first {
             return;
         }
