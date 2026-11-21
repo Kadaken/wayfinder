@@ -18066,6 +18066,9 @@ where
 /// finishing the close leaks a reference. A side popover still hanging off a button
 /// of a closing menu is unparented with it, since one left on a finalised button is
 /// leaked. GTK itself may keep the empty closed root shell alive.
+/// It also waits for GTK's own after-paint focus move (gtkwindow.c
+/// `maybe_unset_focus_and_default`): unparenting first left GTK searching for focus
+/// from a destroyed widget and aborted (D-368 zip test).
 fn unparent_when_closed(popover: &gtk::Popover) {
     fn side_popovers(widget: &gtk::Widget, out: &mut Vec<gtk::Popover>) {
         let mut child = widget.first_child();
@@ -18077,18 +18080,45 @@ fn unparent_when_closed(popover: &gtk::Popover) {
             }
         }
     }
+    fn unparent_now(popover: &gtk::Popover) {
+        if popover.is_mapped() {
+            return;
+        }
+        let mut sides = Vec::new();
+        side_popovers(popover.upcast_ref(), &mut sides);
+        for side in sides.iter().filter(|side| side.parent().is_some()) {
+            side.unparent();
+        }
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+    }
     popover.connect_unmap(|popover| {
         let popover = popover.clone();
-        glib::idle_add_local_once(move || {
-            let mut sides = Vec::new();
-            side_popovers(popover.upcast_ref(), &mut sides);
-            for side in sides.iter().filter(|side| side.parent().is_some()) {
-                side.unparent();
+        let clock = popover.frame_clock();
+        match clock {
+            Some(clock) => {
+                let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> =
+                    Rc::new(RefCell::new(None));
+                let slot = handler.clone();
+                let target = popover.clone();
+                let clock_for_handler = clock.clone();
+                let id = clock.connect_after_paint(move |_| {
+                    if let Some(id) = slot.borrow_mut().take() {
+                        clock_for_handler.disconnect(id);
+                    } else {
+                        return;
+                    }
+                    let target = target.clone();
+                    glib::idle_add_local_once(move || unparent_now(&target));
+                });
+                *handler.borrow_mut() = Some(id);
+                clock.request_phase(gdk::FrameClockPhase::AFTER_PAINT);
             }
-            if popover.parent().is_some() {
-                popover.unparent();
+            None => {
+                glib::idle_add_local_once(move || unparent_now(&popover));
             }
-        });
+        }
     });
 }
 
