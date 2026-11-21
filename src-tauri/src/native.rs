@@ -25205,10 +25205,18 @@ Broken: Either state is wrong.\n";
         d362_wait("GStreamer to refuse the raw file", 40, || plain.error().is_some() || plain.is_prepared());
         assert!(plain.error().is_some(), "GStreamer alone must fail on this file, or the test proves nothing");
         d362_show(&d, "clip.avi");
+        // The raw file is attached first and shows "media" before its error
+        // arrives, so wait for the stream whose file is the converted copy.
+        let converted_stream = || {
+            d.ui.preview_media_controls
+                .media_stream()
+                .and_then(|s| s.downcast::<gtk::MediaFile>().ok())
+                .filter(|m| m.file().and_then(|f| f.path()).is_some_and(|p| p.to_string_lossy().contains("/video-play/")))
+        };
         d362_wait("the converted video", 60, || {
-            d362_stack(&d) == "media" && d.ui.preview_media_picture.paintable().is_some()
+            d362_stack(&d) == "media" && d.ui.preview_media_picture.paintable().is_some() && converted_stream().is_some()
         });
-        let stream = d.ui.preview_media_controls.media_stream().expect("the controls hold the converted stream");
+        let stream = converted_stream().expect("the controls hold the converted stream");
         d362_wait("the converted stream to prepare", 40, || stream.is_prepared() || stream.error().is_some());
         assert!(stream.error().is_none(), "converted stream error: {:?}", stream.error());
         assert!(stream.is_prepared(), "the converted stream is prepared");
