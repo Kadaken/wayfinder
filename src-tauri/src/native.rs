@@ -214,6 +214,19 @@ button.wf-icon-button {
     margin: 0;
 }
 
+/* D-377: the sidebar toggle, a quarter of the old 26x24: 16x16 in all
+   (1px border + 1px padding + 12px icon). */
+button.wf-icon-button.wf-sidebar-corner {
+    min-height: 0;
+    min-width: 0;
+    padding: 1px;
+    border-radius: 3px;
+    font-size: 11px;
+}
+button.wf-sidebar-corner image {
+    -gtk-icon-size: 12px;
+}
+
 button.wf-icon-button:hover {
     background-color: @wf_control_hover;
     background-image: none;
@@ -354,7 +367,7 @@ entry.wf-search,
 
 .wf-sidebar {
     background: @wf_raised;
-    padding: 7px 7px;
+    padding: 24px 7px 7px 7px; /* D-377: room for the corner toggle above FAVORITES */
 }
 
 .wf-sidebar row {
@@ -5197,9 +5210,22 @@ fn build_ui_in(
         None => sidebar_toggle.set_label("\u{25E7}"),
     }
     sidebar_toggle.add_css_class("wf-icon-button");
-    size_toolbar_button(&sidebar_toggle);
-    command_bar.append(&sidebar_toggle);
-    command_bar.append(&command_divider());
+    if d377_old() {
+        size_toolbar_button(&sidebar_toggle);
+        command_bar.append(&sidebar_toggle);
+        command_bar.append(&command_divider());
+    } else {
+        // D-377 (21 Nov 2026): "I want it to be about a quarter of that size and
+        // relocated" to the top-left corner under the command bar, and "it should
+        // stay there". It is an overlay on the main split, so it is at the same
+        // spot open (above FAVORITES) or shut (left of the Name header).
+        sidebar_toggle.add_css_class("wf-sidebar-corner");
+        sidebar_toggle.set_size_request(16, 16);
+        sidebar_toggle.set_halign(gtk::Align::Start);
+        sidebar_toggle.set_valign(gtk::Align::Start);
+        sidebar_toggle.set_margin_top(3);
+        sidebar_toggle.set_margin_start(4);
+    }
     command_bar.append(&new_folder);
     command_bar.append(&new_file);
     command_bar.append(&command_divider());
@@ -5398,7 +5424,17 @@ fn build_ui_in(
     path_scroller.set_size_request(0, 0);
     body.append(&path_scroller);
     body.append(&command_bar);
-    body.append(&main);
+    if d377_old() {
+        body.append(&main);
+    } else {
+        // D-377: the toggle floats over the top-left corner of the main split.
+        let main_overlay = gtk::Overlay::new();
+        main_overlay.set_hexpand(true);
+        main_overlay.set_vexpand(true);
+        main_overlay.set_child(Some(&main));
+        main_overlay.add_overlay(&sidebar_toggle);
+        body.append(&main_overlay);
+    }
 
     #[cfg(feature = "picker-test-driver")]
     let mut picker_cancel_for_driver: Option<gtk::Button> = None;
@@ -6389,6 +6425,11 @@ fn pin_crumbs_right_d375(sw: &gtk::ScrolledWindow) {
     if let Some(child) = sw.child() {
         child.queue_allocate();
     }
+}
+
+/// Test-only gate: D-377 old placement (command bar, old size), to show the old behaviour failing.
+fn d377_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D377_OLD").is_some()
 }
 
 /// Test-only gate: D-375 pin off, to show the old behaviour failing.
@@ -26481,6 +26522,7 @@ Broken: Either state is wrong.\n";
         split_same_folder_move_into_subfolder_keeps_place_d343();
         compare_window_shows_both_files_d351();
         sidebar_button_not_divider_d352();
+        sidebar_corner_toggle_d377();
         split_wrapped_names_click_keeps_place_d358();
         refresh_keeps_scroll_place_d349();
         // D-336 real-drag and D-339 pointer tests: off until the Xvfb pointer reaches the window.
@@ -31895,6 +31937,125 @@ Broken: Either state is wrong.\n";
         assert!(ui.sidebar_scroll.is_visible(), "D-352: the button opens it again");
         assert_eq!(main.position(), SIDEBAR_FIXED_WIDTH, "D-352: it opens at its width");
         assert!(!load_config().sidebar_hidden, "D-352: open is remembered");
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-377 alone, on the private display.
+    #[test]
+    fn sidebar_corner_toggle_d377_alone() { gtk_thread::run(sidebar_corner_toggle_d377_alone_on_gtk_thread); }
+
+    fn sidebar_corner_toggle_d377_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D377_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        sidebar_corner_toggle_d377();
+    }
+
+    /// D-377 (21 Nov 2026): the sidebar toggle is a quarter of its old size, in the
+    /// top-left corner under the command bar, the same place open or shut, and
+    /// covers no text or icon. Fails with WF_TEST_D377_OLD=1 (old: command bar, 26px).
+    fn sidebar_corner_toggle_d377() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d377-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["alpha.txt", "beta.txt", "gamma.txt"] { std::fs::write(dir.join(n), n).unwrap(); }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d377test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (_state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1000, 640);
+        ui.window.present();
+        for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        let main = ui.sidebar_scroll.parent().and_then(|p| p.downcast::<gtk::Paned>().ok()).expect("sidebar sits in the main Paned");
+        let toggle = all_widgets(ui.window.upcast_ref()).into_iter().find(|w| w.widget_name() == "wf-sidebar-toggle")
+            .and_then(|w| w.downcast::<gtk::ToggleButton>().ok()).expect("sidebar button");
+        let window_w: gtk::Widget = ui.window.clone().upcast();
+        let bounds = |w: &gtk::Widget| w.compute_bounds(&window_w).expect("bounds");
+        let settle = || for _ in 0..20 { pump(); std::thread::sleep(Duration::from_millis(10)); };
+        let snap = |name: &str| {
+            let path = format!("/home/user/Projects/Scratch/d368-logs/{name}");
+            let result = (|| -> Option<()> {
+                let (w, h) = (ui.window.width(), ui.window.height());
+                let paintable = gtk::WidgetPaintable::new(Some(&window_w));
+                let snapshot = gtk::Snapshot::new();
+                paintable.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), w as f64, h as f64);
+                let node = snapshot.to_node()?;
+                let renderer = ui.window.native()?.renderer()?;
+                let texture = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, 400.0, 200.0)));
+                texture.save_to_png(&path).ok()
+            })();
+            eprintln!("wf-test D-377 snapshot {path} saved={}", result.is_some());
+        };
+        let check = |state: &str, area: gtk::Widget, want_images: bool| -> (f32, f32) {
+            let tb = bounds(toggle.upcast_ref());
+            let mb = bounds(main.upcast_ref());
+            let (dx, dy) = (tb.x() - mb.x(), tb.y() - mb.y());
+            eprintln!("wf-test D-377 {state} toggle={}x{} at ({},{}) main_origin=({},{}) offset=({dx},{dy})", toggle.width(), toggle.height(), tb.x(), tb.y(), mb.x(), mb.y());
+            assert!(toggle.width() <= 18 && toggle.height() <= 18, "D-377 {state}: the toggle is {}x{}, over 18x18", toggle.width(), toggle.height());
+            assert!((0.0..=8.0).contains(&dx) && (0.0..=8.0).contains(&dy), "D-377 {state}: the toggle is not in the top-left corner of the main area: offset=({dx},{dy})");
+            let mut hits = Vec::new();
+            for w in all_widgets(&area) {
+                if !w.is_mapped() || w.width() <= 0 || w.height() <= 0 { continue; }
+                let text = if let Some(l) = w.downcast_ref::<gtk::Label>() { l.text().to_string() }
+                    else if want_images && w.is::<gtk::Image>() { "<image>".to_string() }
+                    else { continue };
+                if text.is_empty() { continue; }
+                if let Some(b) = w.compute_bounds(&window_w) {
+                    if b.intersection(&tb).is_some() { hits.push((text, b.x(), b.y(), b.width(), b.height())); }
+                }
+            }
+            eprintln!("wf-test D-377 {state} overlaps={hits:?}");
+            assert!(hits.is_empty(), "D-377 {state}: the toggle covers {hits:?}");
+            (dx, dy)
+        };
+        // Not in the command bar.
+        let mut in_bar = false;
+        let mut p = toggle.parent();
+        while let Some(w) = p { if w.has_css_class("wf-commandbar") { in_bar = true; } p = w.parent(); }
+        eprintln!("wf-test D-377 in_command_bar={in_bar}");
+        assert!(!in_bar, "D-377: the toggle is still in the command bar");
+        // Open.
+        assert!(ui.sidebar_scroll.is_visible(), "D-377: the test starts with the sidebar open");
+        let open = check("open", ui.sidebar_scroll.clone().upcast(), false);
+        snap("d377-open.png");
+        // Shut: by the button.
+        toggle.set_active(false);
+        settle();
+        assert!(!ui.sidebar_scroll.is_visible(), "D-377: the button shuts the sidebar");
+        let files_area = main.end_child().expect("file list area");
+        let shut = check("shut", files_area, true);
+        snap("d377-shut.png");
+        assert_eq!(open, shut, "D-377: the toggle stays at the same place open and shut");
+        // Open again.
+        toggle.set_active(true);
+        settle();
+        assert!(ui.sidebar_scroll.is_visible(), "D-377: the button opens it again");
+        toggle.emit_clicked();
+        settle();
+        assert!(!ui.sidebar_scroll.is_visible(), "D-377: a click shuts it");
+        toggle.emit_clicked();
+        settle();
+        assert!(ui.sidebar_scroll.is_visible(), "D-377: a click opens it");
         ui.window.destroy();
         pump();
         match old_home {
