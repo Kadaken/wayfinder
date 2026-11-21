@@ -37,13 +37,12 @@ const DRAG_GHOST_OPACITY: f64 = 0.55;
 /// The ghost is one item's icon and name, never wider than this many pixels.
 const DRAG_GHOST_MAX_WIDTH: i32 = 240;
 const DRAG_GHOST_ICON: i32 = 20;
-const MAX_GRID_THUMBNAILS: usize = 60;
 /// D-267: Icons view is a picture grid, not a column of stamps. A tile's
 /// picture is this many points square at zoom 1.0; Ctrl+scroll scales it with
 /// `icon_zoom` (0.6x to 2.4x), so a tile runs from 90 to 360 points.
 const GRID_TILE_SIZE: f64 = 150.0;
 /// However far the zoom goes, no tile decodes a thumbnail larger than this —
-/// sixty of them are held at once, and a folder of 4K pictures would otherwise
+/// a screenful of them is held at once, and a folder of 4K pictures would otherwise
 /// cost hundreds of megabytes of texture.
 const MAX_GRID_THUMBNAIL_PIXELS: i32 = 384;
 // D-84: measured on a real ~1,214-image folder. 4 concurrent decodes bunch up
@@ -671,16 +670,18 @@ scrollbar slider:active {
     padding: 12px;
 }
 
-.wf-grid-child {
+/* D-368: the icon view is a GridView; its tiles are its `child` nodes. */
+.wf-grid > child {
     border-radius: 6px;
+    margin: 4px;
     color: @wf_text;
 }
 
-.wf-grid-child:hover {
+.wf-grid > child:hover {
     background: @wf_control_hover;
 }
 
-.wf-grid-child:selected {
+.wf-grid > child:selected {
     background: @wf_accent;
     color: #ffffff;
 }
@@ -951,11 +952,11 @@ popover contents {
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.34);
 }
 
-.wf-grid-child:hover {
+.wf-grid > child:hover {
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.32);
 }
 
-.wf-grid-child:selected {
+.wf-grid > child:selected {
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.40);
 }
 
@@ -2739,8 +2740,8 @@ struct ThumbnailQueue {
     pending: VecDeque<ThumbnailJob>,
     active: usize,
     /// D-260: the live row for each file that asked for a thumbnail, keyed by
-    /// its real path. Grid jobs are not registered here: Grid builds one
-    /// widget per file and never recycles a row.
+    /// its real path. Since D-368 the icon view registers here too: each
+    /// GridView tile queues on bind and cancels on unbind.
     row_tokens: HashMap<String, ThumbnailRow>,
 }
 
@@ -2962,7 +2963,7 @@ struct Ui {
     list_selection: gtk::MultiSelection,
     list_placeholder: gtk::Label,
     list_scroll: gtk::ScrolledWindow,
-    grid: gtk::FlowBox,
+    grid: gtk::GridView,
     preview_stack: gtk::Stack,
     /// D-268: the preview pane's folder listing -- one clickable row per child
     /// of the selected folder, so a folder is something you can look into
@@ -4885,16 +4886,19 @@ fn build_ui_in(
     // generates no typed setter for it, so set the property directly. It needs a
     // multi-selection model, which this list has.
     list.set_property("enable-rubberband", true);
-    let grid = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::Multiple)
-        .activate_on_single_click(false)
-        .homogeneous(true)
-        .min_children_per_line(1)
+    // D-368: the icon view is a GtkGridView over the SAME model and selection
+    // the list uses, so it realizes only the tiles on screen and every one of
+    // them can ask for a real thumbnail as it scrolls into view. (It was a
+    // GtkFlowBox that built a tile for every file and could decode only 60.)
+    let grid_factory = gtk::SignalListItemFactory::new();
+    let grid = gtk::GridView::builder()
+        .model(&list_selection)
+        .factory(&grid_factory)
+        .single_click_activate(false)
+        .min_columns(1)
         // D-267: tiles are picture-sized now; a wide window fits more than eight.
-        .max_children_per_line(16)
-        .row_spacing(8)
-        .column_spacing(8)
-        .valign(gtk::Align::Start)
+        .max_columns(16)
+        .enable_rubberband(true)
         .vexpand(true)
         .build();
     grid.set_size_request(-1, 0);
@@ -5261,7 +5265,6 @@ fn build_ui_in(
     watch_scroll_jumps(&grid_scroll, "grid");
     hold_list_at_edges(&files_scroll);
     hold_list_at_edges(&grid_scroll);
-    pointer_keeps_scroll_grid(&grid_scroll);
     let (column_header, columns) = details_header();
     let (quick_access, quick_access_tiles) = build_tile_strip("Quick access");
     let (recent_files_strip, recent_files_tiles) = build_tile_strip("Recent files");
@@ -5659,6 +5662,7 @@ fn build_ui_in(
         ZoomTarget::Preview,
     );
     connect_list_factory(&list_factory, &state, &ui);
+    connect_grid_factory(&grid_factory, &state, &ui);
     connect_background_context(&ui.list, state.clone(), ui.clone());
     connect_grid_background_context(&grid_scroll, state.clone(), ui.clone());
     connect_actions(
@@ -5790,26 +5794,8 @@ fn build_ui_in(
                 }
             }) as Rc<dyn Fn(native_core::EntrySource)>
         };
-        connect_gated_activate(&list, gate, sources, open);
+        connect_gated_activate(&list, &ui.grid, gate, sources, open);
     }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        let grid = ui.grid.clone();
-        grid.connect_selected_children_changed(move |_| update_selection(&state, &ui));
-    }
-    {
-        let state = state.clone();
-        let ui = ui.clone();
-        let grid = ui.grid.clone();
-        grid.connect_child_activated(move |_, child| {
-            if let Some(entry) = entry_for_grid_child(&state, child) {
-                let (state, ui) = (state.clone(), ui.clone());
-                defer_after_signal(move || open_entry(&state, &ui, entry));
-            }
-        });
-    }
-
     let initial = state.borrow().cwd.clone();
     navigate(&state, initial);
     let initial_view = state.borrow().view_mode;
@@ -6033,18 +6019,8 @@ fn reselect_sources(state: &Rc<RefCell<AppState>>, ui: &Ui, sources: &[native_co
         return;
     };
     select_index(state, ui, *first);
-    let view_mode = state.borrow().view_mode;
     for index in rest {
-        match view_mode {
-            ViewMode::Grid => {
-                if let Some(child) = ui.grid.child_at_index(*index as i32) {
-                    ui.grid.select_child(&child);
-                }
-            }
-            ViewMode::Details | ViewMode::Compact => {
-                ui.list_selection.select_item(*index as u32, false);
-            }
-        }
+        ui.list_selection.select_item(*index as u32, false);
     }
 }
 
@@ -9087,13 +9063,11 @@ fn set_view_mode(state: &Rc<RefCell<AppState>>, ui: &Ui, mode: ViewMode) {
     }
     match mode {
         ViewMode::Details => {
-            ui.grid.unselect_all();
             ui.list.remove_css_class("wf-list-compact");
             ui.column_header.set_visible(true);
             ui.files_stack.set_visible_child_name("list");
         }
         ViewMode::Compact => {
-            ui.grid.unselect_all();
             ui.list.add_css_class("wf-list-compact");
             ui.column_header.set_visible(true);
             ui.files_stack.set_visible_child_name("list");
@@ -9756,11 +9730,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::A || key == gdk::Key::a) {
-            if state_for_keys.borrow().view_mode == ViewMode::Grid {
-                ui_for_keys.grid.select_all();
-            } else {
-                ui_for_keys.list_selection.select_all();
-            }
+            ui_for_keys.list_selection.select_all();
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::C || key == gdk::Key::c) {
@@ -10159,10 +10129,8 @@ fn navigate_to_with_message(
 }
 
 fn clear_file_views(ui: &Ui) {
+    // One model feeds both views (D-368).
     ui.list_store.remove_all();
-    while let Some(child) = ui.grid.first_child() {
-        ui.grid.remove(&child);
-    }
 }
 
 fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::Location) {
@@ -10568,85 +10536,76 @@ fn hold_list_at_edges(scroller: &gtk::ScrolledWindow) {
 /// both axes off: for a fully shown cell GTK keeps its exact offset, which is
 /// the place the view already has. Focus follows the click as GTK intends,
 /// nothing moves, and keyboard moves keep GTK's own scroll-to-focus.
-fn pointer_keeps_scroll(list: &gtk::ListView) -> Rc<dyn Fn(&gtk::ListItem, Option<gtk::Widget>)> {
-    let list = list.downgrade();
+fn pointer_keeps_scroll(list: &impl IsA<gtk::ListBase>) -> Rc<dyn Fn(&gtk::ListItem, Option<gtk::Widget>)> {
+    let list = list.upcast_ref::<gtk::ListBase>().downgrade();
     Rc::new(move |item, row| {
         let Some(list) = list.upgrade() else { return };
         let pos = item.position();
-        let count = list.model().map(|m| m.n_items()).unwrap_or(0);
+        let model = if let Some(view) = list.dynamic_cast_ref::<gtk::ListView>() {
+            view.model()
+        } else {
+            list.dynamic_cast_ref::<gtk::GridView>().and_then(|view| view.model())
+        };
+        let count = model.map(|m| m.n_items()).unwrap_or(0);
         if pos == gtk::INVALID_LIST_POSITION || pos >= count {
             return;
         }
+        // GtkListBase has no scroll_to of its own; ListView and GridView each do.
+        let scroll_to = |position: u32, flags: gtk::ListScrollFlags, info: Option<gtk::ScrollInfo>| {
+            if let Some(view) = list.dynamic_cast_ref::<gtk::ListView>() {
+                view.scroll_to(position, flags, info);
+            } else if let Some(view) = list.dynamic_cast_ref::<gtk::GridView>() {
+                view.scroll_to(position, flags, info);
+            }
+        };
         let stay = || {
             let info = gtk::ScrollInfo::new();
             info.set_enable_vertical(false);
             info.set_enable_horizontal(false);
             info
         };
+        // The neighbour a cut row is anchored on. In a list it is the next or
+        // previous row; in the icon view that is a tile in the SAME cut row, so
+        // it is the tile one whole row of columns along instead.
+        let step = if list.is::<gtk::GridView>() {
+            let list_widget: &gtk::Widget = list.upcast_ref();
+            let mut tops: Vec<f32> = Vec::new();
+            let mut child = list_widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if widget.width() > 0 && widget.height() > 0 && widget.is_visible() {
+                    if let Some(b) = widget.compute_bounds(list_widget) {
+                        tops.push(b.y());
+                    }
+                }
+            }
+            let first = tops.iter().copied().reduce(f32::min);
+            let mine = row.as_ref().and_then(|r| r.compute_bounds(list_widget)).map(|b| b.y());
+            // A row's width in tiles: the realized tiles level with the clicked
+            // one or with the top-most realized row, whichever is more.
+            let level = |y: Option<f32>| y.map_or(0, |y| tops.iter().filter(|t| (**t - y).abs() < 1.0).count());
+            level(first).max(level(mine)).max(1) as u32
+        } else {
+            1
+        };
         // Which edge cuts the row, read before anything changes.
         let cut = row.as_ref().and_then(|r| r.compute_bounds(&list)).map(|b| {
             let (top, bottom) = (b.y(), b.y() + b.height());
             if top < 0.0 {
-                Some(pos + 1)
+                Some(pos + step)
             } else if bottom > list.height() as f32 {
-                pos.checked_sub(1)
+                pos.checked_sub(step)
             } else {
                 None
             }
         });
-        list.scroll_to(pos, gtk::ListScrollFlags::FOCUS, Some(stay()));
+        scroll_to(pos, gtk::ListScrollFlags::FOCUS, Some(stay()));
         if let Some(Some(keep)) = cut {
             if keep < count {
-                list.scroll_to(keep, gtk::ListScrollFlags::NONE, Some(stay()));
+                scroll_to(keep, gtk::ListScrollFlags::NONE, Some(stay()));
             }
         }
     })
-}
-
-/// D-364, the icon view. Its tiles sit in a GtkFlowBox inside the viewport the
-/// scrolled window adds, and that viewport scrolls whatever takes focus into
-/// view (gtkviewport.c focus_change_handler, called from the root's
-/// notify::focus-widget). A click selects on release, and the select grabs
-/// focus on the tile (gtkflowbox.c gtk_flow_box_update_cursor), so a tile cut
-/// by the bottom edge moved just as a list row did. The viewport's own
-/// `scroll-to-focus` switch is the GTK-provided control: it is off from a
-/// press until its release has been handled, and on the rest of the time, so
-/// keyboard moves still scroll to the focused tile.
-fn pointer_keeps_scroll_grid(scroller: &gtk::ScrolledWindow) {
-    let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() else { return };
-    let listener = gtk::EventControllerLegacy::new();
-    listener.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let viewport = viewport.downgrade();
-        listener.connect_event(move |_, event| {
-            let Some(viewport) = viewport.upgrade() else { return glib::Propagation::Proceed };
-            match event.event_type() {
-                gdk::EventType::ButtonPress => viewport.set_scroll_to_focus(false),
-                // The tile is selected and focused by the release; the switch
-                // comes back after it has been handled.
-                gdk::EventType::ButtonRelease | gdk::EventType::KeyPress => {
-                    let viewport = viewport.clone();
-                    if event.event_type() == gdk::EventType::KeyPress {
-                        viewport.set_scroll_to_focus(true);
-                    } else {
-                        glib::idle_add_local_once(move || viewport.set_scroll_to_focus(true));
-                    }
-                }
-                // A lost release (a drag takes the pointer): moving with no
-                // button down is proof the press is over.
-                gdk::EventType::MotionNotify
-                    if !event.modifier_state().intersects(
-                        gdk::ModifierType::BUTTON1_MASK | gdk::ModifierType::BUTTON2_MASK | gdk::ModifierType::BUTTON3_MASK,
-                    ) =>
-                {
-                    viewport.set_scroll_to_focus(true)
-                }
-                _ => {}
-            }
-            glib::Propagation::Proceed
-        });
-    }
-    scroller.add_controller(listener);
 }
 
 /// D-349: his own wheel, click or key, or a deliberate scroll by Wayfinder.
@@ -10834,34 +10793,20 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
 
 /// Re-selects every surviving path after a structural rebuild.
 fn restore_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, sources: &[native_core::EntrySource]) {
-    let (view_mode, indices): (ViewMode, Vec<usize>) = {
+    let indices: Vec<usize> = {
         let state = state.borrow();
-        (
-            state.view_mode,
-            sources
-                .iter()
-                .filter_map(|source| state.visible_entries.iter().position(|e| &e.source == source))
-                .collect(),
-        )
+        sources
+            .iter()
+            .filter_map(|source| state.visible_entries.iter().position(|e| &e.source == source))
+            .collect()
     };
     if indices.is_empty() {
         return;
     }
-    match view_mode {
-        ViewMode::Grid => {
-            ui.grid.unselect_all();
-            for index in indices {
-                if let Some(child) = ui.grid.child_at_index(index as i32) {
-                    ui.grid.select_child(&child);
-                }
-            }
-        }
-        ViewMode::Details | ViewMode::Compact => {
-            ui.list_selection.unselect_all();
-            for index in indices {
-                ui.list_selection.select_item(index as u32, false);
-            }
-        }
+    // D-368: one selection model serves both views.
+    ui.list_selection.unselect_all();
+    for index in indices {
+        ui.list_selection.select_item(index as u32, false);
     }
 }
 
@@ -11027,12 +10972,6 @@ fn set_breadcrumbs(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::L
 /// Re-binds one row (after an inline edit starts or is cancelled) and keeps it
 /// selected; a ListStore change on a position drops that row's selection.
 fn refresh_row(state: &Rc<RefCell<AppState>>, ui: &Ui, source: &native_core::EntrySource) {
-    if state.borrow().view_mode == ViewMode::Grid {
-        // Grid has no row model: rebuild its children and re-select the item.
-        repopulate_rows(state, ui);
-        select_entry_by_source(state, ui, source);
-        return;
-    }
     let Some(entry) = state.borrow().visible_entries.iter().find(|e| &e.source == source).cloned() else {
         return;
     };
@@ -11743,6 +11682,218 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
     });
 }
 
+/// D-368: the icon view's tiles. GridView realizes only the tiles on screen
+/// and recycles them, exactly like the list's rows, so `bind` is the one place
+/// a tile asks for its thumbnail or video poster and `unbind` is where it
+/// stops asking. Every image and video in a folder of any size therefore gets
+/// a real picture as it scrolls into view (the FlowBox built every tile at
+/// once and could afford only the first 60).
+fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let state = state.clone();
+    let state_for_unbind = state.clone();
+    let ui = ui.clone();
+    // D-364: the same capture-phase press the list rows use.
+    let pointer_tile = pointer_keeps_scroll(&ui.grid);
+    factory.connect_bind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(boxed) = item.item().and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok()) else {
+            return;
+        };
+        let entry: Entry = boxed.borrow::<Entry>().clone();
+        let (icon_zoom, thumbnail_queue, video_poster_queue, pinned) = {
+            let st = state.borrow();
+            (
+                st.icon_zoom,
+                st.thumbnail_queue.clone(),
+                st.video_poster_queue.clone(),
+                entry_is_pinned(&entry, &st.pins),
+            )
+        };
+        let entry_display_path = entry.source.display_string();
+        let tooltip = entry.metadata_error.as_ref().map_or_else(
+            || entry_display_path.clone(),
+            |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
+        );
+        let grid_item = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        grid_item.add_css_class("wf-grid-item");
+        grid_item.set_halign(gtk::Align::Center);
+        grid_item.set_valign(gtk::Align::Start);
+        grid_item.set_tooltip_text(Some(&tooltip));
+        #[cfg(feature = "guide")]
+        if guide_is_open_file_fixture(&entry) {
+            guide_name(&grid_item, GUIDE_OPEN_FILE);
+        }
+        #[cfg(feature = "guide")]
+        if guide_is_zip_archive_row(&entry) {
+            guide_name(&grid_item, GUIDE_ZIP_ROW);
+        }
+
+        // D-368: every visible image or video tile wants its picture; only the
+        // tiles GTK has realized ever get here.
+        let wants_thumbnail = thumbnail_queue.is_some() || video_poster_queue.is_some();
+        let (icon, thumbnail) = grid_file_icon(&entry, icon_zoom, wants_thumbnail);
+        let tile_px = grid_tile_px(icon_zoom);
+        // D-267: `max_width_chars` only caps a label that can be broken, and the
+        // default WORD wrap cannot break `Gemini_Generated_Image_2kwp542kwp542kwp`,
+        // so such a name asked for its full 337px and every column grew to it --
+        // one tile per row. WORD_CHAR lets the name break mid-word, and the
+        // explicit size request pins the tile to the picture's width whatever
+        // the name is.
+        let name = gtk::Label::builder()
+            .label(&entry.name)
+            .xalign(0.5)
+            .justify(gtk::Justification::Center)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(8)
+            .width_chars(8)
+            .lines(2)
+            .wrap(true)
+            .build();
+        name.add_css_class("wf-grid-name");
+        name.set_attributes(Some(&name_zoom_attrs(icon_zoom)));
+        name.set_lines(((2.0 * name_text_scale(icon_zoom)).ceil() as i32).clamp(2, 4));
+        name.set_size_request(tile_px, -1);
+        grid_item.set_size_request(tile_px, -1);
+        if pinned {
+            let overlay = gtk::Overlay::new();
+            overlay.set_halign(gtk::Align::Center);
+            overlay.set_child(Some(&icon));
+            let badge = pin_badge();
+            badge.set_halign(gtk::Align::Start);
+            badge.set_valign(gtk::Align::Start);
+            overlay.add_overlay(&badge);
+            grid_item.append(&overlay);
+        } else {
+            grid_item.append(&icon);
+        }
+        let editing = state
+            .borrow()
+            .inline_rename
+            .as_ref()
+            .filter(|edit| Some(&edit.path) == entry.source.real_path_string().as_ref())
+            .cloned();
+        match editing {
+            Some(edit) => {
+                let field = build_inline_editor(&state, &ui, &entry, &edit);
+                field.set_width_chars(12);
+                field.set_max_width_chars(12);
+                field.set_hexpand(false);
+                grid_item.append(&field);
+            }
+            None => grid_item.append(&name),
+        }
+
+        {
+            // Records which file each press hit, for the double-click gate (the
+            // list rows do the same), and keeps the view where it is (D-364).
+            let press = gtk::GestureClick::new();
+            press.set_button(1);
+            press.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let gate = state.borrow().activation_gate.clone();
+            let source = entry.source.clone();
+            let (pointer_tile, item_weak) = (pointer_tile.clone(), item.downgrade());
+            press.connect_pressed(move |g, _, _, _| {
+                if let Some(item) = item_weak.upgrade() {
+                    pointer_tile(&item, g.widget().and_then(|w| w.parent()));
+                }
+                let plain = !g.current_event_state().intersects(
+                    gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK,
+                );
+                gate.borrow_mut().press(&source, std::time::Instant::now(), plain);
+            });
+            grid_item.add_controller(press);
+        }
+        connect_file_drag(&grid_item, state.clone(), ui.clone(), &entry.source, None);
+        // D-188: a ZIP directory row has no real path to drop onto; skip the
+        // drop controller entirely rather than converting one (REJECT 1).
+        if let Some(path) = entry.is_dir.then(|| entry.source.real_path()).flatten() {
+            connect_file_drop_to_dir(&grid_item, state.clone(), ui.clone(), path.to_path_buf());
+        }
+        // The tile is built; only now does it ask for its picture, so a job is
+        // never queued for a tile that failed to build.
+        if let (Some(picture), Some(real_path)) = (thumbnail, entry.source.real_path_string()) {
+            if native_core::is_video_path(&real_path) {
+                if let Some(queue) = &video_poster_queue {
+                    queue_grid_video_poster(queue, real_path, picture);
+                }
+            } else if let Some(queue) = &thumbnail_queue {
+                let px = (grid_tile_px(icon_zoom) * 2).min(MAX_GRID_THUMBNAIL_PIXELS);
+                queue_list_thumbnail(
+                    queue,
+                    real_path,
+                    picture,
+                    native_core::ListThumbnailMetrics { display: grid_tile_px(icon_zoom), decode: px },
+                );
+            }
+        }
+        item.set_child(Some(&grid_item));
+    });
+    factory.connect_unbind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        // D-368: this tile is leaving the screen. Drop its queued thumbnail or
+        // poster, mark a decode already running dead. Unbind runs inside widget
+        // teardown, so it never insists on the state borrow (D-237).
+        if let (Some(path), Some(tile)) = (
+            item.item()
+                .and_then(|i| i.downcast::<glib::BoxedAnyObject>().ok())
+                .and_then(|b| b.borrow::<Entry>().source.real_path_string()),
+            item.child(),
+        ) {
+            if let Some(picture) = find_row_thumbnail(&tile) {
+                let (thumbs, posters) = state_for_unbind
+                    .try_borrow()
+                    .map(|st| (st.thumbnail_queue.clone(), st.video_poster_queue.clone()))
+                    .unwrap_or((None, None));
+                if let Some(queue) = thumbs {
+                    cancel_list_thumbnail(&queue, &path, &picture);
+                }
+                if let Some(queue) = posters {
+                    cancel_grid_video_poster(&queue, &picture);
+                }
+            }
+        }
+        #[cfg(feature = "guide")]
+        if guide_waits_for_open_file(&state_for_unbind)
+            && item.child().is_some_and(|c| c.widget_name() == GUIDE_OPEN_FILE)
+        {
+            guide_unpaint(&state_for_unbind);
+            guide_resolve_open_file_later(&state_for_unbind);
+        }
+        #[cfg(feature = "guide")]
+        if guide_waits_for_zip_row(&state_for_unbind)
+            && item.child().is_some_and(|c| c.widget_name() == GUIDE_ZIP_ROW)
+        {
+            guide_unpaint(&state_for_unbind);
+            guide_resolve_zip_row_later(&state_for_unbind);
+        }
+        item.set_child(None::<&gtk::Widget>);
+    });
+}
+
+/// D-368: queue one tile's video poster. The queue is the folder's own; a tile
+/// that scrolls away takes its pending job back out (`cancel_grid_video_poster`).
+fn queue_grid_video_poster(queue: &Rc<RefCell<VideoPosterQueue>>, path: String, picture: gtk::Picture) {
+    queue.borrow_mut().pending.push_back(VideoPosterJob { path, picture });
+    start_video_poster_jobs(queue.clone());
+}
+
+/// D-368: a tile that left the screen. Its poster job is dropped if still
+/// waiting; one already decoding finishes into a picture nobody shows.
+fn cancel_grid_video_poster(queue: &Rc<RefCell<VideoPosterQueue>>, picture: &gtk::Picture) {
+    if let Ok(mut queue_ref) = queue.try_borrow_mut() {
+        queue_ref.pending.retain(|job| job.picture != *picture);
+    }
+}
+
 /// Indices of the selected rows, in order.
 fn selected_indices(ui: &Ui) -> Vec<usize> {
     let bitset = ui.list_selection.selection();
@@ -11838,13 +11989,10 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let focus_was_in_files = focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid);
     // The model is NOT emptied here. Emptying it collapsed the list to nothing,
     // which clamped the scroll offset and made the view jump (D-226); the
-    // details path below replaces its contents in one splice instead, and the
-    // grid path, which has no model rows, clears it there.
-    while let Some(child) = ui.grid.first_child() {
-        ui.grid.remove(&child);
-    }
+    // splice below replaces its contents in one change instead. The icon view
+    // reads the same model (D-368).
 
-    let (entries, filter_text, sort_key, sort_ascending, view_mode, icon_zoom, details_thumbnails) = {
+    let (entries, filter_text, sort_key, sort_ascending, view_mode, details_thumbnails) = {
         let state = state.borrow();
         (
             state.entries.clone(),
@@ -11852,7 +12000,6 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             state.sort_key,
             state.sort_ascending,
             state.view_mode,
-            state.icon_zoom,
             state.details_thumbnails,
         )
     };
@@ -11878,6 +12025,8 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // on is selected (see navigation), not moved: it sits where the chosen sort
     // and the folder placement put it, like every other file.
     let diff = std::mem::take(&mut state.borrow_mut().diff_refresh)
+        // D-368: the icon view takes the full replace: its video poster queue
+        // is rebuilt on every refresh, so every tile must rebind to ask again.
         && view_mode != ViewMode::Grid
         // Test-only: proves the place tests catch the old full replace.
         && !(cfg!(test) && std::env::var_os("WF_TEST_FULL_SPLICE").is_some());
@@ -11893,7 +12042,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         rebind.extend(old);
     }
 
-    let (thumbnail_queue, video_poster_queue) = {
+    {
         let mut state_ref = state.borrow_mut();
         // D-347: a same-folder refresh keeps the queue, because the rows it
         // is decoding for stay on screen and are not bound again.
@@ -11913,35 +12062,28 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         // D-260: one queue serves both views. Grid always wants it; a list
         // view wants it only while the setting is on. Turning the setting off
         // takes this same branch, cancels the old queue and leaves none.
-        let thumbs = (view_mode == ViewMode::Grid || details_thumbnails).then(|| {
-            if let Some(kept) = state_ref.thumbnail_queue.clone() {
-                return kept;
-            }
+        if view_mode == ViewMode::Grid || details_thumbnails {
+            if state_ref.thumbnail_queue.is_none() {
             let queue = Rc::new(RefCell::new(ThumbnailQueue {
                 cancelled: gio::Cancellable::new(),
                 pending: VecDeque::new(),
                 active: 0,
                 row_tokens: HashMap::new(),
             }));
-            state_ref.thumbnail_queue = Some(queue.clone());
-            queue
-        });
-        let posters = (view_mode == ViewMode::Grid).then(|| {
+            state_ref.thumbnail_queue = Some(queue);
+            }
+        }
+        if view_mode == ViewMode::Grid {
+            // The tiles read these two queues when GTK binds them (D-368).
             let queue = Rc::new(RefCell::new(VideoPosterQueue {
                 cancelled: gio::Cancellable::new(),
                 pending: VecDeque::new(),
                 active: 0,
                 live: Vec::new(),
             }));
-            state_ref.video_poster_queue = Some(queue.clone());
-            queue
-        });
-        (thumbs, posters)
-    };
-    // D-267: the tile is square and large, so the thumbnail it holds is decoded
-    // at twice the tile, capped, rather than at the old 116x96 stamp.
-    let grid_thumbnail_px = (grid_tile_px(icon_zoom) * 2).min(MAX_GRID_THUMBNAIL_PIXELS);
-    let thumbnail_size = (grid_thumbnail_px, grid_thumbnail_px);
+            state_ref.video_poster_queue = Some(queue);
+        }
+    }
 
     ui.list_placeholder.set_label(if !filter_text.is_empty() {
         "No items match your search"
@@ -11953,7 +12095,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     // realize only what is on screen. This is O(1) in row count — the 21,436-row
     // folder costs the same here as a 10-row one.
     ui.list_placeholder.set_visible(visible_entries.is_empty());
-    if view_mode != ViewMode::Grid {
+    {
         let items: Vec<glib::BoxedAnyObject> = visible_entries
             .iter()
             .cloned()
@@ -11963,11 +12105,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             update_list_model(&ui.list_store, &visible_entries, &rebind);
         } else {
             // One splice: the old rows out and the new rows in, in a single
-            // change, so the list is never momentarily empty (D-226).
+            // change, so the view is never momentarily empty (D-226).
             ui.list_store.splice(0, ui.list_store.n_items(), &items);
         }
-    } else {
-        ui.list_store.remove_all();
     }
     if view_mode == ViewMode::Grid {
         keep_focus_on_empty_view(&ui.grid, focus_was_in_files, visible_entries.is_empty());
@@ -11975,128 +12115,6 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         keep_focus_on_empty_view(&ui.list, focus_was_in_files, visible_entries.is_empty());
     }
 
-    // Only Grid still builds a widget per item; Details/Compact are served by the
-    // virtualized ListView above and must not walk the whole listing here.
-    // NOTE: Grid remains un-virtualized, so a huge folder is still slow in Icons view.
-    if view_mode != ViewMode::Grid {
-        apply_pending_reveal(state, ui);
-        return;
-    }
-
-    let pins_for_tiles = state.borrow().pins.clone();
-    for (index, entry) in visible_entries.into_iter().enumerate() {
-        let entry_display_path = entry.source.display_string();
-        let tooltip = entry.metadata_error.as_ref().map_or_else(
-            || entry_display_path.clone(),
-            |error| format!("{entry_display_path}\nMetadata unavailable: {error}"),
-        );
-
-        if view_mode == ViewMode::Grid {
-            let grid_child = gtk::FlowBoxChild::builder().tooltip_text(&tooltip).build();
-            grid_child.add_css_class("wf-grid-child");
-            #[cfg(feature = "guide")]
-            if guide_is_open_file_fixture(&entry) {
-                guide_name(&grid_child, GUIDE_OPEN_FILE);
-            }
-            #[cfg(feature = "guide")]
-            if guide_is_zip_archive_row(&entry) {
-                guide_name(&grid_child, GUIDE_ZIP_ROW);
-            }
-            let grid_item = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            grid_item.add_css_class("wf-grid-item");
-            grid_item.set_halign(gtk::Align::Center);
-            grid_item.set_valign(gtk::Align::Start);
-
-            let wants_thumbnail = thumbnail_queue.is_some() && index < MAX_GRID_THUMBNAILS;
-            let (icon, thumbnail) = grid_file_icon(&entry, icon_zoom, wants_thumbnail);
-            let tile_px = grid_tile_px(icon_zoom);
-            // D-267: `max_width_chars` only caps a label that can be broken, and the
-            // default WORD wrap cannot break `Gemini_Generated_Image_2kwp542kwp542kwp`,
-            // so such a name asked for its full 337px and `homogeneous(true)` handed
-            // that width to every column -- one tile per row. WORD_CHAR lets the name
-            // break mid-word, and the explicit size request pins the tile to the
-            // picture's width whatever the name is.
-            let name = gtk::Label::builder()
-                .label(&entry.name)
-                .xalign(0.5)
-                .justify(gtk::Justification::Center)
-                .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .max_width_chars(8)
-                .width_chars(8)
-                .lines(2)
-                .wrap(true)
-                .build();
-            name.add_css_class("wf-grid-name");
-            name.set_attributes(Some(&name_zoom_attrs(icon_zoom)));
-            name.set_lines(((2.0 * name_text_scale(icon_zoom)).ceil() as i32).clamp(2, 4));
-            name.set_size_request(tile_px, -1);
-            grid_item.set_size_request(tile_px, -1);
-            if entry_is_pinned(&entry, &pins_for_tiles) {
-                let overlay = gtk::Overlay::new();
-                overlay.set_halign(gtk::Align::Center);
-                overlay.set_child(Some(&icon));
-                let badge = pin_badge();
-                badge.set_halign(gtk::Align::Start);
-                badge.set_valign(gtk::Align::Start);
-                overlay.add_overlay(&badge);
-                grid_item.append(&overlay);
-            } else {
-                grid_item.append(&icon);
-            }
-            let editing = state
-                .borrow()
-                .inline_rename
-                .as_ref()
-                .filter(|edit| Some(&edit.path) == entry.source.real_path_string().as_ref())
-                .cloned();
-            match editing {
-                Some(edit) => {
-                    let field = build_inline_editor(state, ui, &entry, &edit);
-                    field.set_width_chars(12);
-                    field.set_max_width_chars(12);
-                    field.set_hexpand(false);
-                    grid_item.append(&field);
-                }
-                None => grid_item.append(&name),
-            }
-            grid_child.set_child(Some(&grid_item));
-            connect_file_drag(&grid_child, state.clone(), ui.clone(), &entry.source, None);
-            // D-188: a ZIP directory row has no real path to drop onto; skip the
-            // drop controller entirely rather than converting one (REJECT 1).
-            if let Some(path) = entry.is_dir.then(|| entry.source.real_path()).flatten() {
-                connect_file_drop_to_dir(&grid_child, state.clone(), ui.clone(), path.to_path_buf());
-            }
-            ui.grid.append(&grid_child);
-            if let (Some(picture), Some(real_path)) = (thumbnail, entry.source.real_path_string()) {
-                if native_core::is_video_path(&real_path) {
-                    if let Some(queue) = &video_poster_queue {
-                        queue.borrow_mut().pending.push_back(VideoPosterJob {
-                            path: real_path,
-                            picture,
-                        });
-                    }
-                } else if let Some(queue) = &thumbnail_queue {
-                    queue.borrow_mut().pending.push_back(ThumbnailJob {
-                        path: real_path,
-                        picture,
-                        width: thumbnail_size.0,
-                        height: thumbnail_size.1,
-                        // Grid never recycles a row, so its jobs are never
-                        // cancelled individually; the folder's own cancel ends
-                        // them.
-                        alive: Rc::new(Cell::new(true)),
-                    });
-                }
-            }
-        }
-    }
-    if let Some(queue) = thumbnail_queue {
-        start_thumbnail_jobs(queue);
-    }
-    if let Some(queue) = video_poster_queue {
-        start_video_poster_jobs(queue);
-    }
     apply_pending_reveal(state, ui);
 }
 
@@ -12110,61 +12128,25 @@ fn apply_pending_reveal(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let Some(index) = index else {
         return;
     };
-    let view_mode = state.borrow().view_mode;
-    match view_mode {
-        ViewMode::Grid => {
-            ui.grid.unselect_all();
-            if let Some(child) = ui.grid.child_at_index(index as i32) {
-                ui.grid.select_child(&child);
-                // D-91 follow-up: FlowBox has no scroll_to like ListView; selecting
-                // a child does not move the view. Compute the child's position
-                // against its ScrolledWindow ancestor and nudge the adjustment only
-                // far enough to bring it fully into the viewport. A later inline
-                // editor (creation's own reveal) still wins focus once it opens,
-                // so grabbing focus here never fights that case.
-                child.grab_focus();
-                // The freshly-built grid children have not been allocated a
-                // position yet this frame; compute_bounds would read zeros.
-                // One frame later (matches this file's own next-frame convention,
-                // e.g. the post-rename scroll restore above) their real geometry
-                // is in place.
-                let child_for_scroll = child.clone();
-                glib::timeout_add_local_once(Duration::from_millis(16), move || {
-                    let Some(scroller) = child_for_scroll
-                        .ancestor(gtk::ScrolledWindow::static_type())
-                        .and_then(|w| w.downcast::<gtk::ScrolledWindow>().ok())
-                    else {
-                        return;
-                    };
-                    let widget: gtk::Widget = child_for_scroll.clone().upcast();
-                    if let Some(bounds) = widget.compute_bounds(&scroller) {
-                        let adj = scroller.vadjustment();
-                        mark_scroll_cause("grid scroll to selection");
-                        let top = adj.value() + f64::from(bounds.y());
-                        let bottom = top + f64::from(bounds.height());
-                        let page = adj.page_size();
-                        if top < adj.value() {
-                            adj.set_value(top);
-                        } else if bottom > adj.value() + page {
-                            adj.set_value(bottom - page);
-                        }
-                    }
-                });
-            }
-        }
-        ViewMode::Details | ViewMode::Compact => {
-            ui.list_selection.select_item(index as u32, true);
-            // D-334: after a rename the row takes keyboard focus, so arrows and
-            // F2 work at once; creation leaves focus to its inline editor.
-            let flags = if state.borrow().reveal_focus { gtk::ListScrollFlags::FOCUS } else { gtk::ListScrollFlags::NONE };
-            mark_scroll_cause("reveal a renamed/new item");
-            ui.list.scroll_to(index as u32, flags, None);
-            // scroll_to(FOCUS) only lands when the row widget already exists;
-            // right after a reload it may not, so put focus on the list itself,
-            // which hands it to its focus row (the one just selected).
-            if state.borrow().reveal_focus && !focus_within(&ui.window, &ui.list) {
-                ui.list.grab_focus();
-            }
+    // D-368: one model and one selection serve both views, so the reveal is
+    // the same call in either; only the widget that scrolls differs.
+    ui.list_selection.select_item(index as u32, true);
+    // D-334: after a rename the row takes keyboard focus, so arrows and
+    // F2 work at once; creation leaves focus to its inline editor.
+    let flags = if state.borrow().reveal_focus { gtk::ListScrollFlags::FOCUS } else { gtk::ListScrollFlags::NONE };
+    mark_scroll_cause("reveal a renamed/new item");
+    scroll_files_to(state, ui, index as u32, flags);
+    // scroll_to(FOCUS) only lands when the item widget already exists;
+    // right after a reload it may not, so put focus on the view itself,
+    // which hands it to its focus item (the one just selected).
+    if state.borrow().reveal_focus {
+        let view: gtk::Widget = if state.borrow().view_mode == ViewMode::Grid {
+            ui.grid.clone().upcast()
+        } else {
+            ui.list.clone().upcast()
+        };
+        if !focus_within(&ui.window, &view) {
+            view.grab_focus();
         }
     }
     state.borrow_mut().reveal_focus = false;
@@ -12196,9 +12178,7 @@ fn hold_new_item_on_screen(state: &Rc<RefCell<AppState>>, ui: &Ui, source: nativ
         let mut ix = ((adj.value() - adj.lower()) / span * n as f64).ceil() as usize;
         if st.view_mode == ViewMode::Grid {
             // Icon view: keep the new item at the start of a row of icons.
-            let per_row = ui.grid.max_children_per_line().max(1) as usize;
-            let cols = (0..n).take_while(|i| ui.grid.child_at_index(*i as i32).and_then(|c| c.compute_bounds(&ui.grid)).map(|b| b.y() < 1.0).unwrap_or(false)).count().clamp(1, per_row);
-            ix = ix.div_ceil(cols) * cols;
+            ix = ix.div_ceil(grid_columns(ui)) * grid_columns(ui);
         }
         ix.min(n)
     };
@@ -12579,6 +12559,7 @@ fn grid_file_icon(
         placeholder.set_valign(gtk::Align::Center);
         overlay.set_child(Some(&placeholder));
         let thumb = gtk::Picture::new();
+        thumb.set_widget_name("wf-row-thumbnail");
         thumb.set_can_shrink(true);
         thumb.set_content_fit(gtk::ContentFit::Cover);
         thumb.set_size_request(slot_w, slot_h);
@@ -13280,24 +13261,12 @@ fn old_wayfinder_icon_path_inner(name: &str) -> Option<PathBuf> {
 }
 
 fn selected_entries(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<Entry> {
+    // D-368: both views share one selection model, so this is one read.
     let state = state.borrow();
-    match state.view_mode {
-        ViewMode::Grid => ui
-            .grid
-            .selected_children()
-            .into_iter()
-            .filter_map(|child| {
-                let idx = child.index();
-                (idx >= 0)
-                    .then_some(idx as usize)
-                    .and_then(|idx| state.visible_entries.get(idx).cloned())
-            })
-            .collect(),
-        ViewMode::Details | ViewMode::Compact => selected_indices(ui)
-            .into_iter()
-            .filter_map(|idx| state.visible_entries.get(idx).cloned())
-            .collect(),
-    }
+    selected_indices(ui)
+        .into_iter()
+        .filter_map(|idx| state.visible_entries.get(idx).cloned())
+        .collect()
 }
 
 fn selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> {
@@ -13344,14 +13313,6 @@ fn picker_selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> 
     paths
 }
 
-
-fn entry_for_grid_child(state: &Rc<RefCell<AppState>>, child: &gtk::FlowBoxChild) -> Option<Entry> {
-    let idx = child.index();
-    if idx < 0 {
-        return None;
-    }
-    state.borrow().visible_entries.get(idx as usize).cloned()
-}
 
 fn update_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let entries = selected_entries(state, ui);
@@ -13649,25 +13610,11 @@ fn open_selected(state: &Rc<RefCell<AppState>>, ui: &Ui) {
 }
 
 fn move_selection(state: &Rc<RefCell<AppState>>, ui: &Ui, delta: isize) {
-    let (mode, len) = {
-        let state = state.borrow();
-        (state.view_mode, state.visible_entries.len())
-    };
+    let len = state.borrow().visible_entries.len();
     if len == 0 {
         return;
     }
-    let current = match mode {
-        ViewMode::Grid => ui
-            .grid
-            .selected_children()
-            .first()
-            .map(|child| child.index())
-            .unwrap_or(-1),
-        ViewMode::Details | ViewMode::Compact => selected_indices(ui)
-            .first()
-            .map(|idx| *idx as i32)
-            .unwrap_or(-1),
-    };
+    let current = selected_indices(ui).first().map(|idx| *idx as i32).unwrap_or(-1);
     let next = if current < 0 {
         0
     } else {
@@ -13700,60 +13647,57 @@ fn typeahead_select(state: &Rc<RefCell<AppState>>, ui: &Ui, ch: char) {
 /// Selects exactly the visible rows that are not selected now, in the active
 /// presentation, without rebuilding the listing.
 fn invert_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let (view_mode, count) = {
-        let state = state.borrow();
-        (state.view_mode, state.visible_entries.len())
-    };
-    match view_mode {
-        ViewMode::Grid => {
-            for index in 0..count {
-                if let Some(child) = ui.grid.child_at_index(index as i32) {
-                    if child.is_selected() {
-                        ui.grid.unselect_child(&child);
-                    } else {
-                        ui.grid.select_child(&child);
-                    }
-                }
+    let count = state.borrow().visible_entries.len();
+    let count = (count as u32).min(ui.list_selection.n_items());
+    let complement = gtk::Bitset::new_range(0, count);
+    complement.subtract(&ui.list_selection.selection());
+    ui.list_selection.set_selection(&complement, &gtk::Bitset::new_range(0, count));
+    update_selection(state, ui);
+}
+
+/// D-368: scrolls whichever view is showing. ListView and GridView each have
+/// their own `scroll_to` (GtkListBase has none), so the choice lives here once.
+fn scroll_files_to(state: &Rc<RefCell<AppState>>, ui: &Ui, position: u32, flags: gtk::ListScrollFlags) {
+    if state.borrow().view_mode == ViewMode::Grid {
+        ui.grid.scroll_to(position, flags, None);
+    } else {
+        ui.list.scroll_to(position, flags, None);
+    }
+}
+
+/// D-368: how many tiles sit in one row of the icon view right now: the tiles
+/// GTK has realized that share the top-most realized row's height. A GridView
+/// does not report its column count, and a realized row is always a full row
+/// unless it is the only one.
+fn grid_columns(ui: &Ui) -> usize {
+    let max = ui.grid.max_columns().max(1) as usize;
+    let mut tops: Vec<f32> = Vec::new();
+    let mut child = ui.grid.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.width() > 0 && widget.height() > 0 && widget.is_visible() {
+            if let Some(b) = widget.compute_bounds(&ui.grid) {
+                tops.push(b.y());
             }
         }
-        ViewMode::Details | ViewMode::Compact => {
-            let count = (count as u32).min(ui.list_selection.n_items());
-            let complement = gtk::Bitset::new_range(0, count);
-            complement.subtract(&ui.list_selection.selection());
-            ui.list_selection.set_selection(&complement, &gtk::Bitset::new_range(0, count));
-        }
     }
-    update_selection(state, ui);
+    let Some(first) = tops.iter().copied().reduce(f32::min) else { return 1 };
+    tops.iter().filter(|y| (**y - first).abs() < 1.0).count().clamp(1, max)
 }
 
 fn select_index(state: &Rc<RefCell<AppState>>, ui: &Ui, index: usize) {
     // Copy the mode out: grabbing focus below can run editor handlers that
     // borrow the state again.
-    let view_mode = state.borrow().view_mode;
-    match view_mode {
-        ViewMode::Grid => {
-            ui.grid.unselect_all();
-            if let Some(child) = ui.grid.child_at_index(index as i32) {
-                ui.grid.select_child(&child);
-                child.grab_focus();
-            }
-        }
-        ViewMode::Details | ViewMode::Compact => {
-            // select_item(.., true) clears the rest, and scroll_to brings the row
-            // into view — with virtualization the row may not be realized yet.
-            ui.list_selection.select_item(index as u32, true);
-            mark_scroll_cause("select_index scroll_to");
-            ui.list
-                .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
-        }
-    }
-    // No explicit update_selection() call here: both branches above change a
-    // real GTK selection model/widget, whose own connect_selected_children_changed
-    // (Grid) or connect_selection_changed (Details/Compact) handler already runs
-    // update_selection. A second explicit call here used to run it again for the
-    // same selection, which built a second live GtkMediaFile/GStreamer pipeline
-    // for the same video and let both decode and play in parallel for the rest
-    // of the session (D-86 measurement finding).
+    // select_item(.., true) clears the rest, and scroll_to brings the item into
+    // view: with virtualization the widget may not be realized yet (both views).
+    ui.list_selection.select_item(index as u32, true);
+    mark_scroll_cause("select_index scroll_to");
+    scroll_files_to(state, ui, index as u32, gtk::ListScrollFlags::FOCUS);
+    // No explicit update_selection() call here: the shared selection model's own
+    // connect_selection_changed handler already runs update_selection. A second
+    // explicit call used to run it again for the same selection, which built a
+    // second live GtkMediaFile/GStreamer pipeline for the same video and let both
+    // decode and play in parallel for the rest of the session (D-86 finding).
 }
 
 fn open_entry(state: &Rc<RefCell<AppState>>, ui: &Ui, entry: Entry) {
@@ -15058,7 +15002,7 @@ fn focus_within(window: &impl IsA<gtk::Window>, root: &impl IsA<gtk::Widget>) ->
 /// focusing its root keeps focus in the file pane and on a widget that survives.
 fn keep_focus_on_empty_view(root: &impl IsA<gtk::Widget>, focus_was_in_view: bool, is_empty: bool) {
     if focus_was_in_view && is_empty {
-        // An empty FlowBox is not focusable by default and would pass focus on.
+        // An empty view is not focusable by default and would pass focus on.
         root.set_focusable(true);
         root.grab_focus();
     }
@@ -16985,13 +16929,14 @@ fn defer_after_signal(open: impl FnOnce() + 'static) {
 
 fn connect_gated_activate(
     list: &gtk::ListView,
+    grid: &gtk::GridView,
     gate: Rc<RefCell<ActivationGate>>,
     source_at: Rc<dyn Fn(u32) -> Option<native_core::EntrySource>>,
     open: Rc<dyn Fn(native_core::EntrySource)>,
 ) {
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
+    for view in [list.upcast_ref::<gtk::Widget>(), grid.upcast_ref::<gtk::Widget>()] {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let gate = gate.clone();
         keys.connect_key_pressed(move |_, key, _, _| {
             if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter) {
@@ -16999,9 +16944,11 @@ fn connect_gated_activate(
             }
             glib::Propagation::Proceed
         });
+        view.add_controller(keys);
     }
-    list.add_controller(keys);
-    list.connect_activate(move |_, position| {
+    // One handler for both views: the icon view and the list share the model,
+    // so a position means the same file in either.
+    let activate = Rc::new(move |position: u32| {
         let started = std::time::Instant::now();
         let Some(source) = source_at(position) else { return };
         let allowed = gate.borrow_mut().allows(&source, started);
@@ -17014,6 +16961,9 @@ fn connect_gated_activate(
             started.elapsed().as_millis()
         );
     });
+    let for_list = activate.clone();
+    list.connect_activate(move |_, position| for_list(position));
+    grid.connect_activate(move |_, position| activate(position));
 }
 
 #[allow(deprecated)]
@@ -17436,12 +17386,12 @@ fn connect_grid_background_context(
     click.connect_pressed(move |gesture, _, x, y| {
         let on_item = scroll_for_click
             .pick(x, y, gtk::PickFlags::DEFAULT)
-            .is_some_and(|w| w.ancestor(gtk::FlowBoxChild::static_type()).is_some());
+            .is_some_and(|w| w != ui.grid.clone().upcast::<gtk::Widget>() && w.is_ancestor(&ui.grid));
         if on_item {
             return;
         }
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        ui.grid.unselect_all();
+        ui.list_selection.unselect_all();
         update_selection(&state, &ui);
         show_background_context_menu(&scroll_for_click, state.clone(), ui.clone(), x, y);
     });
@@ -26043,19 +25993,8 @@ Broken: Either state is wrong.\n";
             let state = state.clone();
             let ui = ui.clone();
             move || -> Vec<String> {
+                // D-368: one selection model serves every view.
                 match state.borrow().view_mode {
-                    ViewMode::Grid => ui
-                        .grid
-                        .selected_children()
-                        .iter()
-                        .filter_map(|child| {
-                            state
-                                .borrow()
-                                .visible_entries
-                                .get(child.index() as usize)
-                                .and_then(|entry| entry.source.real_path_string())
-                        })
-                        .collect(),
                     _ => (0..ui.list_selection.n_items())
                         .filter(|i| ui.list_selection.is_selected(*i))
                         .filter_map(|i| {
@@ -26204,6 +26143,220 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-368 alone, on the private display.
+    #[test]
+    fn grid_thumbnails_past_60_d368_alone() { gtk_thread::run(grid_thumbnails_past_60_d368_alone_on_gtk_thread); }
+
+    fn grid_thumbnails_past_60_d368_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D368_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        grid_thumbnails_past_60_d368();
+    }
+
+    /// One GIF frame of 16x16 pixels, every pixel palette entry 0, written
+    /// with a literal LZW stream (a clear code before every second pixel keeps
+    /// the code width at 3 bits). `frames` > 1 makes an animated GIF.
+    fn tiny_gif_d368(frames: usize, red: bool) -> Vec<u8> {
+        let mut data: Vec<u8> = Vec::new();
+        let mut bits: u32 = 0;
+        let mut n_bits = 0;
+        let mut put = |code: u32, data: &mut Vec<u8>| {
+            bits |= code << n_bits;
+            n_bits += 3;
+            while n_bits >= 8 {
+                data.push((bits & 0xff) as u8);
+                bits >>= 8;
+                n_bits -= 8;
+            }
+        };
+        for _ in 0..128 {
+            put(4, &mut data);
+            put(0, &mut data);
+            put(0, &mut data);
+        }
+        put(5, &mut data);
+        if n_bits > 0 {
+            data.push((bits & 0xff) as u8);
+        }
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&[16, 0, 16, 0, 0x80, 0, 0]);
+        out.extend_from_slice(if red { &[200, 30, 30, 255, 255, 255] } else { &[30, 60, 200, 255, 255, 255] });
+        if frames > 1 {
+            out.extend_from_slice(&[0x21, 0xff, 0x0b]);
+            out.extend_from_slice(b"NETSCAPE2.0");
+            out.extend_from_slice(&[3, 1, 0, 0, 0]);
+        }
+        for _ in 0..frames {
+            out.extend_from_slice(&[0x21, 0xf9, 4, 0, 10, 0, 0, 0]);
+            out.extend_from_slice(&[0x2c, 0, 0, 0, 0, 16, 0, 16, 0, 0, 2, data.len() as u8]);
+            out.extend_from_slice(&data);
+            out.push(0);
+        }
+        out.push(0x3b);
+        out
+    }
+
+    /// A 24-bit BMP, `w` x `h`, a gradient so it is not one flat colour.
+    fn tall_bmp_d368(w: usize, h: usize) -> Vec<u8> {
+        let row = (w * 3).div_ceil(4) * 4;
+        let size = 54 + row * h;
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0]);
+        out.extend_from_slice(&(w as u32).to_le_bytes());
+        out.extend_from_slice(&(h as u32).to_le_bytes());
+        out.extend_from_slice(&[1, 0, 24, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&((row * h) as u32).to_le_bytes());
+        out.extend_from_slice(&[0x13, 0x0b, 0, 0, 0x13, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for y in 0..h {
+            for x in 0..w {
+                out.extend_from_slice(&[(x * 255 / w) as u8, (y * 255 / h) as u8, 120]);
+            }
+            out.resize(54 + row * (y + 1), 0);
+        }
+        out
+    }
+
+    /// D-368: the icon view used to build a FlowBox tile for every file and gave
+    /// thumbnails to only the first 60 (`MAX_GRID_THUMBNAILS`), so in a folder
+    /// of 1500 GIFs every tile past the 60th kept its generic icon. The icon
+    /// view is now a GridView: it binds only the tiles on screen and each one
+    /// asks for its own thumbnail. This opens 301 small real pictures (JPG,
+    /// lower-case .gif, upper-case animated .GIF, plus one tall 24-bit BMP),
+    /// scrolls to the end, and requires every realized tile past index 60 to
+    /// hold a real picture (its Picture has a paintable), for each kind. It
+    /// fails on the old cap, where no tile past 60 ever got one.
+    fn grid_thumbnails_past_60_d368() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d368-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("pics"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg = {
+            let pixbuf = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 48, 48).expect("pixbuf");
+            pixbuf.fill(0x40a0e0ff);
+            let probe = dir.join("probe.jpg");
+            pixbuf.savev(&probe, "jpeg", &[]).expect("write a jpeg");
+            let bytes = std::fs::read(&probe).unwrap();
+            std::fs::remove_file(&probe).unwrap();
+            bytes
+        };
+        let (gif_still, gif_anim) = (tiny_gif_d368(1, false), tiny_gif_d368(3, true));
+        let total_pictures = 300usize;
+        for i in 0..total_pictures {
+            let (name, bytes) = match i % 3 {
+                0 => (format!("f{i:03}.jpg"), &jpeg),
+                1 => (format!("f{i:03}.gif"), &gif_still),
+                _ => (format!("f{i:03}.GIF"), &gif_anim),
+            };
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        // Sorts after f250.* and well past tile 60.
+        std::fs::write(dir.join("f250z.bmp"), tall_bmp_d368(400, 3300)).unwrap();
+        let total = total_pictures + 1;
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d368test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1180, 760);
+        ui.window.present();
+        wait_for("d368 listing", || state.borrow().visible_entries.len() == total);
+        {
+            let mut st = state.borrow_mut();
+            st.sort_key = SortKey::Name;
+            st.sort_ascending = true;
+        }
+        repopulate_rows(&state, &ui);
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        wait_for("d368 grid tiles", || grid_child_at(&ui, 0).is_some());
+
+        // (index, name, has a real picture) for each tile GridView has built.
+        let realized = || -> Vec<(usize, String, bool)> {
+            let names: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+            let mut out = Vec::new();
+            let mut child = ui.grid.first_child();
+            while let Some(item) = child {
+                child = item.next_sibling();
+                let widgets = all_widgets(&item);
+                let Some(name) = widgets.iter().find_map(|w| {
+                    let l = w.downcast_ref::<gtk::Label>()?;
+                    l.has_css_class("wf-grid-name").then(|| l.label().to_string())
+                }) else { continue };
+                let Some(index) = names.iter().position(|n| *n == name) else { continue };
+                let painted = widgets.iter().any(|w| {
+                    w.widget_name() == "wf-row-thumbnail"
+                        && w.downcast_ref::<gtk::Picture>().is_some_and(|p| p.paintable().is_some())
+                });
+                out.push((index, name, painted));
+            }
+            out
+        };
+        let settle_until = |what: &str, cond: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(40);
+            while Instant::now() < end {
+                pump();
+                if cond() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("d368 timed out waiting for {what}; realized: {:?}", realized().iter().map(|(i, n, p)| format!("{i}:{n}:{p}")).collect::<Vec<_>>());
+        };
+
+        // Scroll to the end: every realized tile past 60 must get its picture.
+        scroll_files_to(&state, &ui, (total - 1) as u32, gtk::ListScrollFlags::FOCUS);
+        settle_until("tiles at the end", &|| realized().iter().any(|(i, _, _)| *i + 1 >= total - 1));
+        settle_until("pictures at the end", &|| {
+            let r = realized();
+            let late: Vec<_> = r.iter().filter(|(i, _, _)| *i >= 60).collect();
+            !late.is_empty() && late.iter().all(|(_, _, p)| *p)
+        });
+        let r = realized();
+        let late: Vec<&(usize, String, bool)> = r.iter().filter(|(i, _, _)| *i >= 60).collect();
+        eprintln!("wf-test D-368: {} tiles built after scrolling to the end, {} of them past tile 60", r.len(), late.len());
+        for (kind, matches) in [
+            ("jpg", (|n: &str| n.ends_with(".jpg")) as fn(&str) -> bool),
+            ("gif", |n: &str| n.ends_with(".gif")),
+            ("GIF", |n: &str| n.ends_with(".GIF")),
+        ] {
+            let of_kind: Vec<_> = late.iter().filter(|(_, n, _)| matches(n)).collect();
+            assert!(!of_kind.is_empty(), "d368: no {kind} tile past 60 is on screen at the end");
+            assert!(of_kind.iter().all(|(_, _, p)| *p), "d368: a {kind} tile past 60 has no real thumbnail");
+        }
+        assert!(r.len() < total / 2, "d368: GridView built {} tiles of {total}; it must build only what is visible", r.len());
+
+        // Scroll back up and to the tall BMP: it gets a real picture too.
+        let bmp_index = state.borrow().visible_entries.iter().position(|e| e.name == "f250z.bmp").expect("the bmp is listed");
+        assert!(bmp_index > 60);
+        scroll_files_to(&state, &ui, 0, gtk::ListScrollFlags::FOCUS);
+        settle_until("top tiles", &|| realized().iter().any(|(i, _, _)| *i == 0));
+        scroll_files_to(&state, &ui, bmp_index as u32, gtk::ListScrollFlags::FOCUS);
+        settle_until("the bmp tile has a picture", &|| realized().iter().any(|(_, n, p)| n == "f250z.bmp" && *p));
+        eprintln!("wf-test D-368 PROVED: jpg, .gif, .GIF and a 400x3300 BMP past tile 60 all got real thumbnails");
+
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     /// D-263 on its own, under a private display, without the full suite.
     #[test]
     fn odd_picture_thumbnail_alone_d263() {
@@ -26264,8 +26417,8 @@ Broken: Either state is wrong.\n";
         ui.window.present();
         wait_for("d267 listing", || state.borrow().visible_entries.len() == 8);
         set_view_mode(&state, &ui, ViewMode::Grid);
-        wait_for("d267 grid children", || ui.grid.child_at_index(7).is_some());
-        wait_for("d267 laid out", || ui.grid.child_at_index(0).map(|c| c.width() > 0).unwrap_or(false));
+        wait_for("d267 grid children", || grid_child_at(&ui, (7) as u32).is_some());
+        wait_for("d267 laid out", || grid_child_at(&ui, (0) as u32).map(|c| c.width() > 0).unwrap_or(false));
         // Give the thumbnail workers their turn: the tiles start with plain
         // icons and only take their real size once the pictures land.
         for _ in 0..400 {
@@ -26274,7 +26427,7 @@ Broken: Either state is wrong.\n";
 
         let mut rows: std::collections::BTreeMap<i32, Vec<i32>> = std::collections::BTreeMap::new();
         for index in 0..8 {
-            let child = ui.grid.child_at_index(index).expect("grid child");
+            let child = grid_child_at(&ui, (index) as u32).expect("grid child");
             let alloc = child.allocation();
             rows.entry(alloc.y()).or_default().push(alloc.width());
         }
@@ -26358,15 +26511,15 @@ Broken: Either state is wrong.\n";
                 .expect("the picker window is registered");
             wait_for("d267 picker listing", || !pstate.borrow().visible_entries.is_empty());
             set_view_mode(&pstate, &pui, ViewMode::Grid);
-            wait_for("d267 picker grid", || pui.grid.child_at_index(0).is_some());
-            wait_for("d267 picker laid out", || pui.grid.child_at_index(0).map(|c| c.width() > 0).unwrap_or(false));
+            wait_for("d267 picker grid", || grid_child_at(&pui, (0) as u32).is_some());
+            wait_for("d267 picker laid out", || grid_child_at(&pui, (0) as u32).map(|c| c.width() > 0).unwrap_or(false));
             for _ in 0..600 {
                 pump();
             }
             let mut prows: std::collections::BTreeMap<i32, Vec<i32>> = std::collections::BTreeMap::new();
             let shown = pstate.borrow().visible_entries.len().min(24);
             for index in 0..shown as i32 {
-                if let Some(child) = pui.grid.child_at_index(index) {
+                if let Some(child) = grid_child_at(&pui, (index) as u32) {
                     let alloc = child.allocation();
                     prows.entry(alloc.y()).or_default().push(alloc.width());
                 }
@@ -26375,7 +26528,7 @@ Broken: Either state is wrong.\n";
             // widest natural request wins for every one of them.
             let mut widest: Vec<(i32, String)> = Vec::new();
             for index in 0..pstate.borrow().visible_entries.len() as i32 {
-                let Some(child) = pui.grid.child_at_index(index) else { break };
+                let Some(child) = grid_child_at(&pui, (index) as u32) else { break };
                 let (_, nat, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
                 let name = pstate
                     .borrow()
@@ -29265,7 +29418,7 @@ Broken: Either state is wrong.\n";
             let (wx, wy) = (num("X="), num("Y="));
             let _ = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d364-proof", "windowfocus"]).output();
             settle(200);
-            let is_row = |w: &gtk::Widget| if label == "grid" { w.is::<gtk::FlowBoxChild>() } else { w.has_css_class("wf-file-row") };
+            let is_row = |w: &gtk::Widget| if label == "grid" { w.has_css_class("wf-grid-item") } else { w.has_css_class("wf-file-row") };
             let rows = |ui: &Ui| -> Vec<(gtk::Widget, gtk::graphene::Rect)> {
                 let view = scroller.child().expect("view");
                 let mut v: Vec<(gtk::Widget, gtk::graphene::Rect)> = all_widgets(&view).into_iter()
@@ -29276,12 +29429,8 @@ Broken: Either state is wrong.\n";
                 v
             };
             let path_of = |w: &gtk::Widget| -> String {
-                if label == "grid" {
-                    let idx = w.downcast_ref::<gtk::FlowBoxChild>().map(|c| c.index() as usize).unwrap_or(usize::MAX);
-                    state.borrow().visible_entries.get(idx).and_then(|e| e.source.real_path_string()).unwrap_or_default()
-                } else {
-                    w.tooltip_text().map(|t| t.to_string()).unwrap_or_default()
-                }
+                // D-368: a grid tile carries its path as its tooltip, like a list row.
+                w.tooltip_text().map(|t| t.to_string()).unwrap_or_default()
             };
             // Scroll to mid-list, then step the offset until a row is cut by the
             // bottom edge with at least 14px of it showing.
@@ -30090,12 +30239,11 @@ Broken: Either state is wrong.\n";
             std::thread::sleep(Duration::from_millis(300));
             pump();
         };
-        // The item widget for a path: the list row content in list views, the FlowBoxChild in grid.
+        // The item widget for a path: the list row content in list views, the tile content in grid (D-368).
         let item_for = |path: &str| -> gtk::Widget {
             let mode = state.borrow().view_mode;
             if mode == ViewMode::Grid {
-                let entry_ix = state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == path).expect("entry");
-                ui.grid.child_at_index(entry_ix as i32).expect("grid child").upcast()
+                tree().into_iter().find(|w| w.has_css_class("wf-grid-item") && w.tooltip_text().as_deref() == Some(path)).expect("grid tile")
             } else {
                 tree().into_iter().find(|w| w.has_css_class("wf-file-row") && w.tooltip_text().as_deref() == Some(path)).expect("list row")
             }
@@ -30128,7 +30276,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(label_text(&pops[0]), "Double-click this file");
         assert_eq!(pops[0].parent().as_ref(), Some(&target));
         assert!(!pops[0].can_target() && !pops[0].is_focusable() && !pops[0].can_focus(), "input-transparent, no focus");
-        assert!(by_name(GUIDE_OPEN_FILE).iter().all(|w| !w.is::<gtk::FlowBoxChild>()), "no hidden grid duplicate");
+        assert!(by_name(GUIDE_OPEN_FILE).iter().all(|w| !w.has_css_class("wf-grid-item")), "no hidden grid duplicate");
         assert!(ui.grid.first_child().is_none(), "the grid holds nothing in list view");
         let shape = geometry(&target);
         drop(pops);
@@ -30182,11 +30330,11 @@ Broken: Either state is wrong.\n";
         repopulate_rows(&state, &ui);
         wait_for("filter cleared", || by_name(GUIDE_OPEN_FILE).len() == 1 && rings().len() == 1 && label_pops().len() == 1);
 
-        // Grid: the FlowBoxChild is the one target, with no list duplicate.
+        // Grid: the tile is the one target, with no list duplicate.
         set_view_mode(&state, &ui, ViewMode::Grid);
         wait_for("grid target", || {
             let named = by_name(GUIDE_OPEN_FILE);
-            named.len() == 1 && named[0].is::<gtk::FlowBoxChild>() && rings().len() == 1 && label_pops().len() == 1
+            named.len() == 1 && named[0].has_css_class("wf-grid-item") && rings().len() == 1 && label_pops().len() == 1
         });
         let child = by_name(GUIDE_OPEN_FILE).pop().unwrap();
         assert_eq!(rings(), vec![child.clone()]);
@@ -32671,11 +32819,11 @@ Broken: Either state is wrong.\n";
         // Grid: the real child activation.
         back_to_dir(ViewMode::Grid);
         let pos = position_of("sub");
-        let child = ui.grid.child_at_index(pos as i32).expect("grid child");
+        let rows = ui.list_store.n_items();
         let generation = state.borrow().listing_generation;
-        child.emit_by_name::<()>("activate", &[]);
+        ui.grid.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
         assert_eq!(state.borrow().listing_generation, generation, "no navigation began inside the grid signal");
-        assert!(child.parent().is_some(), "the activated grid child is still alive when the signal returns");
+        assert_eq!(ui.list_store.n_items(), rows, "the activated grid item is still alive when the signal returns");
         wait_for("deferred grid open", || state.borrow().cwd.real_path_string().unwrap_or_default() == sub_str);
         wait_for("sub listing", || state.borrow().visible_entries.len() == 1);
 
@@ -32683,8 +32831,7 @@ Broken: Either state is wrong.\n";
         // entries are reversed; only the captured entry (b.txt) may be refused.
         back_to_dir(ViewMode::Grid);
         let pos = position_of("b.txt");
-        let child = ui.grid.child_at_index(pos as i32).expect("grid child");
-        child.emit_by_name::<()>("activate", &[]);
+        ui.grid.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
         std::fs::remove_file(dir.join("a.txt")).unwrap();
         std::fs::remove_file(dir.join("b.txt")).unwrap();
         state.borrow_mut().visible_entries.reverse();
@@ -33202,14 +33349,9 @@ Broken: Either state is wrong.\n";
         for mode in [ViewMode::Details, ViewMode::Compact, ViewMode::Grid] {
             back_to_dir(mode);
             let (root_widget, rows): (gtk::Widget, Box<dyn Fn() -> u32>) = if mode == ViewMode::Grid {
-                let child = ui.grid.child_at_index(0).expect("grid child");
+                let child = grid_child_at(&ui, 0).expect("grid child");
                 child.grab_focus();
-                (ui.grid.clone().upcast(), Box::new(|| {
-                    let mut n = 0;
-                    let mut c = ui.grid.first_child();
-                    while let Some(w) = c { n += 1; c = w.next_sibling(); }
-                    n
-                }))
+                (ui.grid.clone().upcast(), Box::new(|| ui.list_store.n_items()))
             } else {
                 ui.list.grab_focus();
                 (ui.list.clone().upcast(), Box::new(|| ui.list_store.n_items()))
@@ -34587,25 +34729,14 @@ Broken: Either state is wrong.\n";
             all_names.iter().copied().filter(|n| !chosen.contains(n)).collect()
         };
         let index_of = |n: &str| state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().unwrap_or_default() == path(n)).unwrap();
-        let grid = |ui: &Ui| ui.grid.clone();
         let pick = |mode: ViewMode, n: &str, extend: bool| {
             let i = index_of(n);
-            if mode == ViewMode::Grid {
-                let child = grid(&ui).child_at_index(i as i32).unwrap();
-                if !extend {
-                    ui.grid.unselect_all();
-                }
-                ui.grid.select_child(&child);
-            } else {
-                ui.list_selection.select_item(i as u32, !extend);
-            }
+            // D-368: both views share one selection model.
+            let _ = mode;
+            ui.list_selection.select_item(i as u32, !extend);
         };
-        let clear = |mode: ViewMode| {
-            if mode == ViewMode::Grid {
-                ui.grid.unselect_all()
-            } else {
-                ui.list_selection.unselect_all();
-            }
+        let clear = |_mode: ViewMode| {
+            ui.list_selection.unselect_all();
         };
 
         for mode in [ViewMode::Details, ViewMode::Compact, ViewMode::Grid] {
@@ -34613,7 +34744,7 @@ Broken: Either state is wrong.\n";
             set_view_mode(&state, &ui, mode);
             wait_for("view rows", || {
                 if mode == ViewMode::Grid {
-                    ui.grid.child_at_index(5).is_some()
+                    grid_child_at(&ui, (5) as u32).is_some()
                 } else {
                     ui.list_selection.n_items() == 6
                 }
@@ -35042,9 +35173,7 @@ Broken: Either state is wrong.\n";
         set_view_mode(&state, &ui, ViewMode::Grid);
         wait_for("grid children", || ui.grid.observe_children().n_items() == 3);
         select_entry_by_source(&state, &ui, &native_core::EntrySource::real(&b_path));
-        let children_before: Vec<gtk::Widget> = (0..3)
-            .map(|i| ui.grid.child_at_index(i).unwrap().upcast())
-            .collect();
+        let children_before = ui.grid.observe_children().n_items();
         std::fs::write(dir.join("b.txt"), vec![b'y'; 4096]).unwrap();
         wait_for("grid state merged", || {
             state.borrow().visible_entries.iter().any(|e| e.source.real_path_string().unwrap_or_default() == b_path && e.size == 4096)
@@ -35052,10 +35181,9 @@ Broken: Either state is wrong.\n";
         for _ in 0..40 {
             pump();
         }
-        let children_after: Vec<gtk::Widget> = (0..3)
-            .map(|i| ui.grid.child_at_index(i).unwrap().upcast())
-            .collect();
-        assert_eq!(children_before, children_after, "same Grid child objects");
+        let children_after = ui.grid.observe_children().n_items();
+        assert_eq!(children_before, children_after, "same number of realized Grid tiles");
+        assert!(grid_child_at(&ui, 1).is_some(), "the tiles are still built");
         assert_eq!(selected_paths(&state, &ui), vec![b_path.clone()]);
         // Grid structural change still rebuilds and keeps the selection.
         std::fs::write(dir.join("e.txt"), "e").unwrap();
@@ -35145,7 +35273,7 @@ Broken: Either state is wrong.\n";
         };
         let row_widget = |mode: ViewMode, path: &str| -> Option<gtk::Widget> {
             if mode == ViewMode::Grid {
-                ui.grid.child_at_index(index_of(path) as i32).map(|c| c.upcast())
+                grid_child_at(&ui, (index_of(path) as i32) as u32).map(|c| c.upcast())
             } else {
                 state
                     .borrow()
@@ -38082,6 +38210,29 @@ Broken: Either state is wrong.\n";
         all_widgets(widget).into_iter().filter_map(|w| w.downcast::<gtk::Popover>().ok()).collect()
     }
 
+    /// D-368: the realized tile for the item at `index` in the icon view, or
+    /// None while GridView has not built it (it builds only what is on screen).
+    /// It is the item widget GTK wraps the tile in, the GridView's child.
+    fn grid_child_at(ui: &Ui, index: u32) -> Option<gtk::Widget> {
+        let entry = ui
+            .list_store
+            .item(index)
+            .and_then(|o| o.downcast::<glib::BoxedAnyObject>().ok())
+            .map(|b| b.borrow::<Entry>().clone())?;
+        let mut child = ui.grid.first_child();
+        while let Some(item) = child {
+            child = item.next_sibling();
+            let named = all_widgets(&item).iter().any(|w| {
+                w.downcast_ref::<gtk::Label>().is_some_and(|l| l.has_css_class("wf-grid-name") && l.label() == entry.name)
+                    || w.downcast_ref::<gtk::Entry>().is_some_and(|e| e.has_css_class("wf-file-name") && e.text() == entry.name)
+            });
+            if named {
+                return Some(item);
+            }
+        }
+        None
+    }
+
     fn wait_for(what: &str, cond: impl Fn() -> bool) {
         for _ in 0..80 {
             if cond() {
@@ -38156,9 +38307,9 @@ Broken: Either state is wrong.\n";
         let start_index = index_of(&state, &old_path).expect("target present before rename");
         match view {
             ViewMode::Grid => {
-                let child = ui.grid.child_at_index(start_index as i32).expect("target grid child");
-                ui.grid.unselect_all();
-                ui.grid.select_child(&child);
+                let child = grid_child_at(&ui, (start_index as i32) as u32).expect("target grid child");
+                let _ = child;
+                ui.list_selection.select_item(start_index as u32, true);
             }
             ViewMode::Details | ViewMode::Compact => {
                 ui.list_selection.select_item(start_index as u32, true);
@@ -38228,8 +38379,8 @@ Broken: Either state is wrong.\n";
                 });
             }
             ViewMode::Grid => {
-                let child = ui.grid.child_at_index(new_index as i32).expect("renamed grid child");
-                assert!(child.is_selected(), "{tag}: renamed grid child is selected");
+                let child = grid_child_at(&ui, (new_index as i32) as u32).expect("renamed grid child");
+                assert!(ui.list_selection.is_selected(new_index as u32), "{tag}: renamed grid child is selected");
                 let grid_scroll = ui
                     .files_stack
                     .child_by_name("grid")
@@ -38250,7 +38401,6 @@ Broken: Either state is wrong.\n";
         // untouched sibling's mtime) must not resurrect the already-consumed
         // reveal and reselect the renamed file.
         ui.list_selection.unselect_all();
-        ui.grid.unselect_all();
         update_selection(&state, &ui);
         assert!(selected_paths(&state, &ui).is_empty(), "{tag}: selection cleared for the refresh check");
         let listing = crate::native_core::list_dir_cancellable(Path::new(&dir_str), false, &AtomicBool::new(false))
@@ -38539,7 +38689,7 @@ Broken: Either state is wrong.\n";
 
         // ---- Grid: background menu on the grid surface, same editor and commit.
         set_view_mode(&state, &ui, ViewMode::Grid);
-        wait_for("grid children", || ui.grid.child_at_index(0).is_some());
+        wait_for("grid children", || grid_child_at(&ui, (0) as u32).is_some());
         let grid_scroll = ui.files_stack.child_by_name("grid").expect("grid scroller");
         let secondary = all_widgets(&grid_scroll)[..1]
             .iter()
@@ -39300,10 +39450,11 @@ Broken: Either state is wrong.\n";
         });
         let store = gio::ListStore::new::<gtk::StringObject>();
         store.append(&gtk::StringObject::new("only-row"));
-        let list = gtk::ListView::new(Some(gtk::MultiSelection::new(Some(store.clone()))), Some(factory));
-        let grid = gtk::FlowBox::new();
-        let grid_label = gtk::Label::new(Some("grid-item"));
-        grid.append(&grid_label);
+        let list = gtk::ListView::new(Some(gtk::MultiSelection::new(Some(store.clone()))), Some(factory.clone()));
+        // D-368: the icon view is a GridView over the same kind of model.
+        let grid_store = gio::ListStore::new::<gtk::StringObject>();
+        grid_store.append(&gtk::StringObject::new("grid-item"));
+        let grid = gtk::GridView::new(Some(gtk::MultiSelection::new(Some(grid_store.clone()))), Some(factory));
         let entry = gtk::Entry::new();
         let preview = gtk::Label::new(Some("preview"));
         preview.set_selectable(true);
@@ -39351,15 +39502,12 @@ Broken: Either state is wrong.\n";
         keep_focus_on_empty_view(&list, true, false);
         assert_eq!(focus(), before);
 
-        // Grid: the FlowBox is the root.
-        let child = grid_label.parent().expect("flow box child");
-        child.grab_focus();
+        // Grid: the GridView is the root.
+        grid.grab_focus();
         pump();
         assert!(focus_within(&win, &grid) && focus().as_ref() != Some(grid.upcast_ref()));
         let was_in = focus_within(&win, &grid);
-        while let Some(c) = grid.first_child() {
-            grid.remove(&c);
-        }
+        grid_store.remove_all();
         keep_focus_on_empty_view(&grid, was_in, true);
         pump();
         assert_eq!(focus(), Some(grid.clone().upcast()), "empty grid root owns focus, no critical");
@@ -39578,7 +39726,8 @@ Broken: Either state is wrong.\n";
             let opened = opened.clone();
             Rc::new(move |source| opened.borrow_mut().push(source.real_path_string().unwrap_or_default()))
         };
-        connect_gated_activate(&list, gate.clone(), source_at, open);
+        let grid = gtk::GridView::new(None::<gtk::SelectionModel>, None::<gtk::ListItemFactory>);
+        connect_gated_activate(&list, &grid, gate.clone(), source_at, open);
         let started = std::time::Instant::now();
         list.emit_by_name::<()>("activate", &[&0u32]);
         assert!(opened.borrow().is_empty(), "a bare activation opens nothing");
@@ -41606,7 +41755,7 @@ Broken: Either state is wrong.\n";
             })
         };
         let target_name = if mode == ViewMode::Grid {
-            let child = ui.grid.child_at_index(0).expect("a grid child");
+            let child = grid_child_at(&ui, (0) as u32).expect("a grid child");
             row_name(child.upcast_ref()).expect("the grid child's name")
         } else {
             rows_of(&ui)
@@ -41621,13 +41770,9 @@ Broken: Either state is wrong.\n";
             .position(|e| e.name == target_name)
             .expect("the row to delete");
         let row_widget: gtk::Widget = if mode == ViewMode::Grid {
-            let child = ui
-                .grid
-                .child_at_index(target as i32)
-                .expect("the grid child to delete");
-            ui.grid.unselect_all();
-            ui.grid.select_child(&child);
-            child.upcast()
+            let child = grid_child_at(&ui, target as u32).expect("the grid child to delete");
+            ui.list_selection.select_item(target as u32, true);
+            child
         } else {
             ui.list_selection.unselect_all();
             ui.list_selection.select_item(target as u32, true);
@@ -41704,7 +41849,7 @@ Broken: Either state is wrong.\n";
         });
         // One row's worth of movement is allowed: the deleted item is gone from
         // above the viewport. Measured from the live view, not assumed. In Icons
-        // view the model is empty, so the FlowBox children are counted instead.
+        // view the model is the same store, counted below.
         let items = if mode == ViewMode::Grid {
             state.borrow().visible_entries.len() as f64
         } else {
