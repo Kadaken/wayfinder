@@ -32016,6 +32016,7 @@ Broken: Either state is wrong.\n";
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).expect("register test application");
+        install_app_css();
         build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
         let (_state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
@@ -32094,6 +32095,8 @@ Broken: Either state is wrong.\n";
         let main_left = bounds(main.upcast_ref()).x();
         let gap = main_left - (tb_open.x() + tb_open.width());
         eprintln!("wf-test D-377 gap={gap} (button right edge {} to main left {main_left}; first sidebar row top {first_top})", tb_open.x() + tb_open.width());
+        let sl = toggle.parent().expect("sliver");
+        eprintln!("wf-test D-377 toggle bounds x={} y={} w={} h={} measure={:?} sliver x={} w={} css={:?}", tb_open.x(), tb_open.y(), tb_open.width(), tb_open.height(), toggle.measure(gtk::Orientation::Horizontal, -1), bounds(&sl).x(), bounds(&sl).width(), sl.css_classes());
         assert!(gap >= 2.0, "D-377: the sidebar starts {gap}px right of the button, need 2px or more");
         let open = check("open", ui.sidebar_scroll.clone().upcast(), false, sidebar_rows);
         snap("d377-open.png");
