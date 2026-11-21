@@ -686,6 +686,12 @@ scrollbar slider:active {
     color: #ffffff;
 }
 
+/* D-370: the box-select rectangle (BoxSelect); Adwaita styles the same class. */
+.rubberband {
+    background: alpha(@wf_accent, 0.25);
+    border: 1px solid @wf_accent;
+}
+
 .wf-grid-item {
     min-width: 94px;
     min-height: 82px;
@@ -1300,12 +1306,6 @@ struct AppConfig {
     /// anyone who already has it and never gets a prompt they did not ask for.
     #[serde(default)]
     drop_ask: bool,
-    /// D-350: let the list scroll by itself when a box-select or a file drag
-    /// reaches its top or bottom edge. Off by default: with it on, a click on
-    /// one of the bottom rows that moved the pointer a few pixels started the
-    /// scroll and ran the list away from him.
-    #[serde(default)]
-    edge_autoscroll: bool,
     /// D-352: the sidebar shut with its toolbar button. Only that button
     /// changes it; the divider can no longer close it.
     #[serde(default)]
@@ -2052,7 +2052,6 @@ impl Default for AppConfig {
             remembered_networks: Vec::new(),
             trash_keep_days: 0,
             drop_ask: false,
-            edge_autoscroll: false,
             sidebar_hidden: false,
             onboarded: false,
             install_convention: true,
@@ -2308,10 +2307,6 @@ fn config_search_in_files(config: &mut AppConfig, value: bool) {
 
 fn config_drop_ask(config: &mut AppConfig, value: bool) {
     config.drop_ask = value;
-}
-
-fn config_edge_autoscroll(config: &mut AppConfig, value: bool) {
-    config.edge_autoscroll = value;
 }
 
 fn config_onboarded(config: &mut AppConfig, value: bool) {
@@ -4724,7 +4719,6 @@ fn build_ui_in(
                 .map(|(_, path)| path.clone())
         })
         .unwrap_or_else(|| "/".to_string());
-    EDGE_AUTOSCROLL.with(|c| c.set(config.edge_autoscroll));
     let state = Rc::new(RefCell::new(AppState {
         inline_rename: None,
         reveal_path: None,
@@ -4881,11 +4875,12 @@ fn build_ui_in(
     list_placeholder.add_css_class("wf-empty-placeholder");
     list.set_size_request(-1, 0);
     list.add_css_class("wf-list");
-    // Drag a box across the list to select a run of files, like Explorer.
-    // GtkListView inherits `enable-rubberband` from GtkListBase, but gtk4-rs
-    // generates no typed setter for it, so set the property directly. It needs a
-    // multi-selection model, which this list has.
-    list.set_property("enable-rubberband", true);
+    // D-370: dragging a box across the list to select a run of files is
+    // Wayfinder's own (`BoxSelect`, installed below), not GTK's rubberband:
+    // GTK's edge-scrolls on its own, with a fixed zone and no way to switch it
+    // off (gtklistbase.c:1880-1897). Its other edge scroll, for a file drag,
+    // comes from a drop controller every list view adds in its init.
+    silence_gtk_edge_autoscroll(&list);
     // D-368: the icon view is a GtkGridView over the SAME model and selection
     // the list uses, so it realizes only the tiles on screen and every one of
     // them can ask for a real thumbnail as it scrolls into view. (It was a
@@ -4899,9 +4894,11 @@ fn build_ui_in(
         .min_columns(1)
         // D-267: tiles are picture-sized now; a wide window fits more than eight.
         .max_columns(16)
-        .enable_rubberband(true)
         .vexpand(true)
         .build();
+    // D-370: no GTK rubberband here either (see the list above); the box is
+    // Wayfinder's own `BoxSelect`.
+    silence_gtk_edge_autoscroll(&grid);
     grid.set_size_request(-1, 0);
     grid.add_css_class("wf-grid");
     let preview = gtk::Label::builder()
@@ -5260,12 +5257,33 @@ fn build_ui_in(
     files_stack.add_named(&list_overlay, Some("list"));
     files_stack.add_named(&grid_scroll, Some("grid"));
     files_stack.set_visible_child_name("list");
+    // D-370: one overlay over both views carries the box-select rectangle.
+    let files_overlay = gtk::Overlay::new();
+    files_overlay.set_child(Some(&files_stack));
+    files_overlay.set_hexpand(true);
+    files_overlay.set_vexpand(true);
+    files_overlay.set_size_request(-1, 0);
+    let rubber_band = RubberBand::new(&files_overlay);
+    let list_model: Rc<dyn Fn() -> Option<gtk::SelectionModel>> = {
+        let list = list.clone();
+        Rc::new(move || list.model())
+    };
+    let grid_model: Rc<dyn Fn() -> Option<gtk::SelectionModel>> = {
+        let grid = grid.clone();
+        Rc::new(move || grid.model())
+    };
+    for (scroller, view, model) in [
+        (&files_scroll, list.clone().upcast::<gtk::Widget>(), list_model),
+        (&grid_scroll, grid.clone().upcast::<gtk::Widget>(), grid_model),
+    ] {
+        let Some(engine) = EdgeScroll::new(scroller) else { continue };
+        connect_edge_scroll_drag(&view, &engine);
+        BoxSelect::install(&view, model, &engine, &rubber_band);
+    }
     count_his_scroll_input(&files_scroll);
     count_his_scroll_input(&grid_scroll);
     watch_scroll_jumps(&files_scroll, "list");
     watch_scroll_jumps(&grid_scroll, "grid");
-    hold_list_at_edges(&files_scroll);
-    hold_list_at_edges(&grid_scroll);
     let (column_header, columns) = details_header();
     let (quick_access, quick_access_tiles) = build_tile_strip("Quick access");
     let (recent_files_strip, recent_files_tiles) = build_tile_strip("Recent files");
@@ -5281,7 +5299,7 @@ fn build_ui_in(
     files_pane.append(&quick_access);
     files_pane.append(&recent_files_strip);
     files_pane.append(&column_header);
-    files_pane.append(&files_stack);
+    files_pane.append(&files_overlay);
     let preview_scroll = gtk::ScrolledWindow::builder()
         .child(&preview_stack)
         .min_content_width(0)
@@ -8693,15 +8711,6 @@ fn set_placement_this_folder_only(state: &Rc<RefCell<AppState>>, ui: &Ui, own: b
     repopulate_rows(state, ui);
 }
 
-/// D-350: the one path for the edge-scroll setting.
-fn set_edge_autoscroll(value: bool) {
-    if EDGE_AUTOSCROLL.with(|c| c.get()) == value {
-        return;
-    }
-    EDGE_AUTOSCROLL.with(|c| c.set(value));
-    update_config(|config| config_edge_autoscroll(config, value));
-}
-
 fn set_drop_ask(state: &Rc<RefCell<AppState>>, value: bool) {
     if state.borrow().drop_ask == value {
         return;
@@ -9352,22 +9361,6 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
             move || set_drop_ask(&state, !state.borrow().drop_ask),
         );
         row.set_widget_name("wf-drop-ask-option");
-        if checked {
-            row.add_css_class("wf-checked");
-        }
-        menu.append(&row);
-    }
-    {
-        // D-350: off by default; `set_edge_autoscroll` is the only writer.
-        let checked = EDGE_AUTOSCROLL.with(|c| c.get());
-        let row = context_item(
-            if checked { "object-select-symbolic" } else { "" },
-            "Scroll at Edges While Dragging",
-            "",
-            &popover,
-            move || set_edge_autoscroll(!checked),
-        );
-        row.set_widget_name("wf-edge-scroll-option");
         if checked {
             row.add_css_class("wf-checked");
         }
@@ -10433,12 +10426,22 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
 //  - `reapply_scroll`: puts the place back after the rows are rebuilt (refresh,
 //    pin change, navigate back). GTK scrolls a focused row into view or
 //    recomputes the offset from a forgotten row after a rebuild (D-226/D-233/D-349).
-//  - `hold_list_at_edges`: stops GTK's own edge scroll between a press and its
-//    release, and while a file drag is over the view (D-350).
-//  - `mark_scroll_cause`: every deliberate move by Wayfinder calls it first. It
-//    bumps SCROLL_GENERATION; both holds above stand down when it changes, so
-//    they never fight each other or his own wheel, press or key
-//    (`count_his_scroll_input`).
+//  - `EdgeScroll` (D-370): the ONLY thing that scrolls a view while he drags.
+//    It runs while a file drag is over the view (both views) and while a
+//    Wayfinder box-select is held (`BoxSelect`, both views). GTK's own edge
+//    scroll is removed at its source, not held back: the icon view's
+//    `enable-rubberband` is off (GTK's rubberband calls update_autoscroll,
+//    gtklistbase.c:1451-1490, 1880-1897, and cannot be told otherwise), and
+//    the DropControllerMotion that every GtkListBase adds in its init for the
+//    same purpose (gtklistbase.c:2084-2086) is switched off by
+//    `silence_gtk_edge_autoscroll`. The engine scrolls only after the pointer
+//    has stayed 250 ms inside the top or bottom zone, so a plain click near an
+//    edge never moves the list; speed grows with depth into the zone and with
+//    time spent scrolling (slow to fast).
+//  - `mark_scroll_cause`: every deliberate move by Wayfinder calls it first,
+//    the engine on each step. It bumps SCROLL_GENERATION; `reapply_scroll`
+//    stands down when it changes, so they never fight each other or his own
+//    wheel, press or key (`count_his_scroll_input`).
 //  - `watch_scroll_jumps` only writes the jump log. It moves nothing.
 // `hold_new_item_on_screen` does not scroll: it picks where a new item sits in
 // the held order.
@@ -10448,102 +10451,795 @@ thread_local! {
     /// D-349: counts every deliberate scroll, so the place guard can step
     /// aside the moment Wayfinder moves the list on purpose.
     static SCROLL_GENERATION: Cell<u64> = const { Cell::new(0) };
-    /// D-350: mirror of `AppConfig::edge_autoscroll`, read on every list move.
-    static EDGE_AUTOSCROLL: Cell<bool> = const { Cell::new(false) };
-    /// D-350: each view's hold, so the tests can press it the way a click does.
-    static EDGE_HOLDS: RefCell<Vec<(glib::WeakRef<gtk::Widget>, Rc<Cell<Option<(f64, u64)>>>)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// D-350: the place the list is held at while a button is down on it or a file
-/// drag is over it, and the input count at that moment.
-fn edge_hold_for(view: &gtk::Widget) -> Option<Rc<Cell<Option<(f64, u64)>>>> {
-    EDGE_HOLDS.with(|h| {
-        h.borrow()
-            .iter()
-            .find(|(w, _)| w.upgrade().as_ref() == Some(view))
-            .map(|(_, pin)| pin.clone())
-    })
+/// D-370: tallest edge zone, in px, at the top and at the bottom of the view.
+const EDGE_ZONE_PX: f64 = 56.0;
+/// D-370: the zone never takes more than this share of the view's visible height, so a short view keeps a middle.
+const EDGE_ZONE_MAX_SHARE: f64 = 0.25;
+/// D-370: seconds the pointer must stay inside one zone before scrolling starts; leaving the zone resets it.
+const EDGE_ARM_SECS: f64 = 0.25;
+/// D-370: slowest speed in px/s, at the zone's inner border.
+const EDGE_SPEED_MIN_PX_S: f64 = 60.0;
+/// D-370: extra px/s reached at full depth; it grows with the depth squared.
+const EDGE_SPEED_SPAN_PX_S: f64 = 1140.0;
+/// D-370: seconds of scrolling in one zone after which the ramp stops growing.
+const EDGE_RAMP_SECS: f64 = 1.5;
+/// D-370: what the ramp adds at its end (speed goes from 1x to 1x + this, so 3x).
+const EDGE_RAMP_EXTRA: f64 = 2.0;
+/// D-370: a frame later than this many seconds counts as this long. Only a real
+/// stall (the window hidden, the machine frozen) is cut; a busy 120 ms frame
+/// still moves the list by speed x 120 ms so a loaded machine does not slow it.
+const EDGE_MAX_FRAME_SECS: f64 = 0.25;
+/// D-370: key of the item GTK adds to a tile's child so a point can be turned back into a list position.
+const TILE_ITEM_KEY: &str = "wf-list-item";
+
+/// D-370: the zone height for a view this tall, in px.
+fn edge_zone_px(visible_height: f64) -> f64 {
+    EDGE_ZONE_PX.min(visible_height * EDGE_ZONE_MAX_SHARE).max(0.0)
 }
 
-/// D-350: GTK scrolls a list by itself while a box-select or a file drag sits
-/// within 30px of its top or bottom edge (gtklistbase.c update_autoscroll). A
-/// click on one of the bottom rows that moved the pointer a few pixels started
-/// it, and the list ran up under him at ~250px a second until he let go
-/// (screencast 20 Nov 2026 10:04, 4.1s-7.3s). Unless the Options switch is on,
-/// the list is held where it was from the press to the release, and while a
-/// drag is over it. His wheel and keys, and every deliberate scroll by
-/// Wayfinder, bump the input count and are let through.
-fn hold_list_at_edges(scroller: &gtk::ScrolledWindow) {
-    let Some(view) = scroller.child() else { return };
-    let pin: Rc<Cell<Option<(f64, u64)>>> = Rc::new(Cell::new(None));
-    EDGE_HOLDS.with(|h| {
-        let mut h = h.borrow_mut();
-        h.retain(|(w, _)| w.upgrade().is_some());
-        h.push((view.downgrade(), pin.clone()));
-    });
-    let adj = scroller.vadjustment();
-    // On the view, not the scroller: a press on the scrollbar must stay free.
-    let press = gtk::EventControllerLegacy::new();
-    press.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let (pin, adj) = (pin.clone(), adj.clone());
-        press.connect_event(move |_, event| {
-            match event.event_type() {
-                gdk::EventType::ButtonPress => pin.set(Some((adj.value(), scroll_generation()))),
-                gdk::EventType::ButtonRelease => pin.set(None),
-                // A release can go missing (a drag takes the pointer); moving
-                // with no button down is proof it is over.
-                gdk::EventType::MotionNotify
-                    if !event.modifier_state().intersects(
-                        gdk::ModifierType::BUTTON1_MASK | gdk::ModifierType::BUTTON2_MASK | gdk::ModifierType::BUTTON3_MASK,
-                    ) =>
-                {
-                    pin.set(None)
-                }
-                _ => {}
-            }
-            glib::Propagation::Proceed
-        });
+/// D-370: which zone a pointer at `y` (view coordinates) is in and how deep.
+/// -1 is the top zone and +1 the bottom one. Depth is 0 at the zone's inner
+/// border and 1 at the view's edge; a pointer past the edge (a box-select
+/// keeps reporting outside the view) is depth 1.
+fn edge_zone_depth(y: f64, visible_height: f64) -> Option<(i8, f64)> {
+    let zone = edge_zone_px(visible_height);
+    if zone <= 0.0 {
+        return None;
     }
-    view.add_controller(press);
-    let over = gtk::DropControllerMotion::new();
-    {
-        let (pin, adj) = (pin.clone(), adj.clone());
-        let hold = move || {
-            if pin.get().is_none() {
-                pin.set(Some((adj.value(), scroll_generation())));
+    if y < zone {
+        Some((-1, ((zone - y) / zone).clamp(0.0, 1.0)))
+    } else if y > visible_height - zone {
+        Some((1, ((y - (visible_height - zone)) / zone).clamp(0.0, 1.0)))
+    } else {
+        None
+    }
+}
+
+/// D-370: speed in px/s at `depth` after `scrolling_secs` of scrolling in one zone.
+fn edge_speed(depth: f64, scrolling_secs: f64) -> f64 {
+    let ramp = 1.0 + EDGE_RAMP_EXTRA * scrolling_secs.clamp(0.0, EDGE_RAMP_SECS) / EDGE_RAMP_SECS;
+    (EDGE_SPEED_MIN_PX_S + EDGE_SPEED_SPAN_PX_S * depth * depth) * ramp
+}
+
+/// D-370: GTK's own edge scroll for a drag over a list or icon view comes from a
+/// GtkDropControllerMotion that GtkListBase adds in its init and whose only job
+/// is update_autoscroll (gtklistbase.c:2084-2086, 2008-2025). gtk_widget_add_controller
+/// PREPENDS to the controller list (gtkwidget.c:11974), so `observe_controllers()`
+/// lists the newest first and GTK's own, added in the view's init, is the LAST
+/// DropControllerMotion. Taking the last one stays right even if Wayfinder has
+/// already added its own. Phase None means the
+/// controller never sees a drag motion again. Says so loudly if the controller
+/// is not there, because then a GTK change has put the double scroll back.
+fn silence_gtk_edge_autoscroll(view: &impl IsA<gtk::Widget>) -> bool {
+    let controllers = view.observe_controllers();
+    for i in (0..controllers.n_items()).rev() {
+        if let Some(controller) = controllers.item(i).and_then(|o| o.downcast::<gtk::DropControllerMotion>().ok()) {
+            controller.set_propagation_phase(gtk::PropagationPhase::None);
+            return true;
+        }
+    }
+    eprintln!(
+        "wf-event: edge-scroll: no internal GtkDropControllerMotion on {}; GTK will edge-scroll a drag by itself on top of Wayfinder's (D-370 expects gtklistbase.c:2084-2086)",
+        view.as_ref().type_().name()
+    );
+    false
+}
+
+/// D-370: the one edge-scroll engine of a view. Whoever is dragging (a file drag
+/// over the view, or a Wayfinder box-select) reports the pointer's y with
+/// `pointer`; a tick callback on the view scrolls by speed x frame time once the
+/// pointer has stayed in a zone for EDGE_ARM_SECS.
+struct EdgeScroll {
+    view: glib::WeakRef<gtk::Widget>,
+    adj: gtk::Adjustment,
+    /// The pointer's y in view coordinates, as last reported.
+    pointer_y: Cell<Option<f64>>,
+    /// Asked every frame; false ends the run (a drag that ended without telling us).
+    alive: RefCell<Option<Rc<dyn Fn() -> bool>>>,
+    tick: RefCell<Option<gtk::TickCallbackId>>,
+    /// -1 top zone, +1 bottom zone, 0 none.
+    zone: Cell<i8>,
+    zone_since: Cell<f64>,
+    scroll_since: Cell<Option<f64>>,
+    last_frame: Cell<Option<f64>>,
+    /// The part of a step smaller than a pixel. GtkListBase keeps its scroll
+    /// offset in whole pixels (gtklistbase.c:183-215), so a slow step of 0.4 px
+    /// would be lost every frame if it were written to the adjustment as is.
+    carry: Cell<f64>,
+    /// Called after every frame that moved the view (the box follows the content).
+    moved: RefCell<Option<Rc<dyn Fn()>>>,
+}
+
+impl EdgeScroll {
+    fn new(scroller: &gtk::ScrolledWindow) -> Option<Rc<EdgeScroll>> {
+        let view = scroller.child()?;
+        let engine = Rc::new(EdgeScroll {
+            view: view.downgrade(),
+            adj: scroller.vadjustment(),
+            pointer_y: Cell::new(None),
+            alive: RefCell::new(None),
+            tick: RefCell::new(None),
+            zone: Cell::new(0),
+            zone_since: Cell::new(0.0),
+            scroll_since: Cell::new(None),
+            last_frame: Cell::new(None),
+            carry: Cell::new(0.0),
+            moved: RefCell::new(None),
+        });
+        let weak = Rc::downgrade(&engine);
+        view.connect_unmap(move |_| {
+            if let Some(engine) = weak.upgrade() {
+                engine.stop();
+            }
+        });
+        Some(engine)
+    }
+
+    /// Reports the pointer (y in view coordinates) and starts the tick if it is not running.
+    fn pointer(self: &Rc<Self>, y: f64, alive: Rc<dyn Fn() -> bool>) {
+        self.pointer_y.set(Some(y));
+        *self.alive.borrow_mut() = Some(alive);
+        if self.tick.borrow().is_some() {
+            return;
+        }
+        let Some(view) = self.view.upgrade() else { return };
+        self.zone.set(0);
+        self.scroll_since.set(None);
+        self.last_frame.set(None);
+        self.carry.set(0.0);
+        let weak = Rc::downgrade(self);
+        let id = view.add_tick_callback(move |view, clock| match weak.upgrade() {
+            Some(engine) => engine.frame(view, clock.frame_time() as f64 / 1e6),
+            None => glib::ControlFlow::Break,
+        });
+        *self.tick.borrow_mut() = Some(id);
+    }
+
+    /// Ends the run: zone leave, release, drag end, drop, leave, unmap.
+    fn stop(&self) {
+        self.pointer_y.set(None);
+        *self.alive.borrow_mut() = None;
+        self.zone.set(0);
+        self.scroll_since.set(None);
+        if let Some(id) = self.tick.borrow_mut().take() {
+            id.remove();
+        }
+    }
+
+    fn frame(&self, view: &gtk::Widget, now: f64) -> glib::ControlFlow {
+        let alive = self.alive.borrow().clone();
+        if !alive.is_some_and(|alive| alive()) || !view.is_mapped() {
+            // Returning Break removes the callback itself; only forget its id.
+            self.pointer_y.set(None);
+            *self.alive.borrow_mut() = None;
+            self.zone.set(0);
+            self.scroll_since.set(None);
+            self.tick.borrow_mut().take();
+            return glib::ControlFlow::Break;
+        }
+        let dt = self.last_frame.replace(Some(now)).map_or(0.0, |t| (now - t).clamp(0.0, EDGE_MAX_FRAME_SECS));
+        #[cfg(test)]
+        D370_FRAMES.with(|f| f.borrow_mut().push(dt));
+        let Some((dir, depth)) = self.pointer_y.get().and_then(|y| edge_zone_depth(y, view.height() as f64)) else {
+            self.zone.set(0);
+            self.scroll_since.set(None);
+            self.carry.set(0.0);
+            return glib::ControlFlow::Continue;
+        };
+        if self.zone.get() != dir {
+            // Entered a zone (or crossed to the other one): the 250 ms start now.
+            self.zone.set(dir);
+            self.zone_since.set(now);
+            self.scroll_since.set(None);
+            self.carry.set(0.0);
+            return glib::ControlFlow::Continue;
+        }
+        if now - self.zone_since.get() < EDGE_ARM_SECS {
+            return glib::ControlFlow::Continue;
+        }
+        let since = match self.scroll_since.get() {
+            Some(since) => since,
+            None => {
+                self.scroll_since.set(Some(now));
+                now
             }
         };
-        let hold2 = hold.clone();
-        over.connect_enter(move |_, _, _| hold());
-        over.connect_motion(move |_, _, _| hold2());
+        let total = self.carry.get() + edge_speed(depth, now - since) * dt * dir as f64;
+        let whole = total.trunc();
+        self.carry.set(total - whole);
+        if whole != 0.0 {
+            let lowest = self.adj.lower();
+            let highest = (self.adj.upper() - self.adj.page_size()).max(lowest);
+            let before = self.adj.value();
+            let to = (before + whole).clamp(lowest, highest);
+            if (to - before).abs() > 0.0 {
+                mark_scroll_cause("edge-scroll");
+                #[cfg(test)]
+                D370_SCROLL_TIMES.with(|t| t.borrow_mut().push(Instant::now()));
+                self.adj.set_value(to);
+                let moved = self.moved.borrow().clone();
+                if let Some(moved) = moved {
+                    moved();
+                }
+            }
+        }
+        glib::ControlFlow::Continue
     }
-    {
-        let pin = pin.clone();
-        over.connect_leave(move |_| pin.set(None));
-    }
-    view.add_controller(over);
-    let snapping = Rc::new(Cell::new(false));
-    adj.connect_value_changed(move |adj| {
-        let Some((value, generation)) = pin.get() else { return };
-        if snapping.get() || EDGE_AUTOSCROLL.with(|c| c.get()) {
-            return;
+}
+
+/// D-370: is the drag over `over` still going? The controller must still
+/// contain the pointer and hold a drop (gtkdropcontrollermotion.c:105-152; both
+/// are cleared by a leave crossing). A drag that ends without a leave reaching
+/// the view is stopped by the drag's own signals, connected in
+/// `connect_edge_scroll_drag`. No pointer-button test: under X11 the display
+/// does not reliably report the button during a drag.
+fn drag_still_running(over: &gtk::DropControllerMotion) -> bool {
+    over.contains_pointer() && over.drop().is_some()
+}
+
+/// D-370: a file drag over the view feeds the engine. GTK's own controller for
+/// this is off (`silence_gtk_edge_autoscroll`). A plain controller beside the
+/// drop targets; it claims nothing and changes no drop.
+fn connect_edge_scroll_drag(view: &impl IsA<gtk::Widget>, engine: &Rc<EdgeScroll>) {
+    let over = gtk::DropControllerMotion::new();
+    let report = {
+        let engine = engine.clone();
+        move |over: &gtk::DropControllerMotion, y: f64| {
+            let weak = over.downgrade();
+            engine.pointer(y, Rc::new(move || weak.upgrade().is_some_and(|over| drag_still_running(&over))));
         }
-        if scroll_generation() != generation {
-            // His wheel or key, or Wayfinder moving it on purpose.
-            pin.set(None);
-            return;
+    };
+    let enter_report = report.clone();
+    // The drag this view last hooked, so one drag is hooked once however often it re-enters.
+    let hooked: Rc<RefCell<Option<glib::WeakRef<gdk::Drag>>>> = Rc::new(RefCell::new(None));
+    let enter_engine = engine.clone();
+    over.connect_enter(move |over, _, y| {
+        // A drag started in this app has a GdkDrag; it says itself when it is
+        // dropped, cancelled or finished (gdkdrag.c signals), whatever the
+        // pointer and the leave crossings do after that.
+        if let Some(drag) = over.drop().and_then(|d| d.drag()) {
+            let same = hooked.borrow().as_ref().and_then(|w| w.upgrade()).is_some_and(|d| d == drag);
+            if !same {
+                *hooked.borrow_mut() = Some(drag.downgrade());
+                let e = enter_engine.clone();
+                drag.connect_drop_performed(move |_| {
+                    #[cfg(test)]
+                    d370_log("gdk::Drag drop-performed".to_string());
+                    e.stop()
+                });
+                let e = enter_engine.clone();
+                drag.connect_cancel(move |_, reason| {
+                    #[cfg(test)]
+                    d370_log(format!("gdk::Drag cancel {reason:?}"));
+                    e.stop()
+                });
+                let e = enter_engine.clone();
+                drag.connect_dnd_finished(move |_| {
+                    #[cfg(test)]
+                    d370_log("gdk::Drag dnd-finished".to_string());
+                    e.stop()
+                });
+            }
         }
-        if scroll_target_reached(adj.value(), value) {
-            return;
-        }
-        // Put back inside GTK's own set_value, so its edge-scroll tick reads
-        // no movement and stops itself.
-        tag_scroll_cause("edge hold: put back");
-        snapping.set(true);
-        adj.set_value(value);
-        snapping.set(false);
+        enter_report(over, y)
     });
+    over.connect_motion(move |over, _, y| report(over, y));
+    let stopper = engine.clone();
+    over.connect_leave(move |_| stopper.stop());
+    // The drop going away or the pointer leaving ends the run at once, not at
+    // the next frame (both are cleared by the same leave crossing).
+    let stopper = engine.clone();
+    over.connect_drop_notify(move |_| stopper.stop());
+    let stopper = engine.clone();
+    over.connect_contains_pointer_notify(move |over| {
+        if !over.contains_pointer() {
+            stopper.stop();
+        }
+    });
+    view.add_controller(over);
+}
+
+/// D-370: a tile's child remembers the ListItem it is bound to, so a pick on a
+/// tile can be turned back into its position in the model (read live, so a
+/// folder refresh that shifts items stays right).
+fn tag_tile_d370(child: &impl IsA<gtk::Widget>, item: &gtk::ListItem) {
+    // SAFETY: the key is only ever read back as the same type, by `tile_item_d370`.
+    unsafe { child.set_data(TILE_ITEM_KEY, item.downgrade()) };
+}
+
+fn tile_item_d370(child: &gtk::Widget) -> Option<gtk::ListItem> {
+    // SAFETY: see `tag_tile_d370`; the stored type is `WeakRef<ListItem>`.
+    unsafe { child.data::<glib::WeakRef<gtk::ListItem>>(TILE_ITEM_KEY).and_then(|p| p.as_ref().upgrade()) }
+}
+
+/// D-370: one bound tile (or list row) of the view: its position in the model
+/// and its cell in view coordinates.
+#[derive(Clone, Copy, Debug)]
+struct TileCell {
+    pos: u32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// The cells GTK has realized right now, in view coordinates. The view's
+/// children are one list-item widget per tile; the tile Wayfinder built is that
+/// widget's child. Only realized cells are ever measured: tiles vary in height
+/// (names wrap to 2-4 lines), so an off-screen row has no geometry to read.
+fn realized_cells_d370(view: &gtk::Widget) -> Vec<TileCell> {
+    let mut out = Vec::new();
+    let mut next = view.first_child();
+    while let Some(cell) = next {
+        next = cell.next_sibling();
+        let Some(item) = cell.first_child().and_then(|inner| tile_item_d370(&inner)) else { continue };
+        let pos = item.position();
+        if pos == gtk::INVALID_LIST_POSITION {
+            continue;
+        }
+        // GTK keeps cells it has realized but not laid out (recycled, waiting
+        // for a position, gtklistitemmanager.c). They are children with no
+        // allocation (0x0 at 0,0) and would all look like one row. Only a cell
+        // that is shown, has a size and overlaps the view is a real tile.
+        if !cell.is_child_visible() || !cell.is_visible() || cell.width() <= 0 || cell.height() <= 0 {
+            continue;
+        }
+        if let Some(b) = cell.compute_bounds(view) {
+            let (vw, vh) = (view.width() as f32, view.height() as f32);
+            if b.width() <= 0.0 || b.height() <= 0.0 || b.x() + b.width() <= 0.0 || b.y() + b.height() <= 0.0 || b.x() >= vw || b.y() >= vh {
+                continue;
+            }
+            out.push(TileCell { pos, x: b.x() as f64, y: b.y() as f64, w: b.width() as f64, h: b.height() as f64 });
+        }
+    }
+    out
+}
+
+/// D-370: how many tiles sit in one row: the most cells that share a top edge.
+/// A list is 1. Read from live tiles because the count depends on the width.
+fn columns_of_cells(cells: &[TileCell]) -> u32 {
+    let mut best = 0u32;
+    for cell in cells {
+        let mut positions: Vec<u32> = cells.iter().filter(|c| (c.y - cell.y).abs() < 2.0).map(|c| c.pos).collect();
+        positions.sort_unstable();
+        positions.dedup();
+        // A real row holds consecutive positions; stop at the first gap.
+        let same = positions.windows(2).take_while(|w| w[1] == w[0] + 1).count() as u32 + 1;
+        best = best.max(same);
+    }
+    best.max(1)
+}
+
+/// D-370: the row (position / columns) whose cells are nearest to `y`: the one
+/// holding it, or the closest above or below it. None with no cells.
+fn row_at_y(cells: &[TileCell], n: u32, y: f64) -> Option<u32> {
+    let mut best: Option<(f64, u32)> = None;
+    for cell in cells {
+        let distance = if y < cell.y { cell.y - y } else if y > cell.y + cell.h { y - (cell.y + cell.h) } else { 0.0 };
+        if best.is_none_or(|(d, _)| distance < d) {
+            best = Some((distance, cell.pos / n));
+        }
+    }
+    best.map(|(_, row)| row)
+}
+
+/// D-370: where the columns are: the left edge of the first one and the
+/// distance from one column to the next (a cell plus the margin around tiles).
+fn column_layout(cells: &[TileCell]) -> (f64, f64) {
+    let left = cells.iter().map(|c| c.x).fold(f64::MAX, f64::min);
+    let mut xs: Vec<f64> = cells.iter().map(|c| c.x).collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pitch = xs
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| *d > 2.0)
+        .fold(f64::MAX, f64::min);
+    let width = cells.iter().map(|c| c.w).fold(0.0, f64::max).max(1.0);
+    (left, if pitch == f64::MAX { width } else { pitch })
+}
+
+/// D-370: the column of `x`; the gap after a cell belongs to that cell.
+fn column_at_x(cells: &[TileCell], n: u32, x: f64) -> u32 {
+    let (left, pitch) = column_layout(cells);
+    (((x - left) / pitch).floor().max(0.0) as u32).min(n - 1)
+}
+
+/// D-370: the top of row `row` among the realized cells, and whether the row is
+/// above (-1) or below (+1) everything realized when it is not among them.
+fn row_top_d370(cells: &[TileCell], n: u32, row: u32) -> Result<f64, i8> {
+    let mut top: Option<f64> = None;
+    let (mut first, mut last) = (u32::MAX, 0u32);
+    for cell in cells {
+        let r = cell.pos / n;
+        first = first.min(r);
+        last = last.max(r);
+        if r == row {
+            top = Some(top.map_or(cell.y, |t: f64| t.min(cell.y)));
+        }
+    }
+    top.ok_or(if row < first { -1 } else { 1 })
+}
+
+/// D-370: the items in rows `rows` x columns `cols` (both inclusive), cut to `count` items.
+fn box_items_d370(n: u32, rows: (u32, u32), cols: (u32, u32), count: u32) -> gtk::Bitset {
+    let items = gtk::Bitset::new_empty();
+    if count == 0 {
+        return items;
+    }
+    if cols.0 == 0 && cols.1 + 1 >= n {
+        let (start, end) = (rows.0 * n, ((rows.1 + 1) * n).min(count));
+        if start < end {
+            items.add_range(start, end - start);
+        }
+        return items;
+    }
+    for row in rows.0..=rows.1 {
+        let (start, end) = (row * n + cols.0, (row * n + cols.1).min(count - 1));
+        if start <= end {
+            items.add_range(start, end - start + 1);
+        }
+    }
+    items
+}
+
+/// D-370: how a finished box combines with what was selected before the press.
+/// Same four cases as GTK's gtk_list_base_apply_rubberband_selection
+/// (gtklistbase.c:1744-1805), with Ctrl and Shift read as in
+/// get_selection_modifiers (gtklistbase.c:1900-1925).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BoxMode {
+    /// No modifier: the box becomes the selection, the rest is cleared.
+    Replace,
+    /// Ctrl: the box is selected, the rest is kept.
+    Add,
+    /// Shift: the box is unselected, the rest is kept.
+    Remove,
+    /// Ctrl+Shift: the box is toggled against the earlier selection, the rest is kept.
+    /// GTK's own code for this case (gtklistbase.c:1766-1785) intersects the
+    /// current selection with the box and then removes that same set, so GTK
+    /// really UNSELECTS the whole box despite its "toggle" comment. Wayfinder
+    /// keeps a true toggle on purpose.
+    Toggle,
+}
+
+/// D-370: the selection a box makes. Pure so it can be tested.
+fn box_selection_d370(base: &gtk::Bitset, boxed: &gtk::Bitset, mode: BoxMode) -> gtk::Bitset {
+    match mode {
+        BoxMode::Replace => boxed.copy(),
+        BoxMode::Add => {
+            let out = base.copy();
+            out.union(boxed);
+            out
+        }
+        BoxMode::Remove => {
+            let out = base.copy();
+            out.subtract(boxed);
+            out
+        }
+        // Symmetric difference: in exactly one of the two.
+        BoxMode::Toggle => {
+            let out = base.copy();
+            out.difference(boxed);
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// D-370 test hook: when each engine frame that moved the view ran.
+    static D370_SCROLL_TIMES: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// D-370 test hook: the (clamped) length of every engine frame.
+    static D370_FRAMES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// D-370 test hook: every selection write BoxSelect makes, every drag signal
+    /// and every selection change GTK reports, with the time of each.
+    static D370_LOG: RefCell<Vec<(Instant, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn d370_log(line: String) {
+    D370_LOG.with(|l| l.borrow_mut().push((Instant::now(), line)));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// D-370 test hook: the positions of the selection a box-select took at the press.
+    static D370_BOX_BASE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// D-370: the rectangle drawn while a box-select is held. One per file area,
+/// shared by both views, in the overlay that wraps the stack that holds them.
+/// The css class `rubberband` is the one Adwaita styles for a selection box.
+struct RubberBand {
+    widget: gtk::Box,
+    overlay: gtk::Overlay,
+    rect: Cell<Option<gdk::Rectangle>>,
+}
+
+impl RubberBand {
+    fn new(overlay: &gtk::Overlay) -> Rc<RubberBand> {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        widget.add_css_class("rubberband");
+        widget.set_can_target(false);
+        widget.set_can_focus(false);
+        widget.set_visible(false);
+        overlay.add_overlay(&widget);
+        overlay.set_clip_overlay(&widget, true);
+        overlay.set_measure_overlay(&widget, false);
+        let band = Rc::new(RubberBand { widget, overlay: overlay.clone(), rect: Cell::new(None) });
+        let weak = Rc::downgrade(&band);
+        overlay.connect_get_child_position(move |_, child| {
+            let band = weak.upgrade()?;
+            if child != band.widget.upcast_ref::<gtk::Widget>() {
+                return None;
+            }
+            band.rect.get()
+        });
+        band
+    }
+
+    /// Shows the box at `rect`, given in `view` coordinates.
+    fn show(&self, view: &gtk::Widget, x1: f64, y1: f64, x2: f64, y2: f64) {
+        let (vw, vh) = (view.width() as f64, view.height() as f64);
+        let (left, right) = (x1.min(x2).clamp(0.0, vw), x1.max(x2).clamp(0.0, vw));
+        let (top, bottom) = (y1.min(y2).clamp(0.0, vh), y1.max(y2).clamp(0.0, vh));
+        let Some(origin) = view.compute_point(&self.overlay, &gtk::graphene::Point::new(0.0, 0.0)) else { return };
+        let rect = gdk::Rectangle::new(
+            (origin.x() as f64 + left).round() as i32,
+            (origin.y() as f64 + top).round() as i32,
+            ((right - left).round() as i32).max(1),
+            ((bottom - top).round() as i32).max(1),
+        );
+        self.rect.set(Some(rect));
+        self.widget.set_visible(true);
+        self.overlay.queue_allocate();
+    }
+
+    fn hide(&self) {
+        self.rect.set(None);
+        self.widget.set_visible(false);
+    }
+}
+
+/// D-370: Wayfinder's own box-select, one per view, replacing GTK's
+/// rubberband (gtklistbase.c:1709-1845, 1880-1990), which cannot be told not to
+/// edge-scroll. A GestureDrag on the view in the same phase GTK's was, so a
+/// tile's drag source still wins a press on a tile. The box is kept as a start
+/// row and column plus an offset inside that cell (content coordinates), and the
+/// selection is rows x columns by index, so it stays right while the view
+/// scrolls and no off-screen geometry is ever needed.
+///
+/// Modifiers are read at the press: Ctrl toggles against the selection as it
+/// was before the press, Shift adds to it, neither replaces it. (GTK's own box
+/// does Ctrl = add, Shift = remove and applies it only on release.)
+struct BoxSelect {
+    view: gtk::Widget,
+    model: Rc<dyn Fn() -> Option<gtk::SelectionModel>>,
+    engine: Rc<EdgeScroll>,
+    band: Rc<RubberBand>,
+    /// The selection as it was before the press, and the modifiers of the press.
+    pressed: RefCell<Option<(gtk::Bitset, BoxMode)>>,
+    /// Press point, in view coordinates, once the press is on a cell.
+    start: Cell<Option<(f64, f64)>>,
+    /// Row, column and the press's offset inside that cell, and the columns per row.
+    anchor: Cell<Option<(u32, u32, f64, f64, u32)>>,
+    active: Rc<Cell<bool>>,
+    pointer: Cell<(f64, f64)>,
+    /// Rows and columns last applied, so an unchanged box does not touch the selection.
+    applied: Cell<Option<(u32, u32, u32, u32)>>,
+}
+
+impl BoxSelect {
+    #[allow(deprecated)]
+    fn install(
+        view: &impl IsA<gtk::Widget>,
+        model: Rc<dyn Fn() -> Option<gtk::SelectionModel>>,
+        engine: &Rc<EdgeScroll>,
+        band: &Rc<RubberBand>,
+    ) {
+        let view: gtk::Widget = view.clone().upcast();
+        let this = Rc::new(BoxSelect {
+            view: view.clone(),
+            model,
+            engine: engine.clone(),
+            band: band.clone(),
+            pressed: RefCell::new(None),
+            start: Cell::new(None),
+            anchor: Cell::new(None),
+            active: Rc::new(Cell::new(false)),
+            pointer: Cell::new((0.0, 0.0)),
+            applied: Cell::new(None),
+        });
+        // The selection and modifiers as they were at the press. (GTK's row
+        // click selects on RELEASE, gtklistfactorywidget.c:441-470, so the
+        // press still sees the selection from before it.)
+        let press = gtk::EventControllerLegacy::new();
+        press.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let this = this.clone();
+            press.connect_event(move |_, event| {
+                match event.event_type() {
+                    gdk::EventType::ButtonPress if event.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == 1) => {
+                        if let Some(model) = (this.model)() {
+                            let state = event.modifier_state();
+                            let mode = match (state.contains(gdk::ModifierType::CONTROL_MASK), state.contains(gdk::ModifierType::SHIFT_MASK)) {
+                                (true, true) => BoxMode::Toggle,
+                                (true, false) => BoxMode::Add,
+                                (false, true) => BoxMode::Remove,
+                                (false, false) => BoxMode::Replace,
+                            };
+                            // gtk_multi_selection_get_selection_in_range returns the model's OWN bitset,
+                            // referenced, not copied (gtkmultiselection.c:124-131). Without a copy the
+                            // "press snapshot" follows every later write, and only an idempotent mode
+                            // (add, remove) hides it. Copy it.
+                            let base = model.selection().copy();
+                            #[cfg(test)]
+                            D370_BOX_BASE.with(|b| *b.borrow_mut() = (0..model.n_items().min(5000)).filter(|i| base.contains(*i)).collect());
+                            *this.pressed.borrow_mut() = Some((base, mode));
+                        }
+                    }
+                    _ => {}
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        view.add_controller(press);
+        // Same phase and button GTK's rubberband used (gtklistbase.c:1985-1990).
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(1);
+        {
+            let this = this.clone();
+            drag.connect_drag_begin(move |_, x, y| this.begin(x, y));
+        }
+        {
+            let this = this.clone();
+            drag.connect_drag_update(move |gesture, ox, oy| {
+                if !this.active.get() {
+                    // Like gtklistbase.c:1927-1945: nothing until the pointer passes the drag threshold.
+                    if !this.view.drag_check_threshold(0, 0, ox as i32, oy as i32) {
+                        return;
+                    }
+                    if this.start.get().is_none() {
+                        return;
+                    }
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    this.active.set(true);
+                }
+                if let Some((sx, sy)) = this.start.get() {
+                    this.update(sx + ox, sy + oy);
+                }
+            });
+        }
+        {
+            let this = this.clone();
+            drag.connect_drag_end(move |_, ox, oy| {
+                #[cfg(test)]
+                d370_log(format!("BoxSelect drag-end active={} offset ({ox:.0},{oy:.0})", this.active.get()));
+                if this.active.get() {
+                    // The row under the press runs its own click on release
+                    // (gtklistfactorywidget.c:441-470: Ctrl+Shift = unselect the range
+                    // from the last selected row to it) before this handler, and
+                    // would leave its change in the selection if an unchanged
+                    // box skipped the write. Always write the final box.
+                    this.applied.set(None);
+                    if let Some((sx, sy)) = this.start.get() {
+                        this.update(sx + ox, sy + oy);
+                    }
+                }
+                this.finish();
+            });
+        }
+        {
+            let this = this.clone();
+            drag.connect_cancel(move |_, _| this.finish());
+        }
+        view.add_controller(drag);
+        {
+            let weak = Rc::downgrade(&this);
+            *engine.moved.borrow_mut() = Some(Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    if this.active.get() {
+                        this.refresh();
+                    }
+                }
+            }));
+        }
+        let weak = Rc::downgrade(&this);
+        view.connect_unmap(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.finish();
+            }
+        });
+    }
+
+    fn begin(&self, x: f64, y: f64) {
+        self.active.set(false);
+        self.applied.set(None);
+        self.start.set(None);
+        self.anchor.set(None);
+        let cells = realized_cells_d370(&self.view);
+        if cells.is_empty() {
+            return;
+        }
+        let n = columns_of_cells(&cells);
+        let Some(row) = row_at_y(&cells, n, y) else { return };
+        let col = column_at_x(&cells, n, x);
+        let Ok(top) = row_top_d370(&cells, n, row) else { return };
+        let (left, pitch) = column_layout(&cells);
+        self.start.set(Some((x, y)));
+        self.anchor.set(Some((row, col, x - (left + col as f64 * pitch), y - top, n)));
+    }
+
+    fn update(&self, x: f64, y: f64) {
+        self.pointer.set((x, y));
+        let held = self.active.clone();
+        self.engine.pointer(y, Rc::new(move || held.get()));
+        self.refresh();
+    }
+
+    fn refresh(&self) {
+        let Some((row0, col0, dx, dy, n)) = self.anchor.get() else { return };
+        let Some(model) = (self.model)() else { return };
+        let cells = realized_cells_d370(&self.view);
+        if cells.is_empty() {
+            return;
+        }
+        let (vw, vh) = (self.view.width() as f64, self.view.height() as f64);
+        let (px, py) = self.pointer.get();
+        // A pointer past the edge counts as at the edge: the rows there are the ones in view.
+        let (cx, cy) = (px.clamp(0.0, (vw - 1.0).max(0.0)), py.clamp(0.0, (vh - 1.0).max(0.0)));
+        let Some(row1) = row_at_y(&cells, n, cy) else { return };
+        let col1 = column_at_x(&cells, n, cx);
+        let (rows, cols) = ((row0.min(row1), row0.max(row1)), (col0.min(col1), col0.max(col1)));
+        let key = (rows.0, rows.1, cols.0, cols.1);
+        if self.applied.get() != Some(key) {
+            self.applied.set(Some(key));
+            if let Some((base, mode)) = self.pressed.borrow().as_ref() {
+                let count = model.n_items();
+                let boxed = box_items_d370(n, rows, cols, count);
+                let selected = box_selection_d370(base, &boxed, *mode);
+                model.set_selection(&selected, &gtk::Bitset::new_range(0, count));
+                #[cfg(test)]
+                d370_log(format!(
+                    "BoxSelect write {:?}: rows {}-{} cols {}-{}; pointer {:?}; result {:?}",
+                    mode, rows.0, rows.1, cols.0, cols.1, self.pointer.get(),
+                    (0..count.min(5000)).filter(|i| model.is_selected(*i)).collect::<Vec<u32>>()
+                ));
+            }
+        }
+        // The start corner follows its row: a row above or below everything
+        // realized sits at the matching edge of the view.
+        let (left, pitch) = column_layout(&cells);
+        let ax = left + col0 as f64 * pitch + dx;
+        let ay = match row_top_d370(&cells, n, row0) {
+            Ok(top) => top + dy,
+            Err(-1) => -1.0e6,
+            Err(_) => 1.0e6,
+        };
+        self.band.show(&self.view, ax, ay, px, py);
+    }
+
+    fn finish(&self) {
+        let was_active = self.active.replace(false);
+        self.start.set(None);
+        self.anchor.set(None);
+        self.applied.set(None);
+        *self.pressed.borrow_mut() = None;
+        if was_active {
+            self.engine.stop();
+            self.band.hide();
+        }
+    }
 }
 
 /// D-364 (root of "the list jumps when I click a file near the bottom").
@@ -11639,6 +12335,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             guide_name(&line, GUIDE_ZIP_ROW);
             guide_resolve_zip_row_later(&state);
         }
+        tag_tile_d370(&line, item);
         item.set_child(Some(&line));
     });
     factory.connect_unbind(move |_, item| {
@@ -11882,6 +12579,7 @@ fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
                 );
             }
         }
+        tag_tile_d370(&grid_item, item);
         item.set_child(Some(&grid_item));
     });
     factory.connect_unbind(move |_, item| {
@@ -25587,7 +26285,6 @@ Broken: Either state is wrong.\n";
             sidebar_button_not_divider_d352();
             split_wrapped_names_click_keeps_place_d358();
             compare_window_shows_both_files_d351();
-            bottom_row_click_keeps_place_d350();
             split_same_folder_move_into_subfolder_keeps_place_d343();
             eprintln!("wf-test place-only run done");
             return;
@@ -25600,10 +26297,10 @@ Broken: Either state is wrong.\n";
             split_same_folder_move_into_subfolder_keeps_place_d343();
             new_folder_naming_stays_put_d341();
             pin_keeps_item_on_top_d359();
-            bottom_row_click_keeps_place_d350();
             split_wrapped_names_click_keeps_place_d358();
             pointer_click_keeps_scroll_d364();
             delete_keeps_view_d371();
+            edge_scroll_while_dragging_d370();
             refresh_keeps_scroll_place_d349();
             eprintln!("wf-test scroll-only run done");
             return;
@@ -25697,7 +26394,6 @@ Broken: Either state is wrong.\n";
         split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details", false);
         split_move_keeps_source_pane_scroll_d336(ViewMode::Grid, "grid", false);
         split_same_folder_move_into_subfolder_keeps_place_d343();
-        bottom_row_click_keeps_place_d350();
         compare_window_shows_both_files_d351();
         sidebar_button_not_divider_d352();
         split_wrapped_names_click_keeps_place_d358();
@@ -30106,6 +30802,504 @@ Broken: Either state is wrong.\n";
         assert!(problems.is_empty(), "D-364: {problems:?}");
     }
 
+    /// D-370: the zone and speed curve (plain numbers, no GTK).
+    #[test]
+    fn edge_scroll_curve_d370() {
+        assert_eq!(edge_zone_px(900.0), 56.0);
+        assert_eq!(edge_zone_px(120.0), 30.0);
+        assert!(edge_zone_depth(450.0, 900.0).is_none());
+        let (side, d) = edge_zone_depth(899.0, 900.0).unwrap();
+        assert!(side == 1 && d > 0.95);
+        let (side, d) = edge_zone_depth(-20.0, 900.0).unwrap();
+        assert!(side == -1 && d == 1.0);
+        assert!(edge_zone_depth(900.0 - 56.0, 900.0).map_or(true, |(_, d)| d < 0.01));
+        assert!(edge_speed(1.0, 0.0) > edge_speed(0.2, 0.0) * 3.0);
+        assert!(edge_speed(0.5, 1.5) > edge_speed(0.5, 0.0) * 2.5);
+        assert!(edge_speed(0.5, 9.0) == edge_speed(0.5, 1.5));
+    }
+
+    /// D-370: the four modifier cases of a box, as GTK's (gtklistbase.c:1744-1805).
+    #[test]
+    fn box_modes_d370() {
+        let (base, boxed) = (gtk::Bitset::new_empty(), gtk::Bitset::new_empty());
+        base.add_range(2, 3); // 2,3,4
+        boxed.add_range(4, 3); // 4,5,6
+        let list = |m| { let r = box_selection_d370(&base, &boxed, m); (0..10).filter(|i| r.contains(*i)).collect::<Vec<u32>>() };
+        assert_eq!(list(BoxMode::Replace), vec![4, 5, 6]);
+        assert_eq!(list(BoxMode::Add), vec![2, 3, 4, 5, 6]);
+        assert_eq!(list(BoxMode::Remove), vec![2, 3]);
+        assert_eq!(list(BoxMode::Toggle), vec![2, 3, 5, 6]);
+    }
+
+    /// D-370 alone, on the private display, with real X input.
+    #[test]
+    fn edge_scroll_while_dragging_d370_alone() { gtk_thread::run(edge_scroll_while_dragging_d370_alone_on_gtk_thread); }
+
+    fn edge_scroll_while_dragging_d370_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D370_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        edge_scroll_while_dragging_d370();
+    }
+
+    /// D-370: Wayfinder owns edge scrolling while he drags, in both views, with
+    /// real XTEST input (xdotool, only ever inside run232's private Xvfb).
+    ///  a. icon view, box-select from the gap beside a tile, pointer held in the
+    ///     bottom zone: no movement for the first 150 ms (the arm time is 250),
+    ///     then movement; faster later than earlier (ramp); a deep pointer
+    ///     faster than a shallow one; nothing after the release; the selection
+    ///     holds the start item, an item scrolled past and the item under the
+    ///     pointer; the rubber-band widget shows during the box and not after.
+    ///  b. Ctrl box-select toggles against the selection from before the press
+    ///     and the view stays still away from the edges.
+    ///  c. list, a plain press near the bottom edge, moved 10 px and released
+    ///     inside 150 ms: the list does not move.
+    ///  d. list, a real file drag held in the bottom zone scrolls the list;
+    ///     GTK's internal DropControllerMotion (both views) has phase None and
+    ///     the icon view's GTK rubberband is off.
+    ///  e. the top zone scrolls up.
+    fn edge_scroll_while_dragging_d370() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-370 sends real X input and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d370-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 2400usize;
+        for i in 0..total {
+            std::fs::write(dir.join(wrapped_fixture_name(i)), "x").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d370test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d370-proof"));
+        ui.window.set_default_size(1300, 900);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // pump() sleeps 200 ms a call; these timings need a finer loop.
+        let run_for = |ms: u64| {
+            let ctx = glib::MainContext::default();
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end {
+                while ctx.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(4));
+            }
+        };
+        let mut problems: Vec<String> = Vec::new();
+
+        // ---- GTK's own edge scroll is gone at its source, in both views.
+        for (label, view) in [("list", ui.list.clone().upcast::<gtk::Widget>()), ("grid", ui.grid.clone().upcast::<gtk::Widget>())] {
+            let controllers = view.observe_controllers();
+            let phases: Vec<gtk::PropagationPhase> = (0..controllers.n_items())
+                .filter_map(|i| controllers.item(i).and_then(|o| o.downcast::<gtk::DropControllerMotion>().ok()))
+                .map(|c| c.propagation_phase())
+                .collect();
+            eprintln!("wf-test D-370 {label}: DropControllerMotion phases {phases:?}");
+            // gtk_widget_add_controller prepends (gtkwidget.c:11974): GTK's own is the last.
+            if phases.last() != Some(&gtk::PropagationPhase::None) {
+                problems.push(format!("{label}: GTK's internal DropControllerMotion (the last one) is not switched off: {phases:?}"));
+            }
+            if phases.len() < 2 {
+                problems.push(format!("{label}: Wayfinder's own DropControllerMotion is missing: {phases:?}"));
+            }
+        }
+        if ui.grid.enables_rubberband() {
+            problems.push("grid: GTK's rubberband is still on".to_string());
+        }
+
+        let geometry = |display_name: &str| -> (i32, i32) {
+            let mut geo = String::new();
+            for _ in 0..50 {
+                if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", display_name).args(["search", "--name", "wf-d370-proof", "getwindowgeometry", "--shell"]).output() {
+                    if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+                }
+                run_for(50);
+            }
+            let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+            (num("X="), num("Y="))
+        };
+        let (wx, wy) = geometry(&display_name);
+        let _ = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d370-proof", "windowfocus"]).output();
+        run_for(300);
+
+        // Value of the samples (seconds since the pointer reached its place, adjustment value) at time t.
+        let at = |s: &[(f64, f64)], t: f64| -> f64 { s.iter().rev().find(|(ts, _)| *ts <= t).map_or(s[0].1, |x| x.1) };
+        let rubber_shown = |ui: &Ui| -> bool {
+            all_widgets(ui.window.upcast_ref()).iter().any(|w| w.has_css_class("rubberband") && w.is_visible())
+        };
+        let scroll_to = |adj: &gtk::Adjustment, v: f64| {
+            mark_scroll_cause("test: his own scroll");
+            adj.set_value(v);
+            run_for(500);
+        };
+
+        // ================= icon view =================
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        run_for(800);
+        let grid_scroll = view_scroller(&state, &ui);
+        let gadj = grid_scroll.vadjustment();
+        wait_for("icon view scrollable", || gadj.upper() > gadj.page_size() * 6.0);
+        scroll_to(&gadj, 0.0);
+        let gview: gtk::Widget = ui.grid.clone().upcast();
+        let gmodel = ui.grid.model().expect("the icon view has a selection model");
+        let gb = gview.compute_bounds(&ui.window).expect("icon view bounds");
+        let (gx, gy, gh) = (wx + gb.x() as i32, wy + gb.y() as i32, gb.height() as i32);
+        let cells = realized_cells_d370(&gview);
+        let n = columns_of_cells(&cells);
+        let all_children = { let mut c = 0; let mut w = gview.first_child(); while let Some(x) = w { c += 1; w = x.next_sibling(); } c };
+        let (cw, cwmax) = (cells.iter().map(|c| c.w).fold(f64::MAX, f64::min), cells.iter().map(|c| c.w).fold(0.0, f64::max));
+        eprintln!("wf-test D-370 grid: window {}x{}, view {}x{} at ({gx},{gy}), {all_children} child cells, {} laid out inside the view, {n} columns (cell width {cw:.0}-{cwmax:.0}), {} rows in total", ui.window.width(), ui.window.height(), gview.width(), gview.height(), cells.len(), (total as u32).div_ceil(n));
+        assert!(n as f64 * cw <= gview.width() as f64 + 2.0, "D-370: {n} columns of {cw:.0} px cannot fit a {} px wide view; the cell list is wrong", gview.width());
+        assert!(n >= 3, "D-370 needs three icon columns to start a box in a gap (got {n})");
+        assert!(gadj.upper() > gadj.page_size() * 6.0 && total as u32 / n > 20, "D-370 needs 20+ rows");
+        let zone = edge_zone_px(gh as f64);
+        let (deep_y, shallow_y) = (gy + gh - 3, gy + gh - (zone * 0.8) as i32);
+        // The gap right of the tile in column `col` of row `row`, as screen coordinates.
+        // The gap after a cell belongs to that cell, so a box that starts there starts in `col`.
+        let gap_of = |row: u32, col: u32| -> Option<(i32, i32, TileCell)> {
+            let cells = realized_cells_d370(&gview);
+            let tile = cells.iter().find(|c| c.pos == row * n + col)?;
+            Some((gx + (tile.x + tile.w + 4.0) as i32, gy + (tile.y + tile.h / 2.0) as i32, *tile))
+        };
+        // The box runs from column 0 to a middle column, with columns left outside it on the right.
+        let mid = (n / 2).max(1).min(n - 2);
+        let Some((sx, sy, start_tile)) = gap_of(1, 0) else { panic!("D-370: no tile in row 1, column 0 to start beside") };
+        let Some((_, _, mid_tile)) = gap_of(1, mid) else { panic!("D-370: no tile in row 1, column {mid}") };
+        let end_x = gx + (mid_tile.x + mid_tile.w / 2.0) as i32;
+        let picked = ui.window.pick((sx - wx) as f64, (sy - wy) as f64, gtk::PickFlags::DEFAULT).map(|w| w.type_().name().to_string());
+        eprintln!("wf-test D-370 grid: start ({sx},{sy}) beside tile {:?}, the pick there is {picked:?}", start_tile);
+        // The gap after a tile belongs to its GtkListItemWidget (the tile's 4 px margin sits inside it).
+        if !matches!(picked.as_deref(), Some("GtkGridView") | Some("GtkListItemWidget")) {
+            problems.push(format!("grid: the start point is not in a gap of the icon view (pick {picked:?}); the test cannot start a box there"));
+        }
+        let start_index = n;
+        // One box drag. Returns the samples taken while the pointer is held at `end_y`.
+        let box_drag = |sx: i32, sy: i32, end_x: i32, end_y: i32, hold_ms: u64, mods: &[&str], adj: &gtk::Adjustment| -> (Vec<(f64, f64)>, bool) {
+            xdo(&["mousemove", &sx.to_string(), &sy.to_string()]);
+            run_for(150);
+            for m in mods { xdo(&["keydown", m]); }
+            xdo(&["mousedown", "1"]);
+            run_for(80);
+            // Past the drag threshold, still far from both edges.
+            let first_y = if end_y > sy { sy + 24 } else { sy - 24 };
+            xdo(&["mousemove", &end_x.to_string(), &first_y.to_string()]);
+            run_for(120);
+            xdo(&["mousemove", &end_x.to_string(), &end_y.to_string()]);
+            let t0 = Instant::now();
+            let mut samples = vec![(0.0, adj.value())];
+            let mut shown = false;
+            let ctx = glib::MainContext::default();
+            while t0.elapsed() < Duration::from_millis(hold_ms) {
+                while ctx.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(4));
+                samples.push((t0.elapsed().as_secs_f64(), adj.value()));
+                if t0.elapsed() > Duration::from_millis(hold_ms / 2) {
+                    shown = shown || rubber_shown(&ui);
+                }
+            }
+            (samples, shown)
+        };
+        let release = |mods: &[&str]| {
+            xdo(&["mouseup", "1"]);
+            for m in mods { xdo(&["keyup", m]); }
+        };
+
+        // a. shallow pointer first, for the depth comparison.
+        gmodel.unselect_all();
+        let (shallow, _) = box_drag(sx, sy, end_x, shallow_y, 1800, &[], &gadj);
+        release(&[]);
+        run_for(300);
+        let shallow_dist = at(&shallow, 1.6) - at(&shallow, 0.6);
+        eprintln!("wf-test D-370 a shallow (depth ~0.2): moved {:.1} px between 0.6 s and 1.6 s, first 150 ms moved {:.1}", shallow_dist, at(&shallow, 0.15) - at(&shallow, 0.0));
+        scroll_to(&gadj, 0.0);
+
+        // a. deep pointer: arm time, ramp, release, selection.
+        gmodel.unselect_all();
+        D370_FRAMES.with(|f| f.borrow_mut().clear());
+        let (deep, shown) = box_drag(sx, sy, end_x, deep_y, 2800, &[], &gadj);
+        let frames = D370_FRAMES.with(|f| f.borrow().clone());
+        let (fmax, fmean) = (frames.iter().copied().fold(0.0, f64::max), frames.iter().sum::<f64>() / frames.len().max(1) as f64);
+        eprintln!("wf-test D-370 a engine frames over the deep hold: {} frames, mean {:.1} ms, max {:.1} ms, {} over 50 ms", frames.len(), fmean * 1000.0, fmax * 1000.0, frames.iter().filter(|d| **d > 0.05).count());
+        let first = at(&deep, 0.15) - at(&deep, 0.0);
+        let by_one_second = at(&deep, 1.0) - at(&deep, 0.0);
+        let early = (at(&deep, 1.0) - at(&deep, 0.5)) / 0.5;
+        let late = (at(&deep, 2.6) - at(&deep, 2.1)) / 0.5;
+        let deep_dist = at(&deep, 1.6) - at(&deep, 0.6);
+        eprintln!("wf-test D-370 a deep (depth ~0.95): first 150 ms moved {first:.1} px, by 1.0 s {by_one_second:.1} px, speed {early:.0} px/s at 0.5-1.0 s then {late:.0} px/s at 2.1-2.6 s, {deep_dist:.1} px between 0.6 s and 1.6 s (shallow {shallow_dist:.1}), rubber band shown={shown}");
+        if first.abs() > 1.0 { problems.push(format!("a: the view moved {first:.1} px in the first 150 ms, before the 250 ms arm time")); }
+        if by_one_second < 50.0 { problems.push(format!("a: the view moved only {by_one_second:.1} px in the first second")); }
+        if late <= early * 1.15 { problems.push(format!("a: no ramp: {early:.0} px/s early, {late:.0} px/s late")); }
+        if deep_dist <= shallow_dist * 2.0 { problems.push(format!("a: a deep pointer ({deep_dist:.1} px) is not clearly faster than a shallow one ({shallow_dist:.1} px)")); }
+        if !shown { problems.push("a: no visible `rubberband` widget while the box was held".to_string()); }
+        // The pointer's place in the view, for the selection check, before the release.
+        let pointer_local_y = (deep_y - gy) as f64;
+        release(&[]);
+        run_for(150);
+        let after_release = gadj.value();
+        run_for(700);
+        let drift = gadj.value() - after_release;
+        eprintln!("wf-test D-370 a release: value {after_release:.1}, then moved {drift:.1} px in 700 ms; rubber band shown={}", rubber_shown(&ui));
+        if drift.abs() > 2.0 { problems.push(format!("a: the view kept moving {drift:.1} px after the release")); }
+        if rubber_shown(&ui) { problems.push("a: the rubber band is still shown after the release".to_string()); }
+        let cells_now = realized_cells_d370(&gview);
+        let under = cells_now.iter().find(|c| (c.x - mid_tile.x).abs() < 2.0 && c.y <= pointer_local_y && pointer_local_y <= c.y + c.h).map(|c| c.pos);
+        let selection = gmodel.selection();
+        eprintln!("wf-test D-370 a selection: {} items, start item {start_index}, item under the pointer {under:?}", selection.size());
+        if !selection.contains(start_index) { problems.push(format!("a: the start item {start_index} (column 0) is not selected")); }
+        match under {
+            Some(under) => {
+                let (start_row, under_row) = (start_index / n, under / n);
+                let past_row = (start_row + under_row) / 2;
+                if under_row < 10 { problems.push(format!("a: only reached row {under_row} - fewer than 10 rows scrolled past")); }
+                // Inside the box: every column from 0 to `mid` in a row scrolled past.
+                for col in 0..=mid {
+                    for row in [past_row, under_row] {
+                        if !selection.contains(row * n + col) { problems.push(format!("a: row {row}, column {col} is inside the box and not selected")); }
+                    }
+                }
+                // Outside the box: columns right of `mid`, and the row above the start.
+                for col in (mid + 1)..n {
+                    for row in [start_row, past_row, under_row] {
+                        if selection.contains(row * n + col) { problems.push(format!("a: row {row}, column {col} is right of the box and selected")); }
+                    }
+                }
+                for col in 0..n {
+                    if selection.contains((start_row - 1) * n + col) { problems.push(format!("a: row {}, column {col} is above the box and selected", start_row - 1)); }
+                }
+            }
+            None => problems.push("a: no tile of the end column under the pointer at the release".to_string()),
+        }
+        eprintln!("wf-test D-370 a columns: {n} columns, box from column 0 to column {mid}");
+
+        // e. up: from mid-view into the top zone, with the view far down.
+        let mid_row = realized_cells_d370(&gview).iter().filter(|c| c.y <= gh as f64 * 0.5 && c.y + c.h >= gh as f64 * 0.5).map(|c| c.pos / n).next();
+        if let Some(row) = mid_row {
+            // The tile's own centre may lie outside the view (tiles are ~200 px tall): start at the view's middle.
+            if let Some((usx, _, _)) = gap_of(row, 0) {
+                let usy = gy + gh / 2;
+                let before = gadj.value();
+                let top_y = gy + 3;
+                let (up, _) = box_drag(usx, usy, usx, top_y, 1500, &[], &gadj);
+                release(&[]);
+                run_for(200);
+                let first_up = at(&up, 0.15) - at(&up, 0.0);
+                let moved_up = at(&up, 1.4) - at(&up, 0.0);
+                eprintln!("wf-test D-370 e up: value {before:.1} -> {:.1}; first 150 ms moved {first_up:.1}, by 1.4 s {moved_up:.1}", gadj.value());
+                if first_up.abs() > 1.0 { problems.push(format!("e: the view moved {first_up:.1} px up before the arm time")); }
+                if moved_up > -50.0 { problems.push(format!("e: the top zone did not scroll the view up ({moved_up:.1} px)")); }
+            } else {
+                problems.push(format!("e: no tile in column 1 of row {row} to start a box beside"));
+            }
+        } else {
+            problems.push("e: no row near the middle of the view".to_string());
+        }
+
+        // b. The three modifier cases, with the view far from both edges. Box:
+        // column 0 to `mid`, rows 0 to 2. Earlier selection: row 1 whole, plus row 4, column 0.
+        scroll_to(&gadj, 0.0);
+        let cells0 = realized_cells_d370(&gview);
+        // Rows 0 to 2: the icon rows are ~200 px tall, so the middle of row 3 would sit in the bottom zone.
+        let row3 = cells0.iter().find(|c| c.pos == 2 * n + mid).copied();
+        let (Some((bsx, bsy, _)), Some(row3)) = (gap_of(0, 0), row3) else { panic!("D-370 b: rows 0 and 2 are not realized") };
+        let b_end_y = gy + (row3.y + row3.h / 2.0) as i32;
+        let b_end_x = gx + (row3.x + row3.w / 2.0) as i32;
+        let b_before = |model: &gtk::SelectionModel| {
+            model.unselect_all();
+            model.select_range(n, n, false);
+            model.select_item(4 * n, false);
+        };
+        let boxed = |r: u32, c: u32| r <= 2 && c <= mid;
+        let earlier = |r: u32, c: u32| r == 1 || (r == 4 && c == 0);
+        for (label, mods, expect) in [
+            ("ctrl add", &["ctrl"][..], &(|r: u32, c: u32| boxed(r, c) || earlier(r, c)) as &dyn Fn(u32, u32) -> bool),
+            ("shift remove", &["shift"][..], &(|r: u32, c: u32| earlier(r, c) && !boxed(r, c))),
+            ("ctrl+shift toggle", &["ctrl", "shift"][..], &(|r: u32, c: u32| boxed(r, c) != earlier(r, c) || (!boxed(r, c) && earlier(r, c)))),
+        ] {
+            b_before(&gmodel);
+            D370_LOG.with(|l| l.borrow_mut().clear());
+            let log_start = Instant::now();
+            let changed = gmodel.connect_selection_changed(|m, pos, n_items| {
+                d370_log(format!("GTK selection-changed positions {pos}+{n_items}; now {:?}", (0..m.n_items().min(5000)).filter(|i| m.is_selected(*i)).collect::<Vec<u32>>()));
+            });
+            let (still, _) = box_drag(bsx, bsy, b_end_x, b_end_y, 600, mods, &gadj);
+            let base_at_press = D370_BOX_BASE.with(|b| b.borrow().clone());
+            let prior: Vec<u32> = (0..7 * n).filter(|i| earlier(i / n, i % n)).collect();
+            eprintln!("wf-test D-370 b {label}: selection taken at the press {base_at_press:?}, selection set before it {prior:?}");
+            if base_at_press != prior { problems.push(format!("b {label}: the selection taken at the press {base_at_press:?} is not the one from before it {prior:?}")); }
+            d370_log("modifiers released".to_string());
+            release(mods);
+            run_for(300);
+            gmodel.disconnect(changed);
+            for (t, line) in D370_LOG.with(|l| l.borrow().clone()) {
+                eprintln!("wf-test D-370 b {label} +{:.3} s: {line}", t.duration_since(log_start).as_secs_f64());
+            }
+            let sel = gmodel.selection();
+            let moved = at(&still, 0.55) - at(&still, 0.0);
+            eprintln!("wf-test D-370 b {label}: {} items selected, view moved {moved:.1}", sel.size());
+            let mut wrong = Vec::new();
+            for r in 0..7 {
+                for c in 0..n {
+                    if sel.contains(r * n + c) != expect(r, c) { wrong.push((r, c)); }
+                }
+            }
+            if !wrong.is_empty() { problems.push(format!("b {label}: (row, column) wrong: {wrong:?}")); }
+            let picked_cells: Vec<u32> = (0..7 * n).filter(|i| sel.contains(*i)).collect();
+            eprintln!("wf-test D-370 b {label}: selected positions {picked_cells:?}");
+            if moved.abs() > 1.0 { problems.push(format!("b {label}: the view scrolled although the pointer was far from both edges")); }
+        }
+
+        // ================= list =================
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        run_for(800);
+        let list_scroll = view_scroller(&state, &ui);
+        let ladj = list_scroll.vadjustment();
+        wait_for("list scrollable", || ladj.upper() > ladj.page_size() * 3.0);
+        scroll_to(&ladj, (ladj.upper() - ladj.page_size()) / 2.0);
+        let lview: gtk::Widget = ui.list.clone().upcast();
+        let lb = lview.compute_bounds(&ui.window).expect("list bounds");
+        let (lx, ly, lw, lh) = (wx + lb.x() as i32, wy + lb.y() as i32, lb.width() as i32, lb.height() as i32);
+        let lzone = edge_zone_px(lh as f64);
+        // c. a plain press 15 px above the bottom edge, moved 10 px, released at once.
+        let (cx, cy) = (lx + lw / 4, ly + lh - 15);
+        let before_c = ladj.value();
+        xdo(&["mousemove", &cx.to_string(), &cy.to_string()]);
+        run_for(150);
+        xdo(&["mousedown", "1"]);
+        xdo(&["mousemove", &(cx + 10).to_string(), &cy.to_string()]);
+        xdo(&["mouseup", "1"]);
+        run_for(1500);
+        eprintln!("wf-test D-370 c list click near the bottom: value {before_c:.1} -> {:.1}", ladj.value());
+        if (ladj.value() - before_c).abs() > 1.0 { problems.push(format!("c: a plain click and 10 px of movement near the bottom edge moved the list {before_c:.1} -> {:.1}", ladj.value())); }
+
+        // d. a real file drag from a row, held in the bottom zone.
+        scroll_to(&ladj, (ladj.upper() - ladj.page_size()) / 2.0);
+        let before_d = ladj.value();
+        let (dx, dy) = (lx + lw / 4, ly + lh / 2);
+        xdo(&["mousemove", &dx.to_string(), &dy.to_string()]);
+        run_for(150);
+        xdo(&["mousedown", "1"]);
+        // The drag source needs 100 ms from the press before it may start (gtkdragsource.c).
+        run_for(250);
+        for step in 1..=6 {
+            xdo(&["mousemove", &dx.to_string(), &(dy + step * 6).to_string()]);
+            run_for(40);
+        }
+        let end = ly + lh - 3;
+        D370_SCROLL_TIMES.with(|t| t.borrow_mut().clear());
+        xdo(&["mousemove", &dx.to_string(), &end.to_string()]);
+        let t0 = Instant::now();
+        let mut ds = vec![(0.0, ladj.value())];
+        let ctx = glib::MainContext::default();
+        while t0.elapsed() < Duration::from_millis(1600) {
+            while ctx.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(4));
+            ds.push((t0.elapsed().as_secs_f64(), ladj.value()));
+        }
+        // End the drag with the button. Escape is no use here: GDK's X11 drag
+        // handles only motion, button release and grab-broken events
+        // (gdk/x11/gdkdrag-x11.c:2143-2166), so under Xvfb Escape never cancels
+        // a drag (Wayland does it through the compositor). The release drops
+        // the files on the list they came from, which Wayfinder ignores.
+        D370_LOG.with(|l| l.borrow_mut().clear());
+        let t_up = Instant::now();
+        xdo(&["mouseup", "1"]);
+        run_for(400);
+        let times = D370_SCROLL_TIMES.with(|t| t.borrow().clone());
+        let rel = |i: Instant| if i >= t0 { i.duration_since(t0).as_secs_f64() } else { -t0.duration_since(i).as_secs_f64() };
+        eprintln!("wf-test D-370 d edge-scroll frames: {} that moved the list; first at {:?} s, last at {:?} s after the pointer reached the zone; button released at {:.2} s", times.len(), times.first().map(|i| rel(*i)), times.last().map(|i| rel(*i)), rel(t_up));
+        for (t, line) in D370_LOG.with(|l| l.borrow().clone()) {
+            eprintln!("wf-test D-370 d drag signal at {:.3} s: {line}", rel(t));
+        }
+        if times.last().is_some_and(|l| *l > t_up + Duration::from_millis(100)) { problems.push("d: the engine moved the list more than 100 ms after the button was released".to_string()); }
+        let d_first = at(&ds, 0.15) - at(&ds, 0.0);
+        let d_moved = at(&ds, 1.5) - at(&ds, 0.0);
+        eprintln!("wf-test D-370 d list file drag (zone {lzone:.0} px): value {before_d:.1} -> {:.1}; first 150 ms moved {d_first:.1}, by 1.5 s {d_moved:.1}", ladj.value());
+        if d_first.abs() > 1.0 { problems.push(format!("d: the list moved {d_first:.1} px in the first 150 ms of a file drag in the zone")); }
+        if d_moved < 50.0 { problems.push(format!("d: a file drag held in the bottom zone moved the list only {d_moved:.1} px")); }
+        
+
+        // f. list box-select. A row is a file drag source everywhere except the
+        // strip just left of its first metadata label (BOX_SELECT_STRIP_W, the
+        // D-188 rule at connect_file_drag_with), so the box starts there; that
+        // strip exists in the Details view. Found by picking across the row:
+        // the first spot after the name label that is not a label or an icon.
+        set_view_mode(&state, &ui, ViewMode::Details);
+        run_for(800);
+        let lmodel = ui.list.model().expect("the list has a selection model");
+        scroll_to(&ladj, (ladj.upper() - ladj.page_size()) / 2.0);
+        lmodel.unselect_all();
+        let lcells = realized_cells_d370(&lview);
+        let start_cell = lcells.iter().filter(|c| c.y > 60.0 && c.y + c.h < lh as f64 - 80.0).min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal)).copied();
+        if let Some(start_cell) = start_cell {
+            let fy = ly + (start_cell.y + start_cell.h / 2.0) as i32;
+            let mut seen_label = false;
+            let mut found: Option<i32> = None;
+            let mut trace = Vec::new();
+            let mut x = lx + 4;
+            while x < lx + lw - 4 {
+                let kind = ui.window.pick((x - wx) as f64, (fy - wy) as f64, gtk::PickFlags::DEFAULT).map(|w| w.type_().name().to_string()).unwrap_or_default();
+                if trace.last().map(|(_, k): &(i32, String)| k != &kind).unwrap_or(true) { trace.push((x - lx, kind.clone())); }
+                if kind == "GtkLabel" { seen_label = true; } else if seen_label && kind != "GtkImage" { found = Some(x); break; }
+                x += 2;
+            }
+            eprintln!("wf-test D-370 f list row {} picks along the row (x from the list edge, kind): {trace:?}", start_cell.pos);
+            let fx = found.unwrap_or(lx + 4);
+            if found.is_none() { problems.push("f: no box-select strip found in a Details row (no gap after the name label)".to_string()); }
+            eprintln!("wf-test D-370 f list box: start ({fx},{fy}) at row {}", start_cell.pos);
+            let before_f = ladj.value();
+            xdo(&["mousemove", &fx.to_string(), &fy.to_string()]);
+            run_for(150);
+            xdo(&["mousedown", "1"]);
+            run_for(80);
+            xdo(&["mousemove", &fx.to_string(), &(fy + 24).to_string()]);
+            run_for(120);
+            xdo(&["mousemove", &fx.to_string(), &(ly + lh - 3).to_string()]);
+            run_for(2000);
+            let shown_f = rubber_shown(&ui);
+            xdo(&["mouseup", "1"]);
+            run_for(300);
+            let sel = lmodel.selection();
+            let (lo, hi) = (start_cell.pos, sel.maximum());
+            eprintln!("wf-test D-370 f list box: value {before_f:.1} -> {:.1}, {} rows selected from {lo} to {hi}, rubber band shown={shown_f}", ladj.value(), sel.size());
+            if ladj.value() - before_f < 50.0 { problems.push("f: the list did not scroll while a box was held in the bottom zone".to_string()); }
+            if !sel.contains(lo) { problems.push(format!("f: the start row {lo} is not selected")); }
+            if hi < lo + 20 { problems.push(format!("f: only rows up to {hi} selected; fewer than 20 rows past the start")); }
+            else if !sel.contains((lo + hi) / 2) { problems.push(format!("f: a row scrolled past ({}) is not selected", (lo + hi) / 2)); }
+            if lo > 0 && sel.contains(lo - 1) { problems.push(format!("f: row {} above the start is selected", lo - 1)); }
+            if !shown_f { problems.push("f: no visible `rubberband` widget during the list box".to_string()); }
+        } else {
+            problems.push("f: no realized list row to start a box beside".to_string());
+        }
+
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(problems.is_empty(), "D-370: {problems:?}");
+    }
+
     /// D-358 fixture, shared with D-350: names of mixed length so some wrap to
     /// two lines in a narrow pane. The number leads, so short and long names
     /// sort side by side.
@@ -30127,91 +31321,6 @@ Broken: Either state is wrong.\n";
         let paned = ui.split.borrow().clone().expect("split pane").paned;
         paned.set_position(900);
         for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
-    }
-
-    /// D-350 (20 Nov 2026, the owner's screencast 10:04): clicking one of the
-    /// bottom two or three rows jolted the list up about four rows. The list
-    /// is held while a press or a file drag sits at its edge,
-    /// in the D-358 conditions (split view, narrow left pane, wrapping names).
-    /// The click path itself (mid-list and bottom rows, no movement, no height
-    /// flips) is split_wrapped_names_click_keeps_place_d358; it is not repeated here.
-    fn bottom_row_click_keeps_place_d350() {
-        let old_home = std::env::var("HOME").ok();
-        let root = crate::native_core::scratch_root().join(format!("wf-d350-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _cleanup = ScratchCleanup(root.clone());
-        let (home, dir) = (root.join("home"), root.join("dir"));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        let total = 900usize;
-        for i in 0..total {
-            std::fs::write(dir.join(wrapped_fixture_name(i)), "x").unwrap();
-        }
-        std::env::set_var("HOME", &home);
-        let app = adw::Application::builder()
-            .application_id("com.kadaken.wayfinder.d350test")
-            .flags(gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(gio::Cancellable::NONE).expect("register test application");
-        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
-        let (state, ui) = WINDOWS
-            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
-            .expect("the test window is registered");
-        ui.window.set_default_size(1300, 800);
-        ui.window.present();
-        wait_for("listing", || state.borrow().visible_entries.len() == total);
-        set_view_mode(&state, &ui, ViewMode::Details);
-        open_narrow_split(&state, &ui, total);
-        let adj = ui.list_scroll.vadjustment();
-        wait_for("scrollable", || adj.upper() > adj.page_size() * 3.0);
-        mark_scroll_cause("test: his own scroll");
-        adj.set_value((adj.upper() - adj.page_size()) / 2.0);
-        for _ in 0..40 { pump(); std::thread::sleep(Duration::from_millis(10)); }
-        // GTK's edge-scroll, as gtklistbase.c autoscroll_cb does it: add a step
-        // each frame and stop once a step no longer moves the list.
-        let edge_scroll = |adj: &gtk::Adjustment| -> f64 {
-            let start = adj.value();
-            let ran = Rc::new(Cell::new(0u32));
-            let ran_tick = ran.clone();
-            let adj_tick = adj.clone();
-            ui.list.add_tick_callback(move |_, _| {
-                let v = adj_tick.value();
-                adj_tick.set_value(v + 5.0);
-                ran_tick.set(ran_tick.get() + 1);
-                if adj_tick.value() != v && ran_tick.get() < 30 { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
-            });
-            for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
-            eprintln!("wf-test D-350 edge-scroll ran {} frames", ran.get());
-            adj.value() - start
-        };
-        let pin = edge_hold_for(ui.list.upcast_ref()).expect("the list has an edge hold");
-        // Held, switch off (the default): the list stays put.
-        assert!(!EDGE_AUTOSCROLL.with(|c| c.get()), "D-350: edge scroll is off by default");
-        pin.set(Some((adj.value(), scroll_generation())));
-        let moved_off = edge_scroll(&adj);
-        // His wheel while held still scrolls.
-        note_scroll_input();
-        let before_wheel = adj.value();
-        adj.set_value(before_wheel - 120.0);
-        pump();
-        let wheel = adj.value() - before_wheel;
-        pin.set(None);
-        // Switch on: GTK's edge scroll runs as before.
-        EDGE_AUTOSCROLL.with(|c| c.set(true));
-        pin.set(Some((adj.value(), scroll_generation())));
-        let moved_on = edge_scroll(&adj);
-        EDGE_AUTOSCROLL.with(|c| c.set(false));
-        pin.set(None);
-        eprintln!("wf-test D-350 edge-scroll off={moved_off} on={moved_on} wheel={wheel}");
-        assert!(moved_off.abs() < 1.0, "D-350: held with the switch off, the list stayed still (moved {moved_off})");
-        assert!((wheel + 120.0).abs() < 1.0, "D-350: his wheel still scrolls while held (moved {wheel})");
-        assert!(moved_on > 20.0, "D-350: with the switch on, the edge scroll still works (moved {moved_on})");
-        ui.window.destroy();
-        pump();
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// D-358: his real conditions. Split view, a narrow left pane, a long
