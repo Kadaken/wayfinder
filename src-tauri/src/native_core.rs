@@ -2695,14 +2695,53 @@ fn eject_steps(
     power_off()
 }
 
+/// The mounted partitions from the outcome of the `lsblk` call: `Ok((success,
+/// stdout, stderr))` when it ran, `Err(reason)` when it could not start. A
+/// failed listing is an error, never an empty list, so eject cannot mistake
+/// "could not look" for "nothing is mounted" and power the drive off.
+fn mounted_from_lsblk(
+    disk: &str,
+    outcome: Result<(bool, String, String), String>,
+) -> Result<Vec<String>, String> {
+    match outcome {
+        Ok((true, stdout, _)) => Ok(mounted_partitions(&stdout)),
+        Ok((false, _, stderr)) => {
+            let why = stderr.trim();
+            let why = if why.is_empty() { "lsblk exited with an error" } else { why };
+            Err(format!("Could not list the partitions of {disk}: {why}"))
+        }
+        Err(err) => Err(format!("Could not list the partitions of {disk}: {err}")),
+    }
+}
+
+/// Eject with the partition listing and both commands passed in, so a test can
+/// prove a failed listing never reaches power-off.
+fn eject_with_listing(
+    disk: &str,
+    listing: Result<(bool, String, String), String>,
+    unmount: impl FnMut(&str) -> Result<(), String>,
+    power_off: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let mounted = mounted_from_lsblk(disk, listing)?;
+    eject_steps(&mounted, unmount, power_off)
+}
+
 pub fn eject_drive(device: &str) -> Result<(), String> {
     let disk = whole_disk_of(device);
-    let mounted = match Command::new("lsblk").args(["-nro", "PATH,MOUNTPOINT", &disk]).output() {
-        Ok(output) => mounted_partitions(&String::from_utf8_lossy(&output.stdout)),
-        Err(_) => Vec::new(),
-    };
-    eject_steps(
-        &mounted,
+    let listing = Command::new("lsblk")
+        .args(["-nro", "PATH,MOUNTPOINT", &disk])
+        .output()
+        .map(|o| {
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        })
+        .map_err(|e| e.to_string());
+    eject_with_listing(
+        &disk,
+        listing,
         |part| run_cmd_capture("udisksctl", &["unmount", "-b", part]),
         || run_cmd_capture("udisksctl", &["power-off", "-b", &disk]),
     )
@@ -7071,9 +7110,26 @@ pub fn format_sms_conversation(file_name: &str, lines: &[SmsLine], cap: Option<(
     text
 }
 
+/// Largest .smsbackup file read into memory for a preview or text export.
+const SMS_BACKUP_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Err("backup is too large to preview (N MB)") when `len` is over the cap.
+fn check_sms_backup_len(len: u64) -> Result<(), String> {
+    if len > SMS_BACKUP_MAX_BYTES {
+        return Err(format!("backup is too large to preview ({} MB)", len / (1024 * 1024)));
+    }
+    Ok(())
+}
+
+/// Reads a backup file after checking its size against the cap.
+fn read_sms_backup_capped(path: &Path) -> Result<Vec<u8>, String> {
+    check_sms_backup_len(fs::metadata(path).map_err(|e| e.to_string())?.len())?;
+    fs::read(path).map_err(|e| e.to_string())
+}
+
 /// D-382: the preview text for a backup file (newest messages that fit).
 pub fn sms_backup_preview(path: &str) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = read_sms_backup_capped(Path::new(path))?;
     let lines = parse_sms_backup(&bytes)?;
     if lines.is_empty() {
         return Err("no messages".into());
@@ -7094,7 +7150,7 @@ pub fn sms_backup_text_file(path: &str) -> Result<PathBuf, String> {
     if fresh {
         return Ok(out);
     }
-    let bytes = fs::read(src).map_err(|e| e.to_string())?;
+    let bytes = read_sms_backup_capped(src)?;
     let lines = parse_sms_backup(&bytes)?;
     if lines.is_empty() {
         return Err("no messages".into());
@@ -10023,6 +10079,48 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
         })
         .is_err());
         assert!(powered, "nothing mounted: power off still runs and its error is returned");
+    }
+
+    #[test]
+    fn eject_refuses_when_the_partition_list_fails() {
+        for listing in [
+            Err("No such file or directory".to_string()),
+            Ok((false, String::new(), "lsblk: not a block device".to_string())),
+            Ok((false, String::new(), String::new())),
+        ] {
+            let mut unmounted = false;
+            let mut powered = false;
+            let err = eject_with_listing(
+                "/dev/sdb",
+                listing,
+                |_| {
+                    unmounted = true;
+                    Ok(())
+                },
+                || {
+                    powered = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(err.starts_with("Could not list the partitions of /dev/sdb"), "{err}");
+            assert!(!powered && !unmounted, "a failed listing never reaches power-off");
+        }
+        let mut powered = false;
+        let ok = eject_with_listing("/dev/sdb", Ok((true, String::new(), String::new())), |_| Ok(()), || {
+            powered = true;
+            Ok(())
+        });
+        assert!(ok.is_ok() && powered, "a good empty listing still powers off");
+    }
+
+    #[test]
+    fn sms_backup_length_cap() {
+        assert!(check_sms_backup_len(0).is_ok());
+        assert!(check_sms_backup_len(SMS_BACKUP_MAX_BYTES).is_ok());
+        let err = check_sms_backup_len(SMS_BACKUP_MAX_BYTES + 1).unwrap_err();
+        assert_eq!(err, "backup is too large to preview (256 MB)");
+        assert!(check_sms_backup_len(1024 * 1024 * 1024).unwrap_err().contains("1024 MB"));
     }
 
     #[test]
