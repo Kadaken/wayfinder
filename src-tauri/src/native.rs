@@ -25145,6 +25145,19 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test place-only run done");
             return;
         }
+        // Every test of a scroll hold: restore after a refresh (reapply_scroll),
+        // the edge hold, the new-item order, and the fixed-row conditions.
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("scroll") {
+            split_move_keeps_source_pane_scroll_d336(ViewMode::Details, "details", false);
+            split_move_keeps_source_pane_scroll_d336(ViewMode::Grid, "grid", false);
+            split_same_folder_move_into_subfolder_keeps_place_d343();
+            new_folder_naming_stays_put_d341();
+            pin_keeps_item_on_top_d359();
+            bottom_row_click_keeps_place_d350();
+            split_wrapped_names_click_keeps_place_d358();
+            eprintln!("wf-test scroll-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d86") {
             selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
             mpg_counts_as_video_and_shows_a_frame_d362();
