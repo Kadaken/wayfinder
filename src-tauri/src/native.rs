@@ -23500,8 +23500,41 @@ Broken: Either state is wrong.\n";
         // D-188 REJECT 2: activate the real toolbar Undo/Redo controls
         // themselves, still inside the archive, without navigating away.
         assert!(undo_button.is_sensitive(), "Undo must be enabled inside a ZIP once Copy Out recorded a transaction");
+        eprintln!(
+            "D-373 before undo: undo_stack={:?} redo_len={} history_busy={} status={:?}",
+            state.borrow().undo_stack.last(),
+            state.borrow().redo_stack.len(),
+            state.borrow().history_busy,
+            ui.status.label()
+        );
         undo_button.emit_clicked();
         pump();
+        for _ in 0..80 {
+            if !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists() {
+                break;
+            }
+            pump();
+        }
+        let d373_removed = !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists();
+        eprintln!(
+            "D-373 after undo: removed={} undo_len={} undo_top={:?} redo_len={} redo_top={:?} history_busy={} status={:?} toplevels={:?}",
+            d373_removed,
+            state.borrow().undo_stack.len(),
+            state.borrow().undo_stack.last(),
+            state.borrow().redo_stack.len(),
+            state.borrow().redo_stack.last(),
+            state.borrow().history_busy,
+            ui.status.label(),
+            gtk::Window::list_toplevels().iter().map(|w| format!("{}:{}:visible={}", w.type_().name(), w.downcast_ref::<gtk::Window>().and_then(|w| w.title()).unwrap_or_default(), w.is_visible())).collect::<Vec<_>>()
+        );
+        {
+            let data = glib::user_data_dir();
+            let trash = data.join("Trash");
+            eprintln!(
+                "D-373 glib: home_dir={} user_data_dir={} trash_ok={}",
+                glib::home_dir().display(), data.display(), trash.join("files").is_dir() && trash.join("info").is_dir()
+            );
+        }
         wait_for("undo removes both copied-out files", || !out_dir.join("readme.txt").exists() && !out_dir.join("second.txt").exists());
         assert!(state.borrow().cwd.is_zip(), "Undo must not navigate away from the archive");
         assert_eq!(
@@ -25497,6 +25530,29 @@ Broken: Either state is wrong.\n";
     #[test]
     fn gtk_headless_suite() { gtk_thread::run(gtk_headless_suite_on_gtk_thread); }
 
+    /// D-373: the first call (at suite start) primes GLib's cached dirs while
+    /// HOME is still the private one from run232 and remembers it; every later
+    /// call asserts GLib still reports it.
+    fn suite_glib_dirs_d373(when: &str) {
+        static PRIVATE_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let first = PRIVATE_HOME.get().is_none();
+        let expected = PRIVATE_HOME
+            .get_or_init(|| PathBuf::from(std::env::var_os("HOME").expect("HOME is set at suite start")))
+            .clone();
+        let (home, data, config, cache) =
+            (glib::home_dir(), glib::user_data_dir(), glib::user_config_dir(), glib::user_cache_dir());
+        if first {
+            return;
+        }
+        assert_eq!(
+            home, expected,
+            "D-373 ({when}): GLib's cached home dir is not the private HOME, so gio Trash would fail with ENOENT"
+        );
+        for dir in [&data, &config, &cache] {
+            assert!(dir.starts_with(&expected), "D-373 ({when}): GLib dir {} is outside the private HOME", dir.display());
+        }
+    }
+
     fn gtk_headless_suite_on_gtk_thread() {
         if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
             return;
@@ -25504,6 +25560,14 @@ Broken: Either state is wrong.\n";
         // D-232: the suite uses the display's clipboard, so it runs only in a
         // private session. Checked before GTK and GIO read HOME or the display.
         let d232_session = private_session_guard_d232();
+        // D-373: GLib caches g_get_home_dir() and the user data/config/cache
+        // dirs on their FIRST call and never re-reads HOME. Many tests below set
+        // HOME to a temp dir and delete it afterwards; if one of them were the
+        // first caller, GLib would keep that deleted path and gio's
+        // g_local_file_trash would fail every later Trash move with ENOENT
+        // (the zip Copy Out + Undo test, 21 Nov 2026). So the private HOME is
+        // read here once, before any test runs, and checked again later.
+        suite_glib_dirs_d373("suite start");
         // D-290: the app now honours XDG_CONFIG_HOME. The guard above has
         // checked it; the tests below each give themselves a HOME of their own
         // and expect their settings under it, so the variable is dropped here.
@@ -25681,11 +25745,13 @@ Broken: Either state is wrong.\n";
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
         suite_tail_after_d86();
+        suite_glib_dirs_d373("suite end");
     }
 
     /// The suite's last stretch, after the D-86 video test. Also runs alone as
     /// WAYFINDER_SUITE_ONLY=tail, so a stall here reproduces in minutes.
     fn suite_tail_after_d86() {
+        suite_glib_dirs_d373("tail start");
         eprintln!("wf-test tail: d48");
         #[cfg(feature = "guide")]
         guide_request_transport_d48();
