@@ -5261,6 +5261,7 @@ fn build_ui_in(
     watch_scroll_jumps(&grid_scroll, "grid");
     hold_list_at_edges(&files_scroll);
     hold_list_at_edges(&grid_scroll);
+    pointer_keeps_scroll_grid(&grid_scroll);
     let (column_header, columns) = details_header();
     let (quick_access, quick_access_tiles) = build_tile_strip("Quick access");
     let (recent_files_strip, recent_files_tiles) = build_tile_strip("Recent files");
@@ -5647,8 +5648,6 @@ fn build_ui_in(
         let button = ui.path_edit.clone();
         button.connect_clicked(move |_| edit_path_action(&state, &ui));
     }
-    connect_click_move_log(&files_scroll, "list", embedded, &state, &ui);
-    connect_click_move_log(&grid_scroll, "grid", embedded, &state, &ui);
     connect_file_drop(&files_scroll, state.clone(), ui.clone());
     connect_file_drop(&grid_scroll, state.clone(), ui.clone());
     connect_zoom_controller(&files_scroll, state.clone(), ui.clone(), ZoomTarget::Files);
@@ -10551,6 +10550,105 @@ fn hold_list_at_edges(scroller: &gtk::ScrolledWindow) {
     });
 }
 
+/// D-364 (root of "the list jumps when I click a file near the bottom").
+/// GtkListView turns a pointer press into a scroll: the row's click gesture
+/// calls gtk_widget_grab_focus (gtklistfactorywidget.c:433-434), which reaches
+/// gtk_list_base_set_focus_child, and that scrolls the row fully into view
+/// (gtklistbase.c:963-965) whenever it is not the row the list's focus
+/// tracker already names. A row cut by an edge therefore moved under the
+/// pointer.
+/// The press runs first (capture phase on the row's own child). It makes the
+/// clicked row the list's focus row with `scroll_to(FOCUS)`: GTK sets the
+/// tracker before it grabs focus (gtklistbase.c:2405-2425), so the row's own
+/// focus grab later finds nothing to scroll. That call still anchors the view
+/// on the clicked row, and for a cut row GTK's anchor maths always pulls it
+/// fully in (gtk_list_base_compute_scroll_align: a cell past an edge gets
+/// align 0 or 1 whatever the ScrollInfo says). So, in the same press and
+/// before any layout, the view is anchored on the fully shown neighbour with
+/// both axes off: for a fully shown cell GTK keeps its exact offset, which is
+/// the place the view already has. Focus follows the click as GTK intends,
+/// nothing moves, and keyboard moves keep GTK's own scroll-to-focus.
+fn pointer_keeps_scroll(list: &gtk::ListView) -> Rc<dyn Fn(&gtk::ListItem, Option<gtk::Widget>)> {
+    let list = list.downgrade();
+    Rc::new(move |item, row| {
+        let Some(list) = list.upgrade() else { return };
+        let pos = item.position();
+        let count = list.model().map(|m| m.n_items()).unwrap_or(0);
+        if pos == gtk::INVALID_LIST_POSITION || pos >= count {
+            return;
+        }
+        let stay = || {
+            let info = gtk::ScrollInfo::new();
+            info.set_enable_vertical(false);
+            info.set_enable_horizontal(false);
+            info
+        };
+        // Which edge cuts the row, read before anything changes.
+        let cut = row.as_ref().and_then(|r| r.compute_bounds(&list)).map(|b| {
+            let (top, bottom) = (b.y(), b.y() + b.height());
+            if top < 0.0 {
+                Some(pos + 1)
+            } else if bottom > list.height() as f32 {
+                pos.checked_sub(1)
+            } else {
+                None
+            }
+        });
+        list.scroll_to(pos, gtk::ListScrollFlags::FOCUS, Some(stay()));
+        if let Some(Some(keep)) = cut {
+            if keep < count {
+                list.scroll_to(keep, gtk::ListScrollFlags::NONE, Some(stay()));
+            }
+        }
+    })
+}
+
+/// D-364, the icon view. Its tiles sit in a GtkFlowBox inside the viewport the
+/// scrolled window adds, and that viewport scrolls whatever takes focus into
+/// view (gtkviewport.c focus_change_handler, called from the root's
+/// notify::focus-widget). A click selects on release, and the select grabs
+/// focus on the tile (gtkflowbox.c gtk_flow_box_update_cursor), so a tile cut
+/// by the bottom edge moved just as a list row did. The viewport's own
+/// `scroll-to-focus` switch is the GTK-provided control: it is off from a
+/// press until its release has been handled, and on the rest of the time, so
+/// keyboard moves still scroll to the focused tile.
+fn pointer_keeps_scroll_grid(scroller: &gtk::ScrolledWindow) {
+    let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() else { return };
+    let listener = gtk::EventControllerLegacy::new();
+    listener.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let viewport = viewport.downgrade();
+        listener.connect_event(move |_, event| {
+            let Some(viewport) = viewport.upgrade() else { return glib::Propagation::Proceed };
+            match event.event_type() {
+                gdk::EventType::ButtonPress => viewport.set_scroll_to_focus(false),
+                // The tile is selected and focused by the release; the switch
+                // comes back after it has been handled.
+                gdk::EventType::ButtonRelease | gdk::EventType::KeyPress => {
+                    let viewport = viewport.clone();
+                    if event.event_type() == gdk::EventType::KeyPress {
+                        viewport.set_scroll_to_focus(true);
+                    } else {
+                        glib::idle_add_local_once(move || viewport.set_scroll_to_focus(true));
+                    }
+                }
+                // A lost release (a drag takes the pointer): moving with no
+                // button down is proof the press is over.
+                gdk::EventType::MotionNotify
+                    if !event.modifier_state().intersects(
+                        gdk::ModifierType::BUTTON1_MASK | gdk::ModifierType::BUTTON2_MASK | gdk::ModifierType::BUTTON3_MASK,
+                    ) =>
+                {
+                    viewport.set_scroll_to_focus(true)
+                }
+                _ => {}
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    scroller.add_controller(listener);
+}
+
 /// D-349: his own wheel, click or key, or a deliberate scroll by Wayfinder.
 fn note_scroll_input() {
     SCROLL_GENERATION.with(|g| g.set(g.get() + 1));
@@ -10634,184 +10732,10 @@ fn scroll_trace_lines(max: usize) -> Vec<String> {
     trace
         .lines()
         .filter(|l| l.contains("native::") || l.contains("gtk_") || l.contains("_gtk"))
-        .filter(|l| !l.contains("watch_scroll_jumps") && !l.contains("scroll_trace_lines") && !l.contains("connect_click_move_log"))
+        .filter(|l| !l.contains("watch_scroll_jumps") && !l.contains("scroll_trace_lines"))
         .take(max)
         .map(|l| l.trim().to_string())
         .collect()
-}
-
-thread_local! {
-    /// D-364 diagnostic: counts primary-button presses on a list or icon view.
-    static CLICK_PRESSES: Cell<u64> = const { Cell::new(0) };
-}
-
-/// How long after a press `click-moves.log` keeps recording.
-const CLICK_WATCH: Duration = Duration::from_millis(1500);
-
-fn for_each_widget(root: &gtk::Widget, f: &mut dyn FnMut(&gtk::Widget)) {
-    f(root);
-    let mut child = root.first_child();
-    while let Some(w) = child {
-        for_each_widget(&w, f);
-        child = w.next_sibling();
-    }
-}
-
-/// Mapped row widgets of a view: `wf-file-row` boxes in the list, flow-box
-/// children in the icon view.
-fn mapped_view_rows(view: &gtk::Widget, grid: bool) -> Vec<gtk::Widget> {
-    let mut rows = Vec::new();
-    for_each_widget(view, &mut |w| {
-        let is_row = if grid { w.is::<gtk::FlowBoxChild>() } else { w.has_css_class("wf-file-row") };
-        if is_row && w.is_mapped() {
-            rows.push(w.clone());
-        }
-    });
-    rows
-}
-
-/// What a click landed on: the row's list position, its name, and how to find
-/// the same row again (its path in the list, its index in the icon view).
-#[derive(Clone)]
-struct ClickedRow {
-    index: Option<usize>,
-    name: String,
-    path: Option<String>,
-}
-
-fn find_clicked_row(view: &gtk::Widget, grid: bool, row: &ClickedRow) -> Option<gtk::Widget> {
-    mapped_view_rows(view, grid).into_iter().find(|w| {
-        if grid {
-            w.downcast_ref::<gtk::FlowBoxChild>().map(|c| c.index() as usize) == row.index
-        } else {
-            row.path.is_some() && w.tooltip_text().map(|t| t.to_string()) == row.path
-        }
-    })
-}
-
-/// D-364 diagnostic. On every primary-button press in a list or icon view,
-/// ~/.cache/wayfinder/click-moves.log gets one line for the press (pane size,
-/// adjustment, the row under the pointer and its y in the viewport), then for
-/// 1.5 s one line for every adjustment change (any size; a backtrace over
-/// 20 px), every selection change, and at 150, 500 and 1500 ms the same row's y
-/// and the distinct heights of the mapped rows. Nothing runs outside that
-/// window. The press listener is a plain capture-phase click gesture that never
-/// claims the press.
-fn connect_click_move_log(scroller: &gtk::ScrolledWindow, view_name: &'static str, embedded: bool, state: &Rc<RefCell<AppState>>, ui: &Ui) {
-    let grid = view_name == "grid";
-    let pane = if embedded { "right-pane" } else { "left-pane" };
-    let session: Rc<Cell<Option<(u64, Instant)>>> = Rc::new(Cell::new(None));
-    let log = move |id: u64, text: String| {
-        let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
-        let _ = native_core::append_capped_log(&wayfinder_cache_dir().join("click-moves.log"), &format!("{when} #{id} {pane} {view_name} {text}\n"), DIAGNOSTIC_LOG_CAP);
-    };
-    let live = {
-        let session = session.clone();
-        move || session.get().filter(|(_, at)| at.elapsed() < CLICK_WATCH).map(|(id, at)| (id, at.elapsed().as_millis()))
-    };
-    let adj = scroller.vadjustment();
-    let last = Rc::new(Cell::new(adj.value()));
-    {
-        let (live, last) = (live.clone(), last.clone());
-        adj.connect_value_changed(move |adj| {
-            let (from, to) = (last.get(), adj.value());
-            last.set(to);
-            let Some((id, ms)) = live() else { return };
-            let mut text = format!("+{ms}ms VALUE {from:.1} -> {to:.1} upper={:.1} cause: {}", adj.upper(), scroll_cause_text());
-            if (to - from).abs() > 20.0 {
-                for line in scroll_trace_lines(10) {
-                    text.push_str(&format!("\n      {line}"));
-                }
-            }
-            log(id, text);
-        });
-    }
-    let selection_note = {
-        let (live, state) = (live.clone(), state.clone());
-        move |count: usize, first: Option<usize>| {
-            let Some((id, ms)) = live() else { return };
-            let name = first.and_then(|i| state.try_borrow().ok().and_then(|st| st.visible_entries.get(i).map(|e| e.name.clone()))).unwrap_or_default();
-            log(id, format!("+{ms}ms SELECT count={count} first={first:?} \"{name}\""));
-        }
-    };
-    if grid {
-        ui.grid.connect_selected_children_changed(move |flow| {
-            let children = flow.selected_children();
-            selection_note(children.len(), children.first().map(|c| c.index() as usize));
-        });
-    } else {
-        ui.list_selection.connect_selection_changed(move |sel, _, _| {
-            let set = sel.selection();
-            selection_note(set.size() as usize, if set.is_empty() { None } else { Some(set.minimum() as usize) });
-        });
-    }
-    let press = gtk::GestureClick::new();
-    press.set_button(1);
-    press.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let (state, scroller_for_press) = (state.clone(), scroller.clone());
-    press.connect_pressed(move |_, _, x, y| {
-        let Some(view) = scroller_for_press.child() else { return };
-        let id = CLICK_PRESSES.with(|c| {
-            c.set(c.get() + 1);
-            c.get()
-        });
-        session.set(Some((id, Instant::now())));
-        let adj = scroller_for_press.vadjustment();
-        last.set(adj.value());
-        let picked = scroller_for_press
-            .translate_coordinates(&view, x, y)
-            .and_then(|(vx, vy)| view.pick(vx, vy, gtk::PickFlags::DEFAULT));
-        let row_widget = picked.and_then(|mut w| loop {
-            let is_row = if grid { w.is::<gtk::FlowBoxChild>() } else { w.has_css_class("wf-file-row") };
-            if is_row {
-                break Some(w);
-            }
-            w = w.parent()?;
-        });
-        let clicked = row_widget.as_ref().map(|w| {
-            let path = w.tooltip_text().map(|t| t.to_string());
-            let st = state.try_borrow().ok();
-            let index = if grid {
-                w.downcast_ref::<gtk::FlowBoxChild>().map(|c| c.index() as usize)
-            } else {
-                st.as_ref().and_then(|st| st.visible_entries.iter().position(|e| e.source.real_path_string() == path))
-            };
-            let name = st.as_ref().and_then(|st| index.and_then(|i| st.visible_entries.get(i).map(|e| e.name.clone()))).unwrap_or_default();
-            ClickedRow { index, name, path }
-        });
-        let row_y = |w: &gtk::Widget| w.compute_bounds(&scroller_for_press).map(|b| format!("{:.1}", b.y())).unwrap_or_else(|| "?".into());
-        log(
-            id,
-            format!(
-                "PRESS pane={}x{} value={:.1} upper={:.1} page={:.1} click_y={y:.1} row={} \"{}\" row_y={}",
-                scroller_for_press.width(),
-                scroller_for_press.height(),
-                adj.value(),
-                adj.upper(),
-                adj.page_size(),
-                clicked.as_ref().map(|c| format!("{:?}", c.index)).unwrap_or_else(|| "none".into()),
-                clicked.as_ref().map(|c| c.name.as_str()).unwrap_or(""),
-                row_widget.as_ref().map(row_y).unwrap_or_else(|| "?".into()),
-            ),
-        );
-        for ms in [150u64, 500, 1500] {
-            let (scroller, view, clicked) = (scroller_for_press.clone(), view.clone(), clicked.clone());
-            glib::timeout_add_local_once(Duration::from_millis(ms), move || {
-                let mut heights: Vec<i32> = mapped_view_rows(&view, grid).iter().map(|w| w.height()).collect();
-                heights.sort();
-                heights.dedup();
-                let y = clicked
-                    .as_ref()
-                    .and_then(|c| find_clicked_row(&view, grid, c))
-                    .and_then(|w| w.compute_bounds(&scroller))
-                    .map(|b| format!("{:.1}", b.y()))
-                    .unwrap_or_else(|| "row not on screen".into());
-                let adj = scroller.vadjustment();
-                log(id, format!("+{ms}ms ROW y={y} value={:.1} upper={:.1} heights={heights:?}", adj.value(), adj.upper()));
-            });
-        }
-    });
-    scroller.add_controller(press);
 }
 
 /// Audit #13: the cap for every diagnostic log under the cache folder.
@@ -11538,6 +11462,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
     let state_for_unbind = state.clone();
     let ui_for_unbind = ui.clone();
     let ui = ui.clone();
+    let pointer_row = pointer_keeps_scroll(&ui.list);
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -11679,7 +11604,11 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             press.set_propagation_phase(gtk::PropagationPhase::Capture);
             let gate = state.borrow().activation_gate.clone();
             let source = entry.source.clone();
+            let (pointer_row, item_weak) = (pointer_row.clone(), item.downgrade());
             press.connect_pressed(move |g, _, _, _| {
+                if let Some(item) = item_weak.upgrade() {
+                    pointer_row(&item, g.widget().and_then(|w| w.parent()));
+                }
                 let plain = !g.current_event_state().intersects(
                     gdk::ModifierType::CONTROL_MASK
                         | gdk::ModifierType::SHIFT_MASK
@@ -25340,6 +25269,7 @@ Broken: Either state is wrong.\n";
             pin_keeps_item_on_top_d359();
             bottom_row_click_keeps_place_d350();
             split_wrapped_names_click_keeps_place_d358();
+            pointer_click_keeps_scroll_d364();
             refresh_keeps_scroll_place_d349();
             eprintln!("wf-test scroll-only run done");
             return;
@@ -29111,6 +29041,206 @@ Broken: Either state is wrong.\n";
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// D-364 alone, on the private display, with real X input.
+    #[test]
+    fn pointer_click_keeps_scroll_d364_alone() { gtk_thread::run(pointer_click_keeps_scroll_d364_alone_on_gtk_thread); }
+
+    fn pointer_click_keeps_scroll_d364_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D364_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        pointer_click_keeps_scroll_d364();
+    }
+
+    /// D-364: a pointer press on a row cut by the bottom edge must not move the
+    /// list or the icon view, and the keyboard must still scroll to its row.
+    /// His conditions: split view, narrow left pane, compact list, Modified
+    /// newest first, 6000 files. The input is real: xdotool sends XTEST mouse
+    /// and key events to the private display's X server (it only ever runs
+    /// inside run232.sh's Xvfb; DISPLAY is checked below). The earlier tests
+    /// used the list.select-item action, which never grabs focus, so they could
+    /// not see this.
+    ///  - a plain left click on the cut bottom row, twice, and on a whole row:
+    ///    the adjustment stays and the clicked row is the selected row;
+    ///  - Down x3, Up x3, End, Home afterwards: the focused row is the selected
+    ///    row and is always fully inside the view (GTK's keyboard scroll).
+    /// Fails without `pointer_keeps_scroll` (a click moves the list one row).
+    fn pointer_click_keeps_scroll_d364() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-364 sends real X input and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d364-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 6000usize;
+        for i in 0..total {
+            let file = std::fs::File::create(dir.join(wrapped_fixture_name(i))).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000 + i as u64 * 3600)).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d364test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d364-proof"));
+        ui.window.set_default_size(1300, 900);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        {
+            let mut st = state.borrow_mut();
+            st.sort_key = SortKey::Modified;
+            st.sort_ascending = false;
+        }
+        repopulate_rows(&state, &ui);
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let mut problems: Vec<String> = Vec::new();
+        for (label, mode) in [("list", ViewMode::Compact), ("grid", ViewMode::Grid)] {
+            set_view_mode(&state, &ui, mode);
+            if ui.split.borrow().is_none() {
+                open_narrow_split(&state, &ui, total);
+            }
+            settle(600);
+            let scroller = view_scroller(&state, &ui);
+            let adj = scroller.vadjustment();
+            wait_for("left pane scrollable", || adj.upper() > adj.page_size() * 3.0);
+            eprintln!("wf-test D-364 {label}: left pane {}x{}, rows listed {}", scroller.width(), scroller.height(), state.borrow().visible_entries.len());
+            let mut geo = String::new();
+            for _ in 0..50 {
+                if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d364-proof", "getwindowgeometry", "--shell"]).output() {
+                    if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+                }
+                pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+            let (wx, wy) = (num("X="), num("Y="));
+            let _ = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d364-proof", "windowfocus"]).output();
+            settle(200);
+            let is_row = |w: &gtk::Widget| if label == "grid" { w.is::<gtk::FlowBoxChild>() } else { w.has_css_class("wf-file-row") };
+            let rows = |ui: &Ui| -> Vec<(gtk::Widget, gtk::graphene::Rect)> {
+                let view = scroller.child().expect("view");
+                let mut v: Vec<(gtk::Widget, gtk::graphene::Rect)> = all_widgets(&view).into_iter()
+                    .filter(|w| is_row(w) && w.is_mapped())
+                    .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w, b)))
+                    .collect();
+                v.sort_by(|a, b| (a.1.y(), a.1.x()).partial_cmp(&(b.1.y(), b.1.x())).unwrap());
+                v
+            };
+            let path_of = |w: &gtk::Widget| -> String {
+                if label == "grid" {
+                    let idx = w.downcast_ref::<gtk::FlowBoxChild>().map(|c| c.index() as usize).unwrap_or(usize::MAX);
+                    state.borrow().visible_entries.get(idx).and_then(|e| e.source.real_path_string()).unwrap_or_default()
+                } else {
+                    w.tooltip_text().map(|t| t.to_string()).unwrap_or_default()
+                }
+            };
+            // Scroll to mid-list, then step the offset until a row is cut by the
+            // bottom edge with at least 14px of it showing.
+            mark_scroll_cause("test: his own scroll");
+            let mut cut = None;
+            for step in 0..12 {
+                adj.set_value((adj.upper() - adj.page_size()) / 2.0 + step as f64 * 7.0);
+                settle(300);
+                let scroll_b = scroller.compute_bounds(&ui.window).expect("scroller bounds");
+                let bottom = scroll_b.y() + scroll_b.height();
+                cut = rows(&ui).into_iter().find(|(_, b)| b.y() < bottom - 14.0 && b.y() + b.height() > bottom + 2.0).map(|(w, b)| (w, b, bottom));
+                if cut.is_some() { break; }
+            }
+            let Some((row, b, bottom)) = cut else {
+                problems.push(format!("{label}: no row cut by the bottom edge to click"));
+                continue;
+            };
+            let path = path_of(&row);
+            let visible_mid = (b.y() + bottom) / 2.0;
+            let (cx, cy) = (b.x() as f64 + b.width() as f64 / 2.0, visible_mid as f64);
+            let (px, py) = (wx + cx as i32, wy + cy as i32);
+            let picked = ui.window.pick(cx, cy, gtk::PickFlags::DEFAULT).map(|w| w.type_().name().to_string());
+            eprintln!("wf-test D-364 {label}: cut row {path:?} y={:.1} h={:.1} bottom={bottom:.1} click=({px},{py}) picked={picked:?} value={:.1}", b.y(), b.height(), adj.value());
+            let mut click_and_check = |what: &str, px: i32, py: i32, want: &str, problems: &mut Vec<String>| {
+                let before = adj.value();
+                xdo(&["mousemove", &px.to_string(), &py.to_string()]);
+                settle(100);
+                xdo(&["click", "1"]);
+                settle(1500);
+                let after = adj.value();
+                let selected = selected_paths(&state, &ui);
+                eprintln!("wf-test D-364 {label} {what}: value {before:.1} -> {after:.1} (moved {:.1}) selected={selected:?}", after - before);
+                if (after - before).abs() > 1.0 { problems.push(format!("{label} {what}: the click moved the view {before:.1} -> {after:.1}")); }
+                if selected != vec![want.to_string()] { problems.push(format!("{label} {what}: selected {selected:?}, wanted {want:?}")); }
+            };
+            click_and_check("click on the cut bottom row", px, py, &path, &mut problems);
+            click_and_check("second click on the same spot", px, py, &path, &mut problems);
+            // A whole row in the middle of the view.
+            let scroll_b = scroller.compute_bounds(&ui.window).expect("scroller bounds");
+            let mid = rows(&ui).into_iter()
+                .filter(|(_, b)| b.y() > scroll_b.y() + 5.0 && b.y() + b.height() < scroll_b.y() + scroll_b.height() - 5.0)
+                .nth(3)
+                .expect("a whole row");
+            let mid_path = path_of(&mid.0);
+            click_and_check("click on a whole row", wx + (mid.1.x() + mid.1.width() / 2.0) as i32, wy + (mid.1.y() + mid.1.height() / 2.0) as i32, &mid_path, &mut problems);
+            // Keyboard from the cut row: click it again, then walk.
+            click_and_check("click on the cut row before the keys", px, py, &path, &mut problems);
+            let index_of = |p: &str| state.borrow().visible_entries.iter().position(|e| e.source.real_path_string().as_deref() == Some(p)).expect("entry");
+            let start = index_of(&path);
+            let fully_visible = |ui: &Ui, want: &str| -> bool {
+                let sb = scroller.compute_bounds(&ui.window).expect("scroller bounds");
+                rows(ui).iter().any(|(w, b)| path_of(w) == want && b.y() >= sb.y() - 1.0 && b.y() + b.height() <= sb.y() + sb.height() + 1.0)
+            };
+            let mut key_step = |keys: &[&str], expect: usize, what: &str, problems: &mut Vec<String>| {
+                for k in keys {
+                    xdo(&["key", k]);
+                    settle(250);
+                }
+                settle(500);
+                let want = state.borrow().visible_entries[expect].source.real_path_string().unwrap_or_default();
+                let selected = selected_paths(&state, &ui);
+                let shown = fully_visible(&ui, &want);
+                eprintln!("wf-test D-364 {label} {what}: selected={selected:?} wanted row {expect}, fully shown={shown}, value={:.1}", adj.value());
+                if selected != vec![want.clone()] { problems.push(format!("{label} {what}: selected {selected:?}, wanted {want:?}")); }
+                if !shown { problems.push(format!("{label} {what}: the focused row {expect} is not fully in view")); }
+            };
+            let step = if label == "grid" {
+                // One tile row down is a whole line of tiles, not one entry.
+                let per_line = rows(&ui).iter().filter(|(_, b)| (b.y() - rows(&ui)[0].1.y()).abs() < 2.0).count();
+                per_line.max(1)
+            } else { 1 };
+            let down = if label == "grid" { "Down" } else { "Down" };
+            key_step(&[down], start + step, "Down once", &mut problems);
+            key_step(&[down, down], start + 3 * step, "Down twice more", &mut problems);
+            key_step(&["Up", "Up", "Up"], start, "Up three times", &mut problems);
+            key_step(&["End"], total - 1, "End", &mut problems);
+            key_step(&["Home"], 0, "Home", &mut problems);
+        }
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(problems.is_empty(), "D-364: {problems:?}");
     }
 
     /// D-358 fixture, shared with D-350: names of mixed length so some wrap to
