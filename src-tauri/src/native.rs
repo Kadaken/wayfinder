@@ -39500,6 +39500,8 @@ Broken: Either state is wrong.\n";
             pane.append(w);
         }
         list.set_hexpand(true);
+        // D-368: a GridView with no width builds no tile to take focus.
+        grid.set_hexpand(true);
         let win = gtk::Window::new();
         win.set_default_size(500, 200);
         win.set_child(Some(&pane));
@@ -39542,7 +39544,11 @@ Broken: Either state is wrong.\n";
         // Grid: the GridView is the root.
         grid.grab_focus();
         pump();
-        assert!(focus_within(&win, &grid) && focus().as_ref() != Some(grid.upcast_ref()));
+        assert!(
+            focus_within(&win, &grid) && focus().as_ref() != Some(grid.upcast_ref()),
+            "focus is on a grid tile: grid {}x{}, first child {:?}, focus {:?}",
+            grid.width(), grid.height(), grid.first_child().map(|c| (c.type_().name().to_string(), c.width())), focus().map(|f| f.type_().name().to_string())
+        );
         let was_in = focus_within(&win, &grid);
         grid_store.remove_all();
         keep_focus_on_empty_view(&grid, was_in, true);
