@@ -117,6 +117,8 @@ case "$mode" in
         cmd=("${cargo_t[@]}" address_scrolled_right_d375_alone -- --nocapture);;
   d378) export WAYFINDER_D378_ONLY=1
         cmd=("${cargo_t[@]}" rename_click_inside_keeps_editing_d378_alone -- --nocapture);;
+  d378old) export WAYFINDER_D378_ONLY=1 WF_TEST_D378_OLD=1
+        cmd=("${cargo_t[@]}" rename_click_inside_keeps_editing_d378_alone -- --nocapture);;
   d375old) export WAYFINDER_D375_ONLY=1 WF_TEST_D375_OLD=1
         cmd=("${cargo_t[@]}" address_scrolled_right_d375_alone -- --nocapture);;
   d33) export WAYFINDER_D33_ONLY=1

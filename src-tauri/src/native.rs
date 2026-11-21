@@ -11357,6 +11357,18 @@ impl BoxSelect {
     }
 }
 
+
+/// D-378: whether a press on a row landed inside a text box in it (the
+/// rename box). Old behaviour kept for the test's old-code run.
+fn press_in_text_entry_d378(g: &gtk::GestureClick, x: f64, y: f64) -> bool {
+    if cfg!(test) && std::env::var_os("WF_TEST_D378_OLD").is_some() {
+        return false;
+    }
+    g.widget()
+        .and_then(|w| w.pick(x, y, gtk::PickFlags::DEFAULT))
+        .is_some_and(|hit| hit.ancestor(gtk::Entry::static_type()).is_some())
+}
+
 /// D-364 (root of "the list jumps when I click a file near the bottom").
 /// GtkListView turns a pointer press into a scroll: the row's click gesture
 /// calls gtk_widget_grab_focus (gtklistfactorywidget.c:433-434), which reaches
@@ -12420,7 +12432,14 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             let gate = state.borrow().activation_gate.clone();
             let source = entry.source.clone();
             let (pointer_row, item_weak) = (pointer_row.clone(), item.downgrade());
-            press.connect_pressed(move |g, _, _, _| {
+            press.connect_pressed(move |g, _, x, y| {
+                // D-378: a press inside the rename box belongs to the box. The
+                // focus-row call below moved focus to the row, and the box
+                // cancels on focus loss, so a click to place the caret ended the
+                // rename. A double click there must not open the file either.
+                if press_in_text_entry_d378(g, x, y) {
+                    return;
+                }
                 if let Some(item) = item_weak.upgrade() {
                     pointer_row(&item, g.widget().and_then(|w| w.parent()));
                 }
@@ -12672,7 +12691,14 @@ fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
             let gate = state.borrow().activation_gate.clone();
             let source = entry.source.clone();
             let (pointer_tile, item_weak) = (pointer_tile.clone(), item.downgrade());
-            press.connect_pressed(move |g, _, _, _| {
+            press.connect_pressed(move |g, _, x, y| {
+                // D-378: a press inside the rename box belongs to the box. The
+                // focus-row call below moved focus to the row, and the box
+                // cancels on focus loss, so a click to place the caret ended the
+                // rename. A double click there must not open the file either.
+                if press_in_text_entry_d378(g, x, y) {
+                    return;
+                }
                 if let Some(item) = item_weak.upgrade() {
                     pointer_tile(&item, g.widget().and_then(|w| w.parent()));
                 }
