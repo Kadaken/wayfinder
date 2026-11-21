@@ -46,6 +46,14 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.29" date="2026-11-21">
+      <description>
+        <p>The PS2 hard drive shows in the sidebar and opens. Plugged-in drives
+        get Unmount and Eject, which wait for a running transfer and never
+        power off a drive that did not fully unmount. Scrolling, rename and
+        preview fixes.</p>
+      </description>
+    </release>
     <release version="0.9.28" date="2026-11-16">
       <description>
         <p>The sidebar no longer freezes the window. Reading the folders behind

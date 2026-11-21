@@ -4,6 +4,43 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.29 — 21 November 2026
+
+### Added
+
+- The PS2 hard drive shows as one "PS2 HDD" row in the sidebar, and opening it
+  shows its folders.
+- Unmount and Eject for plugged-in drives that are mounted read-write. Both
+  refuse while a transfer is running ("Wait for the transfer to finish before
+  ejecting."), and Eject never powers off a drive that did not fully unmount.
+  Internal drives and read-only drives do not offer them.
+- A file in the wrong format can be renamed to its real extension, one file or
+  the whole folder, and Undo puts the names back. Files whose extension lies
+  are now previewed by what they hold.
+- Samsung .smsbackup files read as a conversation.
+- Videos the system player cannot decode are converted and play in the pane.
+- Icon view shows real thumbnails past the first 60 tiles.
+- Dragging near the edge scrolls the list by itself.
+- The sidebar toggle sits in the corner under the command bar, and its arrow
+  points the way the sidebar will go.
+
+### Fixed
+
+- A click on a row never scrolls the list or grid.
+- A click inside the rename box no longer ends the rename.
+- Deleting a row keeps the list in place instead of blanking it.
+- A stalled or corrupt video can no longer hold up thumbnails.
+- A window narrower than the saved size no longer squeezes the preview to a
+  sliver, and a window wider than one monitor keeps its size.
+- The address crumbs stay pinned to the right end, and a long path in the
+  status line never widens the window.
+- A file-chooser filter name or a typed save name containing control or
+  direction-override characters is refused.
+
+### Changed
+
+- Removed personal paths from tests and source.
+
 ## 0.9.28 — 16 November 2026
 
 ### Fixed

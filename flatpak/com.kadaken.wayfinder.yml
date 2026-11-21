@@ -30,7 +30,7 @@ sdk-extensions:
 # The codecs come with the app. A flatpak carries its own runtime, so a person
 # who downloads this gets AVIF, HEIC and JPEG-XL pictures and every common
 # video decoding straight away, with nothing to install by hand (7 Nov 2026,
-# the owner: "wayfinder comes with any codecs or drivers or whatever needed").
+# Owner: "wayfinder comes with any codecs or drivers or whatever needed").
 add-extensions:
   org.freedesktop.Platform.ffmpeg-full:
     directory: lib/ffmpeg
@@ -99,7 +99,7 @@ modules:
       - type: git
         url: https://github.com/Kadaken/wayfinder.git
         # Point this at the release you are packaging.
-        tag: v0.9.28
+        tag: v0.9.29
       # Regenerate whenever Cargo.lock changes:
       #   python3 flatpak-cargo-generator.py src-tauri/Cargo.lock \
       #     -o flatpak/cargo-sources.json
