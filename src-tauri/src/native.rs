@@ -10620,8 +10620,7 @@ impl EdgeScroll {
             return glib::ControlFlow::Break;
         }
         let dt = self.last_frame.replace(Some(now)).map_or(0.0, |t| (now - t).clamp(0.0, EDGE_MAX_FRAME_SECS));
-        #[cfg(test)]
-        D370_FRAMES.with(|f| f.borrow_mut().push(dt));
+        d370_record_frame(dt);
         let Some((dir, depth)) = self.pointer_y.get().and_then(|y| edge_zone_depth(y, view.height() as f64)) else {
             self.zone.set(0);
             self.scroll_since.set(None);
@@ -10656,8 +10655,7 @@ impl EdgeScroll {
             let to = (before + whole).clamp(lowest, highest);
             if (to - before).abs() > 0.0 {
                 mark_scroll_cause("edge-scroll");
-                #[cfg(test)]
-                D370_SCROLL_TIMES.with(|t| t.borrow_mut().push(Instant::now()));
+                d370_record_scroll();
                 self.adj.set_value(to);
                 let moved = self.moved.borrow().clone();
                 if let Some(moved) = moved {
@@ -10705,20 +10703,17 @@ fn connect_edge_scroll_drag(view: &impl IsA<gtk::Widget>, engine: &Rc<EdgeScroll
                 *hooked.borrow_mut() = Some(drag.downgrade());
                 let e = enter_engine.clone();
                 drag.connect_drop_performed(move |_| {
-                    #[cfg(test)]
-                    d370_log("gdk::Drag drop-performed".to_string());
+                    d370_log(|| "gdk::Drag drop-performed".to_string());
                     e.stop()
                 });
                 let e = enter_engine.clone();
                 drag.connect_cancel(move |_, reason| {
-                    #[cfg(test)]
-                    d370_log(format!("gdk::Drag cancel {reason:?}"));
+                    d370_log(|| format!("gdk::Drag cancel {reason:?}"));
                     e.stop()
                 });
                 let e = enter_engine.clone();
                 drag.connect_dnd_finished(move |_| {
-                    #[cfg(test)]
-                    d370_log("gdk::Drag dnd-finished".to_string());
+                    d370_log(|| "gdk::Drag dnd-finished".to_string());
                     e.stop()
                 });
             }
@@ -10927,36 +10922,6 @@ fn box_selection_d370(base: &gtk::Bitset, boxed: &gtk::Bitset, mode: BoxMode) ->
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// D-370 test hook: when each engine frame that moved the view ran.
-    static D370_SCROLL_TIMES: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-thread_local! {
-    /// D-370 test hook: the (clamped) length of every engine frame.
-    static D370_FRAMES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-thread_local! {
-    /// D-370 test hook: every selection write BoxSelect makes, every drag signal
-    /// and every selection change GTK reports, with the time of each.
-    static D370_LOG: RefCell<Vec<(Instant, String)>> = const { RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-fn d370_log(line: String) {
-    D370_LOG.with(|l| l.borrow_mut().push((Instant::now(), line)));
-}
-
-#[cfg(test)]
-thread_local! {
-    /// D-370 test hook: the positions of the selection a box-select took at the press.
-    static D370_BOX_BASE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-}
-
 /// D-370: the rectangle drawn while a box-select is held. One per file area,
 /// shared by both views, in the overlay that wraps the stack that holds them.
 /// The css class `rubberband` is the one Adwaita styles for a selection box.
@@ -11083,8 +11048,7 @@ impl BoxSelect {
                             // "press snapshot" follows every later write, and only an idempotent mode
                             // (add, remove) hides it. Copy it.
                             let base = model.selection().copy();
-                            #[cfg(test)]
-                            D370_BOX_BASE.with(|b| *b.borrow_mut() = (0..model.n_items().min(5000)).filter(|i| base.contains(*i)).collect());
+                            d370_record_base(&model, &base);
                             *this.pressed.borrow_mut() = Some((base, mode));
                         }
                     }
@@ -11123,8 +11087,7 @@ impl BoxSelect {
         {
             let this = this.clone();
             drag.connect_drag_end(move |_, ox, oy| {
-                #[cfg(test)]
-                d370_log(format!("BoxSelect drag-end active={} offset ({ox:.0},{oy:.0})", this.active.get()));
+                d370_log(|| format!("BoxSelect drag-end active={} offset ({ox:.0},{oy:.0})", this.active.get()));
                 if this.active.get() {
                     // The row under the press runs its own click on release
                     // (gtklistfactorywidget.c:441-470: Ctrl+Shift = unselect the range
@@ -11209,8 +11172,7 @@ impl BoxSelect {
                 let boxed = box_items_d370(n, rows, cols, count);
                 let selected = box_selection_d370(base, &boxed, *mode);
                 model.set_selection(&selected, &gtk::Bitset::new_range(0, count));
-                #[cfg(test)]
-                d370_log(format!(
+                d370_log(|| format!(
                     "BoxSelect write {:?}: rows {}-{} cols {}-{}; pointer {:?}; result {:?}",
                     mode, rows.0, rows.1, cols.0, cols.1, self.pointer.get(),
                     (0..count.min(5000)).filter(|i| model.is_selected(*i)).collect::<Vec<u32>>()
@@ -20941,6 +20903,16 @@ thread_local! {
     /// below the locked drag code, never above it.
     #[cfg(test)]
     static TEST_DRIVE_SCAN: RefCell<Option<DriveScan>> = const { RefCell::new(None) };
+    /// D-370 test records (edge-scroll frame lengths, when the engine moved the
+    /// view, box-select writes and drag signals, the selection taken at a press).
+    #[cfg(test)]
+    static D370_SCROLL_TIMES: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static D370_FRAMES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static D370_LOG: RefCell<Vec<(Instant, String)>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static D370_BOX_BASE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// The only way a test can hand `build_ui` a picker; see
     /// `parse_picker_state`.
     #[cfg(test)]
@@ -20982,6 +20954,38 @@ thread_local! {
     #[cfg(test)]
     static TEST_JOB_POLL_TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// D-370 records. Production calls these plain functions; only a test build
+/// stores anything, a shipped build has empty bodies (same rule as
+/// `take_test_picker_override`).
+#[cfg(test)]
+fn d370_record_frame(dt: f64) {
+    D370_FRAMES.with(|f| f.borrow_mut().push(dt));
+}
+#[cfg(not(test))]
+fn d370_record_frame(_dt: f64) {}
+
+#[cfg(test)]
+fn d370_record_scroll() {
+    D370_SCROLL_TIMES.with(|t| t.borrow_mut().push(Instant::now()));
+}
+#[cfg(not(test))]
+fn d370_record_scroll() {}
+
+#[cfg(test)]
+fn d370_log(line: impl FnOnce() -> String) {
+    let line = line();
+    D370_LOG.with(|l| l.borrow_mut().push((Instant::now(), line)));
+}
+#[cfg(not(test))]
+fn d370_log(_line: impl FnOnce() -> String) {}
+
+#[cfg(test)]
+fn d370_record_base(model: &gtk::SelectionModel, base: &gtk::Bitset) {
+    D370_BOX_BASE.with(|b| *b.borrow_mut() = (0..model.n_items().min(5000)).filter(|i| base.contains(*i)).collect());
+}
+#[cfg(not(test))]
+fn d370_record_base(_model: &gtk::SelectionModel, _base: &gtk::Bitset) {}
 
 /// See `parse_picker_state`. In a shipped binary there is no test hook at
 /// all: this returns `None` and the optimizer removes the check.
@@ -30819,8 +30823,10 @@ Broken: Either state is wrong.\n";
     }
 
     /// D-370: the four modifier cases of a box, as GTK's (gtklistbase.c:1744-1805).
-    #[test]
-    fn box_modes_d370() {
+    /// gtk::Bitset needs GTK initialised, and a plain #[test] must not be the
+    /// first GTK caller (the suite's HOME guard and D-373's GLib priming run
+    /// first), so this runs at the start of edge_scroll_while_dragging_d370.
+    fn box_modes_d370_on_gtk_thread() {
         let (base, boxed) = (gtk::Bitset::new_empty(), gtk::Bitset::new_empty());
         base.add_range(2, 3); // 2,3,4
         boxed.add_range(4, 3); // 4,5,6
@@ -30864,6 +30870,7 @@ Broken: Either state is wrong.\n";
     ///     the icon view's GTK rubberband is off.
     ///  e. the top zone scrolls up.
     fn edge_scroll_while_dragging_d370() {
+        box_modes_d370_on_gtk_thread();
         let display_name = std::env::var("DISPLAY").unwrap_or_default();
         assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-370 sends real X input and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
         let old_home = std::env::var("HOME").ok();
@@ -31139,14 +31146,14 @@ Broken: Either state is wrong.\n";
             D370_LOG.with(|l| l.borrow_mut().clear());
             let log_start = Instant::now();
             let changed = gmodel.connect_selection_changed(|m, pos, n_items| {
-                d370_log(format!("GTK selection-changed positions {pos}+{n_items}; now {:?}", (0..m.n_items().min(5000)).filter(|i| m.is_selected(*i)).collect::<Vec<u32>>()));
+                d370_log(|| format!("GTK selection-changed positions {pos}+{n_items}; now {:?}", (0..m.n_items().min(5000)).filter(|i| m.is_selected(*i)).collect::<Vec<u32>>()));
             });
             let (still, _) = box_drag(bsx, bsy, b_end_x, b_end_y, 600, mods, &gadj);
             let base_at_press = D370_BOX_BASE.with(|b| b.borrow().clone());
             let prior: Vec<u32> = (0..7 * n).filter(|i| earlier(i / n, i % n)).collect();
             eprintln!("wf-test D-370 b {label}: selection taken at the press {base_at_press:?}, selection set before it {prior:?}");
             if base_at_press != prior { problems.push(format!("b {label}: the selection taken at the press {base_at_press:?} is not the one from before it {prior:?}")); }
-            d370_log("modifiers released".to_string());
+            d370_log(|| "modifiers released".to_string());
             release(mods);
             run_for(300);
             gmodel.disconnect(changed);
@@ -31210,11 +31217,17 @@ Broken: Either state is wrong.\n";
         let t0 = Instant::now();
         let mut ds = vec![(0.0, ladj.value())];
         let ctx = glib::MainContext::default();
+        // One main-loop pass per sample. Draining with `while ctx.iteration(false)`
+        // never returned while the loop stayed busy (the merged build keeps it busy
+        // during a drag), so the 1.6 s window took 9.5 s and the value was never
+        // sampled in it: the list moved, the test did not look.
         while t0.elapsed() < Duration::from_millis(1600) {
-            while ctx.iteration(false) {}
-            std::thread::sleep(Duration::from_millis(4));
+            ctx.iteration(false);
             ds.push((t0.elapsed().as_secs_f64(), ladj.value()));
+            std::thread::sleep(Duration::from_millis(4));
         }
+        let max_gap = ds.windows(2).map(|w| w[1].0 - w[0].0).fold(0.0, f64::max);
+        eprintln!("wf-test D-370 d sampling: {} samples in {:.2} s, longest gap {max_gap:.3} s", ds.len(), t0.elapsed().as_secs_f64());
         // End the drag with the button. Escape is no use here: GDK's X11 drag
         // handles only motion, button release and grab-broken events
         // (gdk/x11/gdkdrag-x11.c:2143-2166), so under Xvfb Escape never cancels
