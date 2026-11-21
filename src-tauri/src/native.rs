@@ -31714,7 +31714,9 @@ Broken: Either state is wrong.\n";
         let pane_state = ui.split.borrow().clone().expect("split pane").state;
         wait_for("right pane lists the folder", || pane_state.borrow().visible_entries.len() == total);
         let paned = ui.split.borrow().clone().expect("split pane").paned;
-        paned.set_position(900);
+        // D-377: +15 for the drawer sliver, so the left pane keeps the 479 px
+        // these fixtures were sized at (464 without it: every name wrapped).
+        paned.set_position(915);
         for _ in 0..60 { pump(); std::thread::sleep(Duration::from_millis(10)); }
     }
 
@@ -44753,7 +44755,7 @@ Broken: Either state is wrong.\n";
         let (state, ui) = WINDOWS
             .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
             .expect("window");
-        ui.window.set_default_size(1000, 700);
+        ui.window.set_default_size(1020, 700); // D-377: +20 for the drawer sliver
         ui.window.present();
         wait_for("listing", || state.borrow().visible_entries.len() == 1);
         ui.preview_toggle.set_active(true);
