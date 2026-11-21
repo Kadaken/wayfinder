@@ -5647,6 +5647,8 @@ fn build_ui_in(
         let button = ui.path_edit.clone();
         button.connect_clicked(move |_| edit_path_action(&state, &ui));
     }
+    connect_click_move_log(&files_scroll, "list", embedded, &state, &ui);
+    connect_click_move_log(&grid_scroll, "grid", embedded, &state, &ui);
     connect_file_drop(&files_scroll, state.clone(), ui.clone());
     connect_file_drop(&grid_scroll, state.clone(), ui.clone());
     connect_zoom_controller(&files_scroll, state.clone(), ui.clone(), ZoomTarget::Files);
@@ -10600,33 +10602,216 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
         if (to - from).abs() <= 200.0 {
             return;
         }
-        let cause = SCROLL_CAUSE.with(|c| {
-            let (tag, at) = *c.borrow();
-            match at {
-                Some(at) if at.elapsed() < Duration::from_secs(2) => {
-                    format!("{tag} ({}ms before)", at.elapsed().as_millis())
-                }
-                _ => "no app cause (wheel, drag edge, or GTK)".to_string(),
-            }
-        });
+        let cause = scroll_cause_text();
         let dir = wayfinder_cache_dir();
         let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
         let mut entry = format!("{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}\n", adj.upper() - adj.page_size());
         // A big jump also records who moved it: our functions and GTK's,
         // so the next one names the exact call, not a guess.
         if (to - from).abs() > 1000.0 {
-            let trace = std::backtrace::Backtrace::force_capture().to_string();
-            for line in trace
-                .lines()
-                .filter(|l| l.contains("native::") || l.contains("gtk_") || l.contains("_gtk"))
-                .filter(|l| !l.contains("watch_scroll_jumps"))
-                .take(14)
-            {
-                entry.push_str(&format!("      {}\n", line.trim()));
+            for line in scroll_trace_lines(14) {
+                entry.push_str(&format!("      {line}\n"));
             }
         }
         let _ = native_core::append_capped_log(&dir.join("scroll-jumps.log"), &entry, DIAGNOSTIC_LOG_CAP);
     });
+}
+
+/// The last Wayfinder move of the list in the past two seconds, or "no app cause".
+fn scroll_cause_text() -> String {
+    SCROLL_CAUSE.with(|c| {
+        let (tag, at) = *c.borrow();
+        match at {
+            Some(at) if at.elapsed() < Duration::from_secs(2) => format!("{tag} ({}ms before)", at.elapsed().as_millis()),
+            _ => "no app cause (wheel, drag edge, or GTK)".to_string(),
+        }
+    })
+}
+
+/// Our own and GTK's frames of the current call stack, so a move names its caller.
+fn scroll_trace_lines(max: usize) -> Vec<String> {
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    trace
+        .lines()
+        .filter(|l| l.contains("native::") || l.contains("gtk_") || l.contains("_gtk"))
+        .filter(|l| !l.contains("watch_scroll_jumps") && !l.contains("scroll_trace_lines") && !l.contains("connect_click_move_log"))
+        .take(max)
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+thread_local! {
+    /// D-364 diagnostic: counts primary-button presses on a list or icon view.
+    static CLICK_PRESSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How long after a press `click-moves.log` keeps recording.
+const CLICK_WATCH: Duration = Duration::from_millis(1500);
+
+fn for_each_widget(root: &gtk::Widget, f: &mut dyn FnMut(&gtk::Widget)) {
+    f(root);
+    let mut child = root.first_child();
+    while let Some(w) = child {
+        for_each_widget(&w, f);
+        child = w.next_sibling();
+    }
+}
+
+/// Mapped row widgets of a view: `wf-file-row` boxes in the list, flow-box
+/// children in the icon view.
+fn mapped_view_rows(view: &gtk::Widget, grid: bool) -> Vec<gtk::Widget> {
+    let mut rows = Vec::new();
+    for_each_widget(view, &mut |w| {
+        let is_row = if grid { w.is::<gtk::FlowBoxChild>() } else { w.has_css_class("wf-file-row") };
+        if is_row && w.is_mapped() {
+            rows.push(w.clone());
+        }
+    });
+    rows
+}
+
+/// What a click landed on: the row's list position, its name, and how to find
+/// the same row again (its path in the list, its index in the icon view).
+#[derive(Clone)]
+struct ClickedRow {
+    index: Option<usize>,
+    name: String,
+    path: Option<String>,
+}
+
+fn find_clicked_row(view: &gtk::Widget, grid: bool, row: &ClickedRow) -> Option<gtk::Widget> {
+    mapped_view_rows(view, grid).into_iter().find(|w| {
+        if grid {
+            w.downcast_ref::<gtk::FlowBoxChild>().map(|c| c.index() as usize) == row.index
+        } else {
+            row.path.is_some() && w.tooltip_text().map(|t| t.to_string()) == row.path
+        }
+    })
+}
+
+/// D-364 diagnostic. On every primary-button press in a list or icon view,
+/// ~/.cache/wayfinder/click-moves.log gets one line for the press (pane size,
+/// adjustment, the row under the pointer and its y in the viewport), then for
+/// 1.5 s one line for every adjustment change (any size; a backtrace over
+/// 20 px), every selection change, and at 150, 500 and 1500 ms the same row's y
+/// and the distinct heights of the mapped rows. Nothing runs outside that
+/// window. The press listener is a plain capture-phase click gesture that never
+/// claims the press.
+fn connect_click_move_log(scroller: &gtk::ScrolledWindow, view_name: &'static str, embedded: bool, state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let grid = view_name == "grid";
+    let pane = if embedded { "right-pane" } else { "left-pane" };
+    let session: Rc<Cell<Option<(u64, Instant)>>> = Rc::new(Cell::new(None));
+    let log = move |id: u64, text: String| {
+        let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
+        let _ = native_core::append_capped_log(&wayfinder_cache_dir().join("click-moves.log"), &format!("{when} #{id} {pane} {view_name} {text}\n"), DIAGNOSTIC_LOG_CAP);
+    };
+    let live = {
+        let session = session.clone();
+        move || session.get().filter(|(_, at)| at.elapsed() < CLICK_WATCH).map(|(id, at)| (id, at.elapsed().as_millis()))
+    };
+    let adj = scroller.vadjustment();
+    let last = Rc::new(Cell::new(adj.value()));
+    {
+        let (live, last) = (live.clone(), last.clone());
+        adj.connect_value_changed(move |adj| {
+            let (from, to) = (last.get(), adj.value());
+            last.set(to);
+            let Some((id, ms)) = live() else { return };
+            let mut text = format!("+{ms}ms VALUE {from:.1} -> {to:.1} upper={:.1} cause: {}", adj.upper(), scroll_cause_text());
+            if (to - from).abs() > 20.0 {
+                for line in scroll_trace_lines(10) {
+                    text.push_str(&format!("\n      {line}"));
+                }
+            }
+            log(id, text);
+        });
+    }
+    let selection_note = {
+        let (live, state) = (live.clone(), state.clone());
+        move |count: usize, first: Option<usize>| {
+            let Some((id, ms)) = live() else { return };
+            let name = first.and_then(|i| state.try_borrow().ok().and_then(|st| st.visible_entries.get(i).map(|e| e.name.clone()))).unwrap_or_default();
+            log(id, format!("+{ms}ms SELECT count={count} first={first:?} \"{name}\""));
+        }
+    };
+    if grid {
+        ui.grid.connect_selected_children_changed(move |flow| {
+            let children = flow.selected_children();
+            selection_note(children.len(), children.first().map(|c| c.index() as usize));
+        });
+    } else {
+        ui.list_selection.connect_selection_changed(move |sel, _, _| {
+            let set = sel.selection();
+            selection_note(set.size() as usize, if set.is_empty() { None } else { Some(set.minimum() as usize) });
+        });
+    }
+    let press = gtk::GestureClick::new();
+    press.set_button(1);
+    press.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let (state, scroller_for_press) = (state.clone(), scroller.clone());
+    press.connect_pressed(move |_, _, x, y| {
+        let Some(view) = scroller_for_press.child() else { return };
+        let id = CLICK_PRESSES.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        session.set(Some((id, Instant::now())));
+        let adj = scroller_for_press.vadjustment();
+        last.set(adj.value());
+        let picked = scroller_for_press
+            .translate_coordinates(&view, x, y)
+            .and_then(|(vx, vy)| view.pick(vx, vy, gtk::PickFlags::DEFAULT));
+        let row_widget = picked.and_then(|mut w| loop {
+            let is_row = if grid { w.is::<gtk::FlowBoxChild>() } else { w.has_css_class("wf-file-row") };
+            if is_row {
+                break Some(w);
+            }
+            w = w.parent()?;
+        });
+        let clicked = row_widget.as_ref().map(|w| {
+            let path = w.tooltip_text().map(|t| t.to_string());
+            let st = state.try_borrow().ok();
+            let index = if grid {
+                w.downcast_ref::<gtk::FlowBoxChild>().map(|c| c.index() as usize)
+            } else {
+                st.as_ref().and_then(|st| st.visible_entries.iter().position(|e| e.source.real_path_string() == path))
+            };
+            let name = st.as_ref().and_then(|st| index.and_then(|i| st.visible_entries.get(i).map(|e| e.name.clone()))).unwrap_or_default();
+            ClickedRow { index, name, path }
+        });
+        let row_y = |w: &gtk::Widget| w.compute_bounds(&scroller_for_press).map(|b| format!("{:.1}", b.y())).unwrap_or_else(|| "?".into());
+        log(
+            id,
+            format!(
+                "PRESS pane={}x{} value={:.1} upper={:.1} page={:.1} click_y={y:.1} row={} \"{}\" row_y={}",
+                scroller_for_press.width(),
+                scroller_for_press.height(),
+                adj.value(),
+                adj.upper(),
+                adj.page_size(),
+                clicked.as_ref().map(|c| format!("{:?}", c.index)).unwrap_or_else(|| "none".into()),
+                clicked.as_ref().map(|c| c.name.as_str()).unwrap_or(""),
+                row_widget.as_ref().map(row_y).unwrap_or_else(|| "?".into()),
+            ),
+        );
+        for ms in [150u64, 500, 1500] {
+            let (scroller, view, clicked) = (scroller_for_press.clone(), view.clone(), clicked.clone());
+            glib::timeout_add_local_once(Duration::from_millis(ms), move || {
+                let mut heights: Vec<i32> = mapped_view_rows(&view, grid).iter().map(|w| w.height()).collect();
+                heights.sort();
+                heights.dedup();
+                let y = clicked
+                    .as_ref()
+                    .and_then(|c| find_clicked_row(&view, grid, c))
+                    .and_then(|w| w.compute_bounds(&scroller))
+                    .map(|b| format!("{:.1}", b.y()))
+                    .unwrap_or_else(|| "row not on screen".into());
+                let adj = scroller.vadjustment();
+                log(id, format!("+{ms}ms ROW y={y} value={:.1} upper={:.1} heights={heights:?}", adj.value(), adj.upper()));
+            });
+        }
+    });
+    scroller.add_controller(press);
 }
 
 /// Audit #13: the cap for every diagnostic log under the cache folder.
