@@ -11,6 +11,8 @@
 #   headless-gtk-test.sh d187        the carried round-187 undo/redo regression selector
 #   headless-gtk-test.sh d226        the standalone no-scroll-flick-on-refresh gate
 #   headless-gtk-test.sh d371old     the same gate with the D-371 fix switched off (must FAIL)
+#   headless-gtk-test.sh d374old     the window-wider-than-a-monitor gate with the D-374 fix off (must FAIL)
+#   headless-gtk-test.sh d374        the standalone window-keeps-its-wide-size gate (xdotool windowsize)
 #   headless-gtk-test.sh d371        the standalone delete-keeps-the-view gate (XTEST input, compact list)
 #   headless-gtk-test.sh d370        the standalone edge-scroll-while-dragging gate (XTEST input, list and icon view)
 #   headless-gtk-test.sh d364        the standalone real-click-keeps-scroll gate (XTEST input, list and icon view)
@@ -98,6 +100,10 @@ case "$mode" in
         cmd=("${cargo_t[@]}" delete_keeps_view_d371_alone -- --nocapture);;
   d371old) export WAYFINDER_D371_ONLY=1 WF_TEST_D371_OLD=1
         cmd=("${cargo_t[@]}" delete_keeps_view_d371_alone -- --nocapture);;
+  d374) export WAYFINDER_D374_ONLY=1
+        cmd=("${cargo_t[@]}" wide_window_keeps_width_d374_alone -- --nocapture);;
+  d374old) export WAYFINDER_D374_ONLY=1 WF_TEST_D374_OLD=1
+        cmd=("${cargo_t[@]}" wide_window_keeps_width_d374_alone -- --nocapture);;
   d33) export WAYFINDER_D33_ONLY=1
         cmd=("${cargo_t[@]}" folder_activation_d33_alone -- --nocapture);;
   d20) export WAYFINDER_D20_ONLY=1
@@ -145,7 +151,7 @@ case "$mode" in
              bash -c 'set -e; ip link set lo up; exec dbus-run-session -- "$@"' bash "${inner_test[@]}")
         host_mounts_before="$(cat /proc/self/mountinfo)";;
   --) shift; cmd=("$@");;
-  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d370|d371|d371old|d368|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
+  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d370|d371|d371old|d374|d374old|d368|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
 esac
 
 setsid timeout -k 5 "$t" xvfb-run -a -s "-screen 0 1920x1080x24" "${cmd[@]}" &

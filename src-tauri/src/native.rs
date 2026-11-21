@@ -6351,6 +6351,20 @@ fn title_button(icon_name: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
+/// D-374 (21 Nov 2026): dragging the window wider than one monitor snapped it
+/// back to one monitor on release. GTK clamps a floating toplevel to the
+/// compositor bounds on every relayout (gtkwindow.c gtk_window_compute_default_size).
+/// True when the window is floating and its current size already passes the
+/// bounds, so our compute-size handler must keep that size.
+fn keep_size_past_bounds(state_floating: bool, cur_w: i32, cur_h: i32, bounds_w: i32, bounds_h: i32) -> bool {
+    state_floating && cur_w > 0 && cur_h > 0 && (cur_w > bounds_w || cur_h > bounds_h)
+}
+
+/// Test-only gate: D-374 override off, to show the old behaviour failing.
+fn d374_old() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D374_OLD").is_some()
+}
+
 /// D-354: two windows tiled 50/50 overlapped (20 Nov 2026). Log every size
 /// KWin offers this window against the width it can shrink to, so the next
 /// tile names the cause: ~/.cache/wayfinder/window-sizes.log.
@@ -6359,6 +6373,31 @@ fn record_window_sizes(window: &adw::ApplicationWindow) {
     window.connect_realize(move |_| {
         let Some(window) = weak.upgrade() else { return };
         let Some(toplevel) = window.surface().and_then(|s| s.downcast::<gdk::Toplevel>().ok()) else { return };
+        // D-374: keep a user-chosen size wider/taller than one monitor.
+        // GTK's own handler (connected first) clamps to the compositor
+        // bounds; ours runs after it and puts the current size back.
+        if !d374_old() {
+            let weak = window.downgrade();
+            toplevel.connect_compute_size(move |toplevel, size| {
+                let Some(window) = weak.upgrade() else { return };
+                let Some(surface) = window.surface() else { return };
+                let state = toplevel.state();
+                let floating = !state.intersects(
+                    gdk::ToplevelState::MAXIMIZED
+                        | gdk::ToplevelState::FULLSCREEN
+                        | gdk::ToplevelState::MINIMIZED
+                        | gdk::ToplevelState::TILED
+                        | gdk::ToplevelState::LEFT_TILED
+                        | gdk::ToplevelState::RIGHT_TILED
+                        | gdk::ToplevelState::TOP_TILED
+                        | gdk::ToplevelState::BOTTOM_TILED,
+                );
+                let (bw, bh) = size.bounds();
+                if keep_size_past_bounds(floating, window.width(), window.height(), bw, bh) {
+                    size.set_size(surface.width(), surface.height());
+                }
+            });
+        }
         let last = Rc::new(RefCell::new(String::new()));
         let weak = window.downgrade();
         toplevel.connect_compute_size(move |toplevel, size| {
@@ -30419,6 +30458,109 @@ Broken: Either state is wrong.\n";
         let display = gdk::Display::default().expect("display");
         private_display_check_d232(&display);
         delete_keeps_view_d371();
+    }
+
+    #[test]
+    fn keep_size_past_bounds_decision_d374() {
+        assert!(keep_size_past_bounds(true, 3000, 900, 1920, 1080), "wider than bounds, floating: keep");
+        assert!(keep_size_past_bounds(true, 1200, 1500, 1920, 1080), "taller than bounds, floating: keep");
+        assert!(!keep_size_past_bounds(true, 1200, 800, 1920, 1080), "inside bounds: GTK result stands");
+        assert!(!keep_size_past_bounds(true, 1920, 1080, 1920, 1080), "equal to bounds: GTK result stands");
+        assert!(!keep_size_past_bounds(false, 3000, 900, 1920, 1080), "maximized/tiled/fullscreen: GTK result stands");
+        assert!(!keep_size_past_bounds(true, 0, 0, 1920, 1080), "not laid out yet: GTK result stands");
+    }
+
+    /// D-374 alone, on the private display (1920x1080 Xvfb, no window manager).
+    #[test]
+    fn wide_window_keeps_width_d374_alone() { gtk_thread::run(wide_window_keeps_width_d374_alone_on_gtk_thread); }
+
+    fn wide_window_keeps_width_d374_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D374_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        wide_window_keeps_width_d374();
+    }
+
+    /// D-374 (21 Nov 2026): the window is made wider than the 1920 px screen
+    /// from outside GTK (xdotool windowsize, as a compositor would configure
+    /// it after the user drags it across two monitors), then a toplevel
+    /// relayout is forced (queue_resize plus main-loop iterations). The width
+    /// must stay (>= 2900). Then it is resized down to 1200x800 and must
+    /// follow. Fails with WF_TEST_D374_OLD=1 (width goes back to 1920).
+    fn wide_window_keeps_width_d374() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-374 resizes real X windows and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d374-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..20 {
+            std::fs::File::create(dir.join(format!("f{i:03}.txt"))).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d374test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (_state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d374-proof"));
+        ui.window.set_default_size(1300, 900);
+        ui.window.present();
+        let settle = |ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end { pump(); std::thread::sleep(Duration::from_millis(10)); }
+        };
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        wait_for("window mapped", || ui.window.is_mapped() && ui.window.width() > 0);
+        settle(500);
+        let ids: Vec<String> = xdo(&["search", "--name", "wf-d374-proof"]).split_whitespace().map(str::to_string).collect();
+        assert!(!ids.is_empty(), "no X window named wf-d374-proof");
+        let resize = |w: &str, h: &str| { for id in &ids { xdo(&["windowsize", id, w, h]); } };
+        let (bw, bh) = {
+            let surface = ui.window.surface().expect("surface");
+            let monitor = gdk::Display::default().expect("display").monitor_at_surface(&surface);
+            monitor.map(|m| { let g = m.geometry(); (g.width(), g.height()) }).unwrap_or((0, 0))
+        };
+        resize("3000", "900");
+        let mut got = false;
+        for _ in 0..100 {
+            pump();
+            if ui.window.width() >= 2900 { got = true; break; }
+        }
+        assert!(got, "the X window never reached 3000 wide (width={})", ui.window.width());
+        let before = ui.window.width();
+        ui.window.queue_resize();
+        settle(1000);
+        let after = ui.window.width();
+        eprintln!("wf-test D-374 width before relayout={before} after={after} bounds={bw}x{bh}");
+        assert!(after >= 2900, "D-374: the window snapped back after a relayout: {before} -> {after} (monitor {bw}x{bh})");
+        resize("1200", "800");
+        settle(500);
+        ui.window.queue_resize();
+        settle(1000);
+        let small = ui.window.width();
+        eprintln!("wf-test D-374 shrink: width after resize to 1200 = {small}");
+        assert!((1100..=1300).contains(&small), "D-374: the window can no longer be shrunk: width {small}");
+        ui.window.destroy();
+        settle(200);
+        match old_home { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        println!("wf-test D-374 OK");
     }
 
     /// D-371 (21 Nov 2026, the owner's screencast): in a compact list sorted
