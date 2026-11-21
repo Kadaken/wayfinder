@@ -26165,6 +26165,20 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    /// D-33 folder activation test alone, on the private display.
+    #[test]
+    fn folder_activation_d33_alone() { gtk_thread::run(folder_activation_d33_alone_on_gtk_thread); }
+
+    fn folder_activation_d33_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D33_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        folder_activation_waits_for_gtk_to_finish_d33();
+    }
+
     /// D-20 focus test alone, on the private display.
     #[test]
     fn emptied_folder_focus_d20_alone() { gtk_thread::run(emptied_folder_focus_d20_alone_on_gtk_thread); }
@@ -32865,9 +32879,19 @@ Broken: Either state is wrong.\n";
             wait_for("sub listing", || state.borrow().visible_entries.len() == 1);
         }
 
-        // Grid: the real child activation.
+        // Grid: the real child activation. D-368: the GridView shares the
+        // list's gate, so a bare activation opens nothing here either.
         back_to_dir(ViewMode::Grid);
         let pos = position_of("sub");
+        ui.grid.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
+        pump();
+        assert_eq!(state.borrow().cwd.real_path_string().unwrap_or_default(), dir_str, "a bare grid activation opens nothing");
+        {
+            let gate = state.borrow().activation_gate.clone();
+            let sub_source = native_core::EntrySource::real(&sub_str);
+            gate.borrow_mut().press(&sub_source, std::time::Instant::now(), true);
+            gate.borrow_mut().press(&sub_source, std::time::Instant::now(), true);
+        }
         let rows = ui.list_store.n_items();
         let generation = state.borrow().listing_generation;
         ui.grid.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
@@ -32880,6 +32904,12 @@ Broken: Either state is wrong.\n";
         // entries are reversed; only the captured entry (b.txt) may be refused.
         back_to_dir(ViewMode::Grid);
         let pos = position_of("b.txt");
+        {
+            let gate = state.borrow().activation_gate.clone();
+            let b_source = native_core::EntrySource::real(dir.join("b.txt").to_string_lossy().as_ref());
+            gate.borrow_mut().press(&b_source, std::time::Instant::now(), true);
+            gate.borrow_mut().press(&b_source, std::time::Instant::now(), true);
+        }
         ui.grid.activate_action("list.activate-item", Some(&(pos as u32).to_variant())).unwrap();
         std::fs::remove_file(dir.join("a.txt")).unwrap();
         std::fs::remove_file(dir.join("b.txt")).unwrap();

@@ -89,6 +89,8 @@ case "$mode" in
         cmd=("${cargo_t[@]}" scroll_flick_d226_alone -- --nocapture);;
   d364) export WAYFINDER_D364_ONLY=1
         cmd=("${cargo_t[@]}" pointer_click_keeps_scroll_d364_alone -- --nocapture);;
+  d33) export WAYFINDER_D33_ONLY=1
+        cmd=("${cargo_t[@]}" folder_activation_d33_alone -- --nocapture);;
   d20) export WAYFINDER_D20_ONLY=1
         cmd=("${cargo_t[@]}" emptied_folder_focus_d20_alone -- --nocapture);;
   d368) export WAYFINDER_D368_ONLY=1
