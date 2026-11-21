@@ -15,6 +15,7 @@
 #   headless-gtk-test.sh d375old     the address-bar-right-end gate with the D-375 pin off (must FAIL)
 #   headless-gtk-test.sh d377old     the sidebar-toggle-in-the-corner gate with the old placement (must FAIL)
 #   headless-gtk-test.sh d377        the sidebar-toggle-in-the-corner gate (size, place, no overlap)
+#   headless-gtk-test.sh d378        the standalone click-inside-the-rename-field-keeps-editing gate (xdotool click, .webm and .txt)
 #   headless-gtk-test.sh d375        the standalone address-bar-shows-current-folder gate (xdotool windowsize)
 #   headless-gtk-test.sh d374        the standalone window-keeps-its-wide-size gate (xdotool windowsize)
 #   headless-gtk-test.sh d371        the standalone delete-keeps-the-view gate (XTEST input, compact list)
@@ -114,6 +115,26 @@ case "$mode" in
         cmd=("${cargo_t[@]}" sidebar_corner_toggle_d377_alone -- --nocapture);;
   d375) export WAYFINDER_D375_ONLY=1
         cmd=("${cargo_t[@]}" address_scrolled_right_d375_alone -- --nocapture);;
+  d378) export WAYFINDER_D378_ONLY=1
+        cmd=("${cargo_t[@]}" rename_click_inside_keeps_editing_d378_alone -- --nocapture);;
+  d378old) export WAYFINDER_D378_ONLY=1 WF_TEST_D378_OLD=1
+        cmd=("${cargo_t[@]}" rename_click_inside_keeps_editing_d378_alone -- --nocapture);;
+  d379) export WAYFINDER_D379_ONLY=1
+        cmd=("${cargo_t[@]}" lying_extension_preview_d379_alone -- --nocapture);;
+  d379old) export WAYFINDER_D379_ONLY=1 WF_TEST_D379_OLD=1
+        cmd=("${cargo_t[@]}" lying_extension_preview_d379_alone -- --nocapture);;
+  d380) export WAYFINDER_D380_ONLY=1
+        cmd=("${cargo_t[@]}" doc_bar_narrow_pane_d380_alone -- --nocapture);;
+  d380old) export WAYFINDER_D380_ONLY=1 WF_TEST_D380_OLD=1
+        cmd=("${cargo_t[@]}" doc_bar_narrow_pane_d380_alone -- --nocapture);;
+  d381) export WAYFINDER_D381_ONLY=1
+        cmd=("${cargo_t[@]}" arrow_key_image_preview_d381_alone -- --nocapture);;
+  d381old) export WAYFINDER_D381_ONLY=1 WF_TEST_D381_OLD=1
+        cmd=("${cargo_t[@]}" arrow_key_image_preview_d381_alone -- --nocapture);;
+  d383) export WAYFINDER_D383_ONLY=1
+        cmd=("${cargo_t[@]}" fix_extension_d383_alone -- --nocapture);;
+  d383old) export WAYFINDER_D383_ONLY=1 WF_TEST_D383_OLD=1
+        cmd=("${cargo_t[@]}" fix_extension_d383_alone -- --nocapture);;
   d375old) export WAYFINDER_D375_ONLY=1 WF_TEST_D375_OLD=1
         cmd=("${cargo_t[@]}" address_scrolled_right_d375_alone -- --nocapture);;
   d33) export WAYFINDER_D33_ONLY=1
@@ -163,7 +184,7 @@ case "$mode" in
              bash -c 'set -e; ip link set lo up; exec dbus-run-session -- "$@"' bash "${inner_test[@]}")
         host_mounts_before="$(cat /proc/self/mountinfo)";;
   --) shift; cmd=("$@");;
-  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d370|d371|d371old|d374|d374old|d375|d375old|d377|d377old|d368|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
+  *) echo "usage: $0 full|d154|d53|d155|d185|d186|d188|d187|d226|d364|d370|d371|d371old|d374|d374old|d375|d375old|d378|d379|d379old|d380|d380old|d381|d381old|d383|d383old|d377|d377old|d368|d369|d234|d235|d237|d239|-- CMD..." >&2; exit 2;;
 esac
 
 setsid timeout -k 5 "$t" xvfb-run -a -s "-screen 0 1920x1080x24" "${cmd[@]}" &
