@@ -343,6 +343,28 @@ Wayfinder uses your system's freedesktop icon theme to show per-type icons. Reco
 
 ---
 
+### Show original (duplicates)
+
+Right-click a file and choose **Show original**. It is greyed out when no
+original is known. When one is known, it opens a new window at the original's
+folder with the original selected. Three keys in `native-config.json` control
+where originals come from:
+
+- `originals_lists`: list of paths to tab-separated files. First line
+  `duplicate<TAB>original<TAB>how we know`, then one row per copy with full
+  absolute paths. Rows whose original no longer exists are ignored.
+- `duplicate_index_roots`: list of folders to index for byte-identical copies
+  (same size and same blake2b hash). Default empty, which means the index is
+  off and nothing is read. Only these folders are indexed. Of two identical
+  files the one with the older modification time is the original.
+- `duplicate_index_skip`: list of folders the index must never open. They are
+  checked before opening, so a skipped folder is never listed or read. Trash
+  folders are always skipped and symlinks are never followed.
+
+The index runs in the background at low priority, keeps its results in
+`wayfinder/duplicate-index.tsv` under your XDG cache folder, and writes
+nowhere else.
+
 ### Persistence
 
 The native configuration currently saves:

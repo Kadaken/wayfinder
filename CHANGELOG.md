@@ -4,6 +4,12 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## Unreleased
+
+### Added
+- **Show original** in a file's right-click menu. It is greyed out when no original is known; otherwise it opens a new window at the original's folder with the original selected.
+- Originals come from hand lists (config key `originals_lists`) and from byte-identical copies found by a background index (`duplicate_index_roots`, off until you list folders; `duplicate_index_skip` names folders it must never open). Of two identical files the older one counts as the original.
+
 ## 0.9.31 — 22 November 2026
 
 ### Fixed
