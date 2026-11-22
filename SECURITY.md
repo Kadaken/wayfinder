@@ -42,12 +42,12 @@ and say why rather than leave you waiting.
 
 ## What I have and have not checked myself
 
-As of 0.9.29: `cargo audit` reports no vulnerable dependency, and the refusals
+As of 0.9.30: `cargo audit` reports no vulnerable dependency, and the refusals
 above all have tests behind them. What follows is everything in the release
 audit that is reasoned about but **not measured**. It is here, in the file that
 ships, because a gap nobody wrote down is a gap nobody fixes. One item that
-used to be on this list is now measured: two clean builds of the 0.9.29
-source produce byte-identical programs.
+used to be on this list is now measured: two clean builds of the release
+source produce byte-identical programs (checked again for 0.9.30).
 
 1. **A hostile run at the file dialog has never been written.** The portal
    backend takes its input from other applications, not from the person at the
@@ -73,16 +73,23 @@ source produce byte-identical programs.
    drive off, and both are refused while a transfer runs. The real `udisksctl`
    calls against a real USB drive are not part of any automated run.
 6. **Previews hand files you did not make to outside tools.** LibreOffice,
-   Ghostscript, ImageMagick, `pdftoppm` and Ruffle read the file to draw a
-   preview. Ghostscript runs with `-dSAFER`; none of them is otherwise
-   sandboxed, and no hostile document has been fired at them.
-7. **The PS2 drive row is proven on one machine only.** Reading a PS2-format
+   Ghostscript, ImageMagick, `pdftoppm`, 7-Zip, `unar`, `xz`, `ffmpeg`,
+   GStreamer and Ruffle read the file to draw a preview or list an archive.
+   Since 0.9.30, LibreOffice, Ghostscript and ImageMagick run with no network
+   (a private network namespace via `unshare`), Ghostscript with `-dSAFER`,
+   and ImageMagick with memory and time limits. None of them is otherwise
+   sandboxed: each can still read any file you can. No hostile document,
+   picture, archive or video has been fired at them.
+7. **The no-network rule needs user namespaces.** Where unprivileged user
+   namespaces are switched off, those previews still run, with network, and
+   Wayfinder does not say so on screen.
+8. **The PS2 drive row is proven on one machine only.** Reading a PS2-format
    hard drive was checked against one real drive. Other drives, and damaged
    ones, are not covered.
-8. **Filenames that are not valid UTF-8 are not tested end to end.** Linux
+9. **Filenames that are not valid UTF-8 are not tested end to end.** Linux
    allows them; the program converts paths to text for display in hundreds of
    places. Whether every one of those survives the round trip is unknown.
-9. **One command cannot run the whole suite.** Rust's test harness gives every
+10. **One command cannot run the whole suite.** Rust's test harness gives every
    test its own thread, and GTK refuses to start twice, so the GTK suite has to
    be run on its own. Both runs are reported in the release audit; a single
    `cargo test --bins` cannot pass by construction.
