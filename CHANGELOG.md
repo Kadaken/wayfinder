@@ -7,6 +7,7 @@ change between releases.
 ## Unreleased
 
 ### Fixed
+- Startup and every sidebar refresh no longer wait on slow drives: whether a pin, recent or drive row accepts drops is no longer checked on the window's thread (a slow cloud or USB mount held the window for about 40 seconds).
 
 - Phone videos named `.3gpp`, `.3gpp2` or `.3gp2` are treated as video again, so they get a player and a thumbnail.
 - A copy that fails on thousands of files (for example a drive unplugged mid-copy) no longer freezes the window: the error shows its first lines and says how many more there were.

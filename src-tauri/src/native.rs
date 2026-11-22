@@ -2697,6 +2697,13 @@ struct AppState {
     /// D-272: paths whose children are being read on a worker right now, so
     /// one slow mount is asked for once and not on every sidebar rebuild.
     tree_pending: HashSet<String>,
+    /// D-400: pins and recents found to be folders, so a drop target can be
+    /// attached without a stat on the GTK thread. Only "yes" is kept: a path
+    /// that is missing or a file is asked again on the next rebuild.
+    drop_folders: HashSet<String>,
+    /// D-400: pin and recent rows waiting for that answer, per path. One
+    /// worker per path at a time, however many rebuilds happen meanwhile.
+    drop_pending: HashMap<String, Vec<glib::WeakRef<gtk::ListBoxRow>>>,
     /// D-272: does this drive have subfolders? Answered on a worker and
     /// remembered, because asking costs a network round trip on an rclone or
     /// SMB mount and the sidebar is rebuilt constantly.
@@ -4859,6 +4866,8 @@ fn build_ui_in(
         places_expanded: true,
         tree_cache: native_core::TreeCache::default(),
         tree_pending: HashSet::new(),
+        drop_folders: HashSet::new(),
+        drop_pending: HashMap::new(),
         typeahead: String::new(),
         typeahead_at: Instant::now(),
         pending_offer: None,
@@ -7104,7 +7113,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         row.set_tooltip_text(Some(&path));
         row.set_widget_name(if place_is_trash(&path) { "wf-trash-place-row" } else { "wf-place-row" });
         connect_place_context(&row, state.clone(), ui.clone(), path.clone());
-        connect_sidebar_drop(&row, state, ui, &path);
+        connect_sidebar_drop_folder(&row, state, ui, &path);
         mark_sidebar_active(
             &row,
             &cwd,
@@ -7150,7 +7159,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             // row had no drop target at all, so dragging onto Orchard showed
             // the red "not allowed" circle (18 Nov 2026).
             if !mount.is_empty() {
-                connect_sidebar_drop(&row, state, ui, &mount);
+                connect_sidebar_drop_folder(&row, state, ui, &mount);
             }
             let show_hidden = state.borrow().show_hidden;
             let tree_open = !mount.is_empty() && state.borrow().tree_expanded.contains(&mount);
@@ -8172,7 +8181,7 @@ fn append_tree_row(
             line.set_margin_start(line.margin_start() + depth * SIDEBAR_INDENT);
         }
     }
-    connect_sidebar_drop(&row, state, ui, path);
+    connect_sidebar_drop_folder(&row, state, ui, path);
     mark_sidebar_active(&row, cwd, name, path, sidebar_active_key, active_target);
     ui.sidebar.append(&row);
     if !expanded || !openable {
@@ -8550,11 +8559,67 @@ fn connect_sidebar_drop(
     ui: &Ui,
     path: &str,
 ) {
+    connect_sidebar_drop_with(row, state, ui, path, |path| Path::new(path).is_dir());
+}
+
+/// D-400: a pin or recent row may be a file or gone, so whether it takes a
+/// drop needs a stat. That stat ran here on the GTK thread on every sidebar
+/// rebuild, for every pin and recent, and one on a slow mount held the whole
+/// window (about 40 s at startup, measured 22 Nov 2026). It now runs on a
+/// worker; the drop target is attached when the answer is "folder".
+fn connect_sidebar_drop_with(
+    row: &gtk::ListBoxRow,
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    path: &str,
+    probe: fn(&str) -> bool,
+) {
     // Trash is not a folder to copy into; dropping there means delete, which
     // is its own decision and is not what this does.
-    if place_is_trash(path) || !Path::new(path).is_dir() {
+    if place_is_trash(path) {
         return;
     }
+    if state.borrow().drop_folders.contains(path) {
+        attach_sidebar_drop(row, state, ui, path);
+        return;
+    }
+    let first = {
+        let mut state_ref = state.borrow_mut();
+        let waiting = state_ref.drop_pending.entry(path.to_string()).or_default();
+        waiting.push(row.downgrade());
+        waiting.len() == 1
+    };
+    if !first {
+        return;
+    }
+    let (state, ui, key) = (state.clone(), ui.clone(), path.to_string());
+    let worker_path = key.clone();
+    glib::spawn_future_local(async move {
+        let is_folder = gio::spawn_blocking(move || probe(&worker_path)).await.unwrap_or(false);
+        let rows = {
+            let mut state_ref = state.borrow_mut();
+            if is_folder {
+                state_ref.drop_folders.insert(key.clone());
+            }
+            state_ref.drop_pending.remove(&key).unwrap_or_default()
+        };
+        if is_folder {
+            for row in rows.iter().filter_map(|weak| weak.upgrade()) {
+                attach_sidebar_drop(&row, &state, &ui, &key);
+            }
+        }
+    });
+}
+
+/// A row whose path is a folder by construction (a drive's mount point, a
+/// standard folder, a folder-tree branch): no stat, the drop target goes on now.
+fn connect_sidebar_drop_folder(row: &gtk::ListBoxRow, state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
+    if !place_is_trash(path) {
+        attach_sidebar_drop(row, state, ui, path);
+    }
+}
+
+fn attach_sidebar_drop(row: &gtk::ListBoxRow, state: &Rc<RefCell<AppState>>, ui: &Ui, path: &str) {
     if let Some(line) = row.child().and_then(|child| child.downcast::<gtk::Box>().ok()) {
         connect_file_drop_to_dir(&line, state.clone(), ui.clone(), PathBuf::from(path));
     }
@@ -27356,6 +27421,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d393-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d400") {
+            sidebar_drop_check_runs_off_the_gtk_thread_d400();
+            eprintln!("wf-test d400-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d391") {
             video_preview_pipeline_waits_for_a_steady_selection_d391();
             eprintln!("wf-test d391-only run done");
@@ -27488,6 +27558,7 @@ Broken: Either state is wrong.\n";
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
         video_preview_pipeline_waits_for_a_steady_selection_d391();
+        sidebar_drop_check_runs_off_the_gtk_thread_d400();
         suite_tail_after_d86();
         suite_glib_dirs_d373("suite end");
     }
@@ -36499,6 +36570,82 @@ Broken: Either state is wrong.\n";
         prune_missing_pins_at(&path);
         assert!(read_config_at(&path).pins.is_empty(), "D-392: the worker prunes a missing pin");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D-400: whether a pin or recent row takes a drop is a stat, and it must
+    /// never run on the GTK thread (a slow mount held the window ~40 s). The
+    /// answer still attaches the drop target to a folder row, never to a file
+    /// row, and a known folder is not asked twice.
+    fn sidebar_drop_check_runs_off_the_gtk_thread_d400() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static ON_GTK_THREAD: AtomicBool = AtomicBool::new(false);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn note() {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            if glib::MainContext::default().is_owner() {
+                ON_GTK_THREAD.store(true, Ordering::SeqCst);
+            }
+        }
+        fn folder(_: &str) -> bool {
+            note();
+            true
+        }
+        fn file(_: &str) -> bool {
+            note();
+            false
+        }
+        fn has_drop(row: &gtk::ListBoxRow) -> bool {
+            let Some(line) = row.child() else { return false };
+            let controllers = line.observe_controllers();
+            (0..controllers.n_items())
+                .filter_map(|i| controllers.item(i))
+                .any(|c| c.is::<gtk::DropTarget>())
+        }
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d400-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("home");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d400test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+
+        let pin = sidebar_row("pin", "", "emblem-favorite-symbolic");
+        let again = sidebar_row("pin again", "", "emblem-favorite-symbolic");
+        connect_sidebar_drop_with(&pin, &state, &ui, "/d400/pinned-folder", folder);
+        // A second rebuild before the answer: one worker for the path, and the
+        // new row is served by the same answer.
+        connect_sidebar_drop_with(&again, &state, &ui, "/d400/pinned-folder", folder);
+        assert!(!has_drop(&pin), "D-400: the drop target waits for the worker's answer");
+        wait_for("folder answer", || has_drop(&pin) && has_drop(&again));
+        assert!(!ON_GTK_THREAD.load(Ordering::SeqCst), "D-400: the folder check ran on the GTK thread");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "D-400: one check per path while it is pending");
+
+        let cached = sidebar_row("pin cached", "", "emblem-favorite-symbolic");
+        connect_sidebar_drop_with(&cached, &state, &ui, "/d400/pinned-folder", folder);
+        assert!(has_drop(&cached), "D-400: a known folder gets its drop target at once");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "D-400: a known folder is not checked again");
+
+        let recent = sidebar_row("recent file", "", "document-open-recent-symbolic");
+        connect_sidebar_drop_with(&recent, &state, &ui, "/d400/recent-file.txt", file);
+        wait_for("file answer", || !state.borrow().drop_pending.contains_key("/d400/recent-file.txt"));
+        assert!(!has_drop(&recent), "D-400: a file row must not take a drop");
+        assert!(!ON_GTK_THREAD.load(Ordering::SeqCst), "D-400: the file check ran on the GTK thread");
+
+        ui.window.close();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        eprintln!("wf-test d400 ok");
     }
 
     /// D-391: the GTK media pipeline of a video preview is built only after the
