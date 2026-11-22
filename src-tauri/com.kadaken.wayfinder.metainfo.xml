@@ -51,7 +51,8 @@
         <p>New "Show original" item in the file menu opens the original of a
         duplicate in a new window. A video cut out of the middle of an MPEG
         stream now says it cannot be played instead of leaving the preview
-        blank.</p>
+        blank. Mute and volume are now one setting for every video and
+        song, so a mute no longer silently carries into the next file.</p>
       </description>
     </release>
     <release version="0.9.31" date="2026-11-22">

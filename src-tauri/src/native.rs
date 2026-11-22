@@ -1363,6 +1363,12 @@ struct AppConfig {
     /// Folders the duplicate index must never open, checked before opening.
     #[serde(default)]
     duplicate_index_skip: Vec<String>,
+    /// D-409: one volume and mute for every video and song in Wayfinder,
+    /// kept here so it survives a restart. 1.0 and unmuted by default.
+    #[serde(default = "full_media_volume")]
+    media_volume: f64,
+    #[serde(default)]
+    media_muted: bool,
     /// Opt-in: ask Copy / Move / Link on every drag and drop instead of
     /// deciding from the modifier keys and the device. Off by default, so the
     /// Explorer habit (Ctrl copies, Shift moves) keeps working untouched for
@@ -2116,6 +2122,8 @@ impl Default for AppConfig {
             originals_lists: Vec::new(),
             duplicate_index_roots: Vec::new(),
             duplicate_index_skip: Vec::new(),
+            media_volume: 1.0,
+            media_muted: false,
             drop_ask: false,
             sidebar_hidden: false,
             onboarded: false,
@@ -2406,6 +2414,95 @@ fn config_onboarded(config: &mut AppConfig, value: bool) {
 
 fn config_trash_keep_days(config: &mut AppConfig, value: u32) {
     config.trash_keep_days = value;
+}
+
+fn full_media_volume() -> f64 {
+    1.0
+}
+
+// D-409 (22 Nov 2026): volume and mute are one setting for all of Wayfinder.
+// Muting one video used to mute only that player's controls, while the system
+// remembered the mute for the app name "Wayfinder" and put it back on every
+// new stream. The next video or song then showed "unmuted" and played
+// nothing; he had to press mute twice on each file to hear it.
+thread_local! {
+    static MEDIA_SOUND: Cell<Option<(f64, bool)>> = const { Cell::new(None) };
+    static MEDIA_SOUND_PUSHING: Cell<bool> = const { Cell::new(false) };
+    static MEDIA_SOUND_SAVE: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
+}
+
+/// The shared volume (0.0 to 1.0) and mute, read from the config once.
+fn media_sound() -> (f64, bool) {
+    MEDIA_SOUND.with(|slot| {
+        slot.get().unwrap_or_else(|| {
+            let config = load_config();
+            let sound = (config.media_volume.clamp(0.0, 1.0), config.media_muted);
+            slot.set(Some(sound));
+            sound
+        })
+    })
+}
+
+/// Records a change made on any player and saves it after the slider settles,
+/// so a drag is one config write, not hundreds.
+fn set_media_sound(volume: f64, muted: bool) {
+    if MEDIA_SOUND_PUSHING.with(Cell::get) {
+        return;
+    }
+    let next = (volume.clamp(0.0, 1.0), muted);
+    if MEDIA_SOUND.with(Cell::get) == Some(next) {
+        return;
+    }
+    MEDIA_SOUND.with(|slot| slot.set(Some(next)));
+    MEDIA_SOUND_SAVE.with(|slot| {
+        if let Some(pending) = slot.borrow_mut().take() {
+            pending.remove();
+        }
+        let id = glib::timeout_add_local_once(Duration::from_millis(400), || {
+            MEDIA_SOUND_SAVE.with(|slot| slot.borrow_mut().take());
+            let (volume, muted) = media_sound();
+            update_config(|config| {
+                config.media_volume = volume;
+                config.media_muted = muted;
+            });
+        });
+        *slot.borrow_mut() = Some(id);
+    });
+}
+
+/// Puts the shared volume and mute on a video stream. Mute is flipped and
+/// set back so both values reach the sound server even when they equal what
+/// GTK already believes: the system's remembered mute is invisible to GTK.
+fn push_media_sound(media: &gtk::MediaStream) {
+    let (volume, muted) = media_sound();
+    MEDIA_SOUND_PUSHING.with(|p| p.set(true));
+    media.set_muted(!muted);
+    media.set_volume(volume);
+    media.set_muted(muted);
+    MEDIA_SOUND_PUSHING.with(|p| p.set(false));
+}
+
+/// Every video player follows the shared setting: it starts with it once its
+/// pipeline exists, and a change on its own controls becomes the setting.
+fn follow_media_sound(media: &gtk::MediaStream) {
+    if media.is_prepared() {
+        push_media_sound(media);
+    }
+    media.connect_prepared_notify(|m| {
+        if m.is_prepared() {
+            push_media_sound(m);
+        }
+    });
+    media.connect_volume_notify(|m| set_media_sound(m.volume(), m.is_muted()));
+    media.connect_muted_notify(|m| set_media_sound(m.volume(), m.is_muted()));
+}
+
+/// The song player starts with the shared setting, and again on Play, in case
+/// the system put its remembered mute back when the stream connected.
+fn push_media_sound_to_song(player: &audio_preview::AudioPlayer) {
+    let (volume, muted) = media_sound();
+    player.set_volume(volume);
+    player.set_muted(muted);
 }
 
 fn config_view_mode(config: &mut AppConfig, mode: ViewMode) {
@@ -16484,6 +16581,9 @@ fn compare_side(heading: &str, path: &Path) -> gtk::Box {
         // Same GtkMediaFile path as the preview pane; paused until he plays it.
         let video = gtk::Video::for_filename(Some(path));
         video.set_autoplay(false);
+        if let Some(stream) = video.media_stream() {
+            follow_media_sound(&stream);
+        }
         video.upcast()
     } else if native_core::is_audio_path(&path_str) {
         // Never GtkMediaFile for audio: see update_preview.
@@ -21244,7 +21344,9 @@ fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
     ui.preview_audio_scale.set_value(0.0);
     ui.preview_audio_seeking.set(false);
 
-    show_preview_volume(ui, player.volume(), player.muted());
+    push_media_sound_to_song(&player);
+    let (volume, muted) = media_sound();
+    show_preview_volume(ui, volume, muted);
     *ui.preview_audio.borrow_mut() = Some(player);
     *ui.preview_audio_path.borrow_mut() = Some(path.to_string());
     ui.preview_stack.set_visible_child_name("audio");
@@ -21327,6 +21429,9 @@ fn connect_preview_audio_controls(ui: &Ui) {
                     return;
                 };
                 let wants_play = !player.is_playing();
+                if wants_play {
+                    push_media_sound_to_song(player);
+                }
                 player.set_playing(wants_play);
                 wants_play
             };
@@ -21364,6 +21469,7 @@ fn connect_preview_audio_controls(ui: &Ui) {
                 (player.volume(), player.muted())
             });
             if let Some((volume, muted)) = state {
+                set_media_sound(volume, muted);
                 show_preview_volume(&ui, volume, muted);
             }
         });
@@ -21385,6 +21491,7 @@ fn connect_preview_audio_controls(ui: &Ui) {
                     Some((player.volume(), player.muted()))
                 });
                 if let Some((volume, muted)) = state {
+                    set_media_sound(volume, muted);
                     show_preview_volume(&ui, volume, muted);
                 }
             });
@@ -22259,6 +22366,7 @@ fn attach_preview_media(ui: &Ui, play_path: &str, original: &str, may_convert: b
         (420.0 * zoom).round() as i32
     };
     media.set_loop(false);
+    follow_media_sound(media.upcast_ref());
     ui.preview_media_picture.set_size_request(size, size);
     ui.preview_media_picture.set_paintable(Some(&media));
     ui.preview_media_controls.set_media_stream(Some(&media));
@@ -28104,6 +28212,59 @@ Broken: Either state is wrong.\n";
         assert!(failed.is_empty(), "AVIs that did not play: {failed:?}");
     }
 
+    /// D-409: mute and volume are one setting for every video and song. A mute
+    /// on one video carries to the next, one unmute undoes it everywhere, the
+    /// song player follows, and the setting is saved to the config.
+    fn mute_and_volume_carry_across_files_d409() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("sound", |dir| {
+            for n in ["a.mp4", "b.mp4"] {
+                let a = ["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=2:s=160x120:r=25", "-f", "lavfi", "-i", "sine=d=2:f=440:r=44100", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", n];
+                assert!(d362_run("ffmpeg", &a, dir), "ffmpeg makes {n}");
+            }
+            assert!(d362_run("ffmpeg", &["-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=2:f=440:r=44100", "s.wav"], dir), "ffmpeg makes s.wav");
+        }, 3);
+        let stream = || d.ui.preview_media_controls.media_stream().expect("a video stream");
+        let show_video = |n: &str| {
+            d362_show(&d, n);
+            d362_wait(&format!("{n} prepared"), 40, || {
+                d362_stack(&d) == "media"
+                    && d.ui.preview_media_controls.media_stream().is_some_and(|s| s.is_prepared())
+            });
+        };
+        show_video("a.mp4");
+        assert!(!stream().is_muted(), "the first video starts unmuted");
+        stream().set_muted(true);
+        show_video("b.mp4");
+        assert!(stream().is_muted(), "a mute on a.mp4 carries to b.mp4");
+        stream().set_muted(false);
+        stream().set_volume(0.3);
+        show_video("a.mp4");
+        assert!(!stream().is_muted(), "one unmute on b.mp4 unmutes a.mp4 too");
+        assert!((stream().volume() - 0.3).abs() < 0.01, "volume carried as {}", stream().volume());
+        stream().pause();
+        d362_show(&d, "s.wav");
+        d362_wait("the song player", 40, || d362_stack(&d) == "audio" && d.ui.preview_audio.borrow().is_some());
+        assert!((d.ui.preview_audio_volume.value() - 0.3).abs() < 0.01, "song slider shows {}", d.ui.preview_audio_volume.value());
+        let song_muted = || d.ui.preview_audio.borrow().as_ref().map(|p| p.muted());
+        assert_eq!(song_muted(), Some(false), "the song starts unmuted");
+        d.ui.preview_audio_mute.emit_clicked();
+        assert_eq!(song_muted(), Some(true), "the song's mute button mutes it");
+        show_video("b.mp4");
+        assert!(stream().is_muted(), "a mute on the song carries to the next video");
+        d362_wait("the setting saved", 10, || {
+            let c = load_config();
+            c.media_muted && (c.media_volume - 0.3).abs() < 0.01
+        });
+        stream().set_muted(false);
+        stream().set_volume(1.0);
+        d362_wait("the reset saved", 10, || {
+            let c = load_config();
+            !c.media_muted && (c.media_volume - 1.0).abs() < 0.01
+        });
+        stream().pause();
+    }
+
     /// D-362: new picture formats preview as pictures: tga, pnm, psd and dds,
     /// converted to a cached PNG when GTK cannot load them itself.
     fn new_image_formats_preview_as_pictures_d362() {
@@ -28368,6 +28529,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test tail-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("sound") {
+            mute_and_volume_carry_across_files_d409();
+            eprintln!("wf-test sound-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("avi") {
             avi_codecs_play_in_the_preview_d401();
             real_avi_list_plays_d401();
@@ -28492,6 +28658,7 @@ Broken: Either state is wrong.\n";
         video_preview_pipeline_waits_for_a_steady_selection_d391();
         sidebar_drop_check_runs_off_the_gtk_thread_d400();
         clearing_search_brings_the_folder_back_d402();
+        mute_and_volume_carry_across_files_d409();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();

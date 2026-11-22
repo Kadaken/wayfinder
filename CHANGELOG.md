@@ -12,6 +12,7 @@ change between releases.
 
 ### Fixed
 - A video file cut out of the middle of an MPEG stream (a .mpg that starts part-way through a picture) no longer leaves the preview pane blank; it now says the video cannot be played.
+- Mute and volume are now one setting for every video and song in Wayfinder, kept across restarts. Muting one video used to leave the next video or song silent while its controls said unmuted, so each file needed mute pressed twice.
 
 ## 0.9.31 — 22 November 2026
 
