@@ -11,6 +11,7 @@ change between releases.
 - Phone videos named `.3gpp`, `.3gpp2` or `.3gp2` are treated as video again, so they get a player and a thumbnail.
 - A copy that fails on thousands of files (for example a drive unplugged mid-copy) no longer freezes the window: the error shows its first lines and says how many more there were.
 - Document previews no longer fill the disk: the converted-PDF and drawn-page caches each keep at most 512 MB and drop the oldest first.
+- Document previews made by LibreOffice or Ghostscript run with no network access, so a document cannot reach out to the internet while it is previewed.
 - Uninstalling gives folders back to the app that opened them before Wayfinder, instead of leaving a default that points at nothing.
 
 ## 0.9.29 — 21 November 2026

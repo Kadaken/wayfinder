@@ -154,6 +154,39 @@ pub fn run_cancellable_with(mut cmd: Command, cancel: &AtomicBool, limit: Durati
     }
 }
 
+/// D-396 (S6): the network-off wrapper, if this machine allows one. A
+/// document can point at remote images or links, and LibreOffice would fetch
+/// them while drawing a preview. `unshare --user --map-current-user --net`
+/// gives the converter an empty network namespace with no root needed. Probed
+/// once; where user namespaces are off the converter runs as before.
+fn offline_prefix() -> Option<&'static [&'static str]> {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    const PREFIX: &[&str] = &["unshare", "--user", "--map-current-user", "--net", "--"];
+    let ok = *OK.get_or_init(|| {
+        Command::new(PREFIX[0])
+            .args(&PREFIX[1..])
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    ok.then_some(PREFIX)
+}
+
+/// `program` as a command with no network when that is possible.
+fn offline_command(program: &str) -> Command {
+    match offline_prefix() {
+        Some(prefix) => {
+            let mut cmd = Command::new(prefix[0]);
+            cmd.args(&prefix[1..]).arg(program);
+            cmd
+        }
+        None => Command::new(program),
+    }
+}
+
 /// The PDF to draw for `source`: the file itself, or a cached conversion.
 pub fn pdf_for(source: &Path, kind: DocKind, cancel: &AtomicBool) -> Result<PathBuf, String> {
     if kind == DocKind::Pdf {
@@ -171,7 +204,7 @@ pub fn pdf_for(source: &Path, kind: DocKind, cancel: &AtomicBool) -> Result<Path
     let result = (|| {
         let produced = if kind == DocKind::PostScript {
             let out = work.join("out.pdf");
-            let mut cmd = Command::new("gs");
+            let mut cmd = offline_command("gs");
             cmd.args(["-q", "-dBATCH", "-dNOPAUSE", "-dSAFER", "-sDEVICE=pdfwrite", "-dEPSCrop"])
                 .arg(format!("-sOutputFile={}", out.display()))
                 .arg(source);
@@ -179,7 +212,7 @@ pub fn pdf_for(source: &Path, kind: DocKind, cancel: &AtomicBool) -> Result<Path
             out
         } else {
             let profile = dir.join("lo-profile");
-            let mut cmd = Command::new("soffice");
+            let mut cmd = offline_command("soffice");
             cmd.arg("--headless")
                 .arg(format!("-env:UserInstallation=file://{}", profile.display()))
                 .arg("--convert-to")
@@ -644,6 +677,22 @@ mod tests {
         }
         out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
         out
+    }
+
+    /// D-396 (S6): the document converters run with no network where the
+    /// machine allows it. Checks the wrapper itself has no route out: inside
+    /// it, only the loopback device exists.
+    #[test]
+    fn converters_run_without_network_d396() {
+        let Some(_) = offline_prefix() else {
+            eprintln!("user namespaces off here; skipped");
+            return;
+        };
+        let out = offline_command("sh").arg("-c").arg("cat /proc/net/dev").output().unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let devices: Vec<&str> = text.lines().skip(2).filter_map(|l| l.split(':').next()).map(str::trim).collect();
+        assert_eq!(devices, ["lo"], "{text}");
     }
 
     /// D-395: the drawn-page cache grew for ever. Three old 300 MB pages
