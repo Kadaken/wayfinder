@@ -9,6 +9,7 @@ change between releases.
 ### Fixed
 
 - The file dialog is no longer killed after two minutes while you are still browsing, and installing an update replaces the dialog program and the portal together with the main program.
+- Selecting a video no longer builds its preview player the instant you click: it waits until the selection has stayed on the file for a quarter of a second, so clicking past videos in the file dialog does no player work.
 
 ### Added
 

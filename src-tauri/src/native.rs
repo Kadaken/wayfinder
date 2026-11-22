@@ -14440,6 +14440,7 @@ fn picker_selected_paths(state: &Rc<RefCell<AppState>>, ui: &Ui) -> Vec<String> 
 
 
 fn update_selection(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    video_preview_tick_bump();
     let entries = selected_entries(state, ui);
     update_picker_open_button(state, ui, &entries);
     // D-314: a song that is loaded keeps playing through a refresh. Saving a
@@ -20277,6 +20278,7 @@ fn d383_fix_folder(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn update_preview(ui: &Ui, entry: &Entry) {
+    video_preview_tick_bump();
     if !ui.preview_scroll.is_visible() {
         return;
     }
@@ -21408,12 +21410,48 @@ async fn preview_image_outside(
     }
 }
 
+thread_local! {
+    /// D-391: bumped on every selection change; a pending video preview only
+    /// starts if no selection change happened during its delay.
+    static VIDEO_PREVIEW_TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// D-391: how long the selection must stay on one video before its GTK media
+/// pipeline is built. A click-through of several files builds none.
+const VIDEO_PREVIEW_DELAY_MS: u64 = 250;
+
+fn video_preview_tick_bump() -> u64 {
+    VIDEO_PREVIEW_TICK.with(|t| {
+        let n = t.get().wrapping_add(1);
+        t.set(n);
+        n
+    })
+}
+
+/// D-391: the pane is cleared now; the media pipeline (GtkMediaFile, the poster
+/// and conversion paths) starts only after the selection has stayed on this
+/// file for `VIDEO_PREVIEW_DELAY_MS`. A selection change cancels it.
 fn set_preview_media(ui: &Ui, path: &str) {
     if !ui.preview_scroll.is_visible() {
         return;
     }
-    // Moving to any other kind of file silences a song; see
-    // `stop_preview_audio`.
+    stop_preview_audio(ui);
+    ui.preview_media_controls
+        .set_media_stream(None::<&gtk::MediaStream>);
+    ui.preview_media_picture
+        .set_paintable(None::<&gdk::Paintable>);
+    let tick = VIDEO_PREVIEW_TICK.with(|t| t.get());
+    let ui = ui.clone();
+    let path = path.to_string();
+    glib::timeout_add_local_once(Duration::from_millis(VIDEO_PREVIEW_DELAY_MS), move || {
+        if VIDEO_PREVIEW_TICK.with(|t| t.get()) != tick || !ui.preview_scroll.is_visible() {
+            return;
+        }
+        start_preview_media(&ui, &path);
+    });
+}
+
+fn start_preview_media(ui: &Ui, path: &str) {
     stop_preview_audio(ui);
     // D-362/D-369: containers GStreamer here is not trusted with go straight
     // to the ffmpeg conversion, the same as a video it fails to play.
@@ -27190,6 +27228,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d85-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d391") {
+            video_preview_pipeline_waits_for_a_steady_selection_d391();
+            eprintln!("wf-test d391-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d86") {
             selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
             mpg_counts_as_video_and_shows_a_frame_d362();
@@ -27316,6 +27359,7 @@ Broken: Either state is wrong.\n";
         video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
         video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
+        video_preview_pipeline_waits_for_a_steady_selection_d391();
         suite_tail_after_d86();
         suite_glib_dirs_d373("suite end");
     }
@@ -36116,9 +36160,10 @@ Broken: Either state is wrong.\n";
             });
 
         select_entry_by_source(&state, &ui, &native_core::EntrySource::real(dir.join("clip.mp4")));
-        wait_for("preview switches to media", || {
-            ui.preview_stack.visible_child_name().as_deref() == Some("media")
-        });
+        // D-391: the pipeline is built after the ~250 ms steady-selection delay,
+        // and a fake file errors straight away, so count the stream change
+        // instead of catching the short-lived "media" page.
+        wait_for("preview builds its media pipeline", || changes.get() >= 1);
         // Settle across a few more main-loop turns: a second, redundant
         // construction (the D-86 bug) would show up here as changes == 2.
         for _ in 0..5 {
@@ -36129,6 +36174,63 @@ Broken: Either state is wrong.\n";
             1,
             "one row selection must build the preview media pipeline exactly once"
         );
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// D-391: the GTK media pipeline of a video preview is built only after the
+    /// selection has stayed on that file for ~250 ms. Passing over a video (a
+    /// click-through, arrow keys) builds none; a pipeline built on the main
+    /// thread for a file the selection already left is what froze the dialog.
+    fn video_preview_pipeline_waits_for_a_steady_selection_d391() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d391-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("home");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        std::fs::write(dir.join("clip.mp4"), b"not a real video, only the extension matters here").unwrap();
+        std::fs::write(dir.join("note.txt"), b"plain text").unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d391test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        wait_for("listing", || state.borrow().visible_entries.len() == 2);
+
+        let built = Rc::new(std::cell::Cell::new(0));
+        let built_for_signal = built.clone();
+        ui.preview_media_controls
+            .connect_notify_local(Some("media-stream"), move |c, _| {
+                if c.media_stream().is_some() {
+                    built_for_signal.set(built_for_signal.get() + 1);
+                }
+            });
+
+        // 1. Landing on the video builds nothing synchronously.
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(dir.join("clip.mp4")));
+        assert!(
+            ui.preview_media_controls.media_stream().is_none(),
+            "a media pipeline was built on the main thread the moment the selection landed on a video"
+        );
+        // 2. The selection leaves before the delay: no pipeline is ever built.
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(dir.join("note.txt")));
+        std::thread::sleep(Duration::from_millis(350));
+        for _ in 0..5 {
+            pump();
+        }
+        assert_eq!(built.get(), 0, "a media pipeline was built for a file the selection had already left");
+        // 3. A selection that stays gets its pipeline after the delay.
+        select_entry_by_source(&state, &ui, &native_core::EntrySource::real(dir.join("clip.mp4")));
+        wait_for("the steady selection builds its pipeline", || built.get() == 1);
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
