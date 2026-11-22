@@ -21705,8 +21705,9 @@ fn attach_preview_media(ui: &Ui, play_path: &str, original: &str, may_convert: b
     });
     // D-401: a video track GStreamer has no decoder for (UT Video, Lagarith
     // and the like in an AVI) is not an error: the stream prepares, even says
-    // it has video, and never draws a frame. A video file that prepares with
-    // no picture takes the same ffmpeg conversion as one that fails outright.
+    // it has video, and never draws a frame. A video file that says it has
+    // video and shows no picture takes the same ffmpeg conversion as one that
+    // fails outright; one with no video track stays audio.
     if may_convert && native_core::is_video_path(original) {
         guard_blank_video(ui, &media, original, generation);
     }
@@ -21717,11 +21718,18 @@ fn attach_preview_media(ui: &Ui, play_path: &str, original: &str, may_convert: b
 /// milliseconds of the stream preparing.
 const BLANK_VIDEO_WAIT_MS: u64 = 2500;
 
-/// D-401: converts the video with ffmpeg when its stream prepares but never
-/// shows a picture (no video track, or a track no decoder here can read).
+/// D-401: how long a local video may stay unprepared, with no error, before
+/// it is converted. Some decoders (MS MPEG-4 v1 in AVI) leave the stream
+/// waiting for ever instead of failing.
+const UNPREPARED_VIDEO_WAIT_MS: u64 = 6000;
+
+/// D-401: converts the video with ffmpeg when its stream has a video track
+/// but never shows a picture (a track no decoder here can read). A file with
+/// no video track (audio-only AVI) is left to play as audio.
 fn guard_blank_video(ui: &Ui, media: &gtk::MediaFile, original: &str, generation: u64) {
     let fired = Rc::new(std::cell::Cell::new(false));
     let armed = Rc::new(std::cell::Cell::new(false));
+    let (ui_stuck, path_stuck, fired_stuck) = (ui.clone(), original.to_string(), fired.clone());
     let (ui, path) = (ui.clone(), original.to_string());
     let check = Rc::new(move |m: &gtk::MediaFile| {
         if fired.get() || !m.is_prepared() || m.error().is_some() || ui.preview_generation.get() != generation {
@@ -21738,13 +21746,23 @@ fn guard_blank_video(ui: &Ui, media: &gtk::MediaFile, original: &str, generation
                 convert_and_play_video(&ui, &path);
             }
         };
-        if !m.has_video() {
-            fire(m);
-        } else if m.intrinsic_width() == 0 && !armed.replace(true) {
+        // No video track at all is an audio-only file: it plays as audio.
+        if m.has_video() && m.intrinsic_width() == 0 && !armed.replace(true) {
             let m = m.clone();
             glib::timeout_add_local_once(Duration::from_millis(BLANK_VIDEO_WAIT_MS), move || fire(&m));
         }
     });
+    {
+        let (ui, path, fired, m) = (ui_stuck.clone(), path_stuck, fired_stuck, media.clone());
+        glib::timeout_add_local_once(Duration::from_millis(UNPREPARED_VIDEO_WAIT_MS), move || {
+            if fired.get() || m.is_prepared() || m.error().is_some() || ui.preview_generation.get() != generation {
+                return;
+            }
+            fired.set(true);
+            ui.preview_media_picture.set_paintable(None::<&gdk::Paintable>);
+            convert_and_play_video(&ui, &path);
+        });
+    }
     let again = check.clone();
     media.connect_prepared_notify(move |m| again(m));
     let again = check.clone();
@@ -27313,8 +27331,17 @@ Broken: Either state is wrong.\n";
         add("xvid_two_audio.avi", &["-map", "0:v", "-map", "1:a", "-map", "1:a", "-c:v", "mpeg4", "-vtag", "XVID", "-c:a", "libmp3lame"]);
         add("xvid_dx50.avi", &["-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame"]);
         add("xvid_fmp4.avi", &["-c:v", "mpeg4", "-vtag", "FMP4", "-c:a", "libmp3lame"]);
+        add("audio_only_mp3.avi", &["-vn", "-c:a", "libmp3lame"]);
+        add("audio_only_pcm.avi", &["-vn", "-c:a", "pcm_s16le"]);
         let made = sets.len();
         sets.push(("cut_index.avi", vec![], 60));
+        // Cut from other files below. The first is an MS MPEG-4 v2 stream
+        // relabelled MPG4 (nothing here encodes msmpeg4v1), so it is not a
+        // valid v1 file: GStreamer waits on it for ever, ffmpeg cannot decode
+        // it, and the pane must say so rather than stay blank.
+        sets.push(("msg_msmpeg4v1_mpg4_fake.avi", vec![], 60));
+        sets.push(("msg_unknown_fourcc.avi", vec![], 60));
+        sets.push(("msg_header_only.avi", vec![], 60));
         sets.push(("opendml_big.avi", vec![], 240));
         let d = d362_open("avi", |dir| {
             for (name, args, _) in sets.iter().take(made) {
@@ -27326,6 +27353,20 @@ Broken: Either state is wrong.\n";
             // An AVI cut short has no index at the end.
             let whole = std::fs::read(dir.join("xvid_mp3.avi")).unwrap();
             std::fs::write(dir.join("cut_index.avi"), &whole[..whole.len() * 6 / 10]).unwrap();
+            let swap = |from: &str, find: &[u8], put: &[u8], to: &str| {
+                let mut bytes = std::fs::read(dir.join(from)).unwrap();
+                for w in 0..bytes.len().saturating_sub(4) {
+                    if &bytes[w..w + 4] == find && w < 4096 {
+                        bytes[w..w + 4].copy_from_slice(put);
+                    }
+                }
+                std::fs::write(dir.join(to), bytes).unwrap();
+            };
+            swap("divx2_mp3.avi", b"MP42", b"MPG4", "msg_msmpeg4v1_mpg4_fake.avi");
+            // A video stream with a codec nobody knows, and a header with no stream.
+            swap("xvid_fmp4.avi", b"FMP4", b"ZZZZ", "msg_unknown_fourcc.avi");
+            let whole = std::fs::read(dir.join("xvid_mp3.avi")).unwrap();
+            std::fs::write(dir.join("msg_header_only.avi"), &whole[..300]).unwrap();
             // Over 1 GB, so ffmpeg writes OpenDML (RIFF AVIX) extension chunks.
             assert!(
                 d362_run(
@@ -27335,9 +27376,12 @@ Broken: Either state is wrong.\n";
                 ),
                 "ffmpeg makes the OpenDML .avi"
             );
-        }, made + 2);
+        }, made + 5);
         let mut failed: Vec<String> = Vec::new();
         for (name, _, allowed) in sets.iter() {
+            // A message left by the file before must not count for this one.
+            d.ui.preview.set_label("");
+            d.ui.viewers.frame_info.set_text("");
             d362_show(&d, name);
             let start = Instant::now();
             let mut verdict: Option<String> = None;
@@ -27345,6 +27389,16 @@ Broken: Either state is wrong.\n";
             while start.elapsed() < Duration::from_secs(*allowed) && verdict.is_none() {
                 pump();
                 let stack = d362_stack(&d);
+                if name.starts_with("msg_") {
+                    // Nothing here can play: the pane must say so, never stay blank.
+                    let words = if stack == "frame" { d.ui.viewers.frame_info.text().to_string() } else { d.ui.preview.label().to_string() };
+                    if (stack == "frame" || stack == "text") && words.contains("cannot be played") {
+                        verdict = Some(format!("PASS message on {stack}: {}", words.lines().next().unwrap_or("")));
+                    } else {
+                        last = format!("no message yet (pane shows {stack}: {words})");
+                    }
+                    continue;
+                }
                 let Some(m) = d.ui.preview_media_controls.media_stream().and_then(|s| s.downcast::<gtk::MediaFile>().ok()) else {
                     last = format!("no media stream (pane shows {stack}, {})", d.ui.preview.label());
                     continue;
@@ -27363,7 +27417,14 @@ Broken: Either state is wrong.\n";
                     m.play();
                 }
                 let picture = m.intrinsic_width() > 0 && m.intrinsic_height() > 0;
-                if stack == "media" && picture && m.timestamp() > 0 {
+                let audio_only = name.starts_with("audio_only");
+                if audio_only && (converted || m.has_video()) {
+                    last = format!("audio-only file was treated as video (via {via}, has_video {})", m.has_video());
+                    verdict = Some(format!("FAIL {last}"));
+                    failed.push((*name).to_string());
+                    continue;
+                }
+                if stack == "media" && (picture || audio_only && m.has_audio()) && m.timestamp() > 0 {
                     verdict = Some(format!("PASS via {via}, timestamp {} us", m.timestamp()));
                 } else {
                     last = format!("{via} prepared but not playing (picture {picture}, has_video {}, has_audio {}, timestamp {}, pane shows {stack})", m.has_video(), m.has_audio(), m.timestamp());
