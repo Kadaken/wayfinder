@@ -864,3 +864,5 @@ FIXED, TESTED (headless); the exact live trigger is UNPROVEN. Core `wf-freeze.59
 - D-395 (22 Nov 2026): the document preview caches `doc-pdf` (`native_viewers.rs:162`) and `doc-pages` (`native_viewers.rs:306`) have no size cap or pruning; only `video-play` is capped (`:205`, `:264`). Found by reading the code during the 0.9.29 audit; not measured. Open, for 0.9.30.
 
 - D-396 (22 Nov 2026): carried from the 0.9.29 audit draft, all open, for 0.9.30. S6: LibreOffice previews (soffice) run with no network-off setting. S4: Eject and Unmount have no confirm dialog. W2: the production file chooser has no deadline (`portal_service.rs:374`), so a chooser can stay open if the calling app dies without sending Close; untested.
+
+- D-397 (22 Nov 2026): a phone video named IMG_6414.3gpp showed no player. Cause: `VIDEO_EXT` (native_core.rs:63) and the MP4/3GP signature list (native_core.rs:5811) knew `3gp` and `3g2` but not the long spellings `3gpp`, `3gpp2`, `3gp2`. Fix: added them to both. TESTED: `viewer_lists_d362` now checks those names; fails on the old list, passes with the fix (logs d368-logs/d397-before.log, d397-after.log). Playback in the app not checked.

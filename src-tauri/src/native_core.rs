@@ -64,6 +64,8 @@ const VIDEO_EXT: &[&str] = &[
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv", "ts", "3gp", "ogv", "mpeg",
     // D-362: every other container ffmpeg reads. "mpg" was missing entirely.
     "mpg", "mpe", "m2v", "m2ts", "mts", "vob", "divx", "xvid", "asf", "rm", "rmvb", "f4v", "3g2",
+    // D-397: phones also write the long spellings; IMG_6414.3gpp showed no preview.
+    "3gpp", "3gpp2", "3gp2",
     "ogm", "dv", "mxf", "nut", "qt", "mjpeg", "h264", "h265", "hevc", "264",
 ];
 
@@ -5808,7 +5810,7 @@ pub fn sniff_real_type(head: &[u8]) -> Option<(&'static str, &'static [&'static 
         return Some(("MIDI music", &["mid", "midi", "kar"]));
     }
     if head.len() >= 8 && &head[4..8] == b"ftyp" {
-        return Some(("MP4 or QuickTime media", &["mp4", "m4a", "m4v", "mov", "3gp", "heic", "avif"]));
+        return Some(("MP4 or QuickTime media", &["mp4", "m4a", "m4v", "mov", "3gp", "3gpp", "3g2", "3gpp2", "3gp2", "heic", "avif"]));
     }
     if starts(&[0x30, 0x26, 0xB2, 0x75]) {
         return Some(("Windows Media (ASF)", &["wma", "wmv", "asf"]));
@@ -12771,7 +12773,7 @@ mod viewer_lists_d362 {
         for ext in TRANSCODE_THUMB_EXT {
             assert!(IMG_EXT.contains(ext), "{ext} is transcoded but not an image");
         }
-        for name in ["a.mpg", "a.mpe", "a.m2ts", "a.vob", "a.rmvb", "a.mxf", "a.h264"] {
+        for name in ["a.mpg", "a.mpe", "a.m2ts", "a.vob", "a.rmvb", "a.mxf", "a.h264", "IMG_6414.3gpp", "a.3GPP2", "a.3gp2"] {
             assert!(is_video_path(name), "{name}");
         }
         for name in ["a.cr2", "a.nef", "a.psd", "a.tga", "a.pnm", "a.exr", "a.jp2", "a.dds", "a.xcf"] {

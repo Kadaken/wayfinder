@@ -8,6 +8,7 @@ change between releases.
 
 ### Fixed
 
+- Phone videos named `.3gpp`, `.3gpp2` or `.3gp2` are treated as video again, so they get a player and a thumbnail.
 - Uninstalling gives folders back to the app that opened them before Wayfinder, instead of leaving a default that points at nothing.
 
 ## 0.9.29 — 21 November 2026
