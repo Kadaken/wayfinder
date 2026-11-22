@@ -6013,28 +6013,80 @@ mod tests {
         let short_feature = feature.replace("picker-test-driver-", "ptd-");
         let round_root = scratch_base(&format!("pat-{short_feature}"));
         let round_root = OwnedScratchDir::create(round_root);
-        let target_dir = round_root.path().join("target");
-        let status = Command::new("cargo")
-            .arg("build")
-            .arg("--quiet")
-            .arg("--bin")
-            .arg("wayfinder-portal")
-            .arg("--bin")
-            .arg("wayfinder-native")
-            .arg("--features")
-            .arg(feature)
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .current_dir(manifest_dir)
-            .status()
-            .expect("run cargo build for the round-owned portal/native artifacts");
-        assert!(status.success(), "building the {feature} portal/native artifacts failed");
-        let portal_bin = target_dir.join("debug").join("wayfinder-portal");
+        // Built once per feature per test process into a shared target
+        // dir, then copied into this round's own root. Before 0.9.29 every
+        // routing test ran its own from-scratch `cargo build` in parallel
+        // (about 15 at once), which pushed the suite past its 30-minute cap
+        // and starved the 10-second pick deadlines under that load.
+        let built_debug = shared_portal_activation_build(manifest_dir, feature);
+        let debug_dir = round_root.path().join("target").join("debug");
+        fs::create_dir_all(&debug_dir).expect("create the round-owned debug dir");
+        for name in ["wayfinder-portal", "wayfinder-native"] {
+            fs::copy(built_debug.join(name), debug_dir.join(name))
+                .unwrap_or_else(|e| panic!("copy {name} into the round root: {e}"));
+        }
+        let portal_bin = debug_dir.join("wayfinder-portal");
         assert!(portal_bin.exists(), "expected portal binary at {}", portal_bin.display());
-        let native_bin = target_dir.join("debug").join("wayfinder-native");
+        let native_bin = debug_dir.join("wayfinder-native");
         assert!(native_bin.exists(), "expected native binary at {}", native_bin.display());
         let env = PrivatePortalEnv::start_under(round_root);
         (portal_bin, env)
+    }
+
+    /// Every feature the routing tests drive. All of them are built on the
+    /// FIRST call, before any test starts a pick: a cold compile running
+    /// beside a pick starved its 10 s deadline (routing_bypass_use_in_restored
+    /// timed out, 0.9.29 run, 21 Nov 2026).
+    const PORTAL_ACTIVATION_FEATURES: [&str; 2] = ["picker-test-driver-pick", "picker-test-driver-cancel"];
+
+    /// The dir holding `wayfinder-portal` and `wayfinder-native` built with
+    /// `feature`. The first call builds every feature in
+    /// `PORTAL_ACTIVATION_FEATURES` one after another in one shared target
+    /// dir (the dependencies compile once), copying each feature's two
+    /// programs into its own dir; later calls only look up. The target dir
+    /// sits next to the test binary's own, so a rerun is incremental.
+    fn shared_portal_activation_build(manifest_dir: &str, feature: &str) -> PathBuf {
+        static BUILT: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+        let mut built = BUILT
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if built.is_empty() {
+            // <target>/<profile>/deps/<test binary> -> <target>
+            let target_root = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent()?.parent()?.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from(manifest_dir).join("target"));
+            let target_dir = target_root.join("portal-activation");
+            for each in PORTAL_ACTIVATION_FEATURES {
+                let status = Command::new("cargo")
+                    .arg("build")
+                    .arg("--quiet")
+                    .arg("--bin")
+                    .arg("wayfinder-portal")
+                    .arg("--bin")
+                    .arg("wayfinder-native")
+                    .arg("--features")
+                    .arg(each)
+                    .arg("--target-dir")
+                    .arg(&target_dir)
+                    .current_dir(manifest_dir)
+                    .status()
+                    .expect("run cargo build for the shared portal/native artifacts");
+                assert!(status.success(), "building the {each} portal/native artifacts failed");
+                let bins = target_dir.join(format!("bins-{each}"));
+                fs::create_dir_all(&bins).expect("create the per-feature bins dir");
+                for name in ["wayfinder-portal", "wayfinder-native"] {
+                    fs::copy(target_dir.join("debug").join(name), bins.join(name))
+                        .unwrap_or_else(|e| panic!("copy {name} for {each}: {e}"));
+                }
+                built.insert(each.to_string(), bins);
+            }
+        }
+        built
+            .get(feature)
+            .cloned()
+            .unwrap_or_else(|| panic!("{feature} is not in PORTAL_ACTIVATION_FEATURES"))
     }
 
     /// A fresh, unique D-206 token for one oracle run, and the exact
