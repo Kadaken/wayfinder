@@ -134,7 +134,24 @@ for dst in ("f_vid", "f_vid.htm", "f_vid.js"):
 rnd = random.Random(404)
 open(p("g_junk.mts"), "wb").write(bytes(rnd.getrandbits(8) for _ in range(40000)))
 open(p("h_nostreams.avi"), "wb").write(b"RIFF" + struct.pack("<I", 4 + 12) + b"AVI " + b"LIST" + struct.pack("<I", 4) + b"hdrl")
+# H (D-407): WAV carrying GSM 6.10 (format tag 0x31) that no decoder here accepts:
+# fmt(20) + fact(4) + data(6204), same shape as the real files, random payload.
+def gsm_wav(path, n=6204):
+    fmt = struct.pack("<HHIIHHHH", 0x31, 1, 8000, 1625, 65, 0, 2, 320)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", 20) + fmt
+    body += b"fact" + struct.pack("<I", 4) + struct.pack("<I", 19200)
+    body += b"data" + struct.pack("<I", n) + bytes(random.Random(7).randrange(256) for _ in range(n))
+    open(path, "wb").write(b"RIFF" + struct.pack("<I", len(body)) + body)
+gsm_wav(p("h_gsm.wav"))
 open(p("i_zero.jpg"), "wb").write(bytes(60000))
 open(p("j_random.jpg"), "wb").write(bytes(rnd.getrandbits(8) for _ in range(30000)))
+# F fragments (D-407): pieces cut out of the middle of an MPEG program stream, each
+# starting at a pack header 00 00 01 BA and holding no sequence header, so no
+# decoder finds a stream (same shape as the recovered fragments: 38 B to 14 KB).
+_mpg = open(p("f_good.mpg"), "rb").read()
+_mid = _mpg.index(b"\0\0\1\xba", len(_mpg) // 2)
+open(p("f_frag.mpg"), "wb").write(_mpg[_mid:_mid + 4628])
+open(p("f_frag_tiny.htm"), "wb").write(_mpg[_mid:_mid + 38])
+open(p("f_frag_nodot"), "wb").write(_mpg[_mid:_mid + 1967])
 for helper in ("full.png", "full.jpg", "full.gif", "good.mp4", "f_good.mpg"):
     os.remove(p(helper))

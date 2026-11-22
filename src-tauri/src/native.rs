@@ -32200,7 +32200,7 @@ Broken: Either state is wrong.\n";
             ] {
                 std::fs::write(dir.join(name), d404_rle_bmp(four, top)).unwrap();
             }
-        }, 24);
+        }, 28);
         d38x_preview_on(&d);
 
         #[derive(Clone, Copy)]
@@ -32211,6 +32211,8 @@ Broken: Either state is wrong.\n";
             Player,
             /// A sentence on the text or frame page containing this (lowercase).
             Says(&'static str),
+            /// D-407: the sound page is up with a working Play button and a length.
+            AudioPlays,
         }
         let bound_ms = 6000u64;
         let cases: Vec<(&str, &str, Want)> = vec![
@@ -32230,8 +32232,13 @@ Broken: Either state is wrong.\n";
             ("F", "f_vid", Want::Player),
             ("F", "f_vid.htm", Want::Player),
             ("F", "f_vid.js", Want::Player),
+            // D-407 open: a cut-off .mpg with no sequence header stays on a
+            // blank player (f_frag.mpg). Case returns with the fix in 0.9.31.
+            ("F", "f_frag_tiny.htm", Want::Says("too short to play")),
+            ("F", "f_frag_nodot", Want::Says("too short to play")),
             ("G", "g_junk.mts", Want::Says("no video data")),
             ("H", "h_nostreams.avi", Want::Says("no video data")),
+            ("H", "h_gsm.wav", Want::AudioPlays),
             ("I", "i_zero.jpg", Want::Says("no picture data")),
             ("J", "j_random.jpg", Want::Says("no picture data")),
             ("K", "k_rle8_up.bmp", Want::Picture(Some(41))),
@@ -32259,12 +32266,20 @@ Broken: Either state is wrong.\n";
                             && d.ui.preview_media_controls.media_stream().is_some_and(|m| m.is_prepared() && m.error().is_none())
                     }
                     Want::Says(t) => (this.0 == "text" || this.0 == "frame") && this.1.contains(t),
+                    Want::AudioPlays => {
+                        this.0 == "audio" && d.ui.preview_audio_play.is_sensitive()
+                            && d.ui.preview_audio_total.text() != "0:00"
+                    }
                 }
             };
             let hit = d38x_wait_ms(bound_ms, || met(&seen()));
             let now = seen();
             let elapsed = started.elapsed().as_millis();
-            let shown: String = now.1.chars().take(110).collect();
+            let shown: String = if matches!(want, Want::AudioPlays) {
+                format!("play={} total={}", d.ui.preview_audio_play.is_sensitive(), d.ui.preview_audio_total.text())
+            } else {
+                now.1.chars().take(110).collect()
+            };
             eprintln!(
                 "wf-test D-404 {kind} {name}: {} in {elapsed} ms (stack={:?} width={} text={:?})",
                 if hit.is_some() { "PASS" } else { "FAIL" },
