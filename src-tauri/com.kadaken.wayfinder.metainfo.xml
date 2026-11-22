@@ -46,6 +46,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.31" date="2026-11-22">
+      <description>
+        <p>Right-click menus also open from the keyboard (Menu key or
+        Shift+F10). Secondary text is lighter and easier to read. Icon-only
+        buttons have names a screen reader can speak.</p>
+      </description>
+    </release>
     <release version="0.9.30" date="2026-11-22">
       <description>
         <p>AVI files play in the preview, including old Windows codecs. Video

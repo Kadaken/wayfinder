@@ -4,7 +4,7 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
-## Unreleased
+## 0.9.31 — 22 November 2026
 
 ### Fixed
 - Every icon-only button (toolbar, title bar, tabs, audio player, sidebar arrows, menu tools) now has a name a screen reader can speak.
