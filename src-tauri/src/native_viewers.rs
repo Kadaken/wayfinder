@@ -144,6 +144,7 @@ pub fn run_cancellable_with(mut cmd: Command, cancel: &AtomicBool, limit: Durati
         }
         let stale = cancel.load(Ordering::Relaxed);
         if stale || started.elapsed() > limit {
+            // SAFETY: kill(2) on the process group of the child spawned above (process_group(0) made it the leader); no memory is touched.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
@@ -390,7 +391,9 @@ fn render_pdf_page_in(dir: &Path, pdf: &Path, page: u32, width: i32, cancel: &At
 /// ImageMagick's turn at a picture: first frame only, upright, scaled down to
 /// `width` and never up, written as a PNG.
 pub fn magick_to_png(source: &str, out: &Path, width: i32) -> bool {
-    Command::new("magick")
+    // D-409c: no network (as soffice and gs), and bounded memory and time.
+    offline_command("magick")
+        .args(["-limit", "memory", "256MiB", "-limit", "map", "512MiB", "-limit", "time", "20"])
         .arg(format!("{source}[0]"))
         .args(["-auto-orient", "-resize"])
         .arg(format!("{}x>", width.clamp(16, 1024)))

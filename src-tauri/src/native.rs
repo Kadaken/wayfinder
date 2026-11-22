@@ -17339,7 +17339,7 @@ fn permanent_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
         &ui,
         "Delete permanently?",
         &format!(
-            "{count} item{} will be deleted without using Trash.",
+            "{count} item{} will be deleted without using Trash. This cannot be undone.",
             plural(count)
         ),
         "Delete",
@@ -26959,6 +26959,7 @@ Broken: Either state is wrong.\n";
         std::thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().unwrap().is_none(), "the child must still be mid-stream when killed, or this proof is not testing a hard kill");
         let child_pid = child.id();
+        // SAFETY: kill(2) on this test's own child pid; no memory is touched.
         unsafe {
             libc::kill(child_pid as i32, libc::SIGKILL);
         }
@@ -35776,6 +35777,7 @@ Broken: Either state is wrong.\n";
             if let Some(pop) = w.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()) {
                 let native = pop.native().expect("popover native");
                 let surface = native.surface().expect("popover surface");
+                // SAFETY: `surface` is a live X11 GdkSurface (this test runs on X11); the call only reads its window id.
                 let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) };
                 let g = xdo(&["getwindowgeometry", "--shell", &xid.to_string()]);
                 let n = |k: &str| -> i32 { g.lines().find_map(|l| l.strip_prefix(k)).and_then(|v| v.trim().parse().ok()).expect(k) };
@@ -35805,6 +35807,7 @@ Broken: Either state is wrong.\n";
                 use glib::translate::ToGlibPtr;
                 let native = pops[0].native().expect("arrow popover native");
                 let surface = native.surface().expect("arrow popover surface");
+                // SAFETY: `surface` is a live X11 GdkSurface (this test runs on X11); the call only reads its window id.
                 unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) }.to_string()
             };
             assert!(
@@ -35860,12 +35863,15 @@ Broken: Either state is wrong.\n";
             use glib::translate::ToGlibPtr;
             xdo(&["mousemove", &x.to_string(), &y.to_string()]);
             let xid: std::os::raw::c_ulong = arrow_xid.parse().expect("arrow xid parses");
+            // SAFETY: the default GdkDisplay is X11 in this test; the call only returns its Xlib display pointer.
             let xdisplay = unsafe { gdk_x11_display_get_xdisplay(gdk::Display::default().expect("default display").to_glib_none().0) };
             let input_shape_count = || {
                 let mut count: std::os::raw::c_int = 0;
                 let mut ordering: std::os::raw::c_int = 0;
+                // SAFETY: display and window id are valid and the out-parameters are locals; the returned array is freed below.
                 let rects = unsafe { XShapeGetRectangles(xdisplay, xid, SHAPE_INPUT, &mut count, &mut ordering) };
                 if !rects.is_null() {
+                    // SAFETY: `rects` came from XShapeGetRectangles, is non-null and is freed once.
                     unsafe { XFree(rects as *mut std::os::raw::c_void) };
                 }
                 (count, ordering)
@@ -36446,6 +36452,7 @@ Broken: Either state is wrong.\n";
             if let Some(pop) = w.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()) {
                 let native = pop.native().expect("popover native");
                 let surface = native.surface().expect("popover surface");
+                // SAFETY: `surface` is a live X11 GdkSurface (this test runs on X11); the call only reads its window id.
                 let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) };
                 let (gx, gy) = geometry(&xid.to_string());
                 let (tx, ty) = native.surface_transform();
@@ -41472,6 +41479,7 @@ Broken: Either state is wrong.\n";
             start.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_string_lossy().to_string())
         };
         // The account's home from the password file, never from HOME.
+        // SAFETY: getpwuid returns null or a pointer to a static passwd entry; null is asserted against and pw_dir (NUL-terminated) is copied at once.
         let real_home = unsafe {
             let entry = libc::getpwuid(libc::getuid());
             assert!(!entry.is_null(), "the account has a password-file entry");
@@ -41934,12 +41942,14 @@ Broken: Either state is wrong.\n";
         /// The peer stops running, with whatever it holds: it still owns the
         /// clipboard and answers nothing until it is continued.
         fn stop(&self) {
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGSTOP) }, 0, "the peer is stopped");
             until_d232("the peer to be stopped", || proc_stat_d232(self.child.id()).is_some_and(|(state, _)| state == 'T'));
             self.stopped.set(true);
         }
 
         fn cont(&self) {
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) }, 0, "the peer is continued");
             self.stopped.set(false);
         }
@@ -41978,6 +41988,7 @@ Broken: Either state is wrong.\n";
                 return;
             }
             // Only this test's own child, by its exact process id.
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) };
             drop(self.input.take());
             let end = std::time::Instant::now() + Duration::from_secs(10);
@@ -45689,8 +45700,10 @@ Broken: Either state is wrong.\n";
                 }
                 true
             };
+            // SAFETY: kill(2) on the process group of the child this guard started (its own group, set by setpgid at spawn); no memory is touched.
             unsafe { libc::kill(-self.pgid, libc::SIGTERM) };
             if !wait_until_gone(Instant::now() + Duration::from_secs(5)) {
+                // SAFETY: kill(2) on the process group of the child this guard started (its own group, set by setpgid at spawn); no memory is touched.
                 unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
                 wait_until_gone(Instant::now() + Duration::from_secs(5));
             }
@@ -45856,6 +45869,7 @@ Broken: Either state is wrong.\n";
         // its own fresh group (pgid == its own pid) lets the guard reach
         // every descendant with one `killpg`, without touching the test
         // process's or the wrapper's own group.
+        // SAFETY: the pre_exec closure runs between fork and exec and calls only setpgid, which is async-signal-safe.
         unsafe {
             use std::os::unix::process::CommandExt;
             smbd_cmd.pre_exec(|| {
@@ -46784,6 +46798,7 @@ Broken: Either state is wrong.\n";
         settle("the window opens on Home", &home);
         let win_id = {
             let surface = ui.window.surface().expect("the window has an X surface");
+            // SAFETY: `surface` is a live X11 GdkSurface (this test runs on X11); the call only reads its window id.
             unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) }.to_string()
         };
         let (wx, wy) = {

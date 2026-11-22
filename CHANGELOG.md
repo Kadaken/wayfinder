@@ -7,6 +7,12 @@ change between releases.
 ## Unreleased
 
 ### Fixed
+- Compress to zip no longer runs a command hidden in a file name such as `-TT=...`: names are now passed to zip as paths, never as options.
+- Extract Here refuses an archive or folder path that is not absolute, so a name starting with `-` can never be read by tar, 7z or unar as an option.
+- Picture previews through ImageMagick now run with no network and with memory and time limits.
+- The permanent-delete box now says plainly: "N items will be deleted without using Trash. This cannot be undone."
+- The install check lists optional helper programs (LibreOffice, Ghostscript, poppler, ImageMagick, zip, unar and others) and what each one enables, without making them required.
+- Uninstalling no longer replaces a symlinked ~/.config/mimeapps.list with a plain file; the file it points to is edited.
 - Clicking a file's right-hand end no longer throws the list up or down by a page or to the other end: the scrollbar's empty track no longer reacts to a press, only its slider drags
 - A failed paste says why in plain words (no permission, read-only drive, drive disconnected, disk full) with the folder, instead of the copy tool's raw text, an internal temporary file name and "os error" codes (D-405).
 - Clearing the search box after a search run with Enter shows the folder again; before, the results stayed until F5. A search that finishes after the box was cleared or the folder changed is dropped (D-402).

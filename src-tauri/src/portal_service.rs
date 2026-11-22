@@ -541,6 +541,7 @@ impl ChildWait {
 /// rejected (e.g. the group already has no members). Never targets an
 /// unrelated or reused pid.
 fn kill_owned_process_group(pgid: libc::pid_t) {
+    // SAFETY: kill(2) on a process group and pid this service started; no memory is touched.
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
         libc::kill(pgid, libc::SIGKILL);
@@ -656,6 +657,7 @@ impl Chooser for ProcessChooser {
             // own pid), so a timeout kill can target that exact group --
             // covering any descendant it spawns -- without ever touching
             // an unrelated, pre-existing process group.
+            // SAFETY: the pre_exec closure runs between fork and exec and calls only setpgid, which is async-signal-safe.
             unsafe {
                 command.pre_exec(|| {
                     if libc::setpgid(0, 0) != 0 {
@@ -1849,11 +1851,13 @@ mod tests {
         // another test's scratch folder, and those nest, so a path built from
         // HOME grew to 250 characters. The per-user runtime folder is short,
         // is always on a local disk, and is emptied at logout.
+        // SAFETY: getuid never fails and touches no memory.
         let dir = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
             .join("wf-bus");
         let dir = if fs::create_dir_all(&dir).is_ok() {
             dir
         } else {
+            // SAFETY: getuid never fails and touches no memory.
             let fallback = PathBuf::from("/tmp").join(format!("wf-bus-{}", unsafe { libc::getuid() }));
             fs::create_dir_all(&fallback).expect("create the private bus socket folder");
             fallback
@@ -2157,6 +2161,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut still_alive = true;
         while Instant::now() < deadline {
+            // SAFETY: kill(pid, 0) only probes whether the pid exists; no memory is touched.
             still_alive = unsafe { libc::kill(sleep_pid, 0) } == 0;
             if !still_alive {
                 break;
@@ -4617,6 +4622,7 @@ mod tests {
         /// surviving lock file fails the test rather than being ignored.
         fn finish(mut self) {
             let pid = self.child.id() as i32;
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
@@ -4659,6 +4665,7 @@ mod tests {
                 return;
             }
             let pid = self.child.id() as i32;
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
@@ -6410,6 +6417,7 @@ mod tests {
 
         fn finish(mut self) {
             let pid = self.daemon.id() as i32;
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
@@ -6440,6 +6448,7 @@ mod tests {
                 return;
             }
             let pid = self.daemon.id() as i32;
+            // SAFETY: kill(2) on this test's own child pid; no memory is touched.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
@@ -6493,6 +6502,7 @@ mod tests {
 
     fn terminate_and_reap(child: &mut Child) {
         let pid = child.id() as i32;
+        // SAFETY: kill(2) on this test's own child pid; no memory is touched.
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
@@ -6513,12 +6523,14 @@ mod tests {
 
     fn terminate_and_reap_pid(pid: u32) {
         let pid = pid as i32;
+        // SAFETY: kill(2) on this test's own child pid; no memory is touched.
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while PathBuf::from(format!("/proc/{pid}")).exists() {
             if Instant::now() >= deadline {
+                // SAFETY: kill(2) on this test's own child pid; no memory is touched.
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }

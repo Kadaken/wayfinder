@@ -1387,6 +1387,7 @@ fn parse_owned_stage_pid(name: &str) -> Option<u32> {
 /// file must survive.
 #[cfg(unix)]
 fn is_pid_confirmed_dead(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) sends no signal, it only probes whether the pid exists; no memory is touched.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
@@ -1566,7 +1567,9 @@ pub fn space_from_blocks(frsize: u64, blocks: u64, bavail: u64) -> Option<Space>
 
 pub fn probe_space(mountpoint: &str) -> Option<Space> {
     let path = std::ffi::CString::new(mountpoint).ok()?;
+    // SAFETY: statvfs is plain C data, for which all-zero bytes is a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a NUL-terminated CString alive for the call and `stat` is a valid writable statvfs.
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
@@ -5042,7 +5045,9 @@ pub fn compress_zip(paths: &[String], dest_dir: &str) -> Result<String, String> 
     let mut args = vec!["-r".to_string(), zip_path_string.clone()];
     for path in paths {
         if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
-            args.push(name.to_string());
+            // D-409a: `./` keeps a name like `-TT=cmd` from being read as an
+            // option; Info-ZIP does not store the `./` in the archive.
+            args.push(format!("./{name}"));
         }
     }
 
@@ -5055,6 +5060,14 @@ pub fn compress_zip(paths: &[String], dest_dir: &str) -> Result<String, String> 
         Ok(zip_path_string)
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn require_absolute(what: &str, path: &str) -> Result<(), String> {
+    if Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!("{what} is not an absolute path: {path}"))
     }
 }
 
@@ -5074,6 +5087,15 @@ fn decode_archive(
     run: &RunCmd<'_>,
     out: &mut dyn FnMut() -> Result<String, String>,
 ) -> Result<String, String> {
+    // D-409b: the tools below get no `--`, so a path that starts with `-` could
+    // read as an option. Absolute paths always start with `/`.
+    require_absolute("archive path", path)?;
+    let mut out = || {
+        let dir = out()?;
+        require_absolute("output folder", &dir)?;
+        Ok(dir)
+    };
+    let out: &mut dyn FnMut() -> Result<String, String> = &mut out;
     let lower = path.to_lowercase();
     if lower.ends_with(".tar")
         || lower.ends_with(".tar.gz")
@@ -5451,6 +5473,7 @@ fn extract_here_with(
 const BUILTIN_ZIP: &str = "wayfinder-zip";
 
 fn zip_stamp(dt: zip::DateTime) -> Option<std::time::SystemTime> {
+    // SAFETY: tm is plain C data, for which all-zero bytes is a valid value.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = dt.year() as i32 - 1900;
     tm.tm_mon = dt.month() as i32 - 1;
@@ -5459,6 +5482,7 @@ fn zip_stamp(dt: zip::DateTime) -> Option<std::time::SystemTime> {
     tm.tm_min = dt.minute() as i32;
     tm.tm_sec = dt.second() as i32;
     tm.tm_isdst = -1;
+    // SAFETY: `tm` is a valid, initialised struct tm that mktime may read and normalise.
     let secs = unsafe { libc::mktime(&mut tm) };
     (secs >= 0).then(|| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
 }
@@ -7672,6 +7696,56 @@ mod tests {
         let err = extract_archive_here_ctl(archive.to_str().unwrap(), dest2.to_str().unwrap(), &ctl).unwrap_err();
         assert_eq!(err, CANCELLED_MSG);
         assert_eq!(fs::read_dir(&dest2).unwrap().count(), 0, "a cancelled extraction leaves nothing");
+    }
+
+    /// D-409a: a file named like a zip option must be stored as a file, never read
+    /// as an option. `-T` plus `-TT=<cmd>` makes Info-ZIP run <cmd>.
+    #[test]
+    fn compress_zip_option_named_files_d409a() {
+        let root = scratch_case("wf-d409a");
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        // zip runs the command in its own working folder, which is `src`.
+        let marker = src.join("PWNED");
+        let evil = "-TT=touch PWNED".to_string();
+        for name in ["-T", evil.as_str(), "plain.txt"] {
+            fs::write(src.join(name), b"x").unwrap();
+        }
+        let paths: Vec<String> = ["-T", evil.as_str(), "plain.txt"]
+            .iter()
+            .map(|n| src.join(n).to_string_lossy().to_string())
+            .collect();
+        let made = compress_zip(&paths, src.to_str().unwrap());
+        assert!(!marker.exists(), "zip ran the command in a file name");
+        let zip_path = made.expect("compress_zip");
+        let listing = Command::new("unzip").args(["-Z1", "--", &zip_path]).output().unwrap();
+        let names: Vec<String> =
+            String::from_utf8_lossy(&listing.stdout).lines().map(str::to_string).collect();
+        for want in ["-T", evil.as_str(), "plain.txt"] {
+            assert!(names.iter().any(|n| n == want), "archive lacks {want:?}: {names:?}");
+        }
+    }
+
+    /// D-409b: tar/7z/unar never receive a path that could read as an option.
+    #[test]
+    fn decode_archive_refuses_relative_paths_d409b() {
+        let seen = std::cell::RefCell::new(Vec::<String>::new());
+        let run = |prog: &str, _args: &[&str]| -> Result<(), String> {
+            seen.borrow_mut().push(prog.to_string());
+            Ok(())
+        };
+        let abs_out = || Ok("/tmp/wf-out".to_string());
+        for bad in ["-evil.tar", "rel/a.tar", "-x.7z", "-x.rar"] {
+            let err = decode_archive(bad, &run, &mut { abs_out }).unwrap_err();
+            assert!(err.contains("absolute"), "{bad}: {err}");
+        }
+        for bad_out in ["-o", "rel"] {
+            let err = decode_archive("/a/b.tar", &run, &mut || Ok(bad_out.to_string())).unwrap_err();
+            assert!(err.contains("absolute"), "{bad_out}: {err}");
+        }
+        assert!(seen.borrow().is_empty(), "a tool ran: {:?}", seen.borrow());
+        decode_archive("/a/b.tar", &run, &mut { abs_out }).unwrap();
+        assert_eq!(seen.borrow().as_slice(), ["tar"]);
     }
 
     /// D-323: the built-in reader keeps contents and modes, reports exact bytes,

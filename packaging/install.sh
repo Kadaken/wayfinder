@@ -232,8 +232,15 @@ give_back_folder_app() {
       if [ "$dry" = 1 ]; then
         printf '  would: edit %s\n' "$mimeapps"
       else
-        { grep -v "^inode/directory=$wf_desktop;\?\$" "$mimeapps" || true; } > "$mimeapps.new"
-        mv "$mimeapps.new" "$mimeapps"
+        # D-409g: ~/.config/mimeapps.list is often a symlink (dotfile
+        # managers). Edit the file it points to; a plain mv would replace the
+        # link with a regular file and cut it off from its source.
+        local target
+        target="$(readlink -f -- "$mimeapps")"
+        [ -n "$target" ] || target="$mimeapps"
+        { grep -v "^inode/directory=$wf_desktop;\?\$" "$target" || true; } > "$target.new"
+        chmod --reference="$target" "$target.new" 2>/dev/null || true
+        mv "$target.new" "$target"
       fi
     fi
   fi

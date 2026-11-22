@@ -50,6 +50,33 @@ wf_dep_cost() {
   esac
 }
 
+# D-409f: programs Wayfinder runs for one feature each. None is required: the
+# report lists what is absent and what it switches off, but they never count as
+# MISSING, never reach the install advice, and never change the exit status.
+# Format: command to look for ; what it enables
+WF_OPTIONAL_DEPS="soffice gs pdftoppm pdfinfo magick xz zip unar unshare udisksctl lsblk gio flatpak curl timeout ffprobe"
+
+wf_optional_what() {
+  case "$1" in
+    soffice)   echo "previews of Word, Excel, PowerPoint and OpenDocument files (LibreOffice)" ;;
+    gs)        echo "previews of PostScript and some PDF files (Ghostscript)" ;;
+    pdftoppm)  echo "PDF page pictures (poppler)" ;;
+    pdfinfo)   echo "PDF page counts (poppler)" ;;
+    magick)    echo "previews of extra picture formats (ImageMagick)" ;;
+    xz)        echo "previews of compressed Flash (.swf) files" ;;
+    zip)       echo "Compress to zip" ;;
+    unar)      echo "Extract Here for rar and other formats 7z cannot read" ;;
+    unshare)   echo "running preview helpers with no network" ;;
+    udisksctl) echo "mounting and unmounting drives" ;;
+    lsblk)     echo "listing and unmounting drives" ;;
+    gio)       echo "Empty Trash" ;;
+    flatpak)   echo "playing Flash files in Ruffle (installed as a Flatpak)" ;;
+    curl)      echo "checking for and downloading Wayfinder updates" ;;
+    timeout)   echo "stopping preview helpers that hang" ;;
+    ffprobe)   echo "video length in the Details pane (comes with ffmpeg)" ;;
+  esac
+}
+
 # D-280: gst-inspect-1.0 builds GStreamer's plugin registry as a side effect,
 # so probing for codecs wrote ~/.cache/gstreamer-1.0 into a home directory the
 # caller was only reading. Probe against a throwaway registry instead, so
@@ -189,6 +216,14 @@ wf_dep_report() {
     fi
   done
   WF_DEPS_MISSING="${WF_DEPS_MISSING# }"
+  # D-409f: optional helpers. Information only; never added to WF_DEPS_MISSING.
+  for key in $WF_OPTIONAL_DEPS; do
+    if command -v "$key" >/dev/null 2>&1; then
+      printf '  [ok]       %s: %s\n' "$key" "$(wf_optional_what "$key")"
+    else
+      printf '  [optional] %s not found, without it: %s\n' "$key" "$(wf_optional_what "$key")"
+    fi
+  done
   [ -z "$WF_DEPS_MISSING" ]
 }
 

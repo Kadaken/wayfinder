@@ -713,6 +713,7 @@ fn x11_handle(window: &impl IsA<gtk::Native>) -> Option<(*mut c_void, c_ulong)> 
     if !display.type_().name().contains("X11") {
         return None;
     }
+    // SAFETY: `display` and `surface` are live GDK objects, checked as X11 above; the pointers are only read during this call.
     unsafe {
         let d = gdk_x11_display_get_xdisplay(display.to_glib_none().0);
         let xid = sitting_surface_xid(surface.to_glib_none().0);
@@ -724,6 +725,7 @@ fn x11_handle(window: &impl IsA<gtk::Native>) -> Option<(*mut c_void, c_ulong)> 
 pub fn window_geometry(window: &(impl IsA<gtk::Native> + IsA<gtk::Widget>)) -> Option<(i32, i32, i32, i32)> {
     let (d, xid) = x11_handle(window)?;
     let (mut x, mut y, mut child) = (0 as c_int, 0 as c_int, 0 as c_ulong);
+    // SAFETY: `d` and `xid` come from x11_handle for a live X11 window; the out-parameters are local variables.
     unsafe {
         if XTranslateCoordinates(d, xid, XDefaultRootWindow(d), 0, 0, &mut x, &mut y, &mut child) == 0 {
             return None;
@@ -764,6 +766,7 @@ struct XPropGuard(*mut c_uchar);
 impl Drop for XPropGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: the pointer came from Xlib, is non-null here, and this guard frees it exactly once.
             unsafe { XFree(self.0 as *mut c_void) };
         }
     }
@@ -799,6 +802,7 @@ fn decide_extents_metadata(prop_null: bool, actual_type: c_ulong, actual_format:
 
 fn frame_extents(d: *mut c_void, xid: c_ulong) -> Option<(i32, i32, i32, i32)> {
     let name = std::ffi::CString::new("_NET_FRAME_EXTENTS").ok()?;
+    // SAFETY: `d` and `xid` are a live X11 display and window; out-parameters are locals; `prop` is read only after the metadata checks and freed once by the guard.
     unsafe {
         let atom = XInternAtom(d, name.as_ptr(), 1 /* only_if_exists */);
         if atom == 0 {
@@ -866,6 +870,7 @@ fn compose_outer(
 #[cfg(test)]
 pub fn x11_resize(window: &impl IsA<gtk::Native>, w: u32, h: u32) {
     if let Some((d, xid)) = x11_handle(window) {
+        // SAFETY: `d` and `xid` come from x11_handle for a live X11 window; the Xlib call takes no other pointers.
         unsafe {
             XResizeWindow(d, xid, w, h);
             XFlush(d);
@@ -878,6 +883,7 @@ pub fn x11_resize(window: &impl IsA<gtk::Native>, w: u32, h: u32) {
 #[cfg(test)]
 pub fn x11_move(window: &impl IsA<gtk::Native>, x: i32, y: i32) {
     if let Some((d, xid)) = x11_handle(window) {
+        // SAFETY: `d` and `xid` come from x11_handle for a live X11 window; the Xlib call takes no other pointers.
         unsafe {
             XMoveWindow(d, xid, x, y);
             XFlush(d);
@@ -1655,6 +1661,7 @@ impl Adapter for GtkAdapter {
             ));
         }
         let (d, xid) = x11_handle(&ui.window).ok_or("card has no X11 surface")?;
+        // SAFETY: `d` and `xid` come from x11_handle for a live X11 window; the Xlib call takes no other pointers.
         unsafe {
             XMoveWindow(d, xid, desired.0, desired.1);
             XFlush(d);
