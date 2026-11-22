@@ -12634,28 +12634,40 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         // D-243: Compact is a different ROW, not the same row with less air --
         // a small icon, one line of name and tight leading, the way Explorer's
         // List and Dolphin's compact mode read. Spacing alone was invisible.
-        let (compact, details_thumbnails, thumbnail_queue) = {
+        let (compact, details_thumbnails, thumbnail_queue, video_poster_queue) = {
             let st = state.borrow();
             (
                 st.view_mode == ViewMode::Compact,
                 st.details_thumbnails,
                 st.thumbnail_queue.clone(),
+                st.video_poster_queue.clone(),
             )
         };
         // D-260: only the rows GTK actually realizes are asked for a decode.
         // This is the whole reason the list can stay smooth: no matter how big
         // the folder, the work is bounded by what is on screen.
-        let wants_thumbnail = details_thumbnails
-            && thumbnail_queue.is_some()
-            && native_core::wants_image_thumbnail(&entry);
+        // D-403: a real video row asks the bounded video poster queue (the one
+        // Grid uses) for a frame; every other row asks as before.
+        let wants_poster = details_thumbnails
+            && video_poster_queue.is_some()
+            && native_core::wants_video_poster(&entry);
+        let wants_thumbnail = wants_poster
+            || (details_thumbnails
+                && thumbnail_queue.is_some()
+                && native_core::wants_image_thumbnail(&entry));
         let (icon, thumbnail) = file_icon(&entry, icon_zoom, compact, wants_thumbnail);
-        if let (Some(picture), Some(queue), Some(real_path)) = (
+        if let (Some(picture), Some(real_path)) = (
             thumbnail,
-            thumbnail_queue,
             wants_thumbnail.then(|| entry.source.real_path_string()).flatten(),
         ) {
-            let metrics = native_core::list_thumbnail_metrics(icon_zoom, compact);
-            queue_list_thumbnail(&queue, real_path, picture, metrics);
+            if wants_poster {
+                if let Some(queue) = &video_poster_queue {
+                    queue_grid_video_poster(queue, real_path, picture);
+                }
+            } else if let Some(queue) = thumbnail_queue {
+                let metrics = native_core::list_thumbnail_metrics(icon_zoom, compact);
+                queue_list_thumbnail(&queue, real_path, picture, metrics);
+            }
         }
         // Show full file names: short names stay on one line (compact); long names
         // wrap to a second line rather than being truncated. Only names too long
@@ -12865,16 +12877,22 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         {
             // Same rule as the SizeGroup cleanup above: unbind runs inside
             // widget teardown and must never insist on the state borrow.
-            let queue = state_for_unbind
+            let (queue, posters) = state_for_unbind
                 .try_borrow()
-                .ok()
-                .and_then(|state| state.thumbnail_queue.clone());
-            if let Some(queue) = queue {
+                .map(|state| (state.thumbnail_queue.clone(), state.video_poster_queue.clone()))
+                .unwrap_or((None, None));
+            if queue.is_some() || posters.is_some() {
                 if let Some(picture) = item
                     .child()
                     .and_then(|row| find_row_thumbnail(&row))
                 {
-                    cancel_list_thumbnail(&queue, &path, &picture);
+                    if let Some(queue) = queue {
+                        cancel_list_thumbnail(&queue, &path, &picture);
+                    }
+                    // D-403: a video row's pending poster goes with the row.
+                    if let Some(queue) = posters {
+                        cancel_grid_video_poster(&queue, &picture);
+                    }
                 }
             }
         }
@@ -13279,11 +13297,16 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 previous.borrow().cancelled.cancel();
             }
         }
-        if let Some(previous) = state_ref.video_poster_queue.take() {
-            let previous_ref = previous.borrow();
-            previous_ref.cancelled.cancel();
-            for (pipeline, _watch) in &previous_ref.live {
-                pipeline.set_state(gst::State::Null).ok();
+        // D-403: a same-folder refresh of a list view keeps its poster queue,
+        // for the same reason as the thumbnail queue above.
+        let keep_posters = diff && view_mode != ViewMode::Grid && details_thumbnails;
+        if !keep_posters {
+            if let Some(previous) = state_ref.video_poster_queue.take() {
+                let previous_ref = previous.borrow();
+                previous_ref.cancelled.cancel();
+                for (pipeline, _watch) in &previous_ref.live {
+                    pipeline.set_state(gst::State::Null).ok();
+                }
             }
         }
         state_ref.visible_entries = visible_entries.clone();
@@ -13301,8 +13324,9 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             state_ref.thumbnail_queue = Some(queue);
             }
         }
-        if view_mode == ViewMode::Grid {
-            // The tiles read these two queues when GTK binds them (D-368).
+        if (view_mode == ViewMode::Grid || details_thumbnails) && state_ref.video_poster_queue.is_none() {
+            // The tiles (D-368) and, with the row-thumbnail setting on, the
+            // list rows (D-403) read this queue when GTK binds them.
             let queue = Rc::new(RefCell::new(VideoPosterQueue {
                 cancelled: gio::Cancellable::new(),
                 pending: VecDeque::new(),
@@ -27426,6 +27450,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d85-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d403") {
+            video_rows_get_posters_in_list_views_d403();
+            eprintln!("wf-test d403-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d393") {
             compact_lower_click_keeps_place_d393();
             eprintln!("wf-test d393-only run done");
@@ -27560,6 +27589,7 @@ Broken: Either state is wrong.\n";
         thumbnail_queue_caps_concurrency_and_drains_on_cancel_d84();
         corrupt_image_keeps_fallback_and_queue_drains_to_follower_d152();
         details_thumbnails_in_list_rows_d260();
+        video_rows_get_posters_in_list_views_d403();
         every_image_format_previews_and_thumbnails_d261();
         a_pasted_address_opens_the_folder_d262();
         a_picture_no_loader_reads_still_gets_a_thumbnail_d263();
@@ -29118,6 +29148,129 @@ Broken: Either state is wrong.\n";
             return;
         }
         details_thumbnails_in_list_rows_d260();
+    }
+
+    /// D-403: with "Thumbnails in Details, List and Compact" on, every real
+    /// video row in Compact and in Details paints a frame from its file through
+    /// the bounded video poster queue; a corrupt video keeps its icon; with the
+    /// setting off no queue exists and no poster job runs. Videos are generated
+    /// by ffmpeg in a scratch folder (never an owner file).
+    fn video_rows_get_posters_in_list_views_d403() {
+        gtk::init().expect("gtk init on the virtual display");
+        gst::init().expect("gstreamer init");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-poster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let home = root.join("home");
+        let dir = root.join("vids");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let specs: [(&str, &[&str]); 5] = [
+            ("a.mp4", &["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            ("b.webm", &["-c:v", "libvpx-vp9", "-b:v", "200k"]),
+            ("c.mov", &["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            ("d.mkv", &["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            ("e.avi", &["-c:v", "mpeg4"]),
+        ];
+        for (name, codec) in specs {
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=15"])
+                .args(codec)
+                .arg(dir.join(name))
+                .status()
+                .expect("ffmpeg runs");
+            assert!(out.success() && dir.join(name).is_file(), "ffmpeg made {name}");
+        }
+        // Corrupt: a video name over bytes that are no container at all.
+        let junk: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        std::fs::write(dir.join("z-bad.mp4"), junk).unwrap();
+        let good: Vec<String> = specs.iter().map(|(n, _)| dir.join(n).to_string_lossy().to_string()).collect();
+        let bad = dir.join("z-bad.mp4").to_string_lossy().to_string();
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d403test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(900, 600);
+        ui.window.present();
+        let until = |what: &str, secs: u64, cond: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !cond() {
+                assert!(start.elapsed() < Duration::from_secs(secs), "d403: timed out ({secs}s) waiting for {what}");
+                pump();
+            }
+        };
+        until("d403 listing", 20, &|| state.borrow().visible_entries.len() == 6);
+        set_view_mode(&state, &ui, ViewMode::Details);
+        pump();
+        let thumb_of = |path: &str| -> Option<gtk::Picture> {
+            let row = state
+                .borrow()
+                .meta_labels
+                .get(&native_core::EntrySource::real(path))
+                .and_then(|(size, _)| size.upgrade())
+                .and_then(|label| label.parent())?;
+            all_widgets(&row)
+                .into_iter()
+                .find(|w| w.widget_name() == "wf-row-thumbnail")
+                .and_then(|w| w.downcast::<gtk::Picture>().ok())
+        };
+        let painted = |path: &str| thumb_of(path).is_some_and(|p| p.paintable().is_some());
+
+        // Setting off (the default): no queue, no picture widget, no job.
+        assert!(!state.borrow().details_thumbnails);
+        assert!(state.borrow().video_poster_queue.is_none(), "no poster queue while the setting is off");
+        assert!(thumb_of(&good[0]).is_none(), "no picture widget while the setting is off");
+
+        set_details_thumbnails(&state, true);
+        for (label, mode) in [("Details", ViewMode::Details), ("Compact", ViewMode::Compact)] {
+            set_view_mode(&state, &ui, mode);
+            for path in &good {
+                until(&format!("{label} poster for {}", path.rsplit('/').next().unwrap_or("")), 60, &|| painted(path));
+            }
+            // The corrupt file's job ends (queue idle) with its icon kept.
+            until(&format!("{label} poster queue idle"), 60, &|| {
+                state.borrow().video_poster_queue.as_ref().is_some_and(|q| {
+                    let q = q.borrow();
+                    q.active == 0 && q.pending.is_empty()
+                })
+            });
+            pump();
+            assert!(!painted(&bad), "{label}: a corrupt video must keep its file-type icon");
+            for path in &good {
+                let paintable = thumb_of(path).and_then(|p| p.paintable()).expect("painted");
+                assert_eq!(paintable.intrinsic_width(), 320, "{label}: the frame is a real 320x240 frame");
+            }
+            eprintln!("wf-test d403 {label}: {} video rows painted, corrupt kept its icon", good.len());
+        }
+
+        // Setting off again: queue gone, pictures gone, and no poster job runs.
+        set_details_thumbnails(&state, false);
+        assert!(state.borrow().video_poster_queue.is_none(), "turning it off drops the poster queue");
+        until("rows rebuilt with the setting off", 20, &|| {
+            state.borrow().meta_labels.contains_key(&native_core::EntrySource::real(&good[0]))
+        });
+        let jobs_before = VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().len());
+        for _ in 0..10 {
+            pump();
+        }
+        assert!(thumb_of(&good[0]).is_none(), "no row picture with the setting off");
+        assert_eq!(
+            VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().len()),
+            jobs_before,
+            "no poster job runs with the setting off"
+        );
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     /// D-85: a disposable synthetic short H.264/mp4 clip (never an owner

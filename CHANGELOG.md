@@ -7,6 +7,7 @@ change between releases.
 ## Unreleased
 
 ### Fixed
+- List, Details and Compact views now show a picture from the video for video files (mp4, avi, mov, webm, wmv, mkv, mpg, flv) when "Thumbnails in Details, List and Compact" is on, as Icons view already did; a video that cannot be read keeps its file icon.
 - Startup and every sidebar refresh no longer wait on slow drives: whether a pin, recent or drive row accepts drops is no longer checked on the window's thread (a slow cloud or USB mount held the window for about 40 seconds).
 
 - Browsing a big folder of pictures in Icons view (or Details view) no longer makes memory grow without limit: every file row or tile that scrolled past used to stay in memory with its thumbnail.
