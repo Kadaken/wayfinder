@@ -362,7 +362,8 @@ already handles on its own: dropping `:focus` from the selector and styling
 none for the mouse.
 
 ## D-292 — every context menu is pointer-only
-Status: Open (found by S12 at 0.9.28, 16 Nov 2026)
+Status: FIXED 22 Nov 2026 -- TESTED. `context_menu_opens_from_the_keyboard_d292` (GTK suite, mode a11y) sends Menu and Shift+F10 through the body key controller: list row menu anchored on the selected row, background menu with no selection, grid, sidebar row; search box left alone. Fails with the key branch disabled ("Menu is handled on the file list"). Click and key share `item_context_opener` / the show_*_context_menu builders. Not covered: a real keyboard; grid tiles got a keyboard item menu although right-click on a tile still opens none.
+Was: Open (found by S12 at 0.9.28, 16 Nov 2026)
 
 Context menus are opened by `GestureClick` on button 3 / BUTTON_SECONDARY
 (native.rs:6370, 6556, 8224 and the sidebar). No handler exists for the Menu

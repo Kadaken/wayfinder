@@ -7608,12 +7608,13 @@ fn open_connect_dialog(state: &Rc<RefCell<AppState>>, ui: &Ui, prefill: Option<&
 /// the same Open set the file list offers for a folder, so the sidebar is not
 /// a second-class place to right-click.
 fn connect_place_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
+    let row_for_click = row.clone();
+    let open: ContextOpener =
+        Rc::new(move |x, y| show_place_context_menu(&row_for_click, state.clone(), ui.clone(), path.clone(), x, y));
+    set_context_opener(row, open.clone());
     let click = gtk::GestureClick::new();
     click.set_button(3);
-    let row_for_click = row.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        show_place_context_menu(&row_for_click, state.clone(), ui.clone(), path.clone(), x, y);
-    });
+    click.connect_pressed(move |_, _, x, y| open(x, y));
     row.add_controller(click);
 }
 
@@ -10142,6 +10143,12 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let alt = mods.contains(gdk::ModifierType::ALT_MASK);
 
+        // D-292: the keyboard way to the right-click menu.
+        let menu_key = (key == gdk::Key::Menu && !ctrl && !alt)
+            || (key == gdk::Key::F10 && shift && !ctrl && !alt);
+        if menu_key && open_context_menu_from_key(&state_for_keys, &ui_for_keys) {
+            return glib::Propagation::Stop;
+        }
         if ctrl && shift && (key == gdk::Key::C || key == gdk::Key::c) {
             copy_paths_to_system_clipboard(&state_for_keys, &ui_for_keys);
             return glib::Propagation::Stop;
@@ -13068,6 +13075,11 @@ fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         grid_item.set_halign(gtk::Align::Center);
         grid_item.set_valign(gtk::Align::Start);
         grid_item.set_tooltip_text(Some(&tooltip));
+        // D-292: a grid tile has no right-click item menu, but the keyboard opens one.
+        set_context_opener(
+            &grid_item,
+            item_context_opener(grid_item.upcast_ref(), state.clone(), ui.clone(), entry.clone()),
+        );
         #[cfg(feature = "guide")]
         if guide_is_open_file_fixture(&entry) {
             guide_name(&grid_item, GUIDE_OPEN_FILE);
@@ -19014,19 +19026,37 @@ fn first_hash_run(value: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn connect_row_context(
-    row: &gtk::Box,
+/// What a menu opener does: take the anchor point inside the row it belongs to.
+type ContextOpener = Rc<dyn Fn(f64, f64)>;
+
+/// D-292: a row that has a context menu keeps its opener here, so the pointer
+/// handler and the Menu / Shift+F10 key open one and the same menu.
+const CTX_OPEN_KEY: &str = "wf-ctx-open";
+/// The display string of the file a list or grid row shows, so the key can find
+/// the selected row's widget.
+const CTX_SOURCE_KEY: &str = "wf-ctx-source";
+
+fn set_context_opener(row: &impl IsA<glib::Object>, opener: ContextOpener) {
+    // SAFETY: the keys are private to this file and always hold these types.
+    unsafe { row.set_data(CTX_OPEN_KEY, opener) };
+}
+
+fn context_opener_of(widget: &impl IsA<glib::Object>) -> Option<ContextOpener> {
+    // SAFETY: see set_context_opener.
+    unsafe { widget.data::<ContextOpener>(CTX_OPEN_KEY).map(|p| p.as_ref().clone()) }
+}
+
+/// Select the entry's row if it is not selected, then open its item menu on `row`.
+fn item_context_opener(
+    row: &gtk::Widget,
     state: Rc<RefCell<AppState>>,
     ui: Ui,
     entry: Entry,
-) {
-    let click = gtk::GestureClick::new();
-    click.set_button(3);
-    let row_for_click = row.clone();
-    click.connect_pressed(move |gesture, _, x, y| {
-        // Claim the gesture so the ListView's background handler does not also
-        // fire and clear the selection out from under the menu.
-        gesture.set_state(gtk::EventSequenceState::Claimed);
+) -> ContextOpener {
+    let row = row.clone();
+    // SAFETY: private key, String value.
+    unsafe { row.set_data(CTX_SOURCE_KEY, entry.source.display_string()) };
+    Rc::new(move |x, y| {
         // D-360: the row's position at bind time goes stale when a same-folder
         // refresh inserts or removes rows above a kept row. Find the entry's
         // place now, by its path.
@@ -19042,16 +19072,87 @@ fn connect_row_context(
                 update_selection(&state, &ui);
             }
         }
-        show_item_context_menu(
-            &row_for_click,
-            state.clone(),
-            ui.clone(),
-            entry.clone(),
-            x,
-            y,
-        );
+        show_item_context_menu(&row, state.clone(), ui.clone(), entry.clone(), x, y);
+    })
+}
+
+fn connect_row_context(
+    row: &gtk::Box,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    entry: Entry,
+) {
+    let open = item_context_opener(row.upcast_ref(), state, ui, entry);
+    set_context_opener(row, open.clone());
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    click.connect_pressed(move |gesture, _, x, y| {
+        // Claim the gesture so the ListView's background handler does not also
+        // fire and clear the selection out from under the menu.
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        open(x, y);
     });
     row.add_controller(click);
+}
+
+/// D-292: open the context menu from the keyboard (Menu key, Shift+F10) for
+/// whatever has focus: a sidebar row, or the file list / grid, anchored at the
+/// selected row (the view's top-left when nothing is selected). Returns false
+/// when focus is somewhere that has no context menu or in a text box, which
+/// keeps its own.
+fn open_context_menu_from_key(state: &Rc<RefCell<AppState>>, ui: &Ui) -> bool {
+    let focus = gtk::prelude::GtkWindowExt::focus(&ui.window);
+    let within = |root: &gtk::Widget, w: &gtk::Widget| w == root || w.is_ancestor(root);
+    if let Some(f) = &focus {
+        let mut up = Some(f.clone());
+        while let Some(w) = up {
+            if w.is::<gtk::Editable>() {
+                return false;
+            }
+            up = w.parent();
+        }
+        if within(ui.sidebar.upcast_ref(), f) {
+            let Some(row) = f.ancestor(gtk::ListBoxRow::static_type()) else { return false };
+            let Some(open) = context_opener_of(&row) else { return false };
+            open(8.0, f64::from(row.height().max(2)) / 2.0);
+            return true;
+        }
+    }
+    let grid = state.borrow().view_mode == ViewMode::Grid;
+    let view: gtk::Widget = if grid { ui.grid.clone().upcast() } else { ui.list.clone().upcast() };
+    if let Some(f) = &focus {
+        if !within(&view, f) {
+            return false;
+        }
+    }
+    if let Some(entry) = selected_entries(state, ui).into_iter().next() {
+        let wanted = entry.source.display_string();
+        let mut found = None;
+        let mut stack = vec![view.clone()];
+        while let Some(w) = stack.pop() {
+            // SAFETY: private key, String value.
+            let source = unsafe { w.data::<String>(CTX_SOURCE_KEY).map(|p| p.as_ref().clone()) };
+            if source.as_deref() == Some(wanted.as_str()) {
+                found = Some(w);
+                break;
+            }
+            let mut c = w.first_child();
+            while let Some(child) = c {
+                c = child.next_sibling();
+                stack.push(child);
+            }
+        }
+        if let Some(open) = found.as_ref().and_then(context_opener_of) {
+            let h = found.as_ref().map_or(2, |w| w.height().max(2));
+            open(8.0, f64::from(h) / 2.0);
+        } else {
+            // The row is scrolled out of view and not built: anchor at the view.
+            show_item_context_menu(&view, state.clone(), ui.clone(), entry, 0.0, 0.0);
+        }
+        return true;
+    }
+    show_background_context_menu(&view, state.clone(), ui.clone(), 0.0, 0.0);
+    true
 }
 
 fn connect_background_context(list: &gtk::ListView, state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -19100,19 +19201,14 @@ fn connect_drive_context(
     ui: Ui,
     drive: Drive,
 ) {
+    let row_for_click = row.clone();
+    let open: ContextOpener = Rc::new(move |x, y| {
+        show_drive_context_menu(&row_for_click, state.clone(), ui.clone(), drive.clone(), x, y);
+    });
+    set_context_opener(row, open.clone());
     let click = gtk::GestureClick::new();
     click.set_button(3);
-    let row_for_click = row.clone();
-    click.connect_pressed(move |_, _, x, y| {
-        show_drive_context_menu(
-            &row_for_click,
-            state.clone(),
-            ui.clone(),
-            drive.clone(),
-            x,
-            y,
-        );
-    });
+    click.connect_pressed(move |_, _, x, y| open(x, y));
     row.add_controller(click);
 }
 
@@ -28049,6 +28145,7 @@ Broken: Either state is wrong.\n";
         // A quick run of the place-keeping tests alone, for iterating on them.
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("a11y") {
             icon_buttons_have_accessible_names_d294();
+            context_menu_opens_from_the_keyboard_d292();
             eprintln!("wf-test a11y-only run done");
             return;
         }
@@ -28269,6 +28366,7 @@ Broken: Either state is wrong.\n";
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();
+        context_menu_opens_from_the_keyboard_d292();
         suite_tail_after_d86();
         suite_glib_dirs_d373("suite end");
     }
@@ -33135,6 +33233,102 @@ Broken: Either state is wrong.\n";
         eprintln!("wf-test d294: {seen} icon-only buttons walked, {} without a name", bad.len());
         assert!(seen >= 10, "the walk reaches the toolbar and title buttons (saw {seen})");
         assert!(bad.is_empty(), "icon-only buttons without an accessible name: {bad:?}");
+    }
+
+    /// D-292 (22 Nov 2026): the Menu key and Shift+F10 open the same context menu a
+    /// right-click opens, on the file list, the grid and the sidebar.
+    fn context_menu_opens_from_the_keyboard_d292() {
+        install_app_css();
+        let d = d362_open("a11y292", |dir| {
+            std::fs::write(dir.join("a.txt"), "x").unwrap();
+            std::fs::write(dir.join("b.txt"), "y").unwrap();
+        }, 2);
+        let press = |key: gdk::Key, mods: gdk::ModifierType| -> bool {
+            d.ui.body
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
+                .any(|k| k.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &mods]))
+        };
+        let open_popovers = |root: &gtk::Widget| -> Vec<gtk::Popover> {
+            popovers_of(root).into_iter().filter(|p| p.is_visible()).collect()
+        };
+        let close_all = |root: &gtk::Widget| {
+            for p in popovers_of(root) {
+                p.popdown();
+            }
+            pump();
+        };
+        let none = gdk::ModifierType::empty();
+
+        // List with a selected row: the item menu, parented on that row.
+        d.ui.list_selection.select_item(1, true);
+        update_selection(&d.state, &d.ui);
+        d.ui.list.grab_focus();
+        pump();
+        assert!(press(gdk::Key::Menu, none), "Menu is handled on the file list");
+        pump();
+        let list_w: gtk::Widget = d.ui.list.clone().upcast();
+        let menus = open_popovers(&list_w);
+        assert_eq!(menus.len(), 1, "one context menu is open after Menu on a selected row");
+        let anchor = menus[0].parent().unwrap();
+        // SAFETY: private key written by item_context_opener with a String.
+        let anchored_on = unsafe { anchor.data::<String>(CTX_SOURCE_KEY).map(|p| p.as_ref().clone()) };
+        assert_eq!(
+            anchored_on.as_deref(),
+            Some(d.state.borrow().visible_entries[1].source.display_string().as_str()),
+            "the menu is anchored at the selected row"
+        );
+        close_all(&list_w);
+
+        // Shift+F10 does the same.
+        assert!(press(gdk::Key::F10, gdk::ModifierType::SHIFT_MASK), "Shift+F10 is handled");
+        pump();
+        assert_eq!(open_popovers(&list_w).len(), 1, "Shift+F10 opens the menu");
+        close_all(&list_w);
+
+        // No selection: the background menu at the view's top-left.
+        d.ui.list_selection.unselect_all();
+        update_selection(&d.state, &d.ui);
+        assert!(press(gdk::Key::Menu, none));
+        pump();
+        assert_eq!(open_popovers(&list_w).len(), 1, "Menu with nothing selected opens the background menu");
+        close_all(&list_w);
+
+        // Grid view.
+        set_view_mode(&d.state, &d.ui, ViewMode::Grid);
+        d362_wait("grid tiles", 10, || grid_child_at(&d.ui, 0).is_some());
+        d.ui.list_selection.select_item(0, true);
+        update_selection(&d.state, &d.ui);
+        d.ui.grid.grab_focus();
+        pump();
+        assert!(press(gdk::Key::Menu, none), "Menu is handled on the grid");
+        pump();
+        let grid_w: gtk::Widget = d.ui.grid.clone().upcast();
+        assert_eq!(open_popovers(&grid_w).len(), 1, "Menu opens a menu in the grid");
+        close_all(&grid_w);
+        set_view_mode(&d.state, &d.ui, ViewMode::Details);
+        pump();
+
+        // Sidebar: a row with a menu, focused.
+        let row = all_widgets(d.ui.sidebar.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+            .find(|r| context_opener_of(r).is_some())
+            .expect("a sidebar row has a context menu");
+        row.grab_focus();
+        pump();
+        assert!(press(gdk::Key::Menu, none), "Menu is handled on a sidebar row");
+        pump();
+        let side_w: gtk::Widget = row.clone().upcast();
+        assert_eq!(open_popovers(&side_w).len(), 1, "Menu opens the sidebar row's menu");
+        close_all(&side_w);
+
+        // A text box keeps its own Menu key.
+        d.ui.search.grab_focus();
+        pump();
+        assert!(!press(gdk::Key::Menu, none), "Menu in the search box is left alone");
+        eprintln!("wf-test d292: Menu and Shift+F10 open the list, grid and sidebar menus");
     }
 
     /// D-404 (22 Nov 2026): files from the owner's "Broken - to repair" drive that
