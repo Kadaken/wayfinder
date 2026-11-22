@@ -95,7 +95,9 @@ const APP_CSS: &str = r#"
 @define-color wf_close         #c0392b;
 @define-color wf_text          #e3e5ea;
 @define-color wf_text_dim      #8b909a;
-@define-color wf_text_muted    #6b7079;
+@define-color wf_text_muted    #888d97;
+/* Disabled controls are exempt from the contrast minimum; keep their quiet look. */
+@define-color wf_text_disabled #6b7079;
 
 window.wayfinder-window {
     background: @wf_base;
@@ -296,7 +298,7 @@ button.wf-icon-button:checked:hover {
 .wf-icon-button:disabled {
     background: transparent;
     border-color: transparent;
-    color: @wf_text_muted;
+    color: @wf_text_disabled;
 }
 
 .wf-pathbar {
@@ -50379,5 +50381,30 @@ mod audit_config_save_tests {
         let (_, ok) = try_update_config_at(&root.join("good").join("native-config.json"), |c| c.sidebar_hidden = true);
         assert!(ok.is_ok());
         let _ = fs::remove_dir_all(&root);
+    }
+    /// D-293: the muted text colour must reach 4.5:1 (WCAG 1.4.3) on the listing
+    /// and raised-pane backgrounds.
+    #[test]
+    fn muted_text_contrast_meets_wcag_aa_d293() {
+        fn colour(name: &str) -> [f64; 3] {
+            let key = format!("@define-color {name}");
+            let line = APP_CSS.lines().find(|l| l.starts_with(&key) && l[key.len()..].starts_with(' ')).expect(name);
+            let hex = line.trim_end_matches(';').rsplit('#').next().unwrap().trim();
+            let n = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            [n(0), n(2), n(4)]
+        }
+        fn lum(c: [f64; 3]) -> f64 {
+            let f = |x: f64| if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+            0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+        }
+        fn ratio(a: [f64; 3], b: [f64; 3]) -> f64 {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+        let muted = colour("wf_text_muted");
+        for bg in ["wf_base", "wf_raised"] {
+            let r = ratio(muted, colour(bg));
+            assert!(r >= 4.5, "wf_text_muted on {bg} is {r:.2}:1, needs 4.5:1");
+        }
     }
 }

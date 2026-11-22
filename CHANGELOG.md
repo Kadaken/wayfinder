@@ -4,6 +4,11 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## Unreleased
+
+### Fixed
+- Secondary text (sidebar headings, empty-folder text, menu shortcut labels) is lighter and now meets the 4.5:1 contrast minimum.
+
 ## 0.9.30 — 22 November 2026
 
 ### Fixed

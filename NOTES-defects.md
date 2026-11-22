@@ -372,7 +372,8 @@ also have a shortcut (copy, cut, paste, rename, delete) are fine; the rest are
 not.
 
 ## D-293 — five text roles are below the contrast minimum
-Status: Open (found by S12 at 0.9.28, 16 Nov 2026)
+Status: FIXED 22 Nov 2026 -- TESTED. `muted_text_contrast_meets_wcag_aa_d293` parses the @define-color values and asserts >= 4.5:1 on wf_base and wf_raised; fails on #6b7079 (3.39:1), passes on #888d97 (5.06:1 base, 4.55:1 raised). Disabled buttons keep #6b7079 via new @wf_text_disabled. Not covered: the 1.4.11 pane hairline.
+Was: Open (found by S12 at 0.9.28, 16 Nov 2026)
 
 `@wf_text_muted` (#6b7079) gives 3.39:1 on the listing background and 3.04:1
 on a raised pane, against the 4.5:1 WCAG 2.1 1.4.3 asks for normal-size text.
