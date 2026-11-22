@@ -10,6 +10,7 @@
 
 mod crash;
 mod native_core;
+mod originals;
 mod native_viewers;
 // audio_preview.rs is frozen (never edited), so its two lints are allowed here:
 // `duration_is_computed` is called only from its own tests, and one
@@ -1352,6 +1353,16 @@ struct AppConfig {
     /// never starts deleting anybody's Trash without being asked.
     #[serde(default)]
     trash_keep_days: u32,
+    /// "Show original": hand lists (TSV, `duplicate<TAB>original<TAB>how we know`).
+    #[serde(default)]
+    originals_lists: Vec<String>,
+    /// Folders the background duplicate index may read. Empty (the default)
+    /// means the index is off.
+    #[serde(default)]
+    duplicate_index_roots: Vec<String>,
+    /// Folders the duplicate index must never open, checked before opening.
+    #[serde(default)]
+    duplicate_index_skip: Vec<String>,
     /// Opt-in: ask Copy / Move / Link on every drag and drop instead of
     /// deciding from the modifier keys and the device. Off by default, so the
     /// Explorer habit (Ctrl copies, Shift moves) keeps working untouched for
@@ -2102,6 +2113,9 @@ impl Default for AppConfig {
             columns: ColumnVisibility::default(),
             remembered_networks: Vec::new(),
             trash_keep_days: 0,
+            originals_lists: Vec::new(),
+            duplicate_index_roots: Vec::new(),
+            duplicate_index_skip: Vec::new(),
             drop_ask: false,
             sidebar_hidden: false,
             onboarded: false,
@@ -4834,6 +4848,7 @@ fn build_ui_in(
     host: Option<SplitHost>,
 ) -> Rc<RefCell<AppState>> {
     let config = load_config();
+    originals::start_index_once(config.duplicate_index_roots.clone(), config.duplicate_index_skip.clone());
     let picker = parse_picker_state();
     let initial_cwd = initial_path
         .or_else(|| {
@@ -10124,6 +10139,18 @@ fn toggle_split(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         focus_handler: Rc::new(RefCell::new(focus_handler)),
     });
     eprintln!("wf-event: split on");
+}
+
+/// "Show original": a new window at the original's folder with it selected.
+fn open_new_window_selecting(ui: &Ui, file: &str) {
+    if let Some(app) = ui
+        .window
+        .application()
+        .and_then(|app| app.downcast::<adw::Application>().ok())
+    {
+        let launch = native_core::select_launch_target(file);
+        build_ui(&app, Some(launch.folder), launch.select);
+    }
 }
 
 fn open_new_window(ui: &Ui, path: String) {
@@ -19459,6 +19486,26 @@ fn show_item_context_menu(
         }));
     }
     if let (false, Some(path)) = (entry.is_dir, entry.source.real_path_string()) {
+        let config = load_config();
+        let found = originals::original_for(&path, &config.originals_lists);
+        let ui = ui.clone();
+        let target = found.as_ref().map(|o| o.path.clone());
+        let item = context_item("document-open-symbolic", "Show original", "", &popover, move || {
+            if let Some(target) = &target {
+                open_new_window_selecting(&ui, target);
+            }
+        });
+        item.set_widget_name("wf-show-original");
+        match &found {
+            Some(o) => item.set_tooltip_text(Some(&o.tooltip)),
+            None => {
+                item.set_sensitive(false);
+                item.set_tooltip_text(Some("No original known for this file"));
+            }
+        }
+        menu.append(&item);
+    }
+    if let (false, Some(path)) = (entry.is_dir, entry.source.real_path_string()) {
         let ui = ui.clone();
         menu.append(&context_open_with(&popover, ui.clone(), path.clone()));
     }
@@ -28226,6 +28273,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test a11y-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("orig") {
+            show_original_menu_item_follows_the_list();
+            eprintln!("wf-test orig-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("place") {
             sidebar_button_not_divider_d352();
             split_wrapped_names_click_keeps_place_d358();
@@ -33309,6 +33361,72 @@ Broken: Either state is wrong.\n";
         eprintln!("wf-test d294: {seen} icon-only buttons walked, {} without a name", bad.len());
         assert!(seen >= 10, "the walk reaches the toolbar and title buttons (saw {seen})");
         assert!(bad.is_empty(), "icon-only buttons without an accessible name: {bad:?}");
+    }
+
+    /// "Show original": greyed out for a file with no original, clickable for
+    /// one listed in a hand list.
+    fn show_original_menu_item_follows_the_list() {
+        install_app_css();
+        let d = d362_open("orig", |dir| {
+            std::fs::write(dir.join("copy.txt"), "x").unwrap();
+            std::fs::write(dir.join("loner.txt"), "y").unwrap();
+            std::fs::write(dir.join("master.txt"), "z").unwrap();
+            let list = dir.parent().unwrap().join("originals.tsv");
+            std::fs::write(
+                &list,
+                format!(
+                    "duplicate\toriginal\thow we know\n{}\t{}\tfixture\n",
+                    dir.join("copy.txt").display(),
+                    dir.join("master.txt").display()
+                ),
+            )
+            .unwrap();
+        }, 3);
+        let list = crate::native_core::scratch_root()
+            .join(format!("wf-d362-orig-{}", std::process::id()))
+            .join("originals.tsv");
+        originals::set_test_lists(Some(vec![list.to_string_lossy().to_string()]));
+        fn find_item(w: &gtk::Widget) -> Option<gtk::Widget> {
+            if w.widget_name() == "wf-show-original" {
+                return Some(w.clone());
+            }
+            let mut c = w.first_child();
+            while let Some(child) = c {
+                if let Some(f) = find_item(&child) {
+                    return Some(f);
+                }
+                c = child.next_sibling();
+            }
+            None
+        }
+        let state_of = |name: &str| -> (bool, Option<String>) {
+            let entry = d
+                .state
+                .borrow()
+                .visible_entries
+                .iter()
+                .find(|e| e.name == name)
+                .cloned()
+                .expect("entry");
+            let list_w: gtk::Widget = d.ui.list.clone().upcast();
+            show_item_context_menu(&d.ui.list, d.state.clone(), d.ui.clone(), entry, 5.0, 5.0);
+            pump();
+            let popover = popovers_of(&list_w).into_iter().find(|p| p.is_visible()).expect("menu open");
+            let item = find_item(popover.upcast_ref()).expect("Show original is in every file menu");
+            let out = (item.is_sensitive(), item.tooltip_text().map(|t| t.to_string()));
+            popover.popdown();
+            pump();
+            out
+        };
+        let (loner_on, _) = state_of("loner.txt");
+        assert!(!loner_on, "no original known: the item is greyed out");
+        let (copy_on, tip) = state_of("copy.txt");
+        assert!(copy_on, "an original is listed: the item is clickable");
+        assert!(tip.unwrap_or_default().contains("master.txt"), "the tooltip names the original");
+        let (master_on, _) = state_of("master.txt");
+        assert!(!master_on, "the original itself has no original");
+        originals::set_test_lists(None);
+        eprintln!("wf-test orig: Show original insensitive/sensitive ok");
     }
 
     /// D-292 (22 Nov 2026): the Menu key and Shift+F10 open the same context menu a

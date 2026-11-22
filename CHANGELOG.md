@@ -4,7 +4,11 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
-## Unreleased
+## 0.9.32 — 22 November 2026
+
+### Added
+- **Show original** in a file's right-click menu. It is greyed out when no original is known; otherwise it opens a new window at the original's folder with the original selected.
+- Originals come from hand lists (config key `originals_lists`) and from byte-identical copies found by a background index (`duplicate_index_roots`, off until you list folders; `duplicate_index_skip` names folders and files it must never open). Of two identical files the older one counts as the original.
 
 ### Fixed
 - A video file cut out of the middle of an MPEG stream (a .mpg that starts part-way through a picture) no longer leaves the preview pane blank; it now says the video cannot be played.
