@@ -11,6 +11,7 @@ change between releases.
 - A failed paste says why in plain words (no permission, read-only drive, drive disconnected, disk full) with the folder, instead of the copy tool's raw text, an internal temporary file name and "os error" codes (D-405).
 - Clearing the search box after a search run with Enter shows the folder again; before, the results stayed until F5. A search that finishes after the box was cleared or the folder changed is dropped (D-402).
 - List, Details and Compact views now show a picture from the video for video files (mp4, avi, mov, webm, wmv, mkv, mpg, flv) when "Thumbnails in Details, List and Compact" is on, as Icons view already did; a video that cannot be read keeps its file icon. The frame is scaled to the tile or row size while decoding (less memory), and a file GStreamer cannot read gets its frame from ffmpeg when it is installed.
+- AVI videos whose picture format this computer cannot decode (for example UT Video) now play in the preview, by converting them, instead of leaving a blank pane.
 - Startup and every sidebar refresh no longer wait on slow drives: whether a pin, recent or drive row accepts drops is no longer checked on the window's thread (a slow cloud or USB mount held the window for about 40 seconds).
 
 - Browsing a big folder of pictures in Icons view (or Details view) no longer makes memory grow without limit: every file row or tile that scrolled past used to stay in memory with its thumbnail.

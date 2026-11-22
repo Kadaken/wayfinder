@@ -21975,6 +21975,71 @@ fn attach_preview_media(ui: &Ui, play_path: &str, original: &str, may_convert: b
             set_preview_video_frame(&ui_for_error, &path_for_error, "This video cannot be played in the pane.");
         }
     });
+    // D-401: a video track GStreamer has no decoder for (UT Video, Lagarith
+    // and the like in an AVI) is not an error: the stream prepares, even says
+    // it has video, and never draws a frame. A video file that says it has
+    // video and shows no picture takes the same ffmpeg conversion as one that
+    // fails outright; one with no video track stays audio.
+    if may_convert && native_core::is_video_path(original) {
+        guard_blank_video(ui, &media, original, generation);
+    }
+}
+
+/// How long a prepared video may stay without a picture before D-401 treats
+/// it as undecodable. A first frame of a playable video arrives within
+/// milliseconds of the stream preparing.
+const BLANK_VIDEO_WAIT_MS: u64 = 2500;
+
+/// D-401: how long a local video may stay unprepared, with no error, before
+/// it is converted. Some decoders (MS MPEG-4 v1 in AVI) leave the stream
+/// waiting for ever instead of failing.
+const UNPREPARED_VIDEO_WAIT_MS: u64 = 6000;
+
+/// D-401: converts the video with ffmpeg when its stream has a video track
+/// but never shows a picture (a track no decoder here can read). A file with
+/// no video track (audio-only AVI) is left to play as audio.
+fn guard_blank_video(ui: &Ui, media: &gtk::MediaFile, original: &str, generation: u64) {
+    let fired = Rc::new(std::cell::Cell::new(false));
+    let armed = Rc::new(std::cell::Cell::new(false));
+    let (ui_stuck, path_stuck, fired_stuck) = (ui.clone(), original.to_string(), fired.clone());
+    let (ui, path) = (ui.clone(), original.to_string());
+    let check = Rc::new(move |m: &gtk::MediaFile| {
+        if fired.get() || !m.is_prepared() || m.error().is_some() || ui.preview_generation.get() != generation {
+            return;
+        }
+        let fire = {
+            let (fired, ui, path) = (fired.clone(), ui.clone(), path.clone());
+            move |m: &gtk::MediaFile| {
+                if fired.get() || m.error().is_some() || ui.preview_generation.get() != generation || m.intrinsic_width() > 0 {
+                    return;
+                }
+                fired.set(true);
+                ui.preview_media_picture.set_paintable(None::<&gdk::Paintable>);
+                convert_and_play_video(&ui, &path);
+            }
+        };
+        // No video track at all is an audio-only file: it plays as audio.
+        if m.has_video() && m.intrinsic_width() == 0 && !armed.replace(true) {
+            let m = m.clone();
+            glib::timeout_add_local_once(Duration::from_millis(BLANK_VIDEO_WAIT_MS), move || fire(&m));
+        }
+    });
+    {
+        let (ui, path, fired, m) = (ui_stuck.clone(), path_stuck, fired_stuck, media.clone());
+        glib::timeout_add_local_once(Duration::from_millis(UNPREPARED_VIDEO_WAIT_MS), move || {
+            if fired.get() || m.is_prepared() || m.error().is_some() || ui.preview_generation.get() != generation {
+                return;
+            }
+            fired.set(true);
+            ui.preview_media_picture.set_paintable(None::<&gdk::Paintable>);
+            convert_and_play_video(&ui, &path);
+        });
+    }
+    let again = check.clone();
+    media.connect_prepared_notify(move |m| again(m));
+    let again = check.clone();
+    media.connect_has_video_notify(move |m| again(m));
+    check(media);
 }
 
 /// D-369: a video GStreamer cannot decode is converted by ffmpeg (off the main
@@ -27497,6 +27562,203 @@ Broken: Either state is wrong.\n";
         assert!(native_viewers::video_play_cached(Path::new(&path)).is_some(), "cache hit");
     }
 
+    /// D-401: opens `name` in the pane and waits up to `allowed` seconds for it
+    /// to play (or, for a `msg_` file, to say it cannot). Returns (passed, line).
+    fn d401_check_one(d: &D362, name: &str, allowed: u64) -> (bool, String) {
+        // A message left by the file before must not count for this one.
+        d.ui.preview.set_label("");
+        d.ui.viewers.frame_info.set_text("");
+        d362_show(d, name);
+        let start = Instant::now();
+        let mut verdict: Option<String> = None;
+        let mut last = String::from("no media stream appeared");
+        while start.elapsed() < Duration::from_secs(allowed) && verdict.is_none() {
+            pump();
+            let stack = d362_stack(d);
+            if name.starts_with("msg_") {
+                // Nothing here can play: the pane must say so, never stay blank.
+                let words = if stack == "frame" { d.ui.viewers.frame_info.text().to_string() } else { d.ui.preview.label().to_string() };
+                if (stack == "frame" || stack == "text") && words.contains("cannot be played") {
+                    verdict = Some(format!("PASS message on {stack}: {}", words.lines().next().unwrap_or("")));
+                } else {
+                    last = format!("no message yet (pane shows {stack}: {words})");
+                }
+                continue;
+            }
+            let Some(m) = d.ui.preview_media_controls.media_stream().and_then(|s| s.downcast::<gtk::MediaFile>().ok()) else {
+                last = format!("no media stream (pane shows {stack}, {})", d.ui.preview.label());
+                continue;
+            };
+            let converted = m.file().and_then(|f| f.path()).is_some_and(|p| p.to_string_lossy().contains("/video-play/"));
+            let via = if converted { "ffmpeg fallback" } else { "direct" };
+            if let Some(e) = m.error() {
+                last = format!("{via} stream error: {}", e.message());
+                continue;
+            }
+            if !m.is_prepared() {
+                last = format!("{via} stream not prepared (pane shows {stack})");
+                continue;
+            }
+            if !m.is_playing() && m.timestamp() == 0 {
+                m.play();
+            }
+            let picture = m.intrinsic_width() > 0 && m.intrinsic_height() > 0;
+            let audio_only = name.starts_with("audio_only");
+            if audio_only && (converted || m.has_video()) {
+                last = format!("audio-only file was treated as video (via {via}, has_video {})", m.has_video());
+                verdict = Some(format!("FAIL {last}"));
+                continue;
+            }
+            if stack == "media" && (picture || audio_only && m.has_audio()) && m.timestamp() > 0 {
+                verdict = Some(format!("PASS via {via}, timestamp {} us", m.timestamp()));
+            } else {
+                last = format!("{via} prepared but not playing (picture {picture}, has_video {}, has_audio {}, timestamp {}, pane shows {stack})", m.has_video(), m.has_audio(), m.timestamp());
+            }
+        }
+        match verdict {
+            Some(v) => (!v.starts_with("FAIL"), v),
+            None => (false, format!("FAIL after {allowed}s: {last}")),
+        }
+    }
+
+    /// D-401, optional: plays every AVI named in the file WF_TEST_REAL_AVI_LIST
+    /// (one path per line) in the pane, through symlinks in the scratch folder,
+    /// and prints only the counts. Skipped when the variable is unset.
+    fn real_avi_list_plays_d401() {
+        let Some(list) = std::env::var("WF_TEST_REAL_AVI_LIST").ok() else {
+            eprintln!("skipped: set WF_TEST_REAL_AVI_LIST to a file listing real .avi paths");
+            return;
+        };
+        gtk::init().expect("gtk init on the virtual display");
+        let paths: Vec<String> = std::fs::read_to_string(&list)
+            .expect("the list is readable")
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let d = d362_open("realavi", |dir| {
+            for (i, p) in paths.iter().enumerate() {
+                std::os::unix::fs::symlink(p, dir.join(format!("real_{i:02}.avi"))).expect("symlink");
+            }
+        }, paths.len());
+        let (mut direct, mut fallback, mut fail) = (0, 0, 0);
+        for i in 0..paths.len() {
+            let name = format!("real_{i:02}.avi");
+            let (ok, line) = d401_check_one(&d, &name, 120);
+            if !ok {
+                fail += 1;
+            } else if line.contains("ffmpeg fallback") {
+                fallback += 1;
+            } else {
+                direct += 1;
+            }
+            // Names and paths stay out of the log; only the verdict kind is kept.
+            eprintln!("avi-d401 real #{i}: {}", if ok { line.split(',').next().unwrap_or("PASS").to_string() } else { "FAIL".to_string() });
+            d.ui.preview_media_controls.media_stream().inspect(|s| s.pause());
+        }
+        eprintln!("avi-d401 real counts: {} files, PASS via direct {direct}, PASS via fallback {fallback}, FAIL {fail}", paths.len());
+        assert_eq!(fail, 0, "real AVIs that did not play: {fail}");
+    }
+
+    /// D-401: every common AVI codec plays in the preview pane, either through
+    /// GStreamer directly or through the D-369 ffmpeg copy. "Plays" means the
+    /// stream the controls hold is prepared with no error, has a real picture
+    /// (non-zero intrinsic size) and its timestamp advances after play.
+    fn avi_codecs_play_in_the_preview_d401() {
+        gtk::init().expect("gtk init on the virtual display");
+        // (file, ffmpeg arguments after the two lavfi inputs, seconds allowed)
+        let mut sets: Vec<(&str, Vec<&str>, u64)> = Vec::new();
+        let mut add = |name: &'static str, args: &[&'static str]| sets.push((name, args.to_vec(), 60));
+        add("xvid_mp3.avi", &["-c:v", "mpeg4", "-vtag", "XVID", "-c:a", "libmp3lame"]);
+        add("divx3_mp3.avi", &["-c:v", "msmpeg4", "-vtag", "DIV3", "-c:a", "libmp3lame"]);
+        add("mjpeg_pcm.avi", &["-c:v", "mjpeg", "-c:a", "pcm_s16le"]);
+        add("bgr24_pcm.avi", &["-c:v", "rawvideo", "-pix_fmt", "bgr24", "-c:a", "pcm_s16le"]);
+        add("h264_ac3.avi", &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "ac3"]);
+        add("mpeg2_mp3.avi", &["-c:v", "mpeg2video", "-c:a", "libmp3lame"]);
+        add("dv_pcm.avi", &["-c:v", "dvvideo", "-s", "720x576", "-pix_fmt", "yuv420p", "-r", "25", "-c:a", "pcm_s16le", "-ar", "48000"]);
+        add("cinepak.avi", &["-c:v", "cinepak", "-an"]);
+        add("xvid_ac3.avi", &["-c:v", "mpeg4", "-vtag", "XVID", "-c:a", "ac3"]);
+        add("xvid_bframes_mp3.avi", &["-c:v", "mpeg4", "-vtag", "XVID", "-bf", "2", "-c:a", "libmp3lame"]);
+        add("xvid_lib_vbr.avi", &["-c:v", "libxvid", "-vtag", "XVID", "-c:a", "libmp3lame", "-q:a", "4"]);
+        add("divx2_mp3.avi", &["-c:v", "msmpeg4v2", "-vtag", "MP42", "-c:a", "libmp3lame"]);
+        add("wmv1_wma.avi", &["-c:v", "wmv1", "-c:a", "wmav2"]);
+        add("wmv2_mp2.avi", &["-c:v", "wmv2", "-c:a", "mp2"]);
+        add("msvideo1_adpcm.avi", &["-c:v", "msvideo1", "-c:a", "adpcm_ms"]);
+        add("msrle.avi", &["-c:v", "msrle", "-pix_fmt", "pal8", "-an"]);
+        add("huffyuv_pcm.avi", &["-c:v", "huffyuv", "-c:a", "pcm_u8"]);
+        add("utvideo_pcm.avi", &["-c:v", "utvideo", "-c:a", "pcm_s24le"]);
+        add("ffv1_ima.avi", &["-c:v", "ffv1", "-c:a", "adpcm_ima_wav"]);
+        add("flv1_aac.avi", &["-c:v", "flv", "-c:a", "aac"]);
+        add("h263_pcm.avi", &["-c:v", "h263", "-s", "352x288", "-c:a", "pcm_s16le"]);
+        add("mpeg1_mp2.avi", &["-c:v", "mpeg1video", "-c:a", "mp2"]);
+        add("theora_vorbis.avi", &["-c:v", "libtheora", "-c:a", "libvorbis"]);
+        add("hevc_aac.avi", &["-c:v", "libx265", "-tag:v", "HEVC", "-pix_fmt", "yuv420p", "-c:a", "aac"]);
+        add("h264_high_aac.avi", &["-c:v", "libx264", "-profile:v", "high", "-bf", "2", "-pix_fmt", "yuv420p", "-c:a", "aac"]);
+        add("mjpeg422_mp3.avi", &["-c:v", "mjpeg", "-pix_fmt", "yuvj422p", "-c:a", "libmp3lame"]);
+        add("xvid_interlaced.avi", &["-c:v", "mpeg4", "-vtag", "XVID", "-flags", "+ildct+ilme", "-c:a", "libmp3lame"]);
+        add("xvid_odd_size.avi", &["-c:v", "mpeg4", "-vtag", "XVID", "-s", "322x242", "-c:a", "libmp3lame"]);
+        add("xvid_two_audio.avi", &["-map", "0:v", "-map", "1:a", "-map", "1:a", "-c:v", "mpeg4", "-vtag", "XVID", "-c:a", "libmp3lame"]);
+        add("xvid_dx50.avi", &["-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame"]);
+        add("xvid_fmp4.avi", &["-c:v", "mpeg4", "-vtag", "FMP4", "-c:a", "libmp3lame"]);
+        add("audio_only_mp3.avi", &["-vn", "-c:a", "libmp3lame"]);
+        add("audio_only_pcm.avi", &["-vn", "-c:a", "pcm_s16le"]);
+        let made = sets.len();
+        sets.push(("cut_index.avi", vec![], 60));
+        // Cut from other files below. The first is an MS MPEG-4 v2 stream
+        // relabelled MPG4 (nothing here encodes msmpeg4v1), so it is not a
+        // valid v1 file: GStreamer waits on it for ever, ffmpeg cannot decode
+        // it, and the pane must say so rather than stay blank.
+        sets.push(("msg_msmpeg4v1_mpg4_fake.avi", vec![], 60));
+        sets.push(("msg_unknown_fourcc.avi", vec![], 60));
+        sets.push(("msg_header_only.avi", vec![], 60));
+        sets.push(("opendml_big.avi", vec![], 240));
+        let d = d362_open("avi", |dir| {
+            for (name, args, _) in sets.iter().take(made) {
+                let mut a: Vec<&str> = vec!["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=2:s=320x240:r=25", "-f", "lavfi", "-i", "sine=d=2:f=440:r=44100"];
+                a.extend(args.iter().copied());
+                a.push(name);
+                assert!(d362_run("ffmpeg", &a, dir), "ffmpeg makes {name}");
+            }
+            // An AVI cut short has no index at the end.
+            let whole = std::fs::read(dir.join("xvid_mp3.avi")).unwrap();
+            std::fs::write(dir.join("cut_index.avi"), &whole[..whole.len() * 6 / 10]).unwrap();
+            let swap = |from: &str, find: &[u8], put: &[u8], to: &str| {
+                let mut bytes = std::fs::read(dir.join(from)).unwrap();
+                for w in 0..bytes.len().saturating_sub(4) {
+                    if &bytes[w..w + 4] == find && w < 4096 {
+                        bytes[w..w + 4].copy_from_slice(put);
+                    }
+                }
+                std::fs::write(dir.join(to), bytes).unwrap();
+            };
+            swap("divx2_mp3.avi", b"MP42", b"MPG4", "msg_msmpeg4v1_mpg4_fake.avi");
+            // A video stream with a codec nobody knows, and a header with no stream.
+            swap("xvid_fmp4.avi", b"FMP4", b"ZZZZ", "msg_unknown_fourcc.avi");
+            let whole = std::fs::read(dir.join("xvid_mp3.avi")).unwrap();
+            std::fs::write(dir.join("msg_header_only.avi"), &whole[..300]).unwrap();
+            // Over 1 GB, so ffmpeg writes OpenDML (RIFF AVIX) extension chunks.
+            assert!(
+                d362_run(
+                    "ffmpeg",
+                    &["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=190:s=320x240:r=25", "-c:v", "rawvideo", "-pix_fmt", "bgr24", "-an", "opendml_big.avi"],
+                    dir
+                ),
+                "ffmpeg makes the OpenDML .avi"
+            );
+        }, made + 5);
+        let mut failed: Vec<String> = Vec::new();
+        for (name, _, allowed) in sets.iter() {
+            let (ok, line) = d401_check_one(&d, name, *allowed);
+            eprintln!("avi-d401 {name}: {line}");
+            if !ok {
+                failed.push((*name).to_string());
+            }
+            // Move off the file so its stream and any conversion stop.
+            d.ui.preview_media_controls.media_stream().inspect(|s| s.pause());
+        }
+        assert!(failed.is_empty(), "AVIs that did not play: {failed:?}");
+    }
+
     /// D-362: new picture formats preview as pictures: tga, pnm, psd and dds,
     /// converted to a cached PNG when GTK cannot load them itself.
     fn new_image_formats_preview_as_pictures_d362() {
@@ -27743,6 +28005,12 @@ Broken: Either state is wrong.\n";
             selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
             suite_tail_after_d86();
             eprintln!("wf-test tail-only run done");
+            return;
+        }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("avi") {
+            avi_codecs_play_in_the_preview_d401();
+            real_avi_list_plays_d401();
+            eprintln!("wf-test avi-only run done");
             return;
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d362") {
