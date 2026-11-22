@@ -2212,7 +2212,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn the quick fixture");
-        let wait = chooser.wait_with_deadline(child);
+        // A generous deadline of its own: the quick child must be seen to exit,
+        // and a 200 ms limit lets a loaded machine turn that into a timeout.
+        let patient =
+            ProcessChooser::for_test(quick.path().to_path_buf(), Duration::from_secs(60), base.clone());
+        let wait = patient.wait_with_deadline(child);
         assert!(matches!(wait, ChildWait::Exited(_)), "got {wait:?}");
         assert_eq!(wait.exit_code(), Some(1), "a clean exit still reports its code");
         // No pick() ran, so no scratch root was ever created under `base`.
