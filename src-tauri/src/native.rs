@@ -2704,6 +2704,13 @@ struct AppState {
     /// D-400: pin and recent rows waiting for that answer, per path. One
     /// worker per path at a time, however many rebuilds happen meanwhile.
     drop_pending: HashMap<String, Vec<glib::WeakRef<gtk::ListBoxRow>>>,
+    /// D-402: the query whose recursive results are in `entries` now. While it
+    /// is set, `entries` is not the folder, so clearing or changing the search
+    /// box has to reload the folder, not filter the results.
+    search_results: Option<String>,
+    /// D-402: bumped by every search start, by clearing the box and by every
+    /// navigation; a search whose number is stale is dropped when it lands.
+    search_gen: u64,
     /// D-272: does this drive have subfolders? Answered on a worker and
     /// remembered, because asking costs a network round trip on an rclone or
     /// SMB mount and the sidebar is rebuilt constantly.
@@ -4868,6 +4875,8 @@ fn build_ui_in(
         tree_pending: HashSet::new(),
         drop_folders: HashSet::new(),
         drop_pending: HashMap::new(),
+        search_results: None,
+        search_gen: 0,
         typeahead: String::new(),
         typeahead_at: Instant::now(),
         pending_offer: None,
@@ -5978,7 +5987,25 @@ fn build_ui_in(
         let ui = ui.clone();
         let search = ui.search.clone();
         search.connect_search_changed(move |entry| {
-            state.borrow_mut().filter_text = entry.text().trim().to_string();
+            let text = entry.text().trim().to_string();
+            let leave_results = {
+                let mut state = state.borrow_mut();
+                state.filter_text = text.clone();
+                text.is_empty() && state.search_results.is_some()
+            };
+            // D-402: the list holds the results of a search run with Enter.
+            // Clearing the box goes back to the folder itself, as F5 did by
+            // hand; navigating also drops a search still running. Editing the
+            // text keeps filtering the results.
+            if leave_results {
+                let cwd = state.borrow().cwd.clone();
+                navigate_without_history(&state, cwd);
+                return;
+            }
+            if text.is_empty() {
+                let mut state = state.borrow_mut();
+                state.search_gen = state.search_gen.wrapping_add(1);
+            }
             repopulate_rows(&state, &ui);
             update_selection(&state, &ui);
         });
@@ -10359,6 +10386,10 @@ fn navigate_to_with_message(
         }
         state.listing_generation = state.listing_generation.wrapping_add(1);
         state.deferred_scan = None;
+        // D-402: the folder is being loaded, so search results are gone and a
+        // search still running must not land on top of the new listing.
+        state.search_results = None;
+        state.search_gen = state.search_gen.wrapping_add(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         state.listing_cancel = Some(cancelled.clone());
         (state.listing_generation, cancelled)
@@ -17408,6 +17439,11 @@ fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) 
     };
     let show_hidden = state.borrow().show_hidden;
     let search_in_files = state.borrow().search_in_files;
+    let generation = {
+        let mut state = state.borrow_mut();
+        state.search_gen = state.search_gen.wrapping_add(1);
+        state.search_gen
+    };
     ui.status
         .set_label(&format!("Searching {root} for \"{query}\""));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -17424,6 +17460,8 @@ fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) 
     });
 
     glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
+        // D-402: the box was cleared or the folder changed while this ran.
+        Ok(_) if state.borrow().search_gen != generation => glib::ControlFlow::Break,
         Ok(Ok(report)) => {
             let stopped = report.stopped.clone();
             {
@@ -17431,6 +17469,7 @@ fn recursive_search_action(state: Rc<RefCell<AppState>>, ui: Ui, query: String) 
                 state.entries = report.entries;
                 state.visible_entries.clear();
                 state.filter_text = query.clone();
+                state.search_results = Some(query.clone());
             }
             repopulate_rows(&state, &ui);
             update_selection(&state, &ui);
@@ -27436,6 +27475,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d400-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d402") {
+            clearing_search_brings_the_folder_back_d402();
+            eprintln!("wf-test d402-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d391") {
             video_preview_pipeline_waits_for_a_steady_selection_d391();
             eprintln!("wf-test d391-only run done");
@@ -27569,6 +27613,7 @@ Broken: Either state is wrong.\n";
         selecting_one_video_row_builds_the_preview_pipeline_only_once_d86();
         video_preview_pipeline_waits_for_a_steady_selection_d391();
         sidebar_drop_check_runs_off_the_gtk_thread_d400();
+        clearing_search_brings_the_folder_back_d402();
         suite_tail_after_d86();
         suite_glib_dirs_d373("suite end");
     }
@@ -36783,6 +36828,79 @@ Broken: Either state is wrong.\n";
             None => std::env::remove_var("HOME"),
         }
         eprintln!("wf-test d400 ok");
+    }
+
+    /// D-402: after a search run with Enter, the list holds results from
+    /// subfolders. Clearing the box must bring the folder itself back, not
+    /// leave the results (or an empty list) until F5. A search that lands
+    /// after the user cleared the box or changed folder is dropped.
+    fn clearing_search_brings_the_folder_back_d402() {
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d402-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let dir = root.join("home");
+        std::fs::create_dir_all(dir.join("sub/inner")).unwrap();
+        std::fs::write(dir.join("top-one.txt"), b"1").unwrap();
+        std::fs::write(dir.join("top-two.txt"), b"2").unwrap();
+        std::fs::write(dir.join("sub/deepmatch-a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("sub/inner/deepmatch-b.txt"), b"b").unwrap();
+        std::env::set_var("HOME", &dir);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d402test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        let names = || -> Vec<String> {
+            let mut v: Vec<String> = state.borrow().visible_entries.iter().map(|e| e.name.clone()).collect();
+            v.sort();
+            v
+        };
+        let folder = vec!["sub".to_string(), "top-one.txt".to_string(), "top-two.txt".to_string()];
+        wait_for("folder listed", || names() == folder);
+
+        // Enter: the box holds the query, the list holds the deep results.
+        ui.search.set_text("deepmatch");
+        wait_for("box filtered", || state.borrow().filter_text == "deepmatch");
+        recursive_search_action(state.clone(), ui.clone(), "deepmatch".to_string());
+        wait_for("search results", || names() == ["deepmatch-a.txt", "deepmatch-b.txt"]);
+
+        // Clearing the box shows the folder again, without F5.
+        ui.search.set_text("");
+        wait_for("D-402: folder back after clearing the search", || names() == folder);
+
+        // A search that lands after the box was cleared is dropped.
+        ui.search.set_text("deepmatch");
+        wait_for("box filtered again", || state.borrow().filter_text == "deepmatch");
+        recursive_search_action(state.clone(), ui.clone(), "deepmatch".to_string());
+        ui.search.set_text("");
+        let until = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < until {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(names(), folder, "D-402: a search landing after the clear must not replace the folder");
+
+        // A search that lands after the folder changed is dropped too.
+        recursive_search_action(state.clone(), ui.clone(), "deepmatch".to_string());
+        navigate_without_history(&state, native_core::Location::RealDir(dir.join("sub/inner")));
+        let until = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < until {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(names(), ["deepmatch-b.txt"], "D-402: a search landing after navigation must not replace the new folder");
+
+        ui.window.close();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        eprintln!("wf-test d402 ok");
     }
 
     /// D-391: the GTK media pipeline of a video preview is built only after the

@@ -7,6 +7,7 @@ change between releases.
 ## Unreleased
 
 ### Fixed
+- Clearing the search box after a search run with Enter shows the folder again; before, the results stayed until F5. A search that finishes after the box was cleared or the folder changed is dropped (D-402).
 - Startup and every sidebar refresh no longer wait on slow drives: whether a pin, recent or drive row accepts drops is no longer checked on the window's thread (a slow cloud or USB mount held the window for about 40 seconds).
 
 - Browsing a big folder of pictures in Icons view (or Details view) no longer makes memory grow without limit: every file row or tile that scrolled past used to stay in memory with its thumbnail.
