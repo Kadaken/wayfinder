@@ -5460,6 +5460,8 @@ fn build_ui_in(
     }
     count_his_scroll_input(&files_scroll);
     count_his_scroll_input(&grid_scroll);
+    scrollbar_trough_does_not_jump_d406(&files_scroll);
+    scrollbar_trough_does_not_jump_d406(&grid_scroll);
     watch_scroll_jumps(&files_scroll, "list");
     watch_scroll_jumps(&grid_scroll, "grid");
     let (column_header, columns) = details_header();
@@ -11815,6 +11817,44 @@ fn count_his_scroll_input(scroller: &gtk::ScrolledWindow) {
         glib::Propagation::Proceed
     });
     scroller.add_controller(input);
+}
+
+/// D-406: a press on the scrollbar's empty track moved the list by hundreds or
+/// thousands of px ("the list jumps right after I click a row"). The scrollbar
+/// floats over the right edge of the rows (overlay scrolling, 11 px wide when
+/// the pointer is near), so a click on a row's right-hand end lands on the
+/// track and GtkRange either warps the slider to that spot or pages by a
+/// whole view (scroll-jumps.log 22 Nov: 891 px in 31 ms with a 867 px view;
+/// the whole list in 0.4 s from a press at y=44). Reproduced in
+/// click_near_scrollbar_keeps_place_d406: 13549 -> 126. Only a press ON the
+/// slider (a drag of the scrollbar) is let through; a press on the empty
+/// track is claimed in the capture phase so GtkRange never sees it.
+fn scrollbar_trough_does_not_jump_d406(scroller: &gtk::ScrolledWindow) {
+    let bar = scroller.vscrollbar();
+    let adj = scroller.vadjustment();
+    let press = gtk::GestureClick::new();
+    press.set_button(0);
+    press.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let bar_weak = bar.downgrade();
+    press.connect_pressed(move |gesture, _, _, y| {
+        let Some(bar) = bar_weak.upgrade() else { return };
+        let track = bar.height() as f64;
+        let range = adj.upper() - adj.lower();
+        if track <= 0.0 || range <= adj.page_size() {
+            return;
+        }
+        // The slider's length and top, as GtkRange lays them out: the share of
+        // the content that is visible, never shorter than the CSS minimum
+        // (28 px + 2 px margin each side), placed by the offset.
+        let len = (track * adj.page_size() / range).max(32.0).min(track);
+        let top = (adj.value() - adj.lower()) / (range - adj.page_size()) * (track - len);
+        // A few px of slack so a press on the slider's rim still drags it.
+        if y >= top - 3.0 && y <= top + len + 3.0 {
+            return;
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    bar.add_controller(press);
 }
 
 /// D-393: true when the press landed on a list row, not on the scrollbar
@@ -27471,6 +27511,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d393-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d406") {
+            click_near_scrollbar_keeps_place_d406();
+            eprintln!("wf-test d406-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d400") {
             sidebar_drop_check_runs_off_the_gtk_thread_d400();
             eprintln!("wf-test d400-only run done");
@@ -33660,6 +33705,185 @@ Broken: Either state is wrong.\n";
             None => std::env::remove_var("HOME"),
         }
         assert!(problems.is_empty(), "D-393: a plain click moved the compact list: {problems:?}");
+    }
+
+    /// D-406 alone, on the private display, with real X input.
+    #[test]
+    fn click_near_scrollbar_keeps_place_d406_alone() { gtk_thread::run(click_near_scrollbar_keeps_place_d406_alone_on_gtk_thread); }
+
+    fn click_near_scrollbar_keeps_place_d406_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D406_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        click_near_scrollbar_keeps_place_d406();
+    }
+
+    /// D-406: "the list jumps by hundreds or thousands of pixels right after I
+    /// click a row" (scroll-jumps.log 22 Nov: no app cause, last input a click
+    /// with no motion, then 891 px in 31 ms, or the whole list in 0.4 s). His
+    /// view is Compact, a long folder of short and very long names, scrolled
+    /// to the middle. Real X presses with no motion: on a row near the top of
+    /// the view and mid view, at the row's middle and at the right-hand edge
+    /// where the overlay scrollbar is, and then no input at all for 8 s after
+    /// the wheel stopped. The offset may not move more than 2 px.
+    fn click_near_scrollbar_keeps_place_d406() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-406 sends real X input and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d406-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 1200usize;
+        for i in 0..total {
+            let name = if i % 5 == 0 {
+                format!("{i:04} {}.txt", "very long name that goes on and on ".repeat(5))
+            } else {
+                wrapped_fixture_name(i)
+            };
+            std::fs::File::create(dir.join(name)).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d406test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d406-proof"));
+        ui.window.set_default_size(1300, 700);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let settle_track = |adj: &gtk::Adjustment, ms: u64| -> (f64, f64) {
+            let (mut lo, mut hi) = (adj.value(), adj.value());
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end {
+                pump();
+                std::thread::sleep(Duration::from_millis(5));
+                lo = lo.min(adj.value());
+                hi = hi.max(adj.value());
+            }
+            (lo, hi)
+        };
+        let adj = ui.list_scroll.vadjustment();
+        wait_for("list scrollable", || adj.upper() > adj.page_size() * 3.0);
+        settle_track(&adj, 600);
+        let mut geo = String::new();
+        for _ in 0..50 {
+            if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d406-proof", "getwindowgeometry", "--shell"]).output() {
+                if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+        let (wx, wy) = (num("X="), num("Y="));
+        let _ = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d406-proof", "windowfocus"]).output();
+        settle_track(&adj, 200);
+        let sb = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
+        let vsb = ui.list_scroll.vscrollbar().compute_bounds(&ui.window);
+        eprintln!("wf-test D-406: view {:.0}x{:.0} at ({:.0},{:.0}), upper={:.0} page={:.0}, vscrollbar bounds {vsb:?}, overlay={}", sb.width(), sb.height(), sb.x(), sb.y(), adj.upper(), adj.page_size(), ui.list_scroll.is_overlay_scrolling());
+        let mut problems: Vec<String> = Vec::new();
+        let watching = Rc::new(Cell::new(false));
+        {
+            let watching = watching.clone();
+            adj.connect_value_changed(move |a| {
+                if watching.get() {
+                    eprintln!("wf-test D-406 MOVE to {:.1}; cause text: {}", a.value(), scroll_cause_text());
+                    for line in scroll_trace_lines(10) { eprintln!("wf-test D-406     {line}"); }
+                }
+            });
+        }
+        let base = (adj.upper() - adj.page_size()) / 2.0;
+        let mut presses = 0usize;
+        let right = (sb.x() + sb.width()) as f64;
+        let xs = [("row middle", sb.x() as f64 + sb.width() as f64 / 2.0), ("right edge -3", right - 3.0), ("right edge -8", right - 8.0), ("right edge -14", right - 14.0)];
+        let ys = [("near top", sb.y() as f64 + 44.0), ("mid view", sb.y() as f64 + sb.height() as f64 / 2.0)];
+        for (xwhat, cx) in xs {
+            for (ywhat, cy) in ys {
+                mark_scroll_cause("test: his own scroll");
+                adj.set_value(base);
+                settle_track(&adj, 400);
+                let before = adj.value();
+                xdo(&["mousemove", &(wx + cx as i32).to_string(), &(wy + cy as i32).to_string()]);
+                // The pointer rests first, as it does before a click: the overlay scrollbar reacts to it.
+                settle_track(&adj, 500);
+                watching.set(true);
+                xdo(&["click", "1"]);
+                let (lo, hi) = settle_track(&adj, 1000);
+                watching.set(false);
+                presses += 1;
+                let dev = (before - lo).abs().max((hi - before).abs());
+                eprintln!("wf-test D-406 press {xwhat} {ywhat}: window ({cx:.0},{cy:.0}) value {before:.1} (range {lo:.1}..{hi:.1}) deviation {dev:.1}");
+                if dev > 2.0 {
+                    problems.push(format!("press {xwhat} {ywhat}: the list moved {before:.1} -> range {lo:.1}..{hi:.1}"));
+                }
+            }
+        }
+        // The fix must leave the slider itself alone: grab it mid view and drag it down.
+        {
+            mark_scroll_cause("test: his own scroll");
+            adj.set_value(base);
+            settle_track(&adj, 400);
+            let (gx, gy) = (right as i32 - 5, sb.y() as i32 + (sb.height() / 2.0) as i32);
+            xdo(&["mousemove", &(wx + gx).to_string(), &(wy + gy).to_string()]);
+            settle_track(&adj, 400);
+            xdo(&["mousedown", "1"]);
+            for step in 1..=6 {
+                xdo(&["mousemove", &(wx + gx).to_string(), &(wy + gy + step * 8).to_string()]);
+                settle_track(&adj, 60);
+            }
+            xdo(&["mouseup", "1"]);
+            settle_track(&adj, 300);
+            let moved = adj.value() - base;
+            eprintln!("wf-test D-406 slider drag 48 px down: moved {moved:.0} px");
+            if moved < 1000.0 {
+                problems.push(format!("dragging the slider 48 px moved the list only {moved:.0} px"));
+            }
+        }
+        // No input at all after the wheel stops: the offset must not move.
+        mark_scroll_cause("test: his own scroll");
+        adj.set_value(base);
+        settle_track(&adj, 300);
+        xdo(&["mousemove", &(wx + sb.x() as i32 + sb.width() as i32 / 2).to_string(), &(wy + sb.y() as i32 + sb.height() as i32 / 2).to_string()]);
+        for _ in 0..3 {
+            xdo(&["click", "--repeat", "2", "--delay", "40", "5"]);
+            settle_track(&adj, 150);
+        }
+        settle_track(&adj, 2500);
+        let rest = adj.value();
+        watching.set(true);
+        let (lo, hi) = settle_track(&adj, 8000);
+        watching.set(false);
+        let dev = (rest - lo).abs().max((hi - rest).abs());
+        eprintln!("wf-test D-406 idle 8 s after the wheel: value {rest:.1} (range {lo:.1}..{hi:.1}) deviation {dev:.1}");
+        if dev > 2.0 {
+            problems.push(format!("idle 8 s after the wheel: the list moved {rest:.1} -> range {lo:.1}..{hi:.1}"));
+        }
+        eprintln!("wf-test D-406: {presses} presses sent, {} problems", problems.len());
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(problems.is_empty(), "D-406: the list moved with no input from him: {problems:?}");
     }
 
     /// D-358 fixture, shared with D-350: names of mixed length so some wrap to
