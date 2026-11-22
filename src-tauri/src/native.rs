@@ -27291,6 +27291,104 @@ Broken: Either state is wrong.\n";
         assert!(native_viewers::video_play_cached(Path::new(&path)).is_some(), "cache hit");
     }
 
+    /// D-401: opens `name` in the pane and waits up to `allowed` seconds for it
+    /// to play (or, for a `msg_` file, to say it cannot). Returns (passed, line).
+    fn d401_check_one(d: &D362, name: &str, allowed: u64) -> (bool, String) {
+        // A message left by the file before must not count for this one.
+        d.ui.preview.set_label("");
+        d.ui.viewers.frame_info.set_text("");
+        d362_show(d, name);
+        let start = Instant::now();
+        let mut verdict: Option<String> = None;
+        let mut last = String::from("no media stream appeared");
+        while start.elapsed() < Duration::from_secs(allowed) && verdict.is_none() {
+            pump();
+            let stack = d362_stack(d);
+            if name.starts_with("msg_") {
+                // Nothing here can play: the pane must say so, never stay blank.
+                let words = if stack == "frame" { d.ui.viewers.frame_info.text().to_string() } else { d.ui.preview.label().to_string() };
+                if (stack == "frame" || stack == "text") && words.contains("cannot be played") {
+                    verdict = Some(format!("PASS message on {stack}: {}", words.lines().next().unwrap_or("")));
+                } else {
+                    last = format!("no message yet (pane shows {stack}: {words})");
+                }
+                continue;
+            }
+            let Some(m) = d.ui.preview_media_controls.media_stream().and_then(|s| s.downcast::<gtk::MediaFile>().ok()) else {
+                last = format!("no media stream (pane shows {stack}, {})", d.ui.preview.label());
+                continue;
+            };
+            let converted = m.file().and_then(|f| f.path()).is_some_and(|p| p.to_string_lossy().contains("/video-play/"));
+            let via = if converted { "ffmpeg fallback" } else { "direct" };
+            if let Some(e) = m.error() {
+                last = format!("{via} stream error: {}", e.message());
+                continue;
+            }
+            if !m.is_prepared() {
+                last = format!("{via} stream not prepared (pane shows {stack})");
+                continue;
+            }
+            if !m.is_playing() && m.timestamp() == 0 {
+                m.play();
+            }
+            let picture = m.intrinsic_width() > 0 && m.intrinsic_height() > 0;
+            let audio_only = name.starts_with("audio_only");
+            if audio_only && (converted || m.has_video()) {
+                last = format!("audio-only file was treated as video (via {via}, has_video {})", m.has_video());
+                verdict = Some(format!("FAIL {last}"));
+                continue;
+            }
+            if stack == "media" && (picture || audio_only && m.has_audio()) && m.timestamp() > 0 {
+                verdict = Some(format!("PASS via {via}, timestamp {} us", m.timestamp()));
+            } else {
+                last = format!("{via} prepared but not playing (picture {picture}, has_video {}, has_audio {}, timestamp {}, pane shows {stack})", m.has_video(), m.has_audio(), m.timestamp());
+            }
+        }
+        match verdict {
+            Some(v) => (!v.starts_with("FAIL"), v),
+            None => (false, format!("FAIL after {allowed}s: {last}")),
+        }
+    }
+
+    /// D-401, optional: plays every AVI named in the file WF_TEST_REAL_AVI_LIST
+    /// (one path per line) in the pane, through symlinks in the scratch folder,
+    /// and prints only the counts. Skipped when the variable is unset.
+    fn real_avi_list_plays_d401() {
+        let Some(list) = std::env::var("WF_TEST_REAL_AVI_LIST").ok() else {
+            eprintln!("skipped: set WF_TEST_REAL_AVI_LIST to a file listing real .avi paths");
+            return;
+        };
+        gtk::init().expect("gtk init on the virtual display");
+        let paths: Vec<String> = std::fs::read_to_string(&list)
+            .expect("the list is readable")
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let d = d362_open("realavi", |dir| {
+            for (i, p) in paths.iter().enumerate() {
+                std::os::unix::fs::symlink(p, dir.join(format!("real_{i:02}.avi"))).expect("symlink");
+            }
+        }, paths.len());
+        let (mut direct, mut fallback, mut fail) = (0, 0, 0);
+        for i in 0..paths.len() {
+            let name = format!("real_{i:02}.avi");
+            let (ok, line) = d401_check_one(&d, &name, 120);
+            if !ok {
+                fail += 1;
+            } else if line.contains("ffmpeg fallback") {
+                fallback += 1;
+            } else {
+                direct += 1;
+            }
+            // Names and paths stay out of the log; only the verdict kind is kept.
+            eprintln!("avi-d401 real #{i}: {}", if ok { line.split(',').next().unwrap_or("PASS").to_string() } else { "FAIL".to_string() });
+            d.ui.preview_media_controls.media_stream().inspect(|s| s.pause());
+        }
+        eprintln!("avi-d401 real counts: {} files, PASS via direct {direct}, PASS via fallback {fallback}, FAIL {fail}", paths.len());
+        assert_eq!(fail, 0, "real AVIs that did not play: {fail}");
+    }
+
     /// D-401: every common AVI codec plays in the preview pane, either through
     /// GStreamer directly or through the D-369 ffmpeg copy. "Plays" means the
     /// stream the controls hold is prepared with no error, has a real picture
@@ -27379,62 +27477,11 @@ Broken: Either state is wrong.\n";
         }, made + 5);
         let mut failed: Vec<String> = Vec::new();
         for (name, _, allowed) in sets.iter() {
-            // A message left by the file before must not count for this one.
-            d.ui.preview.set_label("");
-            d.ui.viewers.frame_info.set_text("");
-            d362_show(&d, name);
-            let start = Instant::now();
-            let mut verdict: Option<String> = None;
-            let mut last = String::from("no media stream appeared");
-            while start.elapsed() < Duration::from_secs(*allowed) && verdict.is_none() {
-                pump();
-                let stack = d362_stack(&d);
-                if name.starts_with("msg_") {
-                    // Nothing here can play: the pane must say so, never stay blank.
-                    let words = if stack == "frame" { d.ui.viewers.frame_info.text().to_string() } else { d.ui.preview.label().to_string() };
-                    if (stack == "frame" || stack == "text") && words.contains("cannot be played") {
-                        verdict = Some(format!("PASS message on {stack}: {}", words.lines().next().unwrap_or("")));
-                    } else {
-                        last = format!("no message yet (pane shows {stack}: {words})");
-                    }
-                    continue;
-                }
-                let Some(m) = d.ui.preview_media_controls.media_stream().and_then(|s| s.downcast::<gtk::MediaFile>().ok()) else {
-                    last = format!("no media stream (pane shows {stack}, {})", d.ui.preview.label());
-                    continue;
-                };
-                let converted = m.file().and_then(|f| f.path()).is_some_and(|p| p.to_string_lossy().contains("/video-play/"));
-                let via = if converted { "ffmpeg fallback" } else { "direct" };
-                if let Some(e) = m.error() {
-                    last = format!("{via} stream error: {}", e.message());
-                    continue;
-                }
-                if !m.is_prepared() {
-                    last = format!("{via} stream not prepared (pane shows {stack})");
-                    continue;
-                }
-                if !m.is_playing() && m.timestamp() == 0 {
-                    m.play();
-                }
-                let picture = m.intrinsic_width() > 0 && m.intrinsic_height() > 0;
-                let audio_only = name.starts_with("audio_only");
-                if audio_only && (converted || m.has_video()) {
-                    last = format!("audio-only file was treated as video (via {via}, has_video {})", m.has_video());
-                    verdict = Some(format!("FAIL {last}"));
-                    failed.push((*name).to_string());
-                    continue;
-                }
-                if stack == "media" && (picture || audio_only && m.has_audio()) && m.timestamp() > 0 {
-                    verdict = Some(format!("PASS via {via}, timestamp {} us", m.timestamp()));
-                } else {
-                    last = format!("{via} prepared but not playing (picture {picture}, has_video {}, has_audio {}, timestamp {}, pane shows {stack})", m.has_video(), m.has_audio(), m.timestamp());
-                }
-            }
-            let line = verdict.unwrap_or_else(|| {
-                failed.push((*name).to_string());
-                format!("FAIL after {}s: {last}", allowed)
-            });
+            let (ok, line) = d401_check_one(&d, name, *allowed);
             eprintln!("avi-d401 {name}: {line}");
+            if !ok {
+                failed.push((*name).to_string());
+            }
             // Move off the file so its stream and any conversion stop.
             d.ui.preview_media_controls.media_stream().inspect(|s| s.pause());
         }
@@ -27670,6 +27717,7 @@ Broken: Either state is wrong.\n";
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("avi") {
             avi_codecs_play_in_the_preview_d401();
+            real_avi_list_plays_d401();
             eprintln!("wf-test avi-only run done");
             return;
         }
