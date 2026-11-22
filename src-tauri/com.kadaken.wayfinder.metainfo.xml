@@ -46,6 +46,17 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.30" date="2026-11-22">
+      <description>
+        <p>AVI files play in the preview, including old Windows codecs. Video
+        files show a picture in List, Details and Compact views. More picture
+        kinds open in the preview (HEIC grids, cut-off PNGs, compressed BMPs),
+        and broken files say why. Startup no longer waits on slow drives.
+        Clicking near the scrollbar no longer throws the list. Clearing a
+        search brings the folder back. Paste errors are in plain words.
+        Compressing files with unusual names is safe.</p>
+      </description>
+    </release>
     <release version="0.9.29" date="2026-11-21">
       <description>
         <p>The PS2 hard drive shows in the sidebar and opens. Plugged-in drives

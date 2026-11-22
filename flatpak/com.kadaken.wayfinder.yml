@@ -99,7 +99,7 @@ modules:
       - type: git
         url: https://github.com/Kadaken/wayfinder.git
         # Point this at the release you are packaging.
-        tag: v0.9.29
+        tag: v0.9.30
       # Regenerate whenever Cargo.lock changes:
       #   python3 flatpak-cargo-generator.py src-tauri/Cargo.lock \
       #     -o flatpak/cargo-sources.json

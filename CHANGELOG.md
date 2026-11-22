@@ -4,7 +4,7 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
-## Unreleased
+## 0.9.30 — 22 November 2026
 
 ### Fixed
 - Compress to zip no longer runs a command hidden in a file name such as `-TT=...`: names are now passed to zip as paths, never as options.
