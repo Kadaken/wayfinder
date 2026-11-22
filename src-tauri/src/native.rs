@@ -2905,7 +2905,7 @@ fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
         gtk::Button::with_label("Previous")
     } else {
         let b = gtk::Button::from_icon_name("go-previous-symbolic");
-        b.set_tooltip_text(Some("Previous page"));
+        icon_button_tip(&b, "Previous page");
         b
     };
     doc_prev.set_widget_name("wf-doc-prev");
@@ -2913,7 +2913,7 @@ fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
         gtk::Button::with_label("Next")
     } else {
         let b = gtk::Button::from_icon_name("go-next-symbolic");
-        b.set_tooltip_text(Some("Next page"));
+        icon_button_tip(&b, "Next page");
         b
     };
     doc_next.set_widget_name("wf-doc-next");
@@ -2930,7 +2930,7 @@ fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
     } else {
         let b = gtk::ToggleButton::new();
         b.set_icon_name("format-text-plaintext-symbolic");
-        b.set_tooltip_text(Some("Show source"));
+        icon_button_tip(&b, "Show source");
         b
     };
     doc_source_toggle.set_widget_name("wf-doc-source");
@@ -3014,7 +3014,7 @@ fn build_viewer_panes(live_generation: &Rc<Cell<u64>>) -> ViewerPanes {
             p.doc_source_scroll.set_visible(t.is_active());
             p.doc_picture.set_visible(!t.is_active());
             if !d380_old() {
-                t.set_tooltip_text(Some(if t.is_active() { "Show page" } else { "Show source" }));
+                icon_button_tip(t, if t.is_active() { "Show page" } else { "Show source" });
             }
         });
     }
@@ -4970,6 +4970,7 @@ fn build_ui_in(
         .tooltip_text("Type an address (Ctrl+L)")
         .valign(gtk::Align::Center)
         .build();
+    icon_button_label(&path_edit, "Type an address (Ctrl+L)");
     path_edit.set_widget_name("wf-path-edit");
     path_edit.add_css_class("flat");
     path_edit.add_css_class("wf-path-edit");
@@ -5105,7 +5106,7 @@ fn build_ui_in(
         .build();
     preview_audio_info.add_css_class("dim-label");
     let preview_audio_play = gtk::Button::from_icon_name("media-playback-start-symbolic");
-    preview_audio_play.set_tooltip_text(Some("Play"));
+    icon_button_tip(&preview_audio_play, "Play");
     preview_audio_play.add_css_class("circular");
     preview_audio_play.set_widget_name("wf-audio-play");
     let preview_audio_elapsed = gtk::Label::new(Some("0:00"));
@@ -5126,11 +5127,12 @@ fn build_ui_in(
     // D-330: mute and volume. They show the stream's real state, so a mute
     // the system mixer remembered is visible here instead of silent.
     let preview_audio_mute = gtk::Button::from_icon_name("audio-volume-high-symbolic");
-    preview_audio_mute.set_tooltip_text(Some("Mute"));
+    icon_button_tip(&preview_audio_mute, "Mute");
     preview_audio_mute.add_css_class("flat");
     preview_audio_mute.set_widget_name("wf-audio-mute");
     let preview_audio_volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     preview_audio_volume.set_draw_value(false);
+    icon_button_label(&preview_audio_volume, "Volume");
     preview_audio_volume.set_hexpand(true);
     preview_audio_volume.set_value(1.0);
     preview_audio_volume.set_tooltip_text(Some("Volume"));
@@ -5215,6 +5217,7 @@ fn build_ui_in(
         .tooltip_text("Show hidden files")
         .active(state.borrow().show_hidden)
         .build();
+    icon_button_label(&hidden, "Show hidden files");
     hidden.add_css_class("wf-icon-button");
     size_toolbar_button(&hidden);
     let new_folder = icon_button("folder-new-symbolic", "New folder");
@@ -5257,6 +5260,7 @@ fn build_ui_in(
         .tooltip_text("Details")
         .active(state.borrow().view_mode == ViewMode::Details)
         .build();
+    icon_button_label(&details_view, "Details");
     details_view.add_css_class("wf-icon-button");
     size_toolbar_button(&details_view);
     let compact_view = asset_toggle_button(
@@ -5273,6 +5277,7 @@ fn build_ui_in(
         .tooltip_text("Preview pane")
         .active(true)
         .build();
+    icon_button_label(&preview_toggle, "Preview pane");
     // Icon themes differ (Adwaita has the first, Breeze the others); with none of
     // them installed the button falls back to the ▭ glyph the README names.
     match preview_toggle_icon() {
@@ -5324,6 +5329,7 @@ fn build_ui_in(
         .tooltip_text("Show or hide the sidebar")
         .active(true)
         .build();
+    icon_button_label(&sidebar_toggle, "Show or hide the sidebar");
     sidebar_toggle.set_widget_name("wf-sidebar-toggle");
     match sidebar_toggle_icon() {
         Some(name) => sidebar_toggle.set_icon_name(name),
@@ -6314,11 +6320,28 @@ fn command_divider() -> gtk::Separator {
     sep
 }
 
+/// D-294: give an icon-only widget the accessible name a screen reader speaks.
+/// A tooltip alone is not exposed as a name, so every icon-only button calls this.
+fn icon_button_label(widget: &(impl IsA<gtk::Accessible> + IsA<glib::Object>), text: &str) {
+    widget.update_property(&[gtk::accessible::Property::Label(text)]);
+    // GTK has no public getter for an accessible name, so the name is also kept on
+    // the widget where the headless suite can read it back (D-294).
+    // SAFETY: the key is private to this function and the value is always a String.
+    unsafe { widget.set_data("wf-a11y-label", text.to_string()) };
+}
+
+/// Tooltip and accessible name together, for icon-only buttons whose hover text changes.
+fn icon_button_tip(widget: &(impl IsA<gtk::Widget> + IsA<gtk::Accessible> + IsA<glib::Object>), text: &str) {
+    widget.set_tooltip_text(Some(text));
+    icon_button_label(widget, text);
+}
+
 fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name(icon_name)
         .tooltip_text(tooltip)
         .build();
+    icon_button_label(&button, tooltip);
     button.add_css_class("wf-icon-button");
     size_toolbar_button(&button);
     button
@@ -6329,6 +6352,7 @@ fn asset_toggle_button(asset_name: &str, tooltip: &str, active: bool) -> gtk::To
         .tooltip_text(tooltip)
         .active(active)
         .build();
+    icon_button_label(&button, tooltip);
     button.add_css_class("wf-icon-button");
     size_toolbar_button(&button);
 
@@ -6600,6 +6624,7 @@ fn title_button(icon_name: &str, tooltip: &str) -> gtk::Button {
         .icon_name(icon_name)
         .tooltip_text(tooltip)
         .build();
+    icon_button_label(&button, tooltip);
     button.add_css_class("wf-title-button");
     button
 }
@@ -6674,7 +6699,7 @@ fn sidebar_arrow_d384(button: &gtk::ToggleButton) {
     let icon = gtk::Image::from_icon_name(if shown { "pan-start-symbolic" } else { "pan-end-symbolic" });
     icon.set_pixel_size(12);
     button.set_child(Some(&icon));
-    button.set_tooltip_text(Some(if shown { "Hide the sidebar" } else { "Show the sidebar" }));
+    icon_button_tip(button, if shown { "Hide the sidebar" } else { "Show the sidebar" });
 }
 
 /// Test-only gate: D-375 pin off, to show the old behaviour failing.
@@ -6991,6 +7016,7 @@ fn rebuild_tabs(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         .icon_name("list-add-symbolic")
         .tooltip_text("New tab")
         .build();
+    icon_button_label(&add, "New tab");
     add.add_css_class("wf-tab-add");
     let state_for_add = state.clone();
     let ui_for_add = ui.clone();
@@ -8517,7 +8543,7 @@ fn rebuild_quick_access(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         let reveal = gtk::Button::from_icon_name("folder-open-symbolic");
         reveal.add_css_class("flat");
         reveal.set_valign(gtk::Align::Center);
-        reveal.set_tooltip_text(Some("Show in folder"));
+        icon_button_tip(&reveal, "Show in folder");
         {
             let state = state.clone();
             let path = file.path.clone();
@@ -8552,7 +8578,7 @@ fn sidebar_expander(expanded: bool) -> gtk::Button {
     button.add_css_class("wf-sidebar-twisty");
     button.set_valign(gtk::Align::Center);
     button.set_can_focus(false);
-    button.set_tooltip_text(Some(if expanded { "Collapse" } else { "Expand" }));
+    icon_button_tip(&button, if expanded { "Collapse" } else { "Expand" });
     button
 }
 
@@ -19255,7 +19281,7 @@ fn show_item_context_menu(
         ];
         for (icon, tooltip, action) in tools {
             let button = gtk::Button::from_icon_name(icon);
-            button.set_tooltip_text(Some(tooltip));
+            icon_button_tip(&button, tooltip);
             button.add_css_class("flat");
             button.add_css_class("wf-menu-tool");
             let popover = popover.downgrade();
@@ -21005,7 +21031,7 @@ fn set_preview_audio(ui: &Ui, entry: &Entry, path: &str) {
     ui.preview_audio_scale.set_sensitive(true);
     ui.preview_audio_play
         .set_icon_name("media-playback-start-symbolic");
-    ui.preview_audio_play.set_tooltip_text(Some("Play"));
+    icon_button_tip(&ui.preview_audio_play, "Play");
     ui.preview_audio_elapsed.set_text("0:00");
     // The duration is not always known the instant the pipeline is paused, so
     // whatever it says now is shown and the tick corrects it.
@@ -21064,8 +21090,7 @@ fn start_preview_audio_tick(ui: &Ui) {
         };
         if ui.preview_audio_play.icon_name().as_deref() != Some(icon) {
             ui.preview_audio_play.set_icon_name(icon);
-            ui.preview_audio_play
-                .set_tooltip_text(Some(if playing { "Pause" } else { "Play" }));
+            icon_button_tip(&ui.preview_audio_play, if playing { "Pause" } else { "Play" });
         }
         if let Some(duration) = player.duration_secs() {
             let total = audio_preview::clock_text(duration);
@@ -21112,8 +21137,7 @@ fn connect_preview_audio_controls(ui: &Ui) {
             } else {
                 "media-playback-start-symbolic"
             });
-            ui.preview_audio_play
-                .set_tooltip_text(Some(if wants_play { "Pause" } else { "Play" }));
+            icon_button_tip(&ui.preview_audio_play, if wants_play { "Pause" } else { "Play" });
             if wants_play && ui.preview_audio_tick.borrow().is_none() {
                 start_preview_audio_tick(&ui);
             }
@@ -21182,7 +21206,7 @@ fn show_preview_volume(ui: &Ui, volume: f64, muted: bool) {
         "audio-volume-high-symbolic"
     };
     ui.preview_audio_mute.set_icon_name(icon);
-    ui.preview_audio_mute.set_tooltip_text(Some(if muted { "Unmute" } else { "Mute" }));
+    icon_button_tip(&ui.preview_audio_mute, if muted { "Unmute" } else { "Mute" });
 }
 
 fn set_preview_text(ui: &Ui, text: &str) {
@@ -28023,6 +28047,11 @@ Broken: Either state is wrong.\n";
             display.name()
         );
         // A quick run of the place-keeping tests alone, for iterating on them.
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("a11y") {
+            icon_buttons_have_accessible_names_d294();
+            eprintln!("wf-test a11y-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("place") {
             sidebar_button_not_divider_d352();
             split_wrapped_names_click_keeps_place_d358();
@@ -28239,6 +28268,7 @@ Broken: Either state is wrong.\n";
         clearing_search_brings_the_folder_back_d402();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
+        icon_buttons_have_accessible_names_d294();
         suite_tail_after_d86();
         suite_glib_dirs_d373("suite end");
     }
@@ -33034,6 +33064,77 @@ Broken: Either state is wrong.\n";
         }
         out.extend_from_slice(&data);
         out
+    }
+
+    /// D-294 (22 Nov 2026): every button that shows only an icon must carry an
+    /// accessible name, or a screen reader speaks the icon's file name.
+    fn icon_buttons_have_accessible_names_d294() {
+        install_app_css();
+        let d = d362_open("a11y294", |dir| std::fs::write(dir.join("a.txt"), "x").unwrap(), 1);
+        fn has_text(w: &gtk::Widget) -> bool {
+            let mut c = w.first_child();
+            while let Some(child) = c {
+                if let Some(l) = child.downcast_ref::<gtk::Label>() {
+                    if !l.text().is_empty() {
+                        return true;
+                    }
+                }
+                if has_text(&child) {
+                    return true;
+                }
+                c = child.next_sibling();
+            }
+            false
+        }
+        fn has_icon(w: &gtk::Widget) -> bool {
+            let mut c = w.first_child();
+            while let Some(child) = c {
+                if child.is::<gtk::Image>() || child.is::<gtk::Picture>() || has_icon(&child) {
+                    return true;
+                }
+                c = child.next_sibling();
+            }
+            false
+        }
+        fn name_of(w: &gtk::Widget) -> Option<String> {
+            // SAFETY: only icon_button_label writes this key, always with a String.
+            unsafe { w.data::<String>("wf-a11y-label").map(|p| p.as_ref().clone()) }
+        }
+        fn walk(w: &gtk::Widget, seen: &mut usize, bad: &mut Vec<String>) {
+            // GTK's own media controls name their buttons themselves.
+            if w.is::<gtk::MediaControls>() {
+                return;
+            }
+            let icon_only = if let Some(b) = w.downcast_ref::<gtk::Button>() {
+                b.label().map_or(true, |l| l.is_empty()) && !has_text(w) && (b.icon_name().is_some() || has_icon(w))
+            } else if let Some(m) = w.downcast_ref::<gtk::MenuButton>() {
+                m.label().map_or(true, |l| l.is_empty()) && !has_text(w) && (m.icon_name().is_some() || has_icon(w))
+            } else {
+                false
+            };
+            if icon_only {
+                *seen += 1;
+                if name_of(w).map_or(true, |n| n.trim().is_empty()) {
+                    let mut path = String::new();
+                    let mut up = w.parent();
+                    while let Some(p) = up {
+                        path.push_str(&format!("<{}", p.type_().name()));
+                        up = p.parent();
+                    }
+                    bad.push(format!("{} \"{}\" tooltip={:?} in {path}", w.type_().name(), w.widget_name(), w.tooltip_text()));
+                }
+            }
+            let mut c = w.first_child();
+            while let Some(child) = c {
+                walk(&child, seen, bad);
+                c = child.next_sibling();
+            }
+        }
+        let (mut seen, mut bad) = (0usize, Vec::new());
+        walk(d.ui.window.upcast_ref(), &mut seen, &mut bad);
+        eprintln!("wf-test d294: {seen} icon-only buttons walked, {} without a name", bad.len());
+        assert!(seen >= 10, "the walk reaches the toolbar and title buttons (saw {seen})");
+        assert!(bad.is_empty(), "icon-only buttons without an accessible name: {bad:?}");
     }
 
     /// D-404 (22 Nov 2026): files from the owner's "Broken - to repair" drive that

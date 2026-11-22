@@ -388,7 +388,8 @@ measures 5.26:1 on the same background, clears all five. The pane hairline
 a boundary that carries meaning, and this one is draggable.
 
 ## D-294 — nothing sets an accessible name
-Status: Open (found by S12 at 0.9.28, 16 Nov 2026)
+Status: FIXED 22 Nov 2026 -- TESTED. `icon_buttons_have_accessible_names_d294` (GTK suite, mode a11y) walks the built window: 33 icon-only buttons, 0 unnamed; 33 unnamed with the helper disabled. Names go through `icon_button_label` / `icon_button_tip`. Not covered: GTK's own media-control buttons, popover contents not yet built, and GTK has no public name getter so the test reads a copy kept on the widget.
+Was: Open (found by S12 at 0.9.28, 16 Nov 2026)
 
 No call to `update_property`, `AccessibleProperty` or `set_accessible` exists
 in the binary -- zero, searched by name -- while 12 buttons are icon-only.

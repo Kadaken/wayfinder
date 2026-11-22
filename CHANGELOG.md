@@ -7,6 +7,7 @@ change between releases.
 ## Unreleased
 
 ### Fixed
+- Every icon-only button (toolbar, title bar, tabs, audio player, sidebar arrows, menu tools) now has a name a screen reader can speak.
 - Secondary text (sidebar headings, empty-folder text, menu shortcut labels) is lighter and now meets the 4.5:1 contrast minimum.
 
 ## 0.9.30 — 22 November 2026
