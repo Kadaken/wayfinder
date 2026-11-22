@@ -9,6 +9,7 @@ change between releases.
 ### Fixed
 - Startup and every sidebar refresh no longer wait on slow drives: whether a pin, recent or drive row accepts drops is no longer checked on the window's thread (a slow cloud or USB mount held the window for about 40 seconds).
 
+- Browsing a big folder of pictures in Icons view (or Details view) no longer makes memory grow without limit: every file row or tile that scrolled past used to stay in memory with its thumbnail.
 - Phone videos named `.3gpp`, `.3gpp2` or `.3gp2` are treated as video again, so they get a player and a thumbnail.
 - A copy that fails on thousands of files (for example a drive unplugged mid-copy) no longer freezes the window: the error shows its first lines and says how many more there were.
 - Document previews no longer fill the disk: the converted-PDF and drawn-page caches each keep at most 512 MB and drop the oldest first.
