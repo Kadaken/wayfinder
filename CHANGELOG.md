@@ -4,6 +4,12 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## Unreleased
+
+### Fixed
+
+- Uninstalling gives folders back to the app that opened them before Wayfinder, instead of leaving a default that points at nothing.
+
 ## 0.9.29 — 21 November 2026
 
 ### Fixed

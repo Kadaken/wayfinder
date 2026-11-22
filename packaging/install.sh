@@ -107,6 +107,11 @@ portals_conf="$conf_home/xdg-desktop-portal/portals.conf"
 # file is the switch, and it is written only when the user asks for it.
 qt_env_conf="$conf_home/environment.d/95-wayfinder-qt.conf"
 qt_env_marker="# written by the Wayfinder installer (--kde-apps)"
+# The folder app that was the default before Wayfinder took it, so --uninstall
+# can hand folders back instead of leaving a default that no longer exists.
+prev_folder_app="${XDG_DATA_HOME:-$HOME/.local/share}/wayfinder/previous-folder-app"
+wf_desktop=com.kadaken.wayfinder.desktop
+mimeapps="$conf_home/mimeapps.list"
 
 icon_sizes="32x32:32x32.png 64x64:64x64.png 128x128:128x128.png 256x256:128x128@2x.png 512x512:icon.png"
 
@@ -190,6 +195,52 @@ remove_qt_env() {
   say "  removed $qt_env_conf -- KDE apps get their own dialog back at next login"
 }
 
+# Install: remember the folder app Wayfinder replaces, then take folders.
+# A reinstall never overwrites the record with Wayfinder itself.
+take_folder_app() {
+  command -v xdg-mime >/dev/null 2>&1 || return 0
+  [ "$dry" != 1 ] || return 0
+  local cur=""
+  # Only the user's own choice is recorded, read from their mimeapps.list, so
+  # uninstall restores exactly that file and never writes a system default in.
+  [ -f "$mimeapps" ] && cur="$(awk '
+    /^\[/ { indef = ($0 == "[Default Applications]") ; next }
+    indef && index($0, "inode/directory=") == 1 { print substr($0, 17); exit }
+  ' "$mimeapps")"
+  cur="${cur%;}"
+  if [ -n "$cur" ] && [ "$cur" != "$wf_desktop" ]; then
+    mkdir -p "$(dirname "$prev_folder_app")"
+    printf '%s\n' "$cur" > "$prev_folder_app"
+  fi
+  xdg-mime default "$wf_desktop" inode/directory >/dev/null 2>&1 || true
+}
+
+# Uninstall: give folders back to the app recorded at install, or drop the
+# Wayfinder default so the desktop's own default applies again. Left alone if
+# the user already chose another app.
+give_back_folder_app() {
+  local prev=""
+  # Read the file itself: `xdg-mime query` skips an entry whose desktop file is
+  # gone, and the uninstall has just removed Wayfinder's.
+  if [ -f "$mimeapps" ] && grep -q "^inode/directory=$wf_desktop;\?\$" "$mimeapps"; then
+    [ -f "$prev_folder_app" ] && prev="$(head -n1 "$prev_folder_app")"
+    if [ -n "$prev" ] && [ "$prev" != "$wf_desktop" ] && command -v xdg-mime >/dev/null 2>&1; then
+      say "  giving folders back to $prev"
+      run xdg-mime default "$prev" inode/directory
+    elif [ -f "$mimeapps" ] && grep -q "^inode/directory=$wf_desktop;\?\$" "$mimeapps"; then
+      say "  dropping the Wayfinder folder default from $mimeapps"
+      if [ "$dry" = 1 ]; then
+        printf '  would: edit %s\n' "$mimeapps"
+      else
+        { grep -v "^inode/directory=$wf_desktop;\?\$" "$mimeapps" || true; } > "$mimeapps.new"
+        mv "$mimeapps.new" "$mimeapps"
+      fi
+    fi
+  fi
+  [ -f "$prev_folder_app" ] && run rm -f "$prev_folder_app"
+  return 0
+}
+
 # ---------------------------------------------------------------- uninstall
 if [ "$uninstall" = 1 ]; then
   say "Removing Wayfinder from $prefix"
@@ -213,6 +264,7 @@ if [ "$uninstall" = 1 ]; then
   fi
 
   remove_qt_env
+  [ -n "$destdir" ] || give_back_folder_app
   refresh_caches
   restart_portal
   say "Done. Your own settings in ~/.config/wayfinder were left alone."
@@ -334,9 +386,7 @@ fi
 refresh_caches
 
 if [ -z "$destdir" ]; then
-  if command -v xdg-mime >/dev/null 2>&1 && [ "$dry" != 1 ]; then
-    xdg-mime default com.kadaken.wayfinder.desktop inode/directory >/dev/null 2>&1 || true
-  fi
+  take_folder_app
   restart_portal
 fi
 
