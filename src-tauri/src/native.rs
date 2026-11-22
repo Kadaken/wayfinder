@@ -10774,6 +10774,9 @@ thread_local! {
     /// D-349: counts every deliberate scroll, so the place guard can step
     /// aside the moment Wayfinder moves the list on purpose.
     static SCROLL_GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// D-393: the last input over the list: its kind, when, and for a click
+    /// where (row index, y in the viewport, viewport height). Only read by the jump log.
+    static LAST_INPUT: RefCell<(&'static str, Option<Instant>, Option<(u32, i32, i32)>)> = const { RefCell::new(("", None, None)) };
 }
 
 /// D-370: tallest edge zone, in px, at the top and at the bottom of the view.
@@ -11659,16 +11662,87 @@ fn count_his_scroll_input(scroller: &gtk::ScrolledWindow) {
     // takes the place guard off at once. A plain listener, never claims anything.
     let input = gtk::EventControllerLegacy::new();
     input.set_propagation_phase(gtk::PropagationPhase::Capture);
-    input.connect_event(|_, event| {
+    let weak = scroller.downgrade();
+    input.connect_event(move |_, event| {
         if matches!(
             event.event_type(),
             gdk::EventType::Scroll | gdk::EventType::ButtonPress | gdk::EventType::KeyPress | gdk::EventType::TouchBegin
         ) {
             note_scroll_input();
+            // D-393: a plain press on a row must never move the list. GTK
+            // re-lays the rows out around the pressed one and can move the
+            // offset by the part of the row that was cut (gtk_adjustment_configure
+            // from gtk_widget_allocate). The press itself counted as his input
+            // just above, which took every hold off, so nothing put the offset
+            // back. Hold it from here: started after the count, it ends at his
+            // NEXT wheel, key or press.
+            if event.event_type() == gdk::EventType::ButtonPress
+                && event.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == 1)
+            {
+                if let Some(scroller) = weak.upgrade() {
+                    if press_is_on_row_d393(&scroller, event) {
+                        let offset = scroller.vadjustment().value();
+                        reapply_scroll(&scroller, offset);
+                    }
+                }
+            }
+        }
+        // D-393: remember the last input, for the jump log. Kind and place
+        // only, never a name or a path.
+        let kind = match event.event_type() {
+            gdk::EventType::Scroll => Some("wheel"),
+            gdk::EventType::ButtonPress | gdk::EventType::TouchBegin => Some("click"),
+            gdk::EventType::KeyPress => Some("key"),
+            gdk::EventType::DragEnter | gdk::EventType::DragMotion => Some("drag"),
+            _ => None,
+        };
+        if let (Some(kind), Some(scroller)) = (kind, weak.upgrade()) {
+            let place = if kind == "click" { click_place_d393(&scroller, event) } else { None };
+            LAST_INPUT.with(|l| *l.borrow_mut() = (kind, Some(Instant::now()), place));
         }
         glib::Propagation::Proceed
     });
     scroller.add_controller(input);
+}
+
+/// D-393: true when the press landed on a list row, not on the scrollbar
+/// (a scrollbar drag is his own scrolling and must not be held).
+fn press_is_on_row_d393(scroller: &gtk::ScrolledWindow, event: &gdk::Event) -> bool {
+    let Some((sx, sy)) = event.position() else { return false };
+    let Some(native) = scroller.native() else { return false };
+    let (tx, ty) = native.surface_transform();
+    let Some(point) = native.compute_point(scroller, &gtk::graphene::Point::new((sx - tx) as f32, (sy - ty) as f32)) else { return false };
+    let mut w = scroller.pick(point.x() as f64, point.y() as f64, gtk::PickFlags::DEFAULT);
+    while let Some(cur) = w {
+        if cur.type_().name() == "GtkListItemWidget" {
+            return true;
+        }
+        if &cur == scroller.upcast_ref::<gtk::Widget>() {
+            return false;
+        }
+        w = cur.parent();
+    }
+    false
+}
+
+/// D-393: where a press landed, as (row index, y in the viewport, viewport
+/// height). Rows are one height, so the index is the offset plus y over the
+/// mean row height.
+fn click_place_d393(scroller: &gtk::ScrolledWindow, event: &gdk::Event) -> Option<(u32, i32, i32)> {
+    let (sx, sy) = event.position()?;
+    let native = scroller.native()?;
+    let (tx, ty) = native.surface_transform();
+    let point = native.compute_point(scroller, &gtk::graphene::Point::new((sx - tx) as f32, (sy - ty) as f32))?;
+    let adj = scroller.vadjustment();
+    let items = scroller.child().and_then(|c| {
+        c.dynamic_cast_ref::<gtk::ListView>()
+            .and_then(|v| v.model())
+            .or_else(|| c.dynamic_cast_ref::<gtk::GridView>().and_then(|v| v.model()))
+    })
+    .map(|m| m.n_items())
+    .filter(|n| *n > 0)?;
+    let row = (adj.value() + point.y() as f64) / (adj.upper() / items as f64);
+    Some((row.max(0.0) as u32, point.y() as i32, scroller.height()))
 }
 
 /// D-345: the jump log only; it moves nothing.
@@ -11680,7 +11754,10 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
         if (to - from).abs() <= 200.0 {
             return;
         }
-        let cause = scroll_cause_text();
+        let mut cause = scroll_cause_text();
+        if cause.starts_with("no app cause") {
+            cause.push_str(&last_input_text());
+        }
         let dir = wayfinder_cache_dir();
         let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%F %T").ok()).map(|s| s.to_string()).unwrap_or_default();
         let mut entry = format!("{when} {view} {from:.0} -> {to:.0} max={:.0} cause: {cause}\n", adj.upper() - adj.page_size());
@@ -11693,6 +11770,23 @@ fn watch_scroll_jumps(scroller: &gtk::ScrolledWindow, view: &'static str) {
         }
         let _ = native_core::append_capped_log(&dir.join("scroll-jumps.log"), &entry, DIAGNOSTIC_LOG_CAP);
     });
+}
+
+/// D-393: what the last input was, for a jump no Wayfinder code claims.
+fn last_input_text() -> String {
+    LAST_INPUT.with(|l| {
+        let (kind, at, place) = *l.borrow();
+        match at {
+            None => "; last input: none seen".to_string(),
+            Some(at) => {
+                let ms = at.elapsed().as_millis();
+                match place {
+                    Some((row, y, height)) => format!("; last input: {kind} {ms}ms before, row {row}, y={y} of {height}"),
+                    None => format!("; last input: {kind} {ms}ms before"),
+                }
+            }
+        }
+    })
 }
 
 /// The last Wayfinder move of the list in the past two seconds, or "no app cause".
@@ -27236,6 +27330,7 @@ Broken: Either state is wrong.\n";
             pin_keeps_item_on_top_d359();
             split_wrapped_names_click_keeps_place_d358();
             pointer_click_keeps_scroll_d364();
+            compact_lower_click_keeps_place_d393();
             delete_keeps_view_d371();
             edge_scroll_while_dragging_d370();
             refresh_keeps_scroll_place_d349();
@@ -27252,6 +27347,11 @@ Broken: Either state is wrong.\n";
             video_poster_queue_caps_concurrency_and_drains_on_cancel_d85();
             video_poster_paints_a_real_frame_and_corrupt_file_falls_back_d85();
             eprintln!("wf-test d85-only run done");
+            return;
+        }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d393") {
+            compact_lower_click_keeps_place_d393();
+            eprintln!("wf-test d393-only run done");
             return;
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d391") {
@@ -33130,6 +33230,180 @@ Broken: Either state is wrong.\n";
             None => std::env::remove_var("HOME"),
         }
         assert!(problems.is_empty(), "D-370: {problems:?}");
+    }
+
+    /// D-393 alone, on the private display, with real X input.
+    #[test]
+    fn compact_lower_click_keeps_place_d393_alone() { gtk_thread::run(compact_lower_click_keeps_place_d393_alone_on_gtk_thread); }
+
+    fn compact_lower_click_keeps_place_d393_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D393_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        compact_lower_click_keeps_place_d393();
+    }
+
+    /// D-393: "i click on the lower part and the files move up again". His view
+    /// is Compact (one-line rows), a long folder, the list scrolled to the
+    /// middle. Real X clicks (single, then a double) on the last whole row, on a
+    /// partly shown last row and on rows in the lower part of the view, in a
+    /// single pane and in split view. A plain click must not move the list
+    /// at all, at any moment in the next 1.2 s (the old code moved it by rows).
+    fn compact_lower_click_keeps_place_d393() {
+        let display_name = std::env::var("DISPLAY").unwrap_or_default();
+        assert!(display_name.starts_with(':') && !std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty()), "D-393 sends real X input and must run only in run232's private Xvfb (DISPLAY={display_name:?})");
+        let old_home = std::env::var("HOME").ok();
+        let root = crate::native_core::scratch_root().join(format!("wf-d393-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("dir"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 700usize;
+        for i in 0..total {
+            let file = std::fs::File::create(dir.join(wrapped_fixture_name(i))).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000 + i as u64 * 3600)).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d393test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_title(Some("wf-d393-proof"));
+        ui.window.set_default_size(1300, 900);
+        ui.window.present();
+        wait_for("listing", || state.borrow().visible_entries.len() == total);
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        let xdo = |args: &[&str]| -> String {
+            let out = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(args).output().expect("xdotool");
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // Runs the loop for `ms` and returns the lowest and highest offset seen.
+        let settle_track = |adj: &gtk::Adjustment, ms: u64| -> (f64, f64) {
+            let (mut lo, mut hi) = (adj.value(), adj.value());
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end {
+                pump();
+                std::thread::sleep(Duration::from_millis(5));
+                lo = lo.min(adj.value());
+                hi = hi.max(adj.value());
+            }
+            (lo, hi)
+        };
+        let mut problems: Vec<String> = Vec::new();
+        let mut clicks = 0usize;
+        for label in ["single", "split"] {
+            if label == "split" {
+                open_narrow_split(&state, &ui, total);
+            }
+            let adj = ui.list_scroll.vadjustment();
+            wait_for("list scrollable", || adj.upper() > adj.page_size() * 3.0);
+            settle_track(&adj, 600);
+            eprintln!("wf-test D-393 {label}: pane {}x{}, upper={:.0} page={:.0}", ui.list_scroll.width(), ui.list_scroll.height(), adj.upper(), adj.page_size());
+            let mut geo = String::new();
+            for _ in 0..50 {
+                if let Ok(out) = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d393-proof", "getwindowgeometry", "--shell"]).output() {
+                    if out.status.success() { geo = String::from_utf8_lossy(&out.stdout).into_owned(); break; }
+                }
+                pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let num = |key: &str| -> i32 { geo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).expect(key) };
+            let (wx, wy) = (num("X="), num("Y="));
+            let _ = std::process::Command::new("/usr/bin/xdotool").env("DISPLAY", &display_name).args(["search", "--name", "wf-d393-proof", "windowfocus"]).output();
+            settle_track(&adj, 200);
+            let rows = |ui: &Ui| -> Vec<(gtk::Widget, gtk::graphene::Rect)> {
+                let mut v: Vec<(gtk::Widget, gtk::graphene::Rect)> = all_widgets(ui.list.upcast_ref()).into_iter()
+                    .filter(|w| w.has_css_class("wf-file-row") && w.is_mapped())
+                    .filter_map(|w| w.compute_bounds(&ui.window).map(|b| (w, b)))
+                    .collect();
+                v.sort_by(|a, b| a.1.y().partial_cmp(&b.1.y()).unwrap());
+                v
+            };
+            // Names the caller of any move that happens while a click is being watched.
+            let watching = Rc::new(Cell::new(false));
+            {
+                let watching = watching.clone();
+                adj.connect_value_changed(move |a| {
+                    if watching.get() {
+                        eprintln!("wf-test D-393 MOVE to {:.1}; cause text: {}", a.value(), scroll_cause_text());
+                        for line in scroll_trace_lines(16) { eprintln!("wf-test D-393     {line}"); }
+                    }
+                });
+            }
+            let mut heights: Vec<i32> = rows(&ui).iter().map(|(w, _)| w.height()).collect();
+            heights.sort();
+            heights.dedup();
+            eprintln!("wf-test D-393 {label}: distinct compact row heights={heights:?}");
+            let base = (adj.upper() - adj.page_size()) / 2.0;
+            for step in 0..4 {
+                let offset = base + step as f64 * 5.0;
+                // Candidate rows for this offset, read once.
+                mark_scroll_cause("test: his own scroll");
+                adj.set_value(offset);
+                settle_track(&adj, 400);
+                let sb = ui.list_scroll.compute_bounds(&ui.window).expect("scroller bounds");
+                let (top, bottom) = (sb.y(), sb.y() + sb.height());
+                let all = rows(&ui);
+                let last_whole = all.iter().rev().find(|(_, b)| b.y() + b.height() <= bottom + 0.5).cloned();
+                let cut = all.iter().find(|(_, b)| b.y() < bottom - 6.0 && b.y() + b.height() > bottom + 1.0).cloned();
+                let at = |frac: f32| all.iter().find(|(_, b)| b.y() + b.height() / 2.0 >= top + sb.height() * frac).cloned();
+                let picks = [("last whole row", last_whole), ("partly shown last row", cut), ("row at 70%", at(0.7)), ("row at 90%", at(0.9)), ("row at 80%", at(0.8))];
+                for (what, pick) in picks {
+                    let Some((_, b)) = pick else { continue };
+                    // Click the part of the row that is inside the view.
+                    let vis_top = b.y().max(top);
+                    let vis_bottom = (b.y() + b.height()).min(bottom);
+                    let (cx, cy) = (b.x() as f64 + b.width() as f64 / 2.0, ((vis_top + vis_bottom) / 2.0) as f64);
+                    let (px, py) = (wx + cx as i32, wy + cy as i32);
+                    {
+                        let mut chain = Vec::new();
+                        let mut w = ui.window.pick(cx, cy, gtk::PickFlags::DEFAULT);
+                        while let Some(x) = w { chain.push(x.type_().name().to_string()); if chain.len() >= 6 { break; } w = x.parent(); }
+                        eprintln!("wf-test D-393 {label} {what}: click at window ({cx:.0},{cy:.0}) hits {chain:?}");
+                    }
+                    for double in [false, true] {
+                        mark_scroll_cause("test: his own scroll");
+                        adj.set_value(offset);
+                        settle_track(&adj, 300);
+                        let before = adj.value();
+                        xdo(&["mousemove", &px.to_string(), &py.to_string()]);
+                        settle_track(&adj, 100);
+                        watching.set(true);
+                        if double { xdo(&["click", "--repeat", "2", "--delay", "60", "1"]); } else { xdo(&["click", "1"]); }
+                        let (lo, hi) = settle_track(&adj, 1200);
+                        watching.set(false);
+                        clicks += 1;
+                        let dev = (before - lo).abs().max((hi - before).abs());
+                        eprintln!("wf-test D-393 {label} off+{} {what}{}: y={:.0}..{:.0} view={top:.0}..{bottom:.0} value {before:.1} -> {:.1} (range {lo:.1}..{hi:.1})", step * 5, if double { " DOUBLE" } else { "" }, b.y(), b.y() + b.height(), adj.value());
+                        if dev > 1.0 { problems.push(format!("{label} off+{} {what}{}: the click moved the list {before:.1} -> {:.1} (seen {lo:.1}..{hi:.1})", step * 5, if double { " double" } else { "" }, adj.value())); }
+                    }
+                    // A double click may open a folder or a file; stay in the folder.
+                    if state.borrow().cwd.display_string() != dir.to_string_lossy() {
+                        problems.push(format!("{label}: left the folder during {what}"));
+                    }
+                }
+            }
+        }
+        eprintln!("wf-test D-393: {clicks} clicks sent, {} moved the list", problems.len());
+        ui.window.destroy();
+        pump();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(problems.is_empty(), "D-393: a plain click moved the compact list: {problems:?}");
     }
 
     /// D-358 fixture, shared with D-350: names of mixed length so some wrap to
