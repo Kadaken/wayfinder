@@ -64,4 +64,22 @@ msg=$(run_install lab "$c/new" "$T" 2>&1); r=$?
   && [[ $msg == *"already installed"* ]] \
   && [[ $msg == *"Nothing was written and no rollback was made."* ]]; ok $? "already-installed approved identity is not rewritten by another round"
 
+# D-390: one install updates every installed program together.
+new_case comp; mk "$T" old-binary; mk "$c/bin/wayfinder-native" old-native; mk "$c/bin/wayfinder-portal" old-portal
+mk "$c/wayfinder-portal" new-portal; on=$(sha "$c/bin/wayfinder-native"); op=$(sha "$c/bin/wayfinder-portal")
+run_install lab "$c/new" "$T" >/dev/null 2>&1; r=$?
+[ $r = 0 ] && cmp -s "$c/new" "$T" && cmp -s "$c/new" "$c/bin/wayfinder-native" \
+  && cmp -s "$c/wayfinder-portal" "$c/bin/wayfinder-portal" \
+  && [ "$(sha "$c/bin/wayfinder-native.pre-lab-${on:0:8}")" = "$on" ] \
+  && [ "$(sha "$c/bin/wayfinder-portal.pre-lab-${op:0:8}")" = "$op" ]; ok $? "one install updates wayfinder, wayfinder-native and wayfinder-portal, each with a rollback"
+
+new_case compmiss; mk "$T" old-binary; mk "$c/bin/wayfinder-portal" old-portal; o=$(sha "$T"); p=$(sha "$c/bin/wayfinder-portal")
+msg=$(run_install lab "$c/new" "$T" 2>&1); r=$?
+[ $r != 0 ] && [ "$(sha "$T")" = "$o" ] && [ "$(sha "$c/bin/wayfinder-portal")" = "$p" ] && [ "$(/bin/ls -A "$c/bin" | wc -l)" = 2 ] \
+  && [[ $msg == *"wayfinder-portal is installed but no new"* ]]; ok $? "installed portal with no new portal beside the candidate refuses before any write"
+
+new_case compstale; /bin/cp "$c/new" "$T"; mk "$c/bin/wayfinder-native" old-native
+run_install lab "$c/new" "$T" >/dev/null 2>&1; r=$?
+[ $r = 0 ] && cmp -s "$c/new" "$c/bin/wayfinder-native"; ok $? "stale companion is replaced even when wayfinder is already current"
+
 echo "passed $pass failed $fail"; [ $fail = 0 ]
