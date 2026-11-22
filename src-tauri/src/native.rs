@@ -6324,10 +6324,9 @@ fn command_divider() -> gtk::Separator {
 /// A tooltip alone is not exposed as a name, so every icon-only button calls this.
 fn icon_button_label(widget: &(impl IsA<gtk::Accessible> + IsA<glib::Object>), text: &str) {
     widget.update_property(&[gtk::accessible::Property::Label(text)]);
-    // GTK has no public getter for an accessible name, so the name is also kept on
-    // the widget where the headless suite can read it back (D-294).
-    // SAFETY: the key is private to this function and the value is always a String.
-    unsafe { widget.set_data("wf-a11y-label", text.to_string()) };
+    // GTK has no public getter for an accessible name; test builds record it
+    // so the headless suite can read it back (D-294). A no-op in release.
+    a11y_label_recorded(widget.upcast_ref::<glib::Object>(), text);
 }
 
 /// Tooltip and accessible name together, for icon-only buttons whose hover text changes.
@@ -7608,10 +7607,13 @@ fn open_connect_dialog(state: &Rc<RefCell<AppState>>, ui: &Ui, prefill: Option<&
 /// the same Open set the file list offers for a folder, so the sidebar is not
 /// a second-class place to right-click.
 fn connect_place_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui: Ui, path: String) {
-    let row_for_click = row.clone();
-    let open: ContextOpener =
-        Rc::new(move |x, y| show_place_context_menu(&row_for_click, state.clone(), ui.clone(), path.clone(), x, y));
-    set_context_opener(row, open.clone());
+    let row_weak = row.downgrade();
+    let open: ContextOpener = Rc::new(move |x, y| {
+        if let Some(row) = row_weak.upgrade() {
+            show_place_context_menu(&row, state.clone(), ui.clone(), path.clone(), x, y);
+        }
+    });
+    set_context_opener(row, None, open.clone());
     let click = gtk::GestureClick::new();
     click.set_button(3);
     click.connect_pressed(move |_, _, x, y| open(x, y));
@@ -13078,6 +13080,7 @@ fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         // D-292: a grid tile has no right-click item menu, but the keyboard opens one.
         set_context_opener(
             &grid_item,
+            Some(entry.source.display_string()),
             item_context_opener(grid_item.upcast_ref(), state.clone(), ui.clone(), entry.clone()),
         );
         #[cfg(feature = "guide")]
@@ -19029,21 +19032,41 @@ fn first_hash_run(value: &str) -> Option<(usize, usize)> {
 /// What a menu opener does: take the anchor point inside the row it belongs to.
 type ContextOpener = Rc<dyn Fn(f64, f64)>;
 
-/// D-292: a row that has a context menu keeps its opener here, so the pointer
-/// handler and the Menu / Shift+F10 key open one and the same menu.
-const CTX_OPEN_KEY: &str = "wf-ctx-open";
-/// The display string of the file a list or grid row shows, so the key can find
-/// the selected row's widget.
-const CTX_SOURCE_KEY: &str = "wf-ctx-source";
-
-fn set_context_opener(row: &impl IsA<glib::Object>, opener: ContextOpener) {
-    // SAFETY: the keys are private to this file and always hold these types.
-    unsafe { row.set_data(CTX_OPEN_KEY, opener) };
+/// D-292: a row that has a context menu, so the pointer handler and the
+/// Menu / Shift+F10 key open one and the same menu. `source` is the display
+/// string of the file a list or grid row shows, so the key can find the
+/// selected row's widget. Rows are held weakly and openers never hold their
+/// row strongly, so a dropped row leaves this list on the next registration.
+struct ContextRow {
+    row: glib::WeakRef<gtk::Widget>,
+    source: Option<String>,
+    open: ContextOpener,
 }
 
-fn context_opener_of(widget: &impl IsA<glib::Object>) -> Option<ContextOpener> {
-    // SAFETY: see set_context_opener.
-    unsafe { widget.data::<ContextOpener>(CTX_OPEN_KEY).map(|p| p.as_ref().clone()) }
+thread_local! {
+    static CONTEXT_ROWS: RefCell<Vec<ContextRow>> = const { RefCell::new(Vec::new()) };
+}
+
+fn set_context_opener(row: &impl IsA<gtk::Widget>, source: Option<String>, open: ContextOpener) {
+    let row = row.upcast_ref::<gtk::Widget>();
+    CONTEXT_ROWS.with(|rows| {
+        let mut rows = rows.borrow_mut();
+        rows.retain(|c| c.row.upgrade().is_some_and(|w| &w != row));
+        rows.push(ContextRow { row: row.downgrade(), source, open });
+    });
+}
+
+fn context_row<T>(widget: &impl IsA<gtk::Widget>, pick: impl Fn(&ContextRow) -> T) -> Option<T> {
+    let widget = widget.upcast_ref::<gtk::Widget>();
+    CONTEXT_ROWS.with(|rows| rows.borrow().iter().find(|c| c.row.upgrade().as_ref() == Some(widget)).map(pick))
+}
+
+fn context_opener_of(widget: &impl IsA<gtk::Widget>) -> Option<ContextOpener> {
+    context_row(widget, |c| c.open.clone())
+}
+
+fn context_source_of(widget: &impl IsA<gtk::Widget>) -> Option<String> {
+    context_row(widget, |c| c.source.clone()).flatten()
 }
 
 /// Select the entry's row if it is not selected, then open its item menu on `row`.
@@ -19053,10 +19076,9 @@ fn item_context_opener(
     ui: Ui,
     entry: Entry,
 ) -> ContextOpener {
-    let row = row.clone();
-    // SAFETY: private key, String value.
-    unsafe { row.set_data(CTX_SOURCE_KEY, entry.source.display_string()) };
+    let row = row.downgrade();
     Rc::new(move |x, y| {
+        let Some(row) = row.upgrade() else { return };
         // D-360: the row's position at bind time goes stale when a same-folder
         // refresh inserts or removes rows above a kept row. Find the entry's
         // place now, by its path.
@@ -19082,8 +19104,9 @@ fn connect_row_context(
     ui: Ui,
     entry: Entry,
 ) {
+    let source = entry.source.display_string();
     let open = item_context_opener(row.upcast_ref(), state, ui, entry);
-    set_context_opener(row, open.clone());
+    set_context_opener(row, Some(source), open.clone());
     let click = gtk::GestureClick::new();
     click.set_button(3);
     click.connect_pressed(move |gesture, _, x, y| {
@@ -19130,8 +19153,7 @@ fn open_context_menu_from_key(state: &Rc<RefCell<AppState>>, ui: &Ui) -> bool {
         let mut found = None;
         let mut stack = vec![view.clone()];
         while let Some(w) = stack.pop() {
-            // SAFETY: private key, String value.
-            let source = unsafe { w.data::<String>(CTX_SOURCE_KEY).map(|p| p.as_ref().clone()) };
+            let source = context_source_of(&w);
             if source.as_deref() == Some(wanted.as_str()) {
                 found = Some(w);
                 break;
@@ -19201,11 +19223,13 @@ fn connect_drive_context(
     ui: Ui,
     drive: Drive,
 ) {
-    let row_for_click = row.clone();
+    let row_weak = row.downgrade();
     let open: ContextOpener = Rc::new(move |x, y| {
-        show_drive_context_menu(&row_for_click, state.clone(), ui.clone(), drive.clone(), x, y);
+        if let Some(row) = row_weak.upgrade() {
+            show_drive_context_menu(&row, state.clone(), ui.clone(), drive.clone(), x, y);
+        }
     });
-    set_context_opener(row, open.clone());
+    set_context_opener(row, None, open.clone());
     let click = gtk::GestureClick::new();
     click.set_button(3);
     click.connect_pressed(move |_, _, x, y| open(x, y));
@@ -20624,6 +20648,30 @@ thread_local! {
     static POSTER_FORCE_GST_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Poster jobs started (a job popped from a queue).
     static POSTER_JOBS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// D-294 test record of accessible names (GTK has no getter). Below the locked
+// row-drag code on purpose, like the poster hooks.
+#[cfg(test)]
+thread_local! {
+    static A11Y_LABELS: RefCell<Vec<(glib::WeakRef<glib::Object>, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn a11y_label_recorded(widget: &glib::Object, text: &str) {
+    A11Y_LABELS.with(|l| l.borrow_mut().push((widget.downgrade(), text.to_string())));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn a11y_label_recorded(_widget: &glib::Object, _text: &str) {}
+
+/// The last name icon_button_label gave this widget, if any.
+#[cfg(test)]
+fn a11y_label_of(widget: &glib::Object) -> Option<String> {
+    A11Y_LABELS.with(|l| {
+        l.borrow().iter().rev().find(|(w, _)| w.upgrade().as_ref() == Some(widget)).map(|(_, t)| t.clone())
+    })
 }
 
 /// Counts the job and, when a test forces it, finishes it through the ffmpeg
@@ -33195,8 +33243,7 @@ Broken: Either state is wrong.\n";
             false
         }
         fn name_of(w: &gtk::Widget) -> Option<String> {
-            // SAFETY: only icon_button_label writes this key, always with a String.
-            unsafe { w.data::<String>("wf-a11y-label").map(|p| p.as_ref().clone()) }
+            a11y_label_of(w.upcast_ref::<glib::Object>())
         }
         fn walk(w: &gtk::Widget, seen: &mut usize, bad: &mut Vec<String>) {
             // GTK's own media controls name their buttons themselves.
@@ -33272,8 +33319,7 @@ Broken: Either state is wrong.\n";
         let menus = open_popovers(&list_w);
         assert_eq!(menus.len(), 1, "one context menu is open after Menu on a selected row");
         let anchor = menus[0].parent().unwrap();
-        // SAFETY: private key written by item_context_opener with a String.
-        let anchored_on = unsafe { anchor.data::<String>(CTX_SOURCE_KEY).map(|p| p.as_ref().clone()) };
+        let anchored_on = context_source_of(&anchor);
         assert_eq!(
             anchored_on.as_deref(),
             Some(d.state.borrow().visible_entries[1].source.display_string().as_str()),
