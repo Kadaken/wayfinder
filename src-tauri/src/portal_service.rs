@@ -59,7 +59,7 @@ pub struct WireChoice {
 /// spawned, read by `wayfinder-native` via `--request <path>`. Carries
 /// exactly the decoded, already-resolved request data; never an env var,
 /// never a global file, never a caller-chosen path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WireRequest {
     pub multiple: bool,
     pub filters: Vec<WireFilter>,
@@ -89,22 +89,6 @@ pub struct WireRequest {
     pub directory: bool,
 }
 
-impl Default for WireRequest {
-    fn default() -> Self {
-        Self {
-            multiple: false,
-            filters: Vec::new(),
-            current_filter: None,
-            choices: Vec::new(),
-            save: false,
-            current_name: String::new(),
-            current_folder: None,
-            current_file: None,
-            directory: false,
-        }
-    }
-}
-
 /// The native picker's response metadata beyond the picked paths
 /// themselves: the filter actually active, and every choice's final
 /// `(id, selected_id)` pair. Read from a second, separately-optional
@@ -120,6 +104,7 @@ pub struct WireResultMeta {
 
 pub const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.wayfinder";
 pub const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+#[cfg(test)]
 pub const INTERFACE_NAME: &str = "org.freedesktop.impl.portal.FileChooser";
 
 const RESPONSE_SUCCESS: u32 = 0;
@@ -411,6 +396,7 @@ impl ProcessChooser {
     }
 
     /// The wall-clock limit on the picker process, if any.
+    #[cfg(test)]
     fn wall_clock_limit(&self) -> Option<Duration> {
         self.deadline
     }
@@ -465,6 +451,7 @@ impl ProcessChooser {
     /// group* the child was spawned into (never a reused PID, never an
     /// unrelated process) so a descendant the child spawned -- e.g. a
     /// shell's own child -- cannot outlive it as an orphan.
+    #[cfg(test)]
     fn wait_with_deadline(&self, child: Child) -> ChildWait {
         self.wait_with_deadline_or_cancel(child, &AtomicBool::new(false))
     }
@@ -880,7 +867,8 @@ fn decode_choices(options: &HashMap<String, OwnedValue>) -> Result<Vec<WireChoic
     let Some(value) = options.get("choices") else {
         return Ok(Vec::new());
     };
-    let raw: Vec<(String, String, Vec<(String, String)>, String)> =
+    type RawChoice = (String, String, Vec<(String, String)>, String);
+    let raw: Vec<RawChoice> =
         Vec::try_from(value.clone()).map_err(|_| ())?;
     if raw.len() > MAX_CHOICES {
         return Err(());

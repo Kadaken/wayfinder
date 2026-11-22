@@ -490,7 +490,7 @@ pub fn parse_swf_header(data: &[u8]) -> Result<SwfInfo, String> {
         return Err("the Flash header is empty".into());
     }
     let nbits = (body[0] >> 3) as usize;
-    let rect_bytes = (5 + nbits * 4 + 7) / 8;
+    let rect_bytes = (5 + nbits * 4).div_ceil(8);
     if body.len() < rect_bytes + 4 {
         return Err("the Flash header is cut short".into());
     }

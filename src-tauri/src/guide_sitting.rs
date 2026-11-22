@@ -233,6 +233,7 @@ impl<A: Adapter> Sitting<A> {
     }
 
     /// Open, or closing with an owned window still to close.
+    #[cfg(test)]
     pub fn is_tracked(&self) -> bool {
         matches!(self.lifecycle.as_deref(), Some("open") | Some("closing"))
     }
@@ -367,6 +368,7 @@ impl<A: Adapter> Sitting<A> {
     }
 
     /// Close whatever a failed close left behind, then record the outcome.
+    #[cfg(test)]
     pub fn retry_close(&mut self) -> bool {
         self.reconcile();
         if self.lifecycle.as_deref() != Some("closing") {
@@ -841,14 +843,17 @@ pub fn window_geometry_outer(window: &(impl IsA<gtk::Native> + IsA<gtk::Widget>)
     let (d, xid) = x11_handle(window)?;
     let (cx, cy, cw, ch) = window_geometry(window)?;
     let (l, r, t, b) = frame_extents(d, xid)?;
-    compose_outer(cx, cy, cw, ch, l, r, t, b)
+    compose_outer((cx, cy, cw, ch), (l, r, t, b))
 }
 
 /// Pure checked-arithmetic composition of client geometry + frame extents
 /// into outer geometry. An extents value that would overflow the client
 /// geometry it is applied to is unavailable (`None`), never wrapped or
 /// guessed.
-fn compose_outer(cx: i32, cy: i32, cw: i32, ch: i32, l: i32, r: i32, t: i32, b: i32) -> Option<(i32, i32, i32, i32)> {
+fn compose_outer(
+    (cx, cy, cw, ch): (i32, i32, i32, i32),
+    (l, r, t, b): (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
     let ow = cw.checked_add(l)?.checked_add(r)?;
     let oh = ch.checked_add(t)?.checked_add(b)?;
     let ox = cx.checked_sub(l)?;
@@ -908,7 +913,6 @@ pub struct StepUi {
     pub toggles: Vec<gtk::CheckButton>,
     pub copy_buttons: Vec<gtk::Button>,
     pub notes: gtk::TextView,
-    pub notes_placeholder: gtk::Label,
     pub copy_notes: gtk::Button,
     pub grab: gtk::Button,
     pub shot_rows: gtk::Box,
@@ -1400,7 +1404,7 @@ fn build_card(parent: &adw::ApplicationWindow, payload: &Value, cell: &SittingCe
         }
         list.append(&frame);
         steps.push(StepUi {
-            n, tag, show, toggles, copy_buttons, notes, notes_placeholder, copy_notes, grab, shot_rows,
+            n, tag, show, toggles, copy_buttons, notes, copy_notes, grab, shot_rows,
             shots: RefCell::new(Vec::new()), remove_buttons: RefCell::new(Vec::new()),
             frame, head, head_text,
             copy_texts, was: RefCell::new(String::new()), locked, guard: Cell::new(false),
@@ -2141,13 +2145,13 @@ mod outer_geometry_tests {
     fn compose_outer_matches_the_proven_sacrificial_sitting_geometry() {
         // Card client (892,1168) 460x640, extents (0,0,28,0): outer top must
         // land exactly on the app's outer top of 1140.
-        assert_eq!(compose_outer(892, 1168, 460, 640, 0, 0, 28, 0), Some((892, 1140, 460, 668)));
+        assert_eq!(compose_outer((892, 1168, 460, 640), (0, 0, 28, 0)), Some((892, 1140, 460, 668)));
     }
 
     #[test]
     fn compose_outer_overflow_is_unavailable_not_wrapped() {
-        assert_eq!(compose_outer(0, 0, i32::MAX, 0, 1, 0, 0, 0), None);
-        assert_eq!(compose_outer(i32::MIN, 0, 0, 0, 1, 0, 0, 0), None);
+        assert_eq!(compose_outer((0, 0, i32::MAX, 0), (1, 0, 0, 0)), None);
+        assert_eq!(compose_outer((i32::MIN, 0, 0, 0), (1, 0, 0, 0)), None);
     }
 
     // decide_extents_metadata: the pure decision frame_extents makes BEFORE
