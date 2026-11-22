@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Kadaken
 
+// The test seams above the locked drag code are written with a one-element
+// `any(test)`, not the plain test cfg, on purpose: the D-188 gates
+// (`row_drag_beats_selection_box_locked` and its companion) stop scanning at the
+// first literal plain test-cfg attribute, which must stay below the drag code. Clippy calls the one-element `any()` needless; it is
+// the marker the gates rely on, so the lint is switched off for this file only.
+#![allow(clippy::non_minimal_cfg)]
+
 mod crash;
 mod native_core;
 mod native_viewers;
+// audio_preview.rs is frozen (never edited), so its two lints are allowed here:
+// `duration_is_computed` is called only from its own tests, and one
+// `map_or(true, ..)` there is clippy::unnecessary_map_or.
+#[allow(dead_code, clippy::unnecessary_map_or)]
 mod audio_preview;
 mod native_smb;
 mod update;
@@ -35,6 +46,7 @@ use std::time::{Duration, Instant};
 /// The drag picture is a ghost of the dragged row at about half opacity.
 const DRAG_GHOST_OPACITY: f64 = 0.55;
 /// The ghost is one item's icon and name, never wider than this many pixels.
+#[cfg(any(test))]
 const DRAG_GHOST_MAX_WIDTH: i32 = 240;
 const DRAG_GHOST_ICON: i32 = 20;
 /// D-267: Icons view is a picture grid, not a column of stamps. A tile's
@@ -1441,12 +1453,9 @@ struct WireRequestNative {
     current_folder: Option<String>,
     #[serde(default)]
     current_file: Option<String>,
-    /// Mirrors the portal's `directory` field. The picker's folder mode is
-    /// driven by the `--directory` flag, not by this value; it is carried
-    /// so the mirror stays complete and a request file that has it still
-    /// parses.
-    #[serde(default)]
-    directory: bool,
+    // The portal's `directory` field is deliberately not mirrored: the picker's
+    // folder mode is driven by the `--directory` flag, and serde ignores the
+    // unknown key, so a request file that carries it still parses.
 }
 
 /// Mirrors `portal_service::WireResultMeta`, written back by this process
@@ -1887,12 +1896,14 @@ fn wire_filter_allows(filter: &WireFilterNative, entry: &Entry) -> bool {
 /// `org.freedesktop.portal.FileChooser` contract's own glob grammar, not
 /// an extension of it.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    type ClassParse<'a> = (Vec<(char, char)>, bool, &'a [char]);
+
     /// Parses a `[...]` class starting just after the opening `[` in `p`.
     /// Returns the matched members, whether the class is negated, and the
     /// remaining pattern slice after the closing `]`. `None` when there is
     /// no closing `]` -- an unterminated class is matched as a literal
     /// `[` instead of a class.
-    fn parse_class(p: &[char]) -> Option<(Vec<(char, char)>, bool, &[char])> {
+    fn parse_class(p: &[char]) -> Option<ClassParse<'_>> {
         let mut i = 0;
         let negated = matches!(p.first(), Some('!') | Some('^'));
         if negated {
@@ -2150,7 +2161,7 @@ fn load_config() -> AppConfig {
 /// gone for good (D-297, D-285).
 enum ConfigFile {
     Missing,
-    Parsed(AppConfig),
+    Parsed(Box<AppConfig>),
     Unparseable,
 }
 
@@ -2165,7 +2176,7 @@ fn config_quarantine_path(path: &Path) -> PathBuf {
 fn inspect_config_file(path: &Path) -> ConfigFile {
     match fs::read_to_string(path) {
         Ok(raw) => match serde_json::from_str::<AppConfig>(&raw) {
-            Ok(config) => ConfigFile::Parsed(config),
+            Ok(config) => ConfigFile::Parsed(Box::new(config)),
             Err(_) => ConfigFile::Unparseable,
         },
         // Unreadable bytes (not UTF-8) are damage, not absence.
@@ -2218,11 +2229,11 @@ fn prune_missing_pins_in_background() {
 /// the hook could rewrite it to the new name.
 fn read_config_keeping_pins_at(path: &Path) -> AppConfig {
     let mut config = match inspect_config_file(path) {
-        ConfigFile::Parsed(config) => config,
+        ConfigFile::Parsed(config) => *config,
         ConfigFile::Missing => AppConfig::default(),
         // The live file is damaged: the last good write is the best answer.
         ConfigFile::Unparseable => match inspect_config_file(&config_backup_path(path)) {
-            ConfigFile::Parsed(config) => config,
+            ConfigFile::Parsed(config) => *config,
             _ => AppConfig::default(),
         },
     };
@@ -2267,6 +2278,7 @@ fn write_config_durably(path: &Path, raw: &str) -> std::io::Result<()> {
 /// so two processes cannot both read the same old state and have the second
 /// write erase the first (D-299). A damaged file is moved aside, never
 /// overwritten, and the last good copy is kept as `.bak` (D-297).
+#[cfg(any(test))]
 fn update_config_at(path: &Path, change: impl FnOnce(&mut AppConfig)) -> AppConfig {
     let (config, saved) = try_update_config_at(path, change);
     if let Err(message) = saved {
@@ -2374,10 +2386,6 @@ fn config_drop_ask(config: &mut AppConfig, value: bool) {
 
 fn config_onboarded(config: &mut AppConfig, value: bool) {
     config.onboarded = value;
-}
-
-fn config_install_convention(config: &mut AppConfig, value: bool) {
-    config.install_convention = value;
 }
 
 fn config_trash_keep_days(config: &mut AppConfig, value: u32) {
@@ -3895,7 +3903,7 @@ fn guide_note_opened(state: &Rc<RefCell<AppState>>, entry: &Entry) {
     if !guide_is_open_file_fixture(entry) || !guide_waits_for_open_file(state) {
         return;
     }
-    if !state.borrow().guide_target.as_ref().is_some_and(|t| t.upgrade().is_some()) {
+    if state.borrow().guide_target.as_ref().is_none_or(|t| t.upgrade().is_none()) {
         return;
     }
     {
@@ -4175,7 +4183,9 @@ fn guide_arrow_popover(target: &gtk::Widget, label: &str) -> gtk::Popover {
                                 text.set_margin_start(if now { near } else { far });
                                 text.set_margin_end(if now { far } else { near });
                                 pop.set_offset(if now { -GUIDE_ARROW_OVERLAP } else { GUIDE_ARROW_OVERLAP }, 0);
-                                pop.child().map(|c| c.queue_draw());
+                                if let Some(c) = pop.child() {
+                                    c.queue_draw();
+                                }
                             }
                         });
                     }
@@ -7188,7 +7198,6 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             if !mount.is_empty() {
                 connect_sidebar_drop_folder(&row, state, ui, &mount);
             }
-            let show_hidden = state.borrow().show_hidden;
             let tree_open = !mount.is_empty() && state.borrow().tree_expanded.contains(&mount);
             let can_open = tree_drive_openable(state, ui, &mount);
             if can_open {
@@ -8274,7 +8283,7 @@ fn list_subdirs(path: &str, show_hidden: bool) -> Vec<(String, String, bool)> {
             .unwrap_or(false);
         out.push((name, child_path, has_children));
     }
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by_key(|a| a.0.to_lowercase());
     out
 }
 
@@ -10864,6 +10873,8 @@ fn scroll_target_reached(value: f64, target: f64) -> bool {
 //  - `watch_scroll_jumps` only writes the jump log. It moves nothing.
 // `hold_new_item_on_screen` does not scroll: it picks where a new item sits in
 // the held order.
+type LastInput = (&'static str, Option<Instant>, Option<(u32, i32, i32)>);
+
 thread_local! {
     /// D-345: the last thing Wayfinder itself did that can move the list, and when.
     static SCROLL_CAUSE: RefCell<(&'static str, Option<Instant>)> = const { RefCell::new(("", None)) };
@@ -10872,7 +10883,7 @@ thread_local! {
     static SCROLL_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// D-393: the last input over the list: its kind, when, and for a click
     /// where (row index, y in the viewport, viewport height). Only read by the jump log.
-    static LAST_INPUT: RefCell<(&'static str, Option<Instant>, Option<(u32, i32, i32)>)> = const { RefCell::new(("", None, None)) };
+    static LAST_INPUT: RefCell<LastInput> = const { RefCell::new(("", None, None)) };
 }
 
 /// D-370: tallest edge zone, in px, at the top and at the bottom of the view.
@@ -11398,6 +11409,9 @@ impl RubberBand {
     }
 }
 
+/// Row, column, the press offset inside that cell (x, y), and the columns per row.
+type PressAnchor = (u32, u32, f64, f64, u32);
+
 /// D-370: Wayfinder's own box-select, one per view, replacing GTK's
 /// rubberband (gtklistbase.c:1709-1845, 1880-1990), which cannot be told not to
 /// edge-scroll. A GestureDrag on the view in the same phase GTK's was, so a
@@ -11419,7 +11433,7 @@ struct BoxSelect {
     /// Press point, in view coordinates, once the press is on a cell.
     start: Cell<Option<(f64, f64)>>,
     /// Row, column and the press's offset inside that cell, and the columns per row.
-    anchor: Cell<Option<(u32, u32, f64, f64, u32)>>,
+    anchor: Cell<Option<PressAnchor>>,
     active: Rc<Cell<bool>>,
     pointer: Cell<(f64, f64)>,
     /// Rows and columns last applied, so an unchanged box does not touch the selection.
@@ -11638,6 +11652,8 @@ fn press_in_text_entry_d378(g: &gtk::GestureClick, x: f64, y: f64) -> bool {
         .is_some_and(|hit| hit.ancestor(gtk::Entry::static_type()).is_some())
 }
 
+type ListItemHook = Rc<dyn Fn(&gtk::ListItem, Option<gtk::Widget>)>;
+
 /// D-364 (root of "the list jumps when I click a file near the bottom").
 /// GtkListView turns a pointer press into a scroll: the row's click gesture
 /// calls gtk_widget_grab_focus (gtklistfactorywidget.c:433-434), which reaches
@@ -11656,7 +11672,7 @@ fn press_in_text_entry_d378(g: &gtk::GestureClick, x: f64, y: f64) -> bool {
 /// both axes off: for a fully shown cell GTK keeps its exact offset, which is
 /// the place the view already has. Focus follows the click as GTK intends,
 /// nothing moves, and keyboard moves keep GTK's own scroll-to-focus.
-fn pointer_keeps_scroll(list: &impl IsA<gtk::ListBase>) -> Rc<dyn Fn(&gtk::ListItem, Option<gtk::Widget>)> {
+fn pointer_keeps_scroll(list: &impl IsA<gtk::ListBase>) -> ListItemHook {
     let list = list.upcast_ref::<gtk::ListBase>().downgrade();
     Rc::new(move |item, row| {
         let Some(list) = list.upgrade() else { return };
@@ -11986,7 +12002,6 @@ fn reapply_scroll(scroller: &gtk::ScrolledWindow, target: f64) {
     let stand_down = move || scroll_generation() != started;
     let snapping_check = snapping;
     let handler = adj.connect_value_changed({
-        let stand_down = stand_down.clone();
         let resync = resync.clone();
         move |adj| {
             // Only GTK's own moves are put back; his are left alone.
@@ -12136,10 +12151,6 @@ fn state_for_ui(ui: &Ui) -> Option<Rc<RefCell<AppState>>> {
     // Per PANE, not per window: a split puts two states on one window, and
     // each pane's ListView is its own.
     WINDOWS.with(|windows| windows.borrow().state_for_ui(|other| other.list == ui.list))
-}
-
-fn active_window() -> Option<(Rc<RefCell<AppState>>, Ui)> {
-    WINDOWS.with(|windows| windows.borrow().active(|ui| ui.window.is_active()))
 }
 
 /// Rebuild the address bar as one clickable button per path segment.
@@ -12736,7 +12747,7 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         size.set_widget_name("wf-col-size");
         ui.columns.size.add_widget(&size);
         let kind = gtk::Label::builder()
-            .label(&native_core::kind_label(&entry))
+            .label(native_core::kind_label(&entry))
             .xalign(0.0)
             .max_width_chars(4)
             .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -13321,8 +13332,7 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         // D-260: one queue serves both views. Grid always wants it; a list
         // view wants it only while the setting is on. Turning the setting off
         // takes this same branch, cancels the old queue and leaves none.
-        if view_mode == ViewMode::Grid || details_thumbnails {
-            if state_ref.thumbnail_queue.is_none() {
+        if (view_mode == ViewMode::Grid || details_thumbnails) && state_ref.thumbnail_queue.is_none() {
             let queue = Rc::new(RefCell::new(ThumbnailQueue {
                 cancelled: gio::Cancellable::new(),
                 pending: VecDeque::new(),
@@ -13330,7 +13340,6 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
                 row_tokens: HashMap::new(),
             }));
             state_ref.thumbnail_queue = Some(queue);
-            }
         }
         if view_mode == ViewMode::Grid {
             // The tiles read these two queues when GTK binds them (D-368).
@@ -13450,7 +13459,7 @@ fn hold_new_item_on_screen(state: &Rc<RefCell<AppState>>, ui: &Ui, source: nativ
 
 /// D-334: rows he has already seen keep their held positions; anything new
 /// (not in the held list) follows, in the sorted order it already has.
-fn apply_held_order(entries: &mut Vec<Entry>, held: &[native_core::EntrySource]) {
+fn apply_held_order(entries: &mut [Entry], held: &[native_core::EntrySource]) {
     let rank: HashMap<&native_core::EntrySource, usize> = held.iter().enumerate().map(|(i, s)| (s, i)).collect();
     // Stable sort: held rows by their held index, unheld rows after, unchanged.
     entries.sort_by_key(|e| rank.get(&e.source).copied().unwrap_or(usize::MAX));
@@ -14056,6 +14065,9 @@ fn note_media_failure(path: &str, stage: &str, reason: &str) {
 /// D-251: the second half of a thumbnail job — read one image file and paint
 /// it into the tile. Split out so an AVIF decoded to a cached PNG can reuse
 /// exactly the same path as an ordinary PNG.
+// One call hands over one thumbnail job's whole state (queue, tile, path, size, cancel,
+// liveness, retry flag); a parameter struct would only rename the same nine values.
+#[allow(clippy::too_many_arguments)]
 fn read_thumbnail_from_path(
     queue_for_read: Rc<RefCell<ThumbnailQueue>>,
     picture: gtk::Picture,
@@ -14348,7 +14360,7 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                         drop(stage_ref);
                         let duration = pipeline_for_bus.query_duration::<gst::ClockTime>();
                         let seek_to = duration
-                            .map(|d| d.mseconds().min(1000).max(0))
+                            .map(|d| d.mseconds().min(1000))
                             .filter(|ms| *ms > 0);
                         match seek_to {
                             Some(ms) => {
@@ -14482,10 +14494,10 @@ const VIDEO_POSTER_TIMEOUT: Duration = Duration::from_secs(8);
 
 thread_local! {
     /// D-372: one line per job finished by the timeout (see its closure).
-    static VIDEO_POSTER_TIMEOUT_DIAG: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static VIDEO_POSTER_TIMEOUT_DIAG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// D-372: (path-less) reason each poster job finished, newest last. Read by
     /// the D-85 test to show which finish path a corrupt file took.
-    static VIDEO_POSTER_FINISH_LOG: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+    static VIDEO_POSTER_FINISH_LOG: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Finishes one poster job EXACTLY ONCE. `done` is the job's own flag (shared by
@@ -15212,14 +15224,14 @@ fn open_zip_member(state: &Rc<RefCell<AppState>>, ui: &Ui, member: &native_core:
     });
 }
 
-/// D-188: every test-only seam in this file (anything gated on the "test"
-/// cfg) belongs below the locked drag code, in the cluster starting at
-/// `drive_scan` — never above it. `row_drag_beats_selection_box_locked`
-/// stops scanning the source at the file's first such seam marker; one
-/// placed earlier in the file (as `launch_path`/`note_open_poll_tick`
-/// briefly were) makes that scan miss the real drag code entirely and the
-/// locked gate silently passes for the wrong reason.
-/// `drag_code_precedes_first_test_seam_d188` guards this.
+// D-188: every test-only seam in this file (anything gated on the "test"
+// cfg) belongs below the locked drag code, in the cluster starting at
+// `drive_scan` — never above it. `row_drag_beats_selection_box_locked`
+// stops scanning the source at the file's first such seam marker; one
+// placed earlier in the file (as `launch_path`/`note_open_poll_tick`
+// briefly were) makes that scan miss the real drag code entirely and the
+// locked gate silently passes for the wrong reason.
+// `drag_code_precedes_first_test_seam_d188` guards this.
 
 /// The one New Folder path (background menu, toolbar, options menu, Ctrl+Shift+N):
 /// create a real numbered folder, then open the shared inline editor on it with
@@ -18222,6 +18234,9 @@ where
     });
 }
 
+/// Work a finished job runs after it succeeded.
+type AfterSuccess = dyn Fn(&Rc<RefCell<AppState>>, &Ui, &JobOutcome);
+
 /// A successful job's shared ending: after-success work, Undo, then the refresh
 /// that carries the outcome message.
 fn complete_job(
@@ -18229,7 +18244,7 @@ fn complete_job(
     ui: &Ui,
     outcome: JobOutcome,
     refresh_path: &native_core::Location,
-    after_success: &dyn Fn(&Rc<RefCell<AppState>>, &Ui, &JobOutcome),
+    after_success: &AfterSuccess,
 ) {
     after_success(state, ui, &outcome);
     if let Some(undo) = outcome.undo.clone() {
@@ -18539,7 +18554,7 @@ fn show_batch_rename_dialog(state: Rc<RefCell<AppState>>, ui: Ui, entries: Vec<E
     content.set_margin_start(16);
 
     let title = gtk::Label::builder()
-        .label(&format!(
+        .label(format!(
             "Rename {} item{}",
             entries.len(),
             plural(entries.len())
@@ -18952,7 +18967,8 @@ fn show_item_context_menu(
         let strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         strip.add_css_class("wf-menu-strip");
         strip.set_homogeneous(true);
-        let tools: [(&str, &str, Box<dyn Fn()>); 5] = [
+        type MenuTool<'a> = (&'a str, &'a str, Box<dyn Fn()>);
+        let tools: [MenuTool<'_>; 5] = [
             (
                 "edit-cut-symbolic",
                 "Cut",
@@ -19523,13 +19539,15 @@ fn unparent_when_closed(popover: &gtk::Popover) {
     });
 }
 
+type SubmenuItem = (&'static str, &'static str, &'static str, Rc<dyn Fn()>);
+
 /// A menu row that opens a second popover to its right (Explorer's `New >`).
 /// Choosing an entry closes both popovers, then runs the action.
 fn context_submenu(
     icon: &str,
     label: &str,
     popover: &gtk::Popover,
-    items: Vec<(&'static str, &'static str, &'static str, Rc<dyn Fn()>)>,
+    items: Vec<SubmenuItem>,
 ) -> gtk::Button {
     let row = menu_row(icon, label, "");
     let arrow = gtk::Image::from_icon_name("go-next-symbolic");
@@ -20243,6 +20261,7 @@ fn build_drop_target(
 }
 
 /// The words for the drop confirmation: what moves, from where, to where.
+#[cfg(test)]
 fn drop_confirm_text(txn: &DropTxn) -> (String, String, &'static str) {
     let name_of = |p: &Path| {
         p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string_lossy().into_owned())
@@ -20344,23 +20363,6 @@ fn show_transfer_failure(ui: &Ui, is_copy: bool, err: &str) {
     dialog.set_close_response("ok");
     eprintln!("wf-event: transfer_failure shown");
     dialog.present(Some(&ui.window));
-}
-
-fn show_drop_confirm_dialog(state: Rc<RefCell<AppState>>, ui: Ui, txn: DropTxn) {
-    let (heading, detail, verb) = drop_confirm_text(&txn);
-    let parent = ui.window.clone();
-    let dialog = adw::AlertDialog::new(Some(&heading), Some(&detail));
-    dialog.add_responses(&[("cancel", "Cancel"), ("go", verb)]);
-    dialog.set_response_appearance("go", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-    dialog.connect_response(None, move |_, response| {
-        eprintln!("wf-event: drop_confirm response={response}");
-        if response == "go" {
-            transfer_with_preflight(state.clone(), ui.clone(), txn.clone().into_transfer());
-        }
-    });
-    dialog.present(Some(&parent));
 }
 
 fn connect_file_drop<W: IsA<gtk::Widget>>(widget: &W, state: Rc<RefCell<AppState>>, ui: Ui) {
@@ -21452,7 +21454,7 @@ type D381Key = (String, u128, u64, i32);
 
 thread_local! {
     static D381_PREFETCH: RefCell<HashMap<usize, gio::Cancellable>> = RefCell::new(HashMap::new());
-    static D381_CACHE: RefCell<VecDeque<(D381Key, gdk::Texture)>> = RefCell::new(VecDeque::new());
+    static D381_CACHE: RefCell<VecDeque<(D381Key, gdk::Texture)>> = const { RefCell::new(VecDeque::new()) };
 }
 
 const D381_CACHE_ENTRIES: usize = 24;
@@ -22840,7 +22842,6 @@ mod tests {
                 window: None,
                 request: super::WireRequestNative {
                     multiple: false,
-                    directory: false,
                     filters: Vec::new(),
                     current_filter: None,
                     save: false,

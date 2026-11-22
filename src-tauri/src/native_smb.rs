@@ -187,6 +187,7 @@ pub struct ShareEntry {
 }
 
 impl ShareEntry {
+    #[cfg(test)]
     pub fn plain(name: &str) -> Self {
         Self { name: name.to_string(), display: name.to_string() }
     }
@@ -490,6 +491,7 @@ impl SmbFlow {
         flow
     }
 
+    #[cfg(test)]
     pub fn is_busy(&self) -> bool {
         self.busy.get()
     }

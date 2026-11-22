@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// One external tool call: the program name and its arguments.
+type RunCmd<'a> = dyn Fn(&str, &[&str]) -> Result<(), String> + 'a;
+
 const IMG_EXT: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "svg", "ico", "avif", "heic",
     // D-251: these three were missing, so they were not even treated as images.
@@ -234,6 +237,7 @@ impl Location {
         }
     }
 
+    #[cfg(test)]
     pub fn child_dir(&self, name: &str) -> Location {
         match self {
             Self::RealDir(path) => Self::RealDir(path.join(name)),
@@ -1440,7 +1444,9 @@ fn copy_zip_members_out_inner(
     after_preflight();
     sweep_dead_owned_zip_stage_files(dest_dir);
 
-    let mut stages: Vec<(PathBuf, Option<(u64, u64)>, PathBuf)> = Vec::new();
+    // Each stage: the staged path, the source file identity (dev, ino) when known, and the final path.
+    type ZipStage = (PathBuf, Option<(u64, u64)>, PathBuf);
+    let mut stages: Vec<ZipStage> = Vec::new();
     for (member, file_name) in members {
         let stage = dest_dir.join(next_zip_stage_name(file_name));
         if let Err(e) = stream_zip_member_to(archive_path, member, &stage, cancelled) {
@@ -2011,6 +2017,7 @@ fn unsearchable_mounts() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub fn search_dir(
     root: &str,
     query: &str,
@@ -2098,7 +2105,7 @@ pub fn search_dir_report(
                     break;
                 }
             }
-            if is_dir && !is_symlink && !skip.iter().any(|m| *m == path) {
+            if is_dir && !is_symlink && !skip.contains(&path) {
                 stack.push(path);
             }
         }
@@ -3329,6 +3336,7 @@ pub fn uri_list_for_paths(paths: &[String]) -> String {
 /// Uses GIO's trash API directly. This used to shell out to `gio trash` once per
 /// path and block on each child, so batch-deleting N files meant N sequential
 /// process spawns on the UI thread — which froze the window.
+#[cfg(test)]
 pub fn trash_paths(paths: &[String]) -> Result<(), String> {
     for path in paths {
         gio::File::for_path(path)
@@ -4133,11 +4141,12 @@ fn fingerprint_tick(path: &str, cancel: &AtomicBool, tick: &dyn Fn(u64)) -> Resu
 }
 
 /// Fails if any requested source cannot be recorded.
-#[cfg(any(test))]
+#[cfg(test)]
 pub fn snapshot_sources(srcs: &[String]) -> Result<Vec<SourceSnapshot>, String> {
     snapshot_sources_c(srcs, &NEVER_CANCELLED)
 }
 
+#[cfg(test)]
 fn snapshot_sources_c(srcs: &[String], cancel: &AtomicBool) -> Result<Vec<SourceSnapshot>, String> {
     snapshot_sources_tick(srcs, cancel, &|_| {})
 }
@@ -4155,7 +4164,7 @@ fn snapshot_sources_tick(srcs: &[String], cancel: &AtomicBool, tick: &dyn Fn(u64
 /// Fail-closed postcondition. COPY: every source still present with the same
 /// identity and content, every destination present with matching content. MOVE:
 /// every moved source gone and every destination present with matching content.
-#[cfg(any(test))]
+#[cfg(test)]
 pub fn verify_transfer(
     before: &[SourceSnapshot],
     items: &[ResolvedItem],
@@ -4164,6 +4173,7 @@ pub fn verify_transfer(
     verify_transfer_c(before, items, is_copy, &NEVER_CANCELLED)
 }
 
+#[cfg(test)]
 fn verify_transfer_c(
     before: &[SourceSnapshot],
     items: &[ResolvedItem],
@@ -4686,7 +4696,7 @@ fn plan_transfer_items(
     Ok(plan)
 }
 
-#[cfg(any(test))]
+#[cfg(test)]
 pub fn transfer_batch(
     srcs: &[String],
     dest_dir: &str,
@@ -4946,6 +4956,7 @@ pub fn restore_moved_items(items: &[ResolvedItem]) -> Result<Vec<ResolvedItem>, 
         .collect())
 }
 
+#[cfg(test)]
 pub fn restore_renamed_items(items: &[ResolvedItem]) -> Result<(), String> {
     let requests = items
         .iter()
@@ -5009,7 +5020,7 @@ pub fn extract_archive(path: &str, dest_dir: &str) -> Result<(), String> {
 /// succeeded is returned.
 fn decode_archive(
     path: &str,
-    run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
+    run: &RunCmd<'_>,
     out: &mut dyn FnMut() -> Result<String, String>,
 ) -> Result<String, String> {
     let lower = path.to_lowercase();
@@ -5190,10 +5201,12 @@ pub enum InstallKind {
     /// A single self-contained executable file. Belongs in ~/Applications.
     AppImage,
     /// An unpacked program directory. Belongs in ~/opt/<name>.
+    #[cfg(test)]
     AppTree,
 }
 
 /// The convention folder for a kind, created on demand by the caller.
+#[cfg(test)]
 pub fn install_dir(kind: InstallKind) -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     Ok(install_dir_in(Path::new(&home), kind))
@@ -5204,6 +5217,7 @@ pub fn install_dir(kind: InstallKind) -> Result<PathBuf, String> {
 pub fn install_dir_in(home: &Path, kind: InstallKind) -> PathBuf {
     home.join(match kind {
         InstallKind::AppImage => "Applications",
+        #[cfg(test)]
         InstallKind::AppTree => "opt",
     })
 }
@@ -5229,6 +5243,7 @@ pub fn install_kind_for_name(name: &str) -> Option<InstallKind> {
 /// Whether an unpacked folder is a program rather than documents or data: its
 /// top level holds a `bin` folder, or a file anyone may execute. Read from the
 /// real folder, never guessed from the archive's name.
+#[cfg(test)]
 pub fn looks_like_an_app_tree(dir: &Path) -> bool {
     let kids = |at: &Path| -> Vec<PathBuf> {
         fs::read_dir(at)
@@ -5260,6 +5275,7 @@ pub fn looks_like_an_app_tree(dir: &Path) -> bool {
 }
 
 /// An ordinary file carrying any execute bit.
+#[cfg(test)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path)
@@ -5269,6 +5285,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// The desktop entry that makes a saved AppImage appear in the menu like any
 /// other program. Written beside the user's other entries, never in /usr.
+#[cfg(test)]
 pub fn appimage_desktop_entry(exec: &str, name: &str) -> String {
     // A literal newline or an Exec that splits on spaces would make an entry
     // the desktop silently ignores, so the path is quoted and the name is
@@ -5361,16 +5378,18 @@ impl ExtractHereOutcome {
 /// top-level entry at a time, with a move that cannot replace anything. A name
 /// that is taken is skipped whole, folder or not, and reported: what is there
 /// is never opened, added to or removed. A failed decode moves nothing.
+#[cfg(test)]
 pub fn extract_archive_here(path: &str, dest_dir: &str) -> Result<ExtractHereOutcome, String> {
     extract_here_with(path, dest_dir, &run_cmd_capture, &rename_no_replace_io)
 }
 
 /// `run` starts one tool and `publish` moves one decoded entry into place. They
 /// are parameters so a test can fail a tool or take a name at the last moment.
+#[cfg(test)]
 fn extract_here_with(
     path: &str,
     dest_dir: &str,
-    run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
+    run: &RunCmd<'_>,
     publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<ExtractHereOutcome, String> {
     extract_here_dir(path, dest_dir, run, publish, &|_| Ok(()))
@@ -5495,10 +5514,6 @@ fn dir_apparent_bytes(dir: &Path) -> u64 {
 
 /// Runs one tool, and kills it the moment `cancel` is set. A cancelled run
 /// returns `CANCELLED_MSG`, which the caller never retries with another tool.
-fn run_cmd_cancellable(cmd: &str, args: &[&str], cancel: &AtomicBool) -> Result<(), String> {
-    run_cmd_cancellable_with(cmd, args, cancel, &|_| {})
-}
-
 fn run_cmd_cancellable_with(cmd: &str, args: &[&str], cancel: &AtomicBool, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
     if cmd == BUILTIN_ZIP {
         return extract_zip_builtin(Path::new(args[0]), Path::new(args[1]), cancel, on_bytes);
@@ -5589,7 +5604,7 @@ pub fn extract_archive_here_ctl(path: &str, dest_dir: &str, ctl: &ExtractCtl) ->
 fn extract_here_dir(
     path: &str,
     dest_dir: &str,
-    run: &dyn Fn(&str, &[&str]) -> Result<(), String>,
+    run: &RunCmd<'_>,
     publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
     on_dir: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<ExtractHereOutcome, String> {
@@ -5804,7 +5819,7 @@ pub fn is_image_path(path: &str) -> bool {
 }
 
 pub fn is_audio_path(path: &str) -> bool {
-    has_extension(path, &AUDIO_EXT)
+    has_extension(path, AUDIO_EXT)
 }
 
 /// D-324: what a file's first bytes say it is, as (label, extensions that
@@ -6053,7 +6068,7 @@ pub fn video_frame_only(path: &str) -> bool {
 }
 
 pub fn is_video_path(path: &str) -> bool {
-    has_extension(path, &VIDEO_EXT)
+    has_extension(path, VIDEO_EXT)
 }
 
 /// D-327: how long a MIDI file plays, in seconds, worked out from its own
@@ -6690,6 +6705,7 @@ impl<S, U: Clone, H> WindowRegistry<S, U, H> {
         Some((ui, hold))
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -6814,6 +6830,7 @@ impl TreeCache {
         self.openable.clear();
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.children.len() + self.openable.len()
     }
