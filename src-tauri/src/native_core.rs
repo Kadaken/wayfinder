@@ -12841,13 +12841,25 @@ pub fn list_thumbnail_metrics(icon_zoom: f64, compact: bool) -> ListThumbnailMet
 /// A row earns a thumbnail only when a real image file is behind it. Folders
 /// have no picture, and a ZIP member has no filesystem path to decode from
 /// (D-188), so both keep the ordinary file-type icon. Video rows are excluded
-/// here as well: this setting covers still images only, while Grid's own video
-/// poster queue is unchanged.
+/// here as well (D-403: they take `wants_video_poster` and the video poster
+/// queue instead).
 pub fn wants_image_thumbnail(entry: &Entry) -> bool {
     entry.is_image
         && !entry.is_dir
         && !entry.source.is_zip()
         && entry.source.real_path().is_some()
+}
+
+/// D-403: a real video file on disk (not a folder, not a ZIP member) earns a
+/// poster frame in a List, Details or Compact row, through the same bounded
+/// video poster queue Grid uses.
+pub fn wants_video_poster(entry: &Entry) -> bool {
+    !entry.is_dir
+        && !entry.source.is_zip()
+        && entry
+            .source
+            .real_path()
+            .is_some_and(|p| is_video_path(&p.to_string_lossy()))
 }
 
 #[cfg(test)]
