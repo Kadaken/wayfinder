@@ -1946,7 +1946,7 @@ fn is_unsearchable_fstype(fstype: &str) -> bool {
     // `fuse.<helper>` is a program answering for a filesystem -- rclone for
     // Google Drive, gvfsd, the portal, kio-fuse, gocryptfs. `fuseblk` is NOT
     // one of these: it is how the kernel mounts an ordinary NTFS disk, and
-    // Gaming and Storage are both mounted that way. Skipping anything simply
+    // Lantern and Orchard are both mounted that way. Skipping anything simply
     // starting with "fuse" would have dropped two real hard drives out of
     // every search (caught 9 November 2026, before it shipped).
     is_remote_fstype(fstype)
@@ -9990,13 +9990,13 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
 
     const D386_MOUNTS: &str = "\
 /dev/nvme0n1p3 / btrfs rw 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/Common fuse.pfsfuse ro,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/FFXI fuse.pfsfuse ro 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/Network\\040config fuse.pfsfuse ro 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/POLVIEWER fuse.pfsfuse ro 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/System fuse.pfsfuse ro 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/System\\040config fuse.pfsfuse ro 0 0\n\
-pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
+pfsfuse /run/media/user/Driftwood\\040PS2/Common fuse.pfsfuse ro,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other 0 0\n\
+pfsfuse /run/media/user/Driftwood\\040PS2/FFXI fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/Driftwood\\040PS2/Network\\040config fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/Driftwood\\040PS2/POLVIEWER fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/Driftwood\\040PS2/System fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/Driftwood\\040PS2/System\\040config fuse.pfsfuse ro 0 0\n\
+pfsfuse /run/media/user/Driftwood\\040PS2/TETRAMASTER fuse.pfsfuse ro 0 0\n";
 
     #[test]
     fn ps2_seven_mounts_give_one_row_d386() {
@@ -10011,7 +10011,7 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
 
     #[test]
     fn ps2_no_pfsfuse_mounts_give_no_row_d386() {
-        let other = "/dev/sda1 /mnt/x ext4 rw 0 0\ntmpfs /run/media/user/PS2\\040HDD tmpfs rw 0 0\n";
+        let other = "/dev/sda1 /mnt/x ext4 rw 0 0\ntmpfs /run/media/user/Driftwood\\040PS2 tmpfs rw 0 0\n";
         assert!(ps2_drives(other, &Default::default()).is_empty());
         assert!(ps2_drives("", &Default::default()).is_empty());
     }
@@ -10152,11 +10152,11 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
 
     const D387_LSBLK: &str = r#"{"blockdevices":[
       {"name":"sda","type":"disk","rm":false,"hotplug":true,"size":1000,"children":[
-        {"name":"sda1","type":"part","rm":false,"hotplug":true,"fstype":"exfat","label":"Backup","mountpoint":"/run/media/user/Pebble","path":"/dev/sda1","size":1000}]},
+        {"name":"sda1","type":"part","rm":false,"hotplug":true,"fstype":"exfat","label":"Pebble","mountpoint":"/run/media/user/Pebble","path":"/dev/sda1","size":1000}]},
       {"name":"sdb","type":"disk","rm":true,"hotplug":true,"fstype":"vfat","label":"CARD","mountpoint":"/run/media/user/CARD","path":"/dev/sdb","size":1000},
       {"name":"sdc","type":"disk","rm":true,"hotplug":false,"fstype":"vfat","label":"ODD","mountpoint":"","path":"/dev/sdc","size":1000},
       {"name":"nvme1n1","type":"disk","rm":false,"hotplug":false,"children":[
-        {"name":"nvme1n1p1","type":"part","rm":false,"hotplug":false,"fstype":"ntfs","label":"Storage","mountpoint":"/run/media/user/Orchard","path":"/dev/nvme1n1p1","size":1000}]},
+        {"name":"nvme1n1p1","type":"part","rm":false,"hotplug":false,"fstype":"ntfs","label":"Orchard","mountpoint":"/run/media/user/Orchard","path":"/dev/nvme1n1p1","size":1000}]},
       {"name":"nvme0n1","type":"disk","rm":false,"hotplug":false,"children":[
         {"name":"nvme0n1p3","type":"part","rm":false,"hotplug":false,"fstype":"crypto_LUKS","children":[
           {"name":"luks-x","type":"crypt","rm":false,"hotplug":false,"fstype":"btrfs","label":"fedora","mountpoint":"/home","path":"/dev/mapper/luks-x","size":1000}]}]}
@@ -10168,7 +10168,7 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
 
     #[test]
     fn internal_ntfs_storage_has_no_unmount_or_eject_d387() {
-        let d = d387_by("Storage");
+        let d = d387_by("Orchard");
         assert!(!d.hotplug && !d.removable);
         assert!(!drive_can_unmount(&d));
         assert!(!drive_can_eject(&d));
@@ -10184,7 +10184,7 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
 
     #[test]
     fn usb_partition_hotplug_not_rm_gets_both_d387() {
-        let d = d387_by("Backup");
+        let d = d387_by("Pebble");
         assert!(d.hotplug && !d.removable);
         assert!(drive_can_unmount(&d));
         assert!(drive_can_eject(&d));
@@ -10208,7 +10208,7 @@ pfsfuse /run/media/user/PS2\\040HDD/TETRAMASTER fuse.pfsfuse ro 0 0\n";
 ";
 
     fn d387_plugged(mp: &str, mounts: &str) -> Drive {
-        let mut d = d387_by("Backup");
+        let mut d = d387_by("Pebble");
         d.mountpoint = mp.to_string();
         d.read_only = mount_is_read_only(mounts, mp);
         d
@@ -10260,7 +10260,7 @@ rclone: /home/user/GoogleDrive fuse.rclone rw 0 0
     fn d156_children(root: &str) -> Option<Vec<String>> {
         match root {
             "/run/user/1000/gvfs" => Some(vec![
-                "smb-share:server=nas,share=Backup".to_string(),
+                "smb-share:server=nas,share=Almond".to_string(),
                 "sftp:host=example.com,user=bob".to_string(),
                 "weird:user=bob,password=hunter2".to_string(),
             ]),
@@ -10301,7 +10301,7 @@ rclone: /home/user/GoogleDrive fuse.rclone rw 0 0
         assert_eq!(
             got,
             vec![
-                ("Backup on nas", "/run/user/1000/gvfs/smb-share:server=nas,share=Backup"),
+                ("Almond on nas", "/run/user/1000/gvfs/smb-share:server=nas,share=Almond"),
                 ("example.com", "/run/user/1000/gvfs/sftp:host=example.com,user=bob"),
                 ("Media on nas", "/mnt/nas-media"),
                 ("Network share", "/run/user/1000/gvfs/weird:user=bob,password=hunter2"),

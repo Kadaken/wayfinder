@@ -7121,7 +7121,7 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
             let mount = drive.mountpoint.clone();
             connect_drive_context(&row, state.clone(), ui.clone(), drive);
             // D-318: a drive is a folder to drop into. Without this the drive
-            // row had no drop target at all, so dragging onto Storage showed
+            // row had no drop target at all, so dragging onto Orchard showed
             // the red "not allowed" circle (18 Nov 2026).
             if !mount.is_empty() {
                 connect_sidebar_drop(&row, state, ui, &mount);
@@ -16380,7 +16380,7 @@ struct GhostItem {
 /// arriving, and the speed so far.
 struct TransferView {
     dest: PathBuf,
-    /// "from Untitled to Storage": which folders, so a banner seen in another
+    /// "from Untitled to Orchard": which folders, so a banner seen in another
     /// window says where the transfer is happening.
     route: String,
     items: Vec<GhostItem>,
@@ -16394,7 +16394,7 @@ thread_local! {
     static TRANSFER_VIEW: RefCell<Option<TransferView>> = const { RefCell::new(None) };
 }
 
-/// "from Untitled to Storage": the folder the items are in and the folder they
+/// "from Untitled to Orchard": the folder the items are in and the folder they
 /// are going to, by name.
 fn transfer_route(srcs: &[PathBuf], dest: &Path) -> String {
     let name = |p: &Path| {
@@ -46218,7 +46218,7 @@ Broken: Either state is wrong.\n";
         // the whole GTK suite down with it (baseline, 18 Nov 2026).
         wait_for("the first scan to land", || !state.borrow().drive_refresh_in_flight);
         let test_drives = vec![native_core::Drive {
-            name: "Storage".to_string(),
+            name: "Orchard".to_string(),
             path: "/dev/test-storage".to_string(),
             mountpoint: mount.to_string_lossy().to_string(),
             size: 0,
@@ -46271,7 +46271,7 @@ Broken: Either state is wrong.\n";
         }
     }
 
-    /// D-386: activating the "PS2 HDD" row in Devices opens its folder. Kind
+    /// D-386: activating the "Driftwood PS2" row in Devices opens its folder. Kind
     /// "ps2" must navigate to the mountpoint the way the network and gdrive rows
     /// do, with no lsblk check (the raw disk has no FSTYPE there).
     #[test]
@@ -46300,7 +46300,7 @@ Broken: Either state is wrong.\n";
         wait_for("the first scan to land", || !state.borrow().drive_refresh_in_flight);
         let mount_str = mount.to_string_lossy().to_string();
         let test_drives = vec![native_core::Drive {
-            name: "PS2 HDD".to_string(),
+            name: "Driftwood PS2".to_string(),
             path: mount_str.clone(),
             mountpoint: mount_str.clone(),
             size: 0,
@@ -46329,7 +46329,7 @@ Broken: Either state is wrong.\n";
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
             .find(|r| r.tooltip_text().as_deref() == Some(mount_str.as_str()))
-            .expect("the PS2 HDD row");
+            .expect("the Driftwood PS2 row");
         row.emit_by_name::<()>("activate", &[]);
         wait_for("the PS2 row opened its folder", || state.borrow().cwd.display_string() == mount_str);
         ui.window.destroy();
@@ -46350,11 +46350,11 @@ Broken: Either state is wrong.\n";
             modified: false,
         };
         let (heading, detail, verb) = drop_confirm_text(&txn);
-        assert_eq!(heading, "Move \"Movies.zip\" to \"Storage\"?");
+        assert_eq!(heading, "Move \"Movies.zip\" to \"Orchard\"?");
         assert_eq!(detail, "From: /run/media/user/Untitled\nTo: /run/media/user/Orchard");
         assert_eq!(verb, "Move");
         let many = DropTxn { srcs: vec![PathBuf::from("/a/x"), PathBuf::from("/a/y")], is_copy: true, ..txn };
-        assert_eq!(drop_confirm_text(&many).0, "Copy 2 items to \"Storage\"?");
+        assert_eq!(drop_confirm_text(&many).0, "Copy 2 items to \"Orchard\"?");
     }
 
     #[test]
@@ -46362,7 +46362,7 @@ Broken: Either state is wrong.\n";
         let rows = vec![
             native_core::ReportRow {
                 from: "/card/Movies.zip".into(),
-                to: "/store/iMac Backup/Movies.zip".into(),
+                to: "/store/iMac Pebble/Movies.zip".into(),
                 kind: "file",
                 bytes: 70_903_620_645,
                 files_total: 1,
@@ -46371,7 +46371,7 @@ Broken: Either state is wrong.\n";
             },
             native_core::ReportRow {
                 from: "/card/Pics".into(),
-                to: "/store/iMac Backup/Pics".into(),
+                to: "/store/iMac Pebble/Pics".into(),
                 kind: "folder",
                 bytes: 30,
                 files_total: 2,
