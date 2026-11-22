@@ -14280,25 +14280,37 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
         fs::rename(&part, &cached).ok()?;
         return Some(cached);
     }
-    let status = std::process::Command::new("ffmpeg")
-        .arg("-nostdin")
-        .arg("-v")
-        .arg("error")
-        .arg("-y")
-        .arg("-i")
-        .arg(source)
-        .arg("-frames:v")
-        .arg("1")
-        // Belt and braces: say the format outright as well, so a future
-        // change to the temporary name cannot break this again.
-        .arg("-f")
-        .arg("image2")
-        .arg("-c:v")
-        .arg("png")
-        .arg("-vf")
-        .arg(format!("scale={}:-1:flags=bilinear", want_w.clamp(16, 1024)))
-        .arg(&part)
-        .status();
+    // D-404: a HEIC made of tiles (every phone photo) reaches ffmpeg as a
+    // complex filtergraph, and ffmpeg refuses a -vf on top of it ("Simple and
+    // complex filtering cannot be used together"). Those, and anything that
+    // fails with the scale, are decoded at full size without it.
+    let run_ffmpeg = |scaled: bool| {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-nostdin")
+            .arg("-v")
+            .arg("error")
+            .arg("-y")
+            .arg("-i")
+            .arg(source)
+            .arg("-frames:v")
+            .arg("1")
+            // Belt and braces: say the format outright as well, so a future
+            // change to the temporary name cannot break this again.
+            .arg("-f")
+            .arg("image2")
+            .arg("-c:v")
+            .arg("png");
+        if scaled {
+            cmd.arg("-vf")
+                .arg(format!("scale={}:-1:flags=bilinear", want_w.clamp(16, 1024)));
+        }
+        cmd.arg(&part).status()
+    };
+    let heif = native_core::is_heif_like(source);
+    let mut status = run_ffmpeg(!heif);
+    if !heif && !matches!(&status, Ok(code) if code.success() && part.is_file()) {
+        status = run_ffmpeg(false);
+    }
     match status {
         Ok(code) if code.success() && part.is_file() => {
             // Rename last, so a half-written file is never read as a thumbnail.
@@ -20801,6 +20813,14 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     }
 
     if native_core::is_video_path(&path_str) {
+        // D-404: a picture saved under a video name (phone folders hold
+        // JPEGs named .MOV) is shown as a picture, not sent to the player.
+        if !native_core::d379_off() {
+            if let Some(native_core::Sniffed::Image(_)) = native_core::sniff_content(&path_str) {
+                set_preview_image(ui, &path_str);
+                return;
+            }
+        }
         set_preview_media(ui, &path_str);
         return;
     }
@@ -21850,6 +21870,22 @@ async fn preview_image_outside(
     live_generation: Rc<Cell<u64>>,
     generation: u64,
 ) {
+    // D-404: a run-length BMP is decoded here at its own size, first: the
+    // outside tools refuse the top-down ones or scale them to a blur.
+    let rle_source = source.clone();
+    let rle = gio::spawn_blocking(move || native_viewers::rle_bmp_rgba(&rle_source))
+        .await
+        .ok()
+        .flatten();
+    if live_generation.get() != generation {
+        return;
+    }
+    if let Some((pixels, w, h)) = rle {
+        let bytes = glib::Bytes::from_owned(pixels);
+        picture.set_paintable(Some(&d381_texture((bytes, w as i32, h as i32, w as i32 * 4, true))));
+        stack.set_visible_child_name("image");
+        return;
+    }
     let fallback_source = source.clone();
     let cached = gio::spawn_blocking(move || {
         transcoded_thumbnail_file(&fallback_source, PREVIEW_DECODE_WIDTH)
@@ -21864,6 +21900,22 @@ async fn preview_image_outside(
             stack.set_visible_child_name("image");
         }
         _ => {
+            // D-404: a cut-off PNG: every decoder refuses it, the rows that
+            // survive are shown.
+            let partial_source = source.clone();
+            let partial = gio::spawn_blocking(move || native_viewers::partial_png_rgba(&partial_source))
+                .await
+                .ok()
+                .flatten();
+            if live_generation.get() != generation {
+                return;
+            }
+            if let Some((pixels, w, h)) = partial {
+                let bytes = glib::Bytes::from_owned(pixels);
+                picture.set_paintable(Some(&d381_texture((bytes, w as i32, h as i32, w as i32 * 4, true))));
+                stack.set_visible_child_name("image");
+                return;
+            }
             note_media_failure(
                 &source,
                 "preview: nothing on this machine could decode it",
@@ -21922,6 +21974,22 @@ fn set_preview_media(ui: &Ui, path: &str) {
 
 fn start_preview_media(ui: &Ui, path: &str) {
     stop_preview_audio(ui);
+    // D-404: an MP4 whose recording stopped before the index (moov) was
+    // written plays nowhere. Say so at once: no player, no ffmpeg round trip.
+    if native_core::mp4_without_moov(path) {
+        ui.preview_media_controls
+            .set_media_stream(None::<&gtk::MediaStream>);
+        ui.preview_media_picture
+            .set_paintable(None::<&gdk::Paintable>);
+        set_preview_text(
+            ui,
+            &format!(
+                "Cannot play this video: it has no moov index.\nThe recording was cut off before the index was written ({}). A repair tool and a good video from the same app can rebuild it.",
+                fs::metadata(path).map(|m| native_core::fmt_size(m.len())).unwrap_or_default()
+            ),
+        );
+        return;
+    }
     // D-362/D-369: containers GStreamer here is not trusted with go straight
     // to the ffmpeg conversion, the same as a video it fails to play.
     if native_core::video_frame_only(path) {
@@ -22127,6 +22195,15 @@ fn set_preview_video_frame(ui: &Ui, path: &str, why: &str) {
                     .unwrap_or_default();
                 panes.frame_info.set_text(&format!("{why}{length}"));
                 stack.set_visible_child_name("frame");
+            }
+            Ok((None, None)) if native_viewers::tool_in_path("ffmpeg") => {
+                // D-404: ffmpeg is here and finds neither a picture nor a
+                // length: the file holds no video data.
+                words.set_label(&format!(
+                    "No video data in this file: ffmpeg finds no picture or sound stream in it.\n{}",
+                    native_core::damaged_file_reason(&source, "video")
+                ));
+                stack.set_visible_child_name("text");
             }
             _ => {
                 words.set_label(&format!(
@@ -27971,6 +28048,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test d403mem-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d404") {
+            kinds_d404();
+            eprintln!("wf-test d404-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d393") {
             compact_lower_click_keeps_place_d393();
             eprintln!("wf-test d393-only run done");
@@ -28132,6 +28214,8 @@ Broken: Either state is wrong.\n";
         video_preview_pipeline_waits_for_a_steady_selection_d391();
         sidebar_drop_check_runs_off_the_gtk_thread_d400();
         clearing_search_brings_the_folder_back_d402();
+        avi_codecs_play_in_the_preview_d401();
+        kinds_d404();
         suite_tail_after_d86();
         suite_glib_dirs_d373("suite end");
     }
@@ -32876,6 +32960,190 @@ Broken: Either state is wrong.\n";
         let display = gdk::Display::default().expect("display");
         private_display_check_d232(&display);
         body();
+    }
+
+    /// D-404 kind K: the 41x30 test picture as an RLE8 or RLE4 BMP, rows
+    /// bottom-up or top-down (negative height). Index of pixel (x, y) is
+    /// `d404_rle_index`; runs fill x < 12, absolute mode fills the rest.
+    fn d404_rle_index(x: usize, y: usize) -> u8 {
+        if x < 12 { (y % 4) as u8 } else { ((x * 3 + y) % 16) as u8 }
+    }
+
+    fn d404_rle_bmp(four: bool, top_down: bool) -> Vec<u8> {
+        let (w, h) = (41usize, 30usize);
+        let mut data: Vec<u8> = Vec::new();
+        let order: Vec<usize> = if top_down { (0..h).collect() } else { (0..h).rev().collect() };
+        for y in order {
+            let v = d404_rle_index(0, y);
+            data.extend_from_slice(&[12, if four { v << 4 | v } else { v }]);
+            let rest: Vec<u8> = (12..w).map(|x| d404_rle_index(x, y)).collect();
+            data.extend_from_slice(&[0, rest.len() as u8]);
+            if four {
+                let mut packed: Vec<u8> = rest.chunks(2).map(|p| p[0] << 4 | p.get(1).copied().unwrap_or(0)).collect();
+                if packed.len() % 2 == 1 { packed.push(0); }
+                data.extend_from_slice(&packed);
+            } else {
+                data.extend_from_slice(&rest);
+                if rest.len() % 2 == 1 { data.push(0); }
+            }
+            data.extend_from_slice(&[0, 0]);
+        }
+        data.extend_from_slice(&[0, 1]);
+        let colours = if four { 16u32 } else { 256 };
+        let mut out = b"BM".to_vec();
+        let off = 54 + colours * 4;
+        out.extend_from_slice(&(off + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&(if top_down { -(h as i32) } else { h as i32 }).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(if four { 4u16 } else { 8 }).to_le_bytes());
+        out.extend_from_slice(&(if four { 2u32 } else { 1 }).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&colours.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        for i in 0..colours {
+            let i = (i % 16) as u8;
+            out.extend_from_slice(&[i * 8, 255 - i * 16, i * 16, 0]); // B, G, R
+        }
+        out.extend_from_slice(&data);
+        out
+    }
+
+    /// D-404 (22 Nov 2026): files from the owner's "Broken - to repair" drive that
+    /// the preview could not read. Every kind is made synthetically at run time
+    /// (scripts/make-kinds-d404.py) and selected the way a user selects it; each
+    /// must end on a picture, a player, or a clear sentence inside the time
+    /// bound. Letters follow "Wayfinder - file kinds it may not read, 22 Nov.md".
+    fn kinds_d404() {
+        let script = include_str!("../../scripts/make-kinds-d404.py");
+        install_app_css();
+        let d = d362_open("d404", |dir| {
+            let gen = dir.parent().unwrap().join("make-kinds-d404.py");
+            std::fs::write(&gen, script).unwrap();
+            let ok = std::process::Command::new("python3")
+                .arg("-I")
+                .arg(&gen)
+                .arg(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "scripts/make-kinds-d404.py made the samples");
+            for (name, four, top) in [
+                ("k_rle8_up.bmp", false, false), ("k_rle8_down.bmp", false, true),
+                ("k_rle4_up.bmp", true, false), ("k_rle4_down.bmp", true, true),
+            ] {
+                std::fs::write(dir.join(name), d404_rle_bmp(four, top)).unwrap();
+            }
+        }, 28);
+        d38x_preview_on(&d);
+
+        #[derive(Clone, Copy)]
+        enum Want {
+            /// A picture in the pane; the optional width must match (full size).
+            Picture(Option<i32>),
+            /// The video player has the file prepared, no error.
+            Player,
+            /// A sentence on the text or frame page containing this (lowercase).
+            Says(&'static str),
+            /// D-407: the sound page is up with a working Play button and a length.
+            AudioPlays,
+        }
+        let bound_ms = 6000u64;
+        let cases: Vec<(&str, &str, Want)> = vec![
+            ("A", "a_grid.heic", Want::Picture(Some(256))),
+            ("A", "a_grid_named_jpg.jpg", Want::Picture(Some(256))),
+            ("B", "b_trunc.jpg", Want::Picture(None)),
+            ("B", "b_trunc.png", Want::Picture(None)),
+            ("B", "b_trunc.gif", Want::Picture(None)),
+            ("C", "c_gif.js", Want::Picture(None)),
+            ("C", "c_jpg.htm", Want::Picture(None)),
+            ("C", "c_jpg.css", Want::Picture(None)),
+            ("C", "c_png", Want::Picture(None)),
+            ("C", "c_trunc_jpg.xml", Want::Picture(None)),
+            ("D", "d_pic.avif", Want::Picture(None)),
+            ("D", "d_pic.MOV", Want::Picture(None)),
+            ("E", "e_nomoov.mp4", Want::Says("cannot play")),
+            ("F", "f_vid", Want::Player),
+            ("F", "f_vid.htm", Want::Player),
+            ("F", "f_vid.js", Want::Player),
+            // D-407 open: a cut-off .mpg with no sequence header stays on a
+            // blank player (f_frag.mpg). Case returns with the fix in 0.9.31.
+            ("F", "f_frag_tiny.htm", Want::Says("too short to play")),
+            ("F", "f_frag_nodot", Want::Says("too short to play")),
+            ("G", "g_junk.mts", Want::Says("no video data")),
+            ("H", "h_nostreams.avi", Want::Says("no video data")),
+            ("H", "h_gsm.wav", Want::AudioPlays),
+            ("I", "i_zero.jpg", Want::Says("no picture data")),
+            ("J", "j_random.jpg", Want::Says("no picture data")),
+            ("K", "k_rle8_up.bmp", Want::Picture(Some(41))),
+            ("K", "k_rle8_down.bmp", Want::Picture(Some(41))),
+            ("K", "k_rle4_up.bmp", Want::Picture(Some(41))),
+            ("K", "k_rle4_down.bmp", Want::Picture(Some(41))),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (kind, name, want) in &cases {
+            set_preview_text(&d.ui, "Select a file");
+            d38x_spin_for(150);
+            let started = Instant::now();
+            d38x_select(&d, name);
+            let seen = || -> (String, String, i32) {
+                let stack = d.ui.preview_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_default();
+                let words = format!("{} {}", d.ui.preview.text(), d.ui.viewers.frame_info.text()).to_lowercase();
+                let width = d.ui.preview_picture.paintable().map(|p| p.intrinsic_width()).unwrap_or(0);
+                (stack, words, width)
+            };
+            let met = |this: &(String, String, i32)| -> bool {
+                match want {
+                    Want::Picture(w) => this.0 == "image" && this.2 > 0 && w.map_or(true, |w| this.2 == w),
+                    Want::Player => {
+                        this.0 == "media"
+                            && d.ui.preview_media_controls.media_stream().is_some_and(|m| m.is_prepared() && m.error().is_none())
+                    }
+                    Want::Says(t) => (this.0 == "text" || this.0 == "frame") && this.1.contains(t),
+                    Want::AudioPlays => {
+                        this.0 == "audio" && d.ui.preview_audio_play.is_sensitive()
+                            && d.ui.preview_audio_total.text() != "0:00"
+                    }
+                }
+            };
+            let hit = d38x_wait_ms(bound_ms, || met(&seen()));
+            let now = seen();
+            let elapsed = started.elapsed().as_millis();
+            let shown: String = if matches!(want, Want::AudioPlays) {
+                format!("play={} total={}", d.ui.preview_audio_play.is_sensitive(), d.ui.preview_audio_total.text())
+            } else {
+                now.1.chars().take(110).collect()
+            };
+            eprintln!(
+                "wf-test D-404 {kind} {name}: {} in {elapsed} ms (stack={:?} width={} text={:?})",
+                if hit.is_some() { "PASS" } else { "FAIL" },
+                now.0, now.2, shown
+            );
+            if hit.is_none() {
+                failures.push(format!("{kind} {name}: stack={:?} width={} text={:?}", now.0, now.2, shown));
+            }
+        }
+        // K: the decoded pixels, not only the size. Palette entry i is
+        // (R, G, B) = (i * 16, 255 - i * 16, i * 8).
+        let dir = d.state.borrow().visible_entries.iter().find(|e| e.name == "k_rle8_up.bmp")
+            .and_then(|e| e.source.real_path_string()).map(PathBuf::from).unwrap().parent().unwrap().to_path_buf();
+        for name in ["k_rle8_up.bmp", "k_rle8_down.bmp", "k_rle4_up.bmp", "k_rle4_down.bmp"] {
+            let (px, w, h) = crate::native_viewers::rle_bmp_rgba(&dir.join(name).to_string_lossy()).expect(name);
+            assert_eq!((w, h), (41, 30), "{name}");
+            for (x, y) in [(0usize, 0usize), (5, 3), (11, 29), (12, 0), (20, 7), (40, 29), (39, 13)] {
+                let i = d404_rle_index(x, y) as usize;
+                let at = (y * 41 + x) * 4;
+                let want = [(i * 16) as u8, 255 - (i * 16) as u8, (i * 8) as u8, 255];
+                if i < 16 { assert_eq!(&px[at..at + 4], &want, "{name} pixel ({x},{y})"); }
+            }
+        }
+        eprintln!("wf-test D-404 K pixel values OK");
+        assert!(failures.is_empty(), "D-404 failures ({}):\n{}", failures.len(), failures.join("\n"));
+        println!("wf-test D-404 OK");
     }
 
     /// D-379 alone, on the private display.

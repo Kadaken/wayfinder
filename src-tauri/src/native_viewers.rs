@@ -998,3 +998,202 @@ mod tests {
         }
     }
 }
+
+/// D-404: the rows of a cut-off PNG that still decode, as 8-bit RGBA.
+/// `(pixels, width, rows)`; `None` when no whole row survives or the file is a
+/// kind this reader does not handle (interlaced, 16-bit, unknown colour type).
+/// gdk-pixbuf, ffmpeg and ImageMagick all refuse a PNG whose data stops early;
+/// the top of the picture is still there. Reads at most 64 MB.
+pub fn partial_png_rgba(path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(64 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let (mut width, mut height, mut depth, mut color, mut interlace) = (0usize, 0usize, 0u8, 0u8, 1u8);
+    let mut palette: Vec<u8> = Vec::new();
+    let mut alpha_table: Vec<u8> = Vec::new();
+    let mut idat: Vec<u8> = Vec::new();
+    let mut pos = 8usize;
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        let kind = &bytes[pos + 4..pos + 8];
+        let body_start = pos + 8;
+        // A chunk cut short still gives the data it has: that is the point.
+        let body_end = body_start.saturating_add(len).min(bytes.len());
+        let body = &bytes[body_start..body_end];
+        match kind {
+            b"IHDR" if body.len() >= 13 => {
+                width = u32::from_be_bytes(body[0..4].try_into().ok()?) as usize;
+                height = u32::from_be_bytes(body[4..8].try_into().ok()?) as usize;
+                depth = body[8];
+                color = body[9];
+                interlace = body[12];
+            }
+            b"PLTE" => palette = body.to_vec(),
+            b"tRNS" => alpha_table = body.to_vec(),
+            b"IDAT" => idat.extend_from_slice(body),
+            b"IEND" => break,
+            _ => {}
+        }
+        pos = body_end.saturating_add(4);
+    }
+    if width == 0 || height == 0 || width > 16384 || height > 16384 || depth != 8 || interlace != 0 {
+        return None;
+    }
+    let channels = match color {
+        0 | 3 => 1usize,
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => return None,
+    };
+    if color == 3 && palette.len() < 3 {
+        return None;
+    }
+    let row_len = width * channels;
+    let mut raw = Vec::new();
+    // The decoder stops at the cut; what it produced before that is kept.
+    let _ = flate2::read::ZlibDecoder::new(&idat[..]).take((row_len as u64 + 1) * height as u64).read_to_end(&mut raw);
+    let rows = (raw.len() / (row_len + 1)).min(height);
+    if rows == 0 {
+        return None;
+    }
+    let mut prev = vec![0u8; row_len];
+    let mut cur = vec![0u8; row_len];
+    let mut out = Vec::with_capacity(rows * width * 4);
+    for r in 0..rows {
+        let line = &raw[r * (row_len + 1)..(r + 1) * (row_len + 1)];
+        let filter = line[0];
+        for i in 0..row_len {
+            let x = line[i + 1];
+            let a = if i >= channels { cur[i - channels] } else { 0 };
+            let b = prev[i];
+            let c = if i >= channels { prev[i - channels] } else { 0 };
+            cur[i] = match filter {
+                0 => x,
+                1 => x.wrapping_add(a),
+                2 => x.wrapping_add(b),
+                3 => x.wrapping_add(((a as u16 + b as u16) / 2) as u8),
+                4 => {
+                    let (pa, pb, pc) = (
+                        (b as i32 - c as i32).abs(),
+                        (a as i32 - c as i32).abs(),
+                        (a as i32 + b as i32 - 2 * c as i32).abs(),
+                    );
+                    let pred = if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c };
+                    x.wrapping_add(pred)
+                }
+                _ => return None,
+            };
+        }
+        for px in cur.chunks(channels) {
+            match color {
+                0 => out.extend_from_slice(&[px[0], px[0], px[0], 255]),
+                2 => out.extend_from_slice(&[px[0], px[1], px[2], 255]),
+                3 => {
+                    let i = px[0] as usize;
+                    let rgb = palette.get(i * 3..i * 3 + 3).unwrap_or(&[0, 0, 0]);
+                    out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha_table.get(i).copied().unwrap_or(255)]);
+                }
+                4 => out.extend_from_slice(&[px[0], px[0], px[0], px[1]]),
+                _ => out.extend_from_slice(&[px[0], px[1], px[2], px[3]]),
+            }
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    Some((out, width as u32, rows as u32))
+}
+
+/// D-404: an 8-bit or 4-bit run-length (RLE8/RLE4) BMP decoded by hand, as
+/// RGBA `(pixels, width, height)`. Handles bottom-up and top-down rows.
+/// Pillow, ffmpeg and ImageMagick refuse these (the top-down ones), and
+/// gdk-pixbuf refuses the top-down ones. `None` for any other BMP and for
+/// headers that do not add up. A file that ends early keeps the rows it has
+/// (the rest is palette entry 0). Reads at most 64 MB.
+pub fn rle_bmp_rgba(path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    use std::io::Read;
+    let mut d = Vec::new();
+    std::fs::File::open(path).ok()?.take(64 * 1024 * 1024).read_to_end(&mut d).ok()?;
+    if d.len() < 54 || &d[0..2] != b"BM" {
+        return None;
+    }
+    let u32_at = |i: usize| u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]]);
+    let off = u32_at(10) as usize;
+    let hs = u32_at(14) as usize;
+    let (w, h) = (u32_at(18) as i32, u32_at(22) as i32);
+    let bpp = u16::from_le_bytes([d[28], d[29]]);
+    let comp = u32_at(30);
+    let four = comp == 2;
+    if hs < 40 || !((comp == 1 && bpp == 8) || (comp == 2 && bpp == 4)) || w <= 0 || h == 0 || w > 16384 || h.unsigned_abs() > 16384 {
+        return None;
+    }
+    let (w, rows) = (w as usize, h.unsigned_abs() as usize);
+    let ncol = match u32_at(46) as usize {
+        0 => 1usize << bpp,
+        n => n.min(1 << bpp),
+    };
+    let pal_at = 14 + hs;
+    if pal_at + 4 * ncol > d.len() || off > d.len() {
+        return None;
+    }
+    let colour = |v: u8| -> [u8; 4] {
+        let i = (v as usize).min(ncol - 1);
+        let p = &d[pal_at + 4 * i..pal_at + 4 * i + 4];
+        [p[2], p[1], p[0], 255]
+    };
+    let mut idx = vec![0u8; w * rows];
+    let (mut x, mut y, mut i) = (0usize, 0usize, off);
+    let mut put = |x: usize, y: usize, v: u8| {
+        if x < w && y < rows {
+            idx[y * w + x] = v;
+        }
+    };
+    while i + 1 < d.len() && y < rows {
+        let (n, c) = (d[i] as usize, d[i + 1]);
+        i += 2;
+        if n > 0 {
+            for k in 0..n {
+                let v = if four { if k % 2 == 0 { c >> 4 } else { c & 15 } } else { c };
+                put(x, y, v);
+                x += 1;
+            }
+        } else {
+            match c {
+                0 => {
+                    x = 0;
+                    y += 1;
+                }
+                1 => break,
+                2 => {
+                    if i + 1 >= d.len() {
+                        break;
+                    }
+                    x += d[i] as usize;
+                    y += d[i + 1] as usize;
+                    i += 2;
+                }
+                count => {
+                    let count = count as usize;
+                    let nb = if four { count.div_ceil(2) } else { count };
+                    for k in 0..count {
+                        let Some(&b) = d.get(i + if four { k / 2 } else { k }) else { break };
+                        let v = if four { if k % 2 == 0 { b >> 4 } else { b & 15 } } else { b };
+                        put(x, y, v);
+                        x += 1;
+                    }
+                    i += nb + (nb & 1);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(w * rows * 4);
+    for r in 0..rows {
+        let src = if h > 0 { rows - 1 - r } else { r };
+        for c in 0..w {
+            out.extend_from_slice(&colour(idx[src * w + c]));
+        }
+    }
+    Some((out, w as u32, rows as u32))
+}
