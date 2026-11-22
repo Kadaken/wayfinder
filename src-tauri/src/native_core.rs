@@ -6705,6 +6705,11 @@ impl<S, U: Clone, H> WindowRegistry<S, U, H> {
         Some((ui, hold))
     }
 
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn ui_for_state(&self, state: &std::rc::Rc<std::cell::RefCell<S>>) -> Option<U> {
         self.entries
             .iter()
@@ -6823,6 +6828,11 @@ impl TreeCache {
         self.children.clear();
         self.order.clear();
         self.openable.clear();
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.children.len() + self.openable.len()
     }
 }
 

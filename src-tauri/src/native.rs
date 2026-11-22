@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Kadaken
 
-// The test seams above the locked drag code are written `#[cfg(any(test))]`, not
-// `#[cfg(test)]`, on purpose: the D-188 gates (`row_drag_beats_selection_box_locked`
-// and its companion) stop scanning at the first literal `#[cfg(test)]`, which must
-// stay below the drag code. Clippy calls the one-element `any()` needless; it is
+// The test seams above the locked drag code are written with a one-element
+// `any(test)`, not the plain test cfg, on purpose: the D-188 gates
+// (`row_drag_beats_selection_box_locked` and its companion) stop scanning at the
+// first literal plain test-cfg attribute, which must stay below the drag code. Clippy calls the one-element `any()` needless; it is
 // the marker the gates rely on, so the lint is switched off for this file only.
 #![allow(clippy::non_minimal_cfg)]
 
