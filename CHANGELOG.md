@@ -14,6 +14,10 @@ change between releases.
 - Document previews made by LibreOffice or Ghostscript run with no network access, so a document cannot reach out to the internet while it is previewed.
 - Uninstalling gives folders back to the app that opened them before Wayfinder, instead of leaving a default that points at nothing.
 
+### Changed
+
+- Internal: removed dead code and fixed every clippy warning (no behaviour change).
+
 ## 0.9.29 — 21 November 2026
 
 ### Fixed
