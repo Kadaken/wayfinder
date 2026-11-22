@@ -4525,11 +4525,12 @@ pub fn brief_failure(text: &str, max_lines: usize) -> String {
     let mut out: Vec<String> = lines
         .iter()
         .take(max_lines)
+        .map(|l| plain_failure_line(l))
         .map(|l| {
             if l.chars().count() > 300 {
                 format!("{}...", l.chars().take(300).collect::<String>())
             } else {
-                (*l).to_string()
+                l
             }
         })
         .collect();
@@ -4537,6 +4538,56 @@ pub fn brief_failure(text: &str, max_lines: usize) -> String {
         out.push(format!("... and {} more lines", lines.len() - max_lines));
     }
     out.join("\n")
+}
+
+/// D-405: one failure line in words a person reads. The copy tool's own prefix,
+/// Wayfinder's internal staging names (`.wf-replace-…`, shown as the folder
+/// they sit in) and the "(os error N)" codes are taken out; the common causes
+/// get a plain sentence with the place they happened.
+pub fn plain_failure_line(line: &str) -> String {
+    let line = line.trim();
+    let line = line.strip_prefix("cp: ").unwrap_or(line);
+    // The first quoted path, with an internal staging name replaced by its folder.
+    let place = line.split('\'').nth(1).filter(|p| p.contains('/')).map(|p| {
+        let path = Path::new(p);
+        let internal = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(".wf-replace-"));
+        if internal {
+            path.parent().map(|d| d.display().to_string()).unwrap_or_default()
+        } else {
+            p.to_string()
+        }
+    });
+    let lower = line.to_ascii_lowercase();
+    let reason = if lower.contains("permission denied") || lower.contains("os error 13") || lower.contains("operation not permitted") {
+        Some("no permission to write here")
+    } else if lower.contains("read-only file system") || lower.contains("os error 30") {
+        Some("the drive is read-only")
+    } else if lower.contains("transport endpoint is not connected") || lower.contains("os error 107") {
+        Some("the drive or share is no longer connected")
+    } else if lower.contains("no space left") || lower.contains("os error 28") {
+        Some("not enough free space on the drive")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return match place {
+            Some(place) if !place.is_empty() => format!("{reason}: {place}"),
+            _ => reason.to_string(),
+        };
+    }
+    let mut text = line.to_string();
+    if let Some(start) = text.find(" (os error ") {
+        if let Some(len) = text[start..].find(')') {
+            text.replace_range(start..start + len + 1, "");
+        }
+    }
+    while let Some(at) = text.find("/.wf-replace-") {
+        let end = text[at..].find(['\'', '"', ' ']).map_or(text.len(), |e| at + e);
+        text.replace_range(at..end, "");
+    }
+    text
 }
 
 /// Stages one item with the exact `cp -a -T` child, which is polled: a cancel
@@ -7510,6 +7561,27 @@ mod tests {
         assert!(shown.lines().count() <= 9, "dialog text has {} lines", shown.lines().count());
         assert!(shown.len() < 4000, "dialog text is {} bytes", shown.len());
         assert!(shown.contains("more lines"));
+    }
+
+    #[test]
+    fn failure_text_is_plain_d405() {
+        let raw = "cp: cannot create regular file '/media/ro/Folder/.wf-replace-new-4242-0': Permission denied";
+        assert_eq!(brief_failure(raw, 1), "no permission to write here: /media/ro/Folder");
+        assert_eq!(
+            brief_failure("cannot inspect /media/ro/x.txt: Permission denied (os error 13)", 1),
+            "no permission to write here"
+        );
+        assert_eq!(
+            brief_failure("cp: cannot stat '/net/share/a.txt': Transport endpoint is not connected", 1),
+            "the drive or share is no longer connected: /net/share/a.txt"
+        );
+        assert_eq!(
+            brief_failure("cp: error writing '/mnt/usb/.wf-replace-new-1-2': No space left on device", 1),
+            "not enough free space on the drive: /mnt/usb"
+        );
+        assert_eq!(brief_failure("rename /a/.wf-replace-old-9-1 failed (os error 39)", 1), "rename /a failed");
+        let shown = brief_failure(raw, 1);
+        assert!(!shown.contains(".wf-replace") && !shown.contains("os error") && !shown.starts_with("cp:"), "{shown}");
     }
 
     /// D-313: the read of the sources before a copy reports its progress, so a
