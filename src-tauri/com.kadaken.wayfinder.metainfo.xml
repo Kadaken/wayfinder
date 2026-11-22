@@ -46,6 +46,14 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.32" date="2026-11-22">
+      <description>
+        <p>New "Show original" item in the file menu opens the original of a
+        duplicate in a new window. A video cut out of the middle of an MPEG
+        stream now says it cannot be played instead of leaving the preview
+        blank.</p>
+      </description>
+    </release>
     <release version="0.9.31" date="2026-11-22">
       <description>
         <p>Right-click menus also open from the keyboard (Menu key or
