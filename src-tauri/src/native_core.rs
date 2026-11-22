@@ -5891,7 +5891,31 @@ pub fn damaged_file_reason(path: &str, wanted: &str) -> String {
         Some((label, _)) => format!(
             "Unreadable data: the start of the file says {label}, but it is damaged and cannot be decoded."
         ),
+        None if wanted == "picture" || wanted == "video" => {
+            format!("No {wanted} data: {}.", zero_or_unknown_start(path, wanted))
+        }
         None => format!("Unreadable data: this file has no known {wanted} format signature, so it is damaged or not {wanted} at all."),
+    }
+}
+
+/// D-404: why a file with no known signature holds no picture or video: all
+/// zero bytes (the first 64 KB are checked), or bytes that are not that kind
+/// of data.
+fn zero_or_unknown_start(path: &str, wanted: &str) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let read = fs::File::open(path)
+        .and_then(|f| f.take(64 * 1024).read_to_end(&mut buf))
+        .unwrap_or(0);
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(read as u64);
+    if read > 0 && buf.iter().all(|b| *b == 0) {
+        if size as usize == read {
+            "every byte in the file is zero, so it was blanked or never written".to_string()
+        } else {
+            "the file starts with zero bytes and has no signature, so it was blanked or never written".to_string()
+        }
+    } else {
+        format!("the file starts with no known {wanted} signature, so the {wanted} was overwritten or this is not a {wanted} file")
     }
 }
 
@@ -5962,7 +5986,60 @@ pub fn sniff_content_bytes(head: &[u8]) -> Option<Sniffed> {
     if starts(&[0x00, 0x00, 0x01, 0xBA]) {
         return Some(Sniffed::MpegPs);
     }
+    // D-404: HEIC and AVIF pictures are ISO-BMFF files; phone backups name
+    // some of them .jpg. The brand after "ftyp" says picture, not video.
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        match &head[8..12] {
+            b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => {
+                return Some(Sniffed::Image("HEIC"));
+            }
+            b"avif" | b"avis" => return Some(Sniffed::Image("AVIF")),
+            _ => {}
+        }
+    }
     None
+}
+
+/// D-404: true when the file is an MP4/QuickTime file (it starts with an
+/// `ftyp` box) whose top-level boxes never include `moov`: the recording was
+/// cut off before the index was written, so nothing can play it. Reads only
+/// box headers. Anything it cannot follow (a box size under 8) answers false
+/// and leaves the file to the normal player.
+pub fn mp4_without_moov(path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    let Ok(len) = f.metadata().map(|m| m.len()) else { return false };
+    let mut head = [0u8; 16];
+    let mut pos = 0u64;
+    for round in 0..4096 {
+        if pos + 8 > len {
+            break;
+        }
+        if f.seek(SeekFrom::Start(pos)).is_err() {
+            return false;
+        }
+        let n = f.read(&mut head).unwrap_or(0);
+        if n < 8 {
+            break;
+        }
+        if round == 0 && &head[4..8] != b"ftyp" {
+            return false;
+        }
+        let size = match u32::from_be_bytes([head[0], head[1], head[2], head[3]]) {
+            0 => len - pos,
+            1 if n >= 16 => u64::from_be_bytes(head[8..16].try_into().unwrap()),
+            1 => return false,
+            small => small as u64,
+        };
+        if size < 8 {
+            return false;
+        }
+        if &head[4..8] == b"moov" {
+            return false;
+        }
+        pos += size;
+    }
+    pos > 0
 }
 
 /// D-379: reads at most 32 bytes of `path` and says what they are.
@@ -5971,6 +6048,17 @@ pub fn sniff_content(path: &str) -> Option<Sniffed> {
     let mut head = [0u8; 32];
     let n = fs::File::open(path).and_then(|mut f| f.read(&mut head)).ok()?;
     sniff_content_bytes(&head[..n])
+}
+
+/// D-404: a HEIF-family picture, by extension or by the brand after `ftyp`.
+pub fn is_heif_like(path: &str) -> bool {
+    has_extension(path, &["heic", "heif"])
+        || matches!(sniff_content(path), Some(Sniffed::Image("HEIC")))
+}
+
+/// D-404: test-only switch for the picture-under-a-video-name routing.
+pub fn d379_off() -> bool {
+    cfg!(test) && std::env::var_os("WF_TEST_D404_OLD").is_some()
 }
 
 /// D-383: test-only switch, old behaviour (no way to fix a lying extension).

@@ -7,6 +7,7 @@ change between releases.
 ## Unreleased
 
 ### Fixed
+- Preview opens HEIC tile grids, truncated PNG, RLE8/RLE4 BMP and picture-type .MOV, and gives a clear quick message for MP4 without moov and files with no picture or video data (D-404).
 - Startup and every sidebar refresh no longer wait on slow drives: whether a pin, recent or drive row accepts drops is no longer checked on the window's thread (a slow cloud or USB mount held the window for about 40 seconds).
 
 - Browsing a big folder of pictures in Icons view (or Details view) no longer makes memory grow without limit: every file row or tile that scrolled past used to stay in memory with its thumbnail.
