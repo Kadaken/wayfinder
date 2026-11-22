@@ -2813,6 +2813,9 @@ struct ThumbnailQueue {
 struct VideoPosterJob {
     path: String,
     picture: gtk::Picture,
+    /// D-403: the longest edge, in pixels, the frame is scaled to INSIDE the
+    /// pipeline (aspect kept), so a 4K video never becomes a 4K texture.
+    size: i32,
 }
 
 /// D-85: same shape as `ThumbnailQueue`, but for extracting one real frame
@@ -12662,7 +12665,8 @@ fn connect_list_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         ) {
             if wants_poster {
                 if let Some(queue) = &video_poster_queue {
-                    queue_grid_video_poster(queue, real_path, picture);
+                    let size = native_core::list_thumbnail_metrics(icon_zoom, compact).decode;
+                    queue_grid_video_poster(queue, real_path, picture, size);
                 }
             } else if let Some(queue) = thumbnail_queue {
                 let metrics = native_core::list_thumbnail_metrics(icon_zoom, compact);
@@ -13061,7 +13065,8 @@ fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
         if let (Some(picture), Some(real_path)) = (thumbnail, entry.source.real_path_string()) {
             if native_core::is_video_path(&real_path) {
                 if let Some(queue) = &video_poster_queue {
-                    queue_grid_video_poster(queue, real_path, picture);
+                    let size = (grid_tile_px(icon_zoom) * 2).min(MAX_GRID_THUMBNAIL_PIXELS);
+                    queue_grid_video_poster(queue, real_path, picture, size);
                 }
             } else if let Some(queue) = &thumbnail_queue {
                 let px = (grid_tile_px(icon_zoom) * 2).min(MAX_GRID_THUMBNAIL_PIXELS);
@@ -13122,8 +13127,8 @@ fn connect_grid_factory(factory: &gtk::SignalListItemFactory, state: &Rc<RefCell
 
 /// D-368: queue one tile's video poster. The queue is the folder's own; a tile
 /// that scrolls away takes its pending job back out (`cancel_grid_video_poster`).
-fn queue_grid_video_poster(queue: &Rc<RefCell<VideoPosterQueue>>, path: String, picture: gtk::Picture) {
-    queue.borrow_mut().pending.push_back(VideoPosterJob { path, picture });
+fn queue_grid_video_poster(queue: &Rc<RefCell<VideoPosterQueue>>, path: String, picture: gtk::Picture, size: i32) {
+    queue.borrow_mut().pending.push_back(VideoPosterJob { path, picture, size });
     start_video_poster_jobs(queue.clone());
 }
 
@@ -14293,6 +14298,13 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                 continue;
             }
         };
+        #[cfg(test)]
+        POSTER_JOBS_STARTED.with(|n| n.set(n.get() + 1));
+        #[cfg(test)]
+        if POSTER_FORCE_GST_FAIL.with(|f| f.get()) {
+            poster_finish_or_ffmpeg(&queue, &Rc::new(std::cell::Cell::new(false)), None, "forced", &job.path, &job.picture, job.size);
+            continue;
+        }
         let Ok(pipeline_elem) = gst::ElementFactory::make("playbin").property("uri", &uri).build()
         else {
             finish_video_poster_job(&queue, None, None, "no-playbin");
@@ -14305,14 +14317,15 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                 p.add(&elem).ok();
                 p
             });
-        let Ok(appsink) = gst::ElementFactory::make("appsink").build() else {
+        // D-403: scale INSIDE the pipeline, in the decoder's own format, before
+        // anything is converted to RGB, so no full-size RGB frame (24 MB for 4K)
+        // is ever made. The box keeps the aspect ratio (square pixels, each edge
+        // at most `size`); a smaller video passes through at its own size.
+        let Some((sink_bin, appsink)) = poster_sink(job.size) else {
             finish_video_poster_job(&queue, None, Some(&pipeline), "no-appsink");
             continue;
         };
-        let caps = gst::Caps::builder("video/x-raw").field("format", "RGB").build();
-        appsink.set_property("caps", &caps);
-        appsink.set_property("sync", false);
-        pipeline.set_property("video-sink", &appsink);
+        pipeline.set_property("video-sink", &sink_bin);
 
         // 0 = awaiting first preroll (paused at position 0); 1 = seek issued,
         // awaiting the preroll that follows it.
@@ -14323,6 +14336,8 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
         let done_for_bus = done.clone();
         let bus = pipeline.bus().expect("playbin always has a bus");
         let picture = job.picture.clone();
+        let job_path = job.path.clone();
+        let job_size = job.size;
         let queue_for_bus = queue.clone();
         let cancelled_for_bus = cancelled.clone();
         let pipeline_for_bus = pipeline.clone();
@@ -14354,26 +14369,26 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                                     .is_ok();
                                 if !ok {
                                     paint_poster_frame(&appsink_for_bus, &picture);
-                                    finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "seek-failed");
+                                    poster_finish_or_ffmpeg(&queue_for_bus, &done_for_bus, Some(&pipeline_for_bus), "seek-failed", &job_path, &picture, job_size);
                                     return glib::ControlFlow::Break;
                                 }
                             }
                             None => {
                                 paint_poster_frame(&appsink_for_bus, &picture);
-                                finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "no-duration");
+                                poster_finish_or_ffmpeg(&queue_for_bus, &done_for_bus, Some(&pipeline_for_bus), "no-duration", &job_path, &picture, job_size);
                                 return glib::ControlFlow::Break;
                             }
                         }
                         glib::ControlFlow::Continue
                     } else {
                         paint_poster_frame(&appsink_for_bus, &picture);
-                        finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), "second-preroll");
+                        poster_finish_or_ffmpeg(&queue_for_bus, &done_for_bus, Some(&pipeline_for_bus), "second-preroll", &job_path, &picture, job_size);
                         glib::ControlFlow::Break
                     }
                 }
                 MessageView::Error(_) | MessageView::Eos(_) => {
                     let why = if matches!(msg.view(), MessageView::Error(_)) { "bus-error" } else { "bus-eos" };
-                    finish_video_poster_job(&queue_for_bus, Some(&done_for_bus), Some(&pipeline_for_bus), why);
+                    poster_finish_or_ffmpeg(&queue_for_bus, &done_for_bus, Some(&pipeline_for_bus), why, &job_path, &picture, job_size);
                     glib::ControlFlow::Break
                 }
                 _ => glib::ControlFlow::Continue,
@@ -14400,6 +14415,9 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
             let queue_for_timeout = queue.clone();
             let done_for_timeout = done.clone();
             let pipeline_for_timeout = pipeline.clone();
+            let picture_for_timeout = job.picture.clone();
+            let path_for_timeout = job.path.clone();
+            let size_for_timeout = job.size;
             glib::timeout_add_local_once(VIDEO_POSTER_TIMEOUT, move || {
                 if !done_for_timeout.get() {
                     // D-372 diagnostic, taken BEFORE the finish tears the
@@ -14425,7 +14443,7 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                     eprintln!("wf-event video-poster-timeout {line}");
                     VIDEO_POSTER_TIMEOUT_DIAG.with(|d| d.borrow_mut().push(line));
                 }
-                finish_video_poster_job(&queue_for_timeout, Some(&done_for_timeout), Some(&pipeline_for_timeout), "timeout");
+                poster_finish_or_ffmpeg(&queue_for_timeout, &done_for_timeout, Some(&pipeline_for_timeout), "timeout", &path_for_timeout, &picture_for_timeout, size_for_timeout);
             });
         }
         if pipeline.set_state(gst::State::Paused).is_err() {
@@ -14452,26 +14470,175 @@ fn paint_poster_frame(appsink: &gst::Element, picture: &gtk::Picture) {
     };
     let Some(buffer) = sample.buffer() else { return };
     let Ok(map) = buffer.map_readable() else { return };
-    let rowstride = ((width * 3 + 3) / 4) * 4;
-    let bytes = glib::Bytes::from(map.as_slice());
-    let pixbuf = Pixbuf::from_bytes(
-        &bytes,
-        gdk_pixbuf::Colorspace::Rgb,
-        false,
-        8,
-        width,
-        height,
-        rowstride,
-    );
+    paint_rgb_frame(picture, width, ((width * 3 + 3) / 4) * 4, height, map.as_slice());
+}
+
+/// Paints tightly decoded RGB bytes into a row/tile picture.
+fn paint_rgb_frame(picture: &gtk::Picture, width: i32, rowstride: i32, height: i32, data: &[u8]) {
+    let bytes = glib::Bytes::from(data);
+    let pixbuf = Pixbuf::from_bytes(&bytes, gdk_pixbuf::Colorspace::Rgb, false, 8, width, height, rowstride);
     #[allow(deprecated)]
     let texture = gdk::Texture::for_pixbuf(&pixbuf);
     picture.set_paintable(Some(&texture));
+}
+
+/// D-403: `videoscale ! caps(size box) ! videoconvert ! caps(RGB) ! appsink`
+/// as one bin for playbin's `video-sink`. Returns the bin and its appsink.
+fn poster_sink(size: i32) -> Option<(gst::Element, gst::Element)> {
+    let size = size.max(8);
+    let make = |name: &str| gst::ElementFactory::make(name).build().ok();
+    let scale = make("videoscale")?;
+    let fit = make("capsfilter")?;
+    let convert = make("videoconvert")?;
+    let rgb = make("capsfilter")?;
+    let appsink = make("appsink")?;
+    fit.set_property(
+        "caps",
+        gst::Caps::builder("video/x-raw")
+            .field("width", gst::IntRange::new(1, size))
+            .field("height", gst::IntRange::new(1, size))
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build(),
+    );
+    rgb.set_property("caps", gst::Caps::builder("video/x-raw").field("format", "RGB").build());
+    appsink.set_property("sync", false);
+    let bin = gst::Bin::new();
+    gst::prelude::GstBinExtManual::add_many(&bin, [&scale, &fit, &convert, &rgb, &appsink]).ok()?;
+    gst::Element::link_many([&scale, &fit, &convert, &rgb, &appsink]).ok()?;
+    let pad = scale.static_pad("sink")?;
+    bin.add_pad(&gst::GhostPad::with_target(&pad).ok()?).ok()?;
+    Some((bin.upcast(), appsink))
+}
+
+/// D-403: finish a poster job; when GStreamer left the picture empty (a codec
+/// or pixel format it refuses, a stall) ask ffmpeg for one frame instead, off
+/// the GTK thread, inside the same 8 s bound. The job keeps its queue slot
+/// until ffmpeg is done, so the concurrency cap still holds. Audio-only and
+/// corrupt files yield no frame and keep their icon.
+fn poster_finish_or_ffmpeg(
+    queue: &Rc<RefCell<VideoPosterQueue>>,
+    done: &Rc<std::cell::Cell<bool>>,
+    pipeline: Option<&gst::Pipeline>,
+    why: &'static str,
+    path: &str,
+    picture: &gtk::Picture,
+    size: i32,
+) {
+    if picture.paintable().is_some() || queue.borrow().cancelled.is_cancelled() || done.get() {
+        finish_video_poster_job(queue, Some(done), pipeline, why);
+        return;
+    }
+    // Claim the job: the timeout timer and any late bus message now no-op.
+    done.set(true);
+    if let Some(pipeline) = pipeline {
+        pipeline.set_state(gst::State::Null).ok();
+    }
+    let (queue, pipeline, picture, path) = (queue.clone(), pipeline.cloned(), picture.clone(), path.to_string());
+    glib::MainContext::default().spawn_local(async move {
+        let frame = gio::spawn_blocking(move || ffmpeg_video_poster(&path, size)).await.ok().flatten();
+        let mut reason = why;
+        eprintln!("wf-event video-poster-ffmpeg after={why} frame={}", frame.is_some());
+        if let Some((w, h, rgb)) = frame {
+            if !queue.borrow().cancelled.is_cancelled() {
+                paint_rgb_frame(&picture, w, w * 3, h, &rgb);
+                reason = "ffmpeg-poster";
+            }
+        }
+        finish_video_poster_job(&queue, None, pipeline.as_ref(), reason);
+    });
+}
+
+/// D-403: one frame of a video from ffmpeg as tight RGB (PPM on a pipe, never a
+/// file), scaled to fit `size` x `size` with the aspect kept. Tries ~1 s in,
+/// then the first frame (a clip shorter than 1 s), both inside one 8 s bound;
+/// a stuck ffmpeg is killed. `None` for audio-only, corrupt or unreadable.
+fn ffmpeg_video_poster(path: &str, size: i32) -> Option<(i32, i32, Vec<u8>)> {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + VIDEO_POSTER_TIMEOUT;
+    let size = size.clamp(16, 1024);
+    for ss in ["1", "0"] {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let mut child = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-an", "-sn", "-ss", ss, "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-vf"])
+            .arg(format!("scale={size}:{size}:force_original_aspect_ratio=decrease:flags=bilinear"))
+            .args(["-f", "image2pipe", "-c:v", "ppm", "-"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut out = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        });
+        let ok = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+            }
+        };
+        let bytes = reader.join().unwrap_or_default();
+        if ok {
+            if let Some(frame) = parse_ppm(&bytes) {
+                return Some(frame);
+            }
+        }
+    }
+    None
+}
+
+/// Binary PPM (P6, 8 bit) into (width, height, rgb bytes).
+fn parse_ppm(bytes: &[u8]) -> Option<(i32, i32, Vec<u8>)> {
+    let mut pos = 0;
+    let mut token = || -> Option<&[u8]> {
+        while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
+            pos += 1;
+        }
+        let start = pos;
+        while bytes.get(pos).is_some_and(|b| !b.is_ascii_whitespace()) {
+            pos += 1;
+        }
+        (pos > start).then(|| &bytes[start..pos])
+    };
+    if token()? != b"P6" {
+        return None;
+    }
+    let w: i32 = std::str::from_utf8(token()?).ok()?.parse().ok()?;
+    let h: i32 = std::str::from_utf8(token()?).ok()?.parse().ok()?;
+    if token()? != b"255" || w < 1 || h < 1 {
+        return None;
+    }
+    let data = bytes.get(pos + 1..)?;
+    let need = (w as usize).checked_mul(h as usize)?.checked_mul(3)?;
+    (data.len() >= need).then(|| (w, h, data[..need].to_vec()))
 }
 
 /// D-372: longest a single poster job may run before it is finished anyway.
 /// Open question: whether 8 s is the right bound (a stalled corrupt file costs
 /// one poster slot for this long).
 const VIDEO_POSTER_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(test)]
+thread_local! {
+    /// D-403 test hook: make every GStreamer poster pipeline fail at once, so
+    /// the ffmpeg fallback can be proven on files GStreamer here accepts.
+    static POSTER_FORCE_GST_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// D-403 test hook: poster jobs started (a job popped from a queue).
+    static POSTER_JOBS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 thread_local! {
     /// D-372: one line per job finished by the timeout (see its closure).
@@ -27451,8 +27618,14 @@ Broken: Either state is wrong.\n";
             return;
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d403") {
+            video_poster_memory_is_bounded_d403();
             video_rows_get_posters_in_list_views_d403();
             eprintln!("wf-test d403-only run done");
+            return;
+        }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d403mem") {
+            video_poster_memory_is_bounded_d403();
+            eprintln!("wf-test d403mem-only run done");
             return;
         }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("d393") {
@@ -29166,12 +29339,14 @@ Broken: Either state is wrong.\n";
         let dir = root.join("vids");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        let specs: [(&str, &[&str]); 5] = [
+        let specs: [(&str, &[&str]); 7] = [
             ("a.mp4", &["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
             ("b.webm", &["-c:v", "libvpx-vp9", "-b:v", "200k"]),
             ("c.mov", &["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
             ("d.mkv", &["-c:v", "libx264", "-pix_fmt", "yuv420p"]),
             ("e.avi", &["-c:v", "mpeg4"]),
+            ("f.mpg", &["-r", "25", "-c:v", "mpeg1video"]),
+            ("g.mov", &["-c:v", "libx264", "-pix_fmt", "yuv444p"]),
         ];
         for (name, codec) in specs {
             let out = std::process::Command::new("ffmpeg")
@@ -29185,6 +29360,14 @@ Broken: Either state is wrong.\n";
         // Corrupt: a video name over bytes that are no container at all.
         let junk: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
         std::fs::write(dir.join("z-bad.mp4"), junk).unwrap();
+        // Audio only: a .mov with no video stream must keep its icon.
+        let audio_only = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=duration=1", "-c:a", "aac"])
+            .arg(dir.join("y-audio.mov"))
+            .status()
+            .expect("ffmpeg runs");
+        assert!(audio_only.success());
+        let audio = dir.join("y-audio.mov").to_string_lossy().to_string();
         let good: Vec<String> = specs.iter().map(|(n, _)| dir.join(n).to_string_lossy().to_string()).collect();
         let bad = dir.join("z-bad.mp4").to_string_lossy().to_string();
         std::env::set_var("HOME", &home);
@@ -29207,7 +29390,7 @@ Broken: Either state is wrong.\n";
                 pump();
             }
         };
-        until("d403 listing", 20, &|| state.borrow().visible_entries.len() == 6);
+        until("d403 listing", 20, &|| state.borrow().visible_entries.len() == 9);
         set_view_mode(&state, &ui, ViewMode::Details);
         pump();
         let thumb_of = |path: &str| -> Option<gtk::Picture> {
@@ -29244,12 +29427,73 @@ Broken: Either state is wrong.\n";
             });
             pump();
             assert!(!painted(&bad), "{label}: a corrupt video must keep its file-type icon");
+            assert!(!painted(&audio), "{label}: an audio-only .mov must keep its file-type icon");
+            let edge = native_core::list_thumbnail_metrics(1.0, mode == ViewMode::Compact).decode;
             for path in &good {
                 let paintable = thumb_of(path).and_then(|p| p.paintable()).expect("painted");
-                assert_eq!(paintable.intrinsic_width(), 320, "{label}: the frame is a real 320x240 frame");
+                let (w, h) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+                assert!(w <= edge && h <= edge && w >= 1, "{label}: the frame is scaled into {edge}px, not {w}x{h}");
+                assert!((w * 3 - h * 4).abs() <= 8, "{label}: the 4:3 aspect is kept ({w}x{h})");
             }
-            eprintln!("wf-test d403 {label}: {} video rows painted, corrupt kept its icon", good.len());
+            eprintln!("wf-test d403 {label}: {} video rows painted inside {edge}px, corrupt and audio-only kept their icon", good.len());
         }
+        let finished = VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().clone());
+        eprintln!(
+            "wf-test d403 finish paths: gstreamer={} ffmpeg-fallback={}",
+            finished.iter().filter(|w| **w != "ffmpeg-poster").count(),
+            finished.iter().filter(|w| **w == "ffmpeg-poster").count()
+        );
+
+        // Grid: the same scaling, to the tile's own decode size.
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        let grid_edge = (grid_tile_px(1.0) * 2).min(MAX_GRID_THUMBNAIL_PIXELS);
+        let grid_pics = || -> Vec<gtk::Picture> {
+            all_widgets(ui.window.upcast_ref::<gtk::Widget>())
+                .into_iter()
+                .filter(|w| w.widget_name() == "wf-row-thumbnail")
+                .filter_map(|w| w.downcast::<gtk::Picture>().ok())
+                .collect()
+        };
+        until("grid posters", 60, &|| grid_pics().iter().filter(|p| p.paintable().is_some()).count() >= good.len());
+        for pic in grid_pics().iter().filter_map(|p| p.paintable()) {
+            assert!(
+                pic.intrinsic_width() <= grid_edge && pic.intrinsic_height() <= grid_edge,
+                "grid frame must fit {grid_edge}px, got {}x{}",
+                pic.intrinsic_width(),
+                pic.intrinsic_height()
+            );
+        }
+
+        // Fallback: GStreamer here accepts every generated file, so force its
+        // pipeline to fail. Every good video must then still get a scaled
+        // frame from ffmpeg; audio-only and corrupt files keep their icon.
+        set_view_mode(&state, &ui, ViewMode::Compact);
+        pump();
+        POSTER_FORCE_GST_FAIL.with(|f| f.set(true));
+        VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow_mut().clear());
+        set_view_mode(&state, &ui, ViewMode::Details);
+        for path in &good {
+            until(&format!("ffmpeg fallback poster for {}", path.rsplit('/').next().unwrap_or("")), 60, &|| painted(path));
+        }
+        until("fallback queue idle", 60, &|| {
+            state.borrow().video_poster_queue.as_ref().is_some_and(|q| {
+                let q = q.borrow();
+                q.active == 0 && q.pending.is_empty()
+            })
+        });
+        pump();
+        POSTER_FORCE_GST_FAIL.with(|f| f.set(false));
+        let edge = native_core::list_thumbnail_metrics(1.0, false).decode;
+        for path in &good {
+            let paintable = thumb_of(path).and_then(|p| p.paintable()).expect("painted by ffmpeg");
+            let (w, h) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+            assert!(w <= edge && h <= edge && (w * 3 - h * 4).abs() <= 8, "ffmpeg frame scaled and 4:3 ({w}x{h})");
+        }
+        assert!(!painted(&bad), "fallback: a corrupt video keeps its icon");
+        assert!(!painted(&audio), "fallback: an audio-only .mov keeps its icon");
+        let fallback = VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().iter().filter(|w| **w == "ffmpeg-poster").count());
+        eprintln!("wf-test d403 fallback: GStreamer forced to fail, {fallback} of {} posters came from ffmpeg", good.len());
+        assert_eq!(fallback, good.len(), "ffmpeg supplied every poster GStreamer refused");
 
         // Setting off again: queue gone, pictures gone, and no poster job runs.
         set_details_thumbnails(&state, false);
@@ -29257,13 +29501,16 @@ Broken: Either state is wrong.\n";
         until("rows rebuilt with the setting off", 20, &|| {
             state.borrow().meta_labels.contains_key(&native_core::EntrySource::real(&good[0]))
         });
-        let jobs_before = VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().len());
+        for _ in 0..20 {
+            pump();
+        }
+        let jobs_before = POSTER_JOBS_STARTED.with(|n| n.get());
         for _ in 0..10 {
             pump();
         }
         assert!(thumb_of(&good[0]).is_none(), "no row picture with the setting off");
         assert_eq!(
-            VIDEO_POSTER_FINISH_LOG.with(|log| log.borrow().len()),
+            POSTER_JOBS_STARTED.with(|n| n.get()),
             jobs_before,
             "no poster job runs with the setting off"
         );
@@ -29272,6 +29519,80 @@ Broken: Either state is wrong.\n";
             None => std::env::remove_var("HOME"),
         }
     }
+
+    /// D-403: generated 4K clips run through the poster queue at a row's size;
+    /// the process's peak memory may not grow by more than `POSTER_PEAK_RSS_KB`.
+    /// (Before the in-pipeline scale each painted row kept a full 4K RGB frame.)
+    fn video_poster_memory_is_bounded_d403() {
+        gtk::init().expect("gtk init on the virtual display");
+        gst::init().expect("gstreamer init");
+        let root = crate::native_core::scratch_root().join(format!("wf-poster-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let kb = |field: &str| -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with(field))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let out = root.join(format!("big{i}.mp4"));
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=3840x2160:rate=10"])
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(&out)
+                .status()
+                .expect("ffmpeg runs")
+                .success();
+            assert!(ok);
+            paths.push(out.to_string_lossy().to_string());
+        }
+        let edge = native_core::list_thumbnail_metrics(1.0, false).decode;
+        let queue = Rc::new(RefCell::new(VideoPosterQueue {
+            cancelled: gio::Cancellable::new(),
+            pending: VecDeque::new(),
+            active: 0,
+            live: Vec::new(),
+        }));
+        // Reset the kernel's peak-RSS mark so the peak below is this test's own.
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let start_rss = kb("VmRSS:");
+        let pictures: Vec<gtk::Picture> = paths.iter().map(|_| gtk::Picture::new()).collect();
+        for (path, picture) in paths.iter().zip(&pictures) {
+            queue_grid_video_poster(&queue, path.clone(), picture.clone(), edge);
+        }
+        let begun = std::time::Instant::now();
+        loop {
+            let ctx = glib::MainContext::default();
+            while ctx.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+            let q = queue.borrow();
+            if q.active == 0 && q.pending.is_empty() {
+                break;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(120), "d403 memory: posters did not finish");
+        }
+        let painted = pictures.iter().filter(|p| p.paintable().is_some()).count();
+        let growth_kb = kb("VmHWM:").saturating_sub(start_rss);
+        eprintln!("wf-test d403 memory: {painted}/6 4K posters painted, peak RSS growth {} MB", growth_kb / 1024);
+        assert_eq!(painted, 6, "every 4K clip gets a poster");
+        assert!(
+            growth_kb <= POSTER_PEAK_RSS_KB,
+            "peak RSS grew {} MB painting six 4K posters; the bound is {} MB",
+            growth_kb / 1024,
+            POSTER_PEAK_RSS_KB / 1024
+        );
+        for p in &pictures {
+            let w = p.paintable().unwrap().intrinsic_width();
+            assert!(w <= edge, "4K frame scaled to {edge}px, got {w}");
+        }
+    }
+    const POSTER_PEAK_RSS_KB: u64 = 100 * 1024;
 
     /// D-85: a disposable synthetic short H.264/mp4 clip (never an owner
     /// video) proves the poster queue actually paints a real decoded frame,
@@ -29751,6 +30072,7 @@ Broken: Either state is wrong.\n";
                 pending: VecDeque::from([VideoPosterJob {
                     path: path.to_string_lossy().to_string(),
                     picture: picture.clone(),
+                    size: 96,
                 }]),
                 active: 0,
                 live: Vec::new(),
@@ -30268,6 +30590,7 @@ Broken: Either state is wrong.\n";
                     .map(|p| VideoPosterJob {
                         path: p.to_string_lossy().to_string(),
                         picture: gtk::Picture::new(),
+                        size: 96,
                     })
                     .collect(),
                 active: 0,
@@ -47539,7 +47862,7 @@ Broken: Either state is wrong.\n";
             let picture = gtk::Picture::new();
             let queue = Rc::new(RefCell::new(VideoPosterQueue {
                 cancelled: gio::Cancellable::new(),
-                pending: VecDeque::from([VideoPosterJob { path: file.clone(), picture: picture.clone() }]),
+                pending: VecDeque::from([VideoPosterJob { path: file.clone(), picture: picture.clone(), size: 96 }]),
                 active: 0,
                 live: Vec::new(),
             }));
