@@ -16839,7 +16839,7 @@ fn run_transfer(
                             complete_job(&state, &ui, JobOutcome::message(message), &refresh_path, &|_, _, _| {});
                         }
                         Err(native_core::TransferFail::Failed(err)) => {
-                            ui.status.set_label(&format!("Operation failed: {err}"));
+                            ui.status.set_label(&format!("Operation failed: {}", native_core::brief_failure(&err, 1).replace('\n', " ")));
                             show_transfer_failure(&ui, is_copy, &err);
                         }
                     }
@@ -20222,7 +20222,9 @@ fn show_transfer_report(_ui: &Ui, is_copy: bool, report: &[native_core::ReportRo
 /// bar.
 fn show_transfer_failure(ui: &Ui, is_copy: bool, err: &str) {
     let verb = if is_copy { "Copy" } else { "Move" };
-    let dialog = adw::AlertDialog::new(Some(&format!("{verb} did NOT complete")), Some(err));
+    // D-398: never the whole text; see `brief_failure`.
+    let body = native_core::brief_failure(err, 8);
+    let dialog = adw::AlertDialog::new(Some(&format!("{verb} did NOT complete")), Some(&body));
     dialog.add_responses(&[("ok", "OK")]);
     dialog.set_default_response(Some("ok"));
     dialog.set_close_response("ok");

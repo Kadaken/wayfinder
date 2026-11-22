@@ -4503,6 +4503,32 @@ impl Progress<'_> {
     }
 }
 
+/// D-398: how much of a copy program's error output is kept in memory.
+const FAILURE_TEXT_KEEP: usize = 64 * 1024;
+
+/// D-398: a failure message cut to what a dialog can show. A copy that lost
+/// its drive mid-way reported one line per file; the whole text in an alert
+/// froze the window for minutes. Keeps the first `max_lines` lines, each cut
+/// to 300 characters, and says how many lines were left out.
+pub fn brief_failure(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(max_lines)
+        .map(|l| {
+            if l.chars().count() > 300 {
+                format!("{}...", l.chars().take(300).collect::<String>())
+            } else {
+                (*l).to_string()
+            }
+        })
+        .collect();
+    if lines.len() > max_lines {
+        out.push(format!("... and {} more lines", lines.len() - max_lines));
+    }
+    out.join("\n")
+}
+
 /// Stages one item with the exact `cp -a -T` child, which is polled: a cancel
 /// kills and reaps that child only, and bytes come from what it has written.
 fn copy_item(
@@ -4525,10 +4551,25 @@ fn copy_item(
         .spawn()
         .map_err(|e| format!("{}: {e}", ctl.copy_program))?;
     let mut stderr = child.stderr.take();
+    // D-398: drain all of it (a full pipe would stall cp) but keep only the
+    // head; a 20,000-file copy that lost its drive printed one line per file.
     let drain = std::thread::spawn(move || {
-        let mut text = String::new();
+        let mut kept = Vec::new();
+        let mut extra_lines = 0usize;
         if let Some(pipe) = stderr.as_mut() {
-            let _ = pipe.read_to_string(&mut text);
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let room = FAILURE_TEXT_KEEP.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+                extra_lines += buf[n.min(room)..n].iter().filter(|b| **b == b'\n').count();
+            }
+        }
+        let mut text = String::from_utf8_lossy(&kept).into_owned();
+        if extra_lines > 0 {
+            text.push_str(&format!("\n... and {extra_lines} more lines"));
         }
         text
     });
@@ -7420,6 +7461,38 @@ mod tests {
         let bytes = bytes_of(&events);
         assert_eq!(bytes.first(), Some(&(0, 30)));
         assert_eq!(bytes.last(), Some(&(30, 30)));
+    }
+
+    /// D-398: a copy whose drive went away printed one error line per file
+    /// (20,000 here). All of it went into the alert and froze the window for
+    /// minutes. The error kept is now capped and says how much was left out,
+    /// and the dialog text is a few lines.
+    #[test]
+    fn huge_copy_error_is_capped_d398() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_case("wf-d398-noisy");
+        let (srcs, dest) = big_file_fixture(&root);
+        let program = root.join("noisycp.sh");
+        fs::write(
+            &program,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 20000 ]; do\n\
+             echo \"cp: cannot stat '/media/gone/folder/file-number-$i.jpg': No such file or directory\" >&2\n\
+             i=$((i+1)); done\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let events = Events::default();
+        let never = AtomicBool::new(false);
+        let result = run_ctl(&srcs, &dest, true, PasteConflict::KeepBoth, &|_| Ok(()), false, &never,
+            program.to_str().unwrap(), &events, &|_| {});
+        let Err(TransferFail::Failed(err)) = result else { panic!("expected a failure: {result:?}") };
+        assert!(err.len() < 80 * 1024, "kept error is {} bytes", err.len());
+        assert!(err.contains("file-number-0.jpg"), "the first error is kept");
+        assert!(err.contains("more lines"), "says how much was left out");
+        let shown = brief_failure(&err, 8);
+        assert!(shown.lines().count() <= 9, "dialog text has {} lines", shown.lines().count());
+        assert!(shown.len() < 4000, "dialog text is {} bytes", shown.len());
+        assert!(shown.contains("more lines"));
     }
 
     /// D-313: the read of the sources before a copy reports its progress, so a
