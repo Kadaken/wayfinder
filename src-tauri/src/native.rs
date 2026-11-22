@@ -22288,7 +22288,7 @@ mod tests {
     /// and asserts the file is back at its original path with its bytes.
     #[test]
     fn restore_each_puts_a_really_trashed_file_back_where_it_came_from() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = native_core::real_trash_lock();
         let dir = owned_scratch_dir_225("trash-restore-roundtrip");
         let original = dir.join("restore-me.txt");
         fs::write(&original, b"restore me unchanged").unwrap();
@@ -22682,7 +22682,7 @@ mod tests {
     /// process's real user data dir and is not redirected by a test's fake HOME.
     #[test]
     fn created_trashed_reciprocal_round_trip_and_fail_closed() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = native_core::real_trash_lock();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -22771,7 +22771,7 @@ mod tests {
     /// restores it exactly.
     #[test]
     fn pasted_copy_reciprocal_round_trip_and_fail_closed() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = native_core::real_trash_lock();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -24640,7 +24640,7 @@ Broken: Either state is wrong.\n";
         // this one cannot be redirected to a private per-test `$HOME` the way
         // `undo_redo_gate_trash_d187` already established: lock out other
         // real-trash tests and use the ambient `$HOME` instead.
-        let _trash_guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _trash_guard = native_core::real_trash_lock();
         let _xdg_lock = XDG_RUNTIME_DIR_TEST_LOCK.lock().unwrap();
         // Installs no override (limits stay at the shipped defaults for this
         // test) but holds the ZIP-limits serialization lock for the test's
@@ -43114,7 +43114,7 @@ Broken: Either state is wrong.\n";
     /// trashed folder, and a destination reappearing between the fingerprint
     /// check and the no-replace restore.
     fn undo_redo_gate_trash_d187() {
-        let _guard = native_core::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = native_core::real_trash_lock();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let stem = format!("wf-d187-gate-trash-{}-{nanos}", std::process::id());
@@ -46203,6 +46203,13 @@ Broken: Either state is wrong.\n";
             if GTK_THREAD.get() == Some(&std::thread::current().id()) {
                 return test();
             }
+            // Tests on the GTK thread set HOME (a process-wide variable) to a
+            // scratch folder, which the real-Trash tests on other threads read
+            // live: they failed with "No such file" only when both ran at
+            // once. Hold the real-Trash lock for the whole job; code on the
+            // GTK thread takes it through `real_trash_lock`, which skips it
+            // there because this caller already holds it.
+            let _real_trash = crate::native_core::real_trash_lock();
             let sender = SENDER.get_or_init(|| {
                 let (tx, rx) = mpsc::channel::<Job>();
                 std::thread::Builder::new()

@@ -3368,6 +3368,17 @@ pub struct TrashReceipt {
 #[cfg(test)]
 pub static REAL_TRASH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Takes `REAL_TRASH_TEST_LOCK`, except on the GTK test thread: every job
+/// handed to that thread already holds it (`gtk_thread::run`), and a second
+/// take there would deadlock.
+#[cfg(test)]
+pub fn real_trash_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    if std::thread::current().name() == Some("gtk-test-thread") {
+        return None;
+    }
+    Some(REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
 /// D-231: a Trash of a test's own. While one is installed, the exact batch's
 /// move and its Trash folder are this fixture's, not GIO's and the home Trash,
 /// so the test never reads or changes the real Trash. The move is a real one:
@@ -3400,11 +3411,11 @@ pub mod fixture_trash {
 
     /// The fixture stays installed for as long as this lives.
     pub struct Installed {
-        _real_trash: MutexGuard<'static, ()>,
+        _real_trash: Option<MutexGuard<'static, ()>>,
     }
 
     pub fn install(dir: &Path) -> Installed {
-        let real_trash = super::REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let real_trash = super::real_trash_lock();
         *active() = Some(Active { dir: dir.to_path_buf(), ..Default::default() });
         Installed { _real_trash: real_trash }
     }
@@ -8510,7 +8521,7 @@ mod tests {
         // a before/after diff itself, but trashing into the shared real Trash
         // concurrently with a test that does (trash_paths_exact) would corrupt
         // that other test's diff.
-        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = real_trash_lock();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8562,7 +8573,7 @@ mod tests {
         // each restore to their own exact payload, never "newest by original
         // path" (that heuristic is what `restore_from_trash` uses and is exactly
         // the bug this gate exists to prove fixed for Redo).
-        let _guard = REAL_TRASH_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = real_trash_lock();
         let home = std::env::var("HOME").expect("HOME");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
