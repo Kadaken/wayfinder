@@ -14393,11 +14393,7 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
                 continue;
             }
         };
-        #[cfg(test)]
-        POSTER_JOBS_STARTED.with(|n| n.set(n.get() + 1));
-        #[cfg(test)]
-        if POSTER_FORCE_GST_FAIL.with(|f| f.get()) {
-            poster_finish_or_ffmpeg(&queue, &Rc::new(std::cell::Cell::new(false)), None, "forced", &job.path, &job.picture, job.size);
+        if poster_test_hooks(&queue, &job) {
             continue;
         }
         let Ok(pipeline_elem) = gst::ElementFactory::make("playbin").property("uri", &uri).build()
@@ -14725,15 +14721,6 @@ fn parse_ppm(bytes: &[u8]) -> Option<(i32, i32, Vec<u8>)> {
 /// Open question: whether 8 s is the right bound (a stalled corrupt file costs
 /// one poster slot for this long).
 const VIDEO_POSTER_TIMEOUT: Duration = Duration::from_secs(8);
-
-#[cfg(test)]
-thread_local! {
-    /// D-403 test hook: make every GStreamer poster pipeline fail at once, so
-    /// the ffmpeg fallback can be proven on files GStreamer here accepts.
-    static POSTER_FORCE_GST_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// D-403 test hook: poster jobs started (a job popped from a queue).
-    static POSTER_JOBS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 thread_local! {
     /// D-372: one line per job finished by the timeout (see its closure).
@@ -20501,6 +20488,36 @@ fn build_drop_target(
         true
     });
     drop
+}
+
+// D-403 test hooks for start_video_poster_jobs. They live below the locked
+// row-drag code on purpose: drag_code_precedes_first_test_seam_d188 needs the
+// first test seam in this file to come after it.
+#[cfg(test)]
+thread_local! {
+    /// Make every GStreamer poster pipeline fail at once, so the ffmpeg
+    /// fallback can be proven on files GStreamer here accepts.
+    static POSTER_FORCE_GST_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Poster jobs started (a job popped from a queue).
+    static POSTER_JOBS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts the job and, when a test forces it, finishes it through the ffmpeg
+/// fallback. True = the job is done and the caller moves on.
+#[cfg(test)]
+fn poster_test_hooks(queue: &Rc<RefCell<VideoPosterQueue>>, job: &VideoPosterJob) -> bool {
+    POSTER_JOBS_STARTED.with(|n| n.set(n.get() + 1));
+    if POSTER_FORCE_GST_FAIL.with(|f| f.get()) {
+        poster_finish_or_ffmpeg(queue, &Rc::new(std::cell::Cell::new(false)), None, "forced", &job.path, &job.picture, job.size);
+        return true;
+    }
+    false
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn poster_test_hooks(_queue: &Rc<RefCell<VideoPosterQueue>>, _job: &VideoPosterJob) -> bool {
+    false
 }
 
 /// The words for the drop confirmation: what moves, from where, to where.
@@ -27656,7 +27673,11 @@ Broken: Either state is wrong.\n";
             if name.starts_with("msg_") {
                 // Nothing here can play: the pane must say so, never stay blank.
                 let words = if stack == "frame" { d.ui.viewers.frame_info.text().to_string() } else { d.ui.preview.label().to_string() };
-                if (stack == "frame" || stack == "text") && words.contains("cannot be played") {
+                let lower = words.to_lowercase();
+                // D-404 words a damaged AVI as "No video data ... cannot be decoded".
+                if (stack == "frame" || stack == "text")
+                    && (lower.contains("cannot be played") || lower.contains("no video data") || lower.contains("cannot be decoded"))
+                {
                     verdict = Some(format!("PASS message on {stack}: {}", words.lines().next().unwrap_or("")));
                 } else {
                     last = format!("no message yet (pane shows {stack}: {words})");
