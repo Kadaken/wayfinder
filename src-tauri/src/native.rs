@@ -19878,9 +19878,16 @@ fn connect_file_drag_with<W: IsA<gtk::Widget>>(
     path: String,
     box_select_edge: Option<&gtk::Label>,
 ) -> gtk::DragSource {
-    let row: gtk::Widget = widget.clone().upcast();
+    // D-399: weak. These closures are stored in controllers that sit ON this
+    // widget, so a strong handle made widget -> controller -> closure -> widget
+    // a cycle: every tile or row ever built (with its picture and texture) was
+    // kept alive for the life of the process.
+    let row_weak = widget.upcast_ref::<gtk::Widget>().downgrade();
     let edge = box_select_edge.cloned();
     let in_box_select_strip = Rc::new(move |x: f64| {
+        let Some(row) = row_weak.upgrade() else {
+            return false;
+        };
         let Some(edge) = edge.as_ref() else {
             return false;
         };
@@ -19923,7 +19930,7 @@ fn connect_file_drag_with<W: IsA<gtk::Widget>>(
     // starts as soon as its 100 ms are up. No widget state is changed here.
     let claim = gtk::GestureDrag::new();
     claim.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let row_for_claim = widget.clone().upcast::<gtk::Widget>();
+    let row_for_claim = widget.upcast_ref::<gtk::Widget>().downgrade();
     claim.connect_drag_update(move |gesture, offset_x, offset_y| {
         let Some((start_x, _)) = gesture.start_point() else {
             return;
@@ -19931,6 +19938,9 @@ fn connect_file_drag_with<W: IsA<gtk::Widget>>(
         if in_box_select_strip(start_x) {
             return;
         }
+        let Some(row_for_claim) = row_for_claim.upgrade() else {
+            return;
+        };
         let threshold = row_for_claim.settings().gtk_dnd_drag_threshold() as f64 / 2.0;
         if offset_x.abs() > threshold || offset_y.abs() > threshold {
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -28445,6 +28455,133 @@ Broken: Either state is wrong.\n";
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// D-399 alone, on the private display.
+    #[test]
+    fn grid_memory_plateaus_d399_alone() { gtk_thread::run(grid_memory_plateaus_d399_alone_on_gtk_thread); }
+
+    fn grid_memory_plateaus_d399_alone_on_gtk_thread() {
+        if std::env::var("WAYFINDER_D399_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+        let _session = private_session_guard_d232();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        gtk::init().expect("gtk init on the virtual display");
+        let display = gdk::Display::default().expect("display");
+        private_display_check_d232(&display);
+        grid_memory_plateaus_d399();
+    }
+
+    /// Resident set size of this process in KiB, from /proc/self/statm.
+    fn rss_kib_d399() -> u64 {
+        let text = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let pages: u64 = text.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        pages * 4
+    }
+
+    /// D-399: browsing a big folder of pictures in the icon view grew memory
+    /// without a ceiling (audit S19: 5,000 JPEGs, 262 MB then 1,183 MB then
+    /// 2,312 MB over two passes). Scrolls through the folder several times and
+    /// measures the process's resident memory after each pass: from the second
+    /// pass on it must stay flat. WAYFINDER_D399_N sets the file count,
+    /// WAYFINDER_D399_PASSES the pass count.
+    fn grid_memory_plateaus_d399() {
+        let old_home = std::env::var("HOME").ok();
+        let count: usize = std::env::var("WAYFINDER_D399_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let passes: usize = std::env::var("WAYFINDER_D399_PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let root = crate::native_core::scratch_root().join(format!("wf-d399-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _cleanup = ScratchCleanup(root.clone());
+        let (home, dir) = (root.join("home"), root.join("pics"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // 400x300 JPEGs with a pattern in them, as photographs are not flat.
+        let jpeg = {
+            let pixbuf = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 400, 300).expect("pixbuf");
+            let (stride, n) = (pixbuf.rowstride() as usize, pixbuf.n_channels() as usize);
+            // SAFETY: the pixbuf was just made and is not shared.
+            let data = unsafe { pixbuf.pixels() };
+            for y in 0..300usize {
+                for x in 0..400usize {
+                    let o = y * stride + x * n;
+                    data[o] = ((x * 7 + y * 3) % 256) as u8;
+                    data[o + 1] = ((x * y) % 251) as u8;
+                    data[o + 2] = ((x ^ y) % 256) as u8;
+                }
+            }
+            let probe = dir.join("probe.jpg");
+            pixbuf.savev(&probe, "jpeg", &[]).expect("write a jpeg");
+            let bytes = std::fs::read(&probe).unwrap();
+            std::fs::remove_file(&probe).unwrap();
+            bytes
+        };
+        for i in 0..count {
+            std::fs::write(dir.join(format!("p{i:05}.jpg")), &jpeg).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+
+        let app = adw::Application::builder()
+            .application_id("com.kadaken.wayfinder.d399test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).expect("register test application");
+        build_ui(&app, Some(dir.to_string_lossy().to_string()), None);
+        let (state, ui) = WINDOWS
+            .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+            .expect("the test window is registered");
+        ui.window.set_default_size(1180, 760);
+        ui.window.present();
+        wait_for("d399 listing", || state.borrow().visible_entries.len() == count);
+        {
+            let mut st = state.borrow_mut();
+            st.sort_key = SortKey::Name;
+            st.sort_ascending = true;
+        }
+        repopulate_rows(&state, &ui);
+        set_view_mode(&state, &ui, ViewMode::Grid);
+        wait_for("d399 grid tiles", || grid_child_at(&ui, 0).is_some());
+        pump();
+
+        let trim = std::env::var("WAYFINDER_D399_TRIM").as_deref() == Ok("1");
+        let settle = || {
+            // Let queued decodes finish and idle work run.
+            let end = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < end {
+                pump();
+            }
+            if trim {
+                // SAFETY: plain libc call, no arguments to get wrong.
+                unsafe { libc::malloc_trim(0) };
+            }
+        };
+        let page = (ui.grid.max_columns().max(1) as usize * 4).max(8);
+        let mut rss = vec![rss_kib_d399()];
+        eprintln!("wf-test D-399: {count} pictures, start RSS {} MB", rss[0] / 1024);
+        for pass in 1..=passes {
+            let mut at = 0usize;
+            while at < count {
+                scroll_files_to(&state, &ui, at as u32, gtk::ListScrollFlags::FOCUS);
+                pump();
+                at += page;
+            }
+            scroll_files_to(&state, &ui, (count - 1) as u32, gtk::ListScrollFlags::FOCUS);
+            pump();
+            scroll_files_to(&state, &ui, 0, gtk::ListScrollFlags::FOCUS);
+            settle();
+            rss.push(rss_kib_d399());
+            eprintln!("wf-test D-399: after pass {pass}: RSS {} MB", rss[pass] / 1024);
+        }
+        ui.window.destroy();
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        // Plateau: the last pass adds at most 5% of the first pass's total or
+        // 30 MB, whichever is larger. A leak per scrolled tile adds hundreds.
+        let last = rss[passes] as i64 - rss[passes - 1] as i64;
+        let allowed = (rss[1] as i64 / 20).max(30 * 1024);
+        assert!(last <= allowed, "d399: the last pass grew RSS by {} MB (allowed {} MB); RSS per pass in MB: {:?}", last / 1024, allowed / 1024, rss.iter().map(|k| k / 1024).collect::<Vec<_>>());
     }
 
     /// D-263 on its own, under a private display, without the full suite.

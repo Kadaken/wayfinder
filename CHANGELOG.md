@@ -8,6 +8,7 @@ change between releases.
 
 ### Fixed
 
+- Browsing a big folder of pictures in Icons view (or Details view) no longer makes memory grow without limit: every file row or tile that scrolled past used to stay in memory with its thumbnail.
 - Phone videos named `.3gpp`, `.3gpp2` or `.3gp2` are treated as video again, so they get a player and a thumbnail.
 - A copy that fails on thousands of files (for example a drive unplugged mid-copy) no longer freezes the window: the error shows its first lines and says how many more there were.
 - Uninstalling gives folders back to the app that opened them before Wayfinder, instead of leaving a default that points at nothing.
