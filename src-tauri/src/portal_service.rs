@@ -280,7 +280,9 @@ impl Drop for RequestRoot {
 /// D-Bus caller can reach.
 pub struct ProcessChooser {
     executable: PathBuf,
-    deadline: Duration,
+    /// `None` in production (D-390): a person may browse as long as they
+    /// like. Only tests set a wall-clock limit.
+    deadline: Option<Duration>,
     /// `None` means the owner-only picker root could not be derived (the
     /// production case: `XDG_RUNTIME_DIR` absent). Every pick then fails
     /// closed without ever spawning a child -- never a daemon panic.
@@ -376,7 +378,7 @@ impl ProcessChooser {
             .unwrap_or_else(|| PathBuf::from("wayfinder-native"));
         Self {
             executable,
-            deadline: Duration::from_secs(120),
+            deadline: None,
             scratch_base: production_scratch_base(),
             #[cfg(test)]
             test_override: TestOverride::default(),
@@ -387,7 +389,7 @@ impl ProcessChooser {
     fn for_test(executable: PathBuf, deadline: Duration, scratch_base: PathBuf) -> Self {
         Self {
             executable,
-            deadline,
+            deadline: Some(deadline),
             scratch_base: Some(scratch_base),
             test_override: TestOverride::default(),
         }
@@ -402,10 +404,15 @@ impl ProcessChooser {
     ) -> Self {
         Self {
             executable,
-            deadline,
+            deadline: Some(deadline),
             scratch_base: Some(scratch_base),
             test_override,
         }
+    }
+
+    /// The wall-clock limit on the picker process, if any.
+    fn wall_clock_limit(&self) -> Option<Duration> {
+        self.deadline
     }
 
     #[cfg(test)]
@@ -474,10 +481,12 @@ impl ProcessChooser {
                         let _ = child.wait();
                         return ChildWait::Cancelled;
                     }
-                    if !self.should_ignore_deadline() && start.elapsed() >= self.deadline {
-                        kill_owned_process_group(pgid);
-                        let _ = child.wait();
-                        return ChildWait::TimedOut;
+                    if let Some(limit) = self.deadline.filter(|_| !self.should_ignore_deadline()) {
+                        if start.elapsed() >= limit {
+                            kill_owned_process_group(pgid);
+                            let _ = child.wait();
+                            return ChildWait::TimedOut;
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -684,7 +693,7 @@ impl Chooser for ProcessChooser {
         };
 
         let wait = self.wait_with_deadline_or_cancel(child, cancel);
-        wait.report(self.deadline);
+        wait.report(self.deadline.unwrap_or_default());
         let exit_code = wait.exit_code();
         if matches!(wait, ChildWait::Cancelled) {
             // The caller closed the request: the picker was killed, and
@@ -2034,7 +2043,7 @@ mod tests {
         ));
         let chooser = ProcessChooser {
             executable: native.path().to_path_buf(),
-            deadline: Duration::from_secs(5),
+            deadline: Some(Duration::from_secs(5)),
             scratch_base: None,
             test_override: TestOverride::default(),
         };
@@ -2116,6 +2125,15 @@ mod tests {
     /// shell) must not outlive a timeout kill as an orphan: both the
     /// shell and the `sleep` it spawned are in the same owned process
     /// group, so the group-wide `SIGKILL` must reap both.
+    /// D-390: a person browsing a file dialog for longer than two minutes
+    /// must not have the picker killed under them. The production chooser
+    /// has no wall-clock limit; only Request.Close() or the child's own
+    /// exit ends the wait.
+    #[test]
+    fn production_chooser_has_no_wall_clock_kill() {
+        assert_eq!(ProcessChooser::production().wall_clock_limit(), None);
+    }
+
     #[test]
     fn process_chooser_deadline_expiry_reaps_child_and_its_descendant() {
         // The sleeper's own pid is written one level above the request

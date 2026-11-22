@@ -6,6 +6,10 @@ change between releases.
 
 ## 0.9.29 — 21 November 2026
 
+### Fixed
+
+- The file dialog is no longer killed after two minutes while you are still browsing, and installing an update replaces the dialog program and the portal together with the main program.
+
 ### Added
 
 - The PS2 hard drive shows as one "PS2 HDD" row in the sidebar, and opening it
