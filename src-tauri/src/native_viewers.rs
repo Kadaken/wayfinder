@@ -197,6 +197,9 @@ pub fn pdf_for(source: &Path, kind: DocKind, cancel: &AtomicBool) -> Result<Path
         std::fs::rename(&produced, &cached).map_err(|e| e.to_string())
     })();
     let _ = std::fs::remove_dir_all(&work);
+    if result.is_ok() {
+        prune_cache_dir(&dir, &cached, "pdf", DOC_CACHE_CAP);
+    }
     result.map(|_| cached)
 }
 
@@ -262,6 +265,18 @@ pub fn video_play_copy(source: &Path, cancel: &AtomicBool) -> Result<PathBuf, St
 
 /// Deletes the oldest converted files until the folder is under the cap.
 fn prune_video_play_cache(dir: &Path, keep: &Path) {
+    prune_cache_dir(dir, keep, "webm", VIDEO_PLAY_CACHE_CAP);
+}
+
+/// D-395: the most each document preview cache may hold (converted PDFs, and
+/// drawn pages). Before this both grew for ever.
+pub const DOC_CACHE_CAP: u64 = 512 * 1024 * 1024;
+
+/// D-369/D-395: deletes the oldest finished `.<ext>` files in `dir` until the
+/// total is at most `cap`. `keep` (the file just made) is never deleted, and
+/// half-written `.part.<ext>` files are left to their writer.
+fn prune_cache_dir(dir: &Path, keep: &Path, ext: &str, cap: u64) {
+    let part = format!(".part.{ext}");
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -269,14 +284,14 @@ fn prune_video_play_cache(dir: &Path, keep: &Path) {
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             let p = e.path();
-            (m.is_file() && p.extension().is_some_and(|x| x == "webm") && !p.to_string_lossy().ends_with(".part.webm"))
+            (m.is_file() && p.extension().is_some_and(|x| x == ext) && !p.to_string_lossy().ends_with(&part))
                 .then(|| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), p))
         })
         .collect();
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     files.sort_by_key(|f| f.0);
     for (_, len, path) in files {
-        if total <= VIDEO_PLAY_CACHE_CAP {
+        if total <= cap {
             break;
         }
         if path != keep && std::fs::remove_file(&path).is_ok() {
@@ -304,6 +319,12 @@ pub fn pdf_page_count(pdf: &Path) -> Result<u32, String> {
 /// One page as a cached PNG `width` pixels wide.
 pub fn render_pdf_page(pdf: &Path, page: u32, width: i32, cancel: &AtomicBool) -> Result<PathBuf, String> {
     let dir = cache_dir("doc-pages").ok_or("no cache folder")?;
+    render_pdf_page_in(&dir, pdf, page, width, cancel)
+}
+
+/// `render_pdf_page` with its cache folder given, so a test can use its own.
+fn render_pdf_page_in(dir: &Path, pdf: &Path, page: u32, width: i32, cancel: &AtomicBool) -> Result<PathBuf, String> {
+    let dir = dir.to_path_buf();
     let width = width.clamp(200, 2400);
     let key = cache_key(pdf, &format!("p{page}w{width}")).ok_or("cannot read the PDF")?;
     let cached = dir.join(format!("{key:016x}.png"));
@@ -329,6 +350,7 @@ pub fn render_pdf_page(pdf: &Path, page: u32, width: i32, cancel: &AtomicBool) -
         return Err("pdftoppm drew no page".into());
     }
     std::fs::rename(&made, &cached).map_err(|e| e.to_string())?;
+    prune_cache_dir(&dir, &cached, "png", DOC_CACHE_CAP);
     Ok(cached)
 }
 
@@ -601,6 +623,60 @@ pub fn describe_file(path: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A one-page PDF with valid cross-reference offsets.
+    fn tiny_pdf() -> Vec<u8> {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for o in offsets {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+        out
+    }
+
+    /// D-395: the drawn-page cache grew for ever. Three old 300 MB pages
+    /// (sparse, so the test writes almost nothing) sit in the cache; drawing
+    /// one more page must bring it back under the cap, oldest first, and keep
+    /// the page just drawn.
+    #[test]
+    fn page_cache_stays_under_its_cap_d395() {
+        if Command::new("pdftoppm").arg("-v").output().is_err() {
+            eprintln!("pdftoppm missing; skipped");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("wf-d395-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join("doc-pages");
+        std::fs::create_dir_all(&cache).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for i in 0..3 {
+            let f = std::fs::File::create(cache.join(format!("old{i}.png"))).unwrap();
+            f.set_len(300 * 1024 * 1024).unwrap();
+            f.set_modified(old + Duration::from_secs(i)).unwrap();
+        }
+        let pdf = root.join("a.pdf");
+        std::fs::write(&pdf, tiny_pdf()).unwrap();
+        let drawn = render_pdf_page_in(&cache, &pdf, 1, 200, &AtomicBool::new(false)).unwrap();
+        let total: u64 = std::fs::read_dir(&cache).unwrap().flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+        let left: Vec<String> = std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(drawn.exists() || left.iter().any(|n| drawn.ends_with(n)), "the page just drawn is kept: {left:?}");
+        assert!(total <= DOC_CACHE_CAP, "cache holds {total} bytes, cap {DOC_CACHE_CAP}: {left:?}");
+        assert!(!left.contains(&"old0.png".to_string()), "oldest goes first: {left:?}");
+        assert!(left.contains(&"old2.png".to_string()), "newest old page stays: {left:?}");
+    }
 
     /// A 550x400 pixel stage (11000 x 8000 twips), 24 fps, 12 frames.
     fn swf_body() -> Vec<u8> {
