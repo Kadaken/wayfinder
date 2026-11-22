@@ -21010,6 +21010,15 @@ fn update_preview(ui: &Ui, entry: &Entry) {
                 return;
             }
         }
+        // D-407: a piece cut from the middle of an MPEG stream decodes to one
+        // grey damaged frame and no error, which the player shows as blank.
+        if d407_mpeg_starts_mid_stream(&path_str) {
+            set_preview_text(
+                ui,
+                "This video cannot be played in the pane: it is part of an MPEG video that starts in the middle, with no sequence header before its first picture.",
+            );
+            return;
+        }
         set_preview_media(ui, &path_str);
         return;
     }
@@ -22238,6 +22247,26 @@ fn attach_preview_media(ui: &Ui, play_path: &str, original: &str, may_convert: b
     if may_convert && native_core::is_video_path(original) {
         guard_blank_video(ui, &media, original, generation);
     }
+}
+
+/// D-407: true for an MPEG program stream whose first video start code (the
+/// first one below B9, after the pack, system and PES codes) is a slice
+/// (01 to AF) in its first 256 KB: the file was cut out of the middle of a
+/// picture, so no decoder finds a stream. A real stream opens on a sequence
+/// header (B3); anything else, or a file that is not MPEG-PS, is left to play.
+fn d407_mpeg_starts_mid_stream(path: &str) -> bool {
+    if native_core::d379_off() || !matches!(native_core::sniff_content(path), Some(native_core::Sniffed::MpegPs)) {
+        return false;
+    }
+    use std::io::Read;
+    let mut data = Vec::new();
+    let Ok(f) = fs::File::open(path) else { return false };
+    if f.take(256 * 1024).read_to_end(&mut data).is_err() {
+        return false;
+    }
+    data.windows(4)
+        .find(|w| w[..3] == [0, 0, 1] && w[3] < 0xB9)
+        .is_some_and(|w| (0x01..=0xAF).contains(&w[3]))
 }
 
 /// How long a prepared video may stay without a picture before D-401 treats
@@ -33434,8 +33463,9 @@ Broken: Either state is wrong.\n";
             ("F", "f_vid", Want::Player),
             ("F", "f_vid.htm", Want::Player),
             ("F", "f_vid.js", Want::Player),
-            // D-407 open: a cut-off .mpg with no sequence header stays on a
-            // blank player (f_frag.mpg). Case returns with the fix in 0.9.31.
+            // D-407: a cut-off .mpg that starts mid-stream, no sequence header
+            // before its first picture, decodes only a grey damaged frame.
+            ("F", "f_frag.mpg", Want::Says("cannot be played")),
             ("F", "f_frag_tiny.htm", Want::Says("too short to play")),
             ("F", "f_frag_nodot", Want::Says("too short to play")),
             ("G", "g_junk.mts", Want::Says("no video data")),

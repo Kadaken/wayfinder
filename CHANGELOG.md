@@ -4,6 +4,11 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## Unreleased
+
+### Fixed
+- A video file cut out of the middle of an MPEG stream (a .mpg that starts part-way through a picture) no longer leaves the preview pane blank; it now says the video cannot be played.
+
 ## 0.9.31 — 22 November 2026
 
 ### Fixed
