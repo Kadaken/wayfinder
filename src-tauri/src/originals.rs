@@ -159,6 +159,10 @@ pub fn walk_roots(
                     stack.push(path);
                 }
             } else if kind.is_file() {
+                // A skipped file is never stat-ed, read or hashed.
+                if skip.iter().any(|s| path.starts_with(s)) {
+                    continue;
+                }
                 let Ok(meta) = entry.metadata() else { continue };
                 let Some(text) = path.to_str() else { continue };
                 if text.contains('\t') || text.contains('\n') {
@@ -523,6 +527,17 @@ mod tests {
         assert!(opened.iter().all(|d| !d.starts_with(&skipped)), "nothing under the skipped folder was opened: {opened:?}");
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("keep/f"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_skipped_file_is_never_listed_or_hashed() {
+        let dir = fixture("skipfile");
+        std::fs::write(dir.join("secret.enc"), "same").unwrap();
+        std::fs::write(dir.join("copy"), "same").unwrap();
+        let files = walk_roots(&[dir.clone()], &[dir.join("secret.enc")], &[], &mut |_| {}, &|| false);
+        assert_eq!(files.len(), 1, "only the unskipped file: {:?}", files.iter().map(|f| &f.path).collect::<Vec<_>>());
+        assert!(files[0].path.ends_with("/copy"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
