@@ -2175,15 +2175,41 @@ fn inspect_config_file(path: &Path) -> ConfigFile {
 }
 
 fn read_config_at(path: &Path) -> AppConfig {
-    let mut config = read_config_keeping_pins_at(path);
-    // D-359: a pin for something that is gone is ignored, and the next write
-    // removes it from the file.
-    prune_missing_pins(&mut config);
-    config
+    // D-392: no stat of a saved path here. A pin on a slow or busy drive
+    // (NTFS over FUSE) blocked this call, and it runs on the GTK thread. A pin
+    // for something gone is harmless (it matches no row); the worker in
+    // `prune_missing_pins_in_background` removes it from the file.
+    read_config_keeping_pins_at(path)
 }
 
-fn prune_missing_pins(config: &mut AppConfig) {
-    config.pins.retain(|p| Path::new(p).symlink_metadata().is_ok());
+/// D-392: the pins whose target is gone. Stats every pin, so it may block;
+/// call it only off the GTK thread.
+fn missing_pins(pins: &[String]) -> Vec<String> {
+    pins.iter().filter(|p| Path::new(p).symlink_metadata().is_err()).cloned().collect()
+}
+
+/// D-359/D-392: drops pins for things that are gone from the file. The stats
+/// run with no lock held; only the removal runs under the config lock, and it
+/// does no filesystem call on the pins. Blocking: never call on the GTK thread.
+fn prune_missing_pins_at(path: &Path) {
+    let missing = missing_pins(&read_config_keeping_pins_at(path).pins);
+    if missing.is_empty() {
+        return;
+    }
+    let (_, saved) = try_update_config_at(path, |c| c.pins.retain(|p| !missing.contains(p)));
+    if let Err(message) = saved {
+        eprintln!("wayfinder: {message}");
+    }
+}
+
+/// D-392: the pruning above on a worker thread, so a stat that blocks costs
+/// no frame. Nothing waits for it.
+fn prune_missing_pins_in_background() {
+    if let Some(path) = config_path() {
+        let _ = std::thread::Builder::new()
+            .name("wf-prune-pins".into())
+            .spawn(move || prune_missing_pins_at(&path));
+    }
 }
 
 /// D-359: the config with its pins untouched. A write must start from this, not
@@ -2282,8 +2308,7 @@ fn try_update_config_at(
     let damaged = matches!(on_disk, ConfigFile::Unparseable);
     let mut config = read_config_keeping_pins_at(path);
     change(&mut config);
-    // D-359: pins for things that are gone are dropped after the change ran.
-    prune_missing_pins(&mut config);
+    // D-392: pins are not stat-ed here (GTK thread); see prune_missing_pins_at.
 
     match serde_json::to_string_pretty(&config) {
         Ok(raw) => {
@@ -4467,6 +4492,7 @@ A path may be a plain path or a file:// address."#
     // D-85: required once before any playbin/appsink use (video Grid posters,
     // preview). No-op cost if a folder is never opened.
     gst::init().expect("gstreamer init");
+    prune_missing_pins_in_background();
 
     // A picker must be its own process with its own window. Registering the
     // app id the ordinary file manager already holds made this a REMOTE
@@ -31027,8 +31053,8 @@ Broken: Either state is wrong.\n";
         assert_eq!(config_pins(), vec![renamed.clone()], "D-359: the pin follows a rename");
         // A pin for something gone is ignored and pruned.
         std::fs::remove_file(&renamed).unwrap();
-        assert!(config_pins().is_empty(), "D-359: a pin for a missing path is ignored on load");
-        update_config(|_| {});
+        prune_missing_pins_at(&config_path().unwrap());
+        assert!(config_pins().is_empty(), "D-359: a pin for a missing path is pruned by the worker");
         assert!(!std::fs::read_to_string(config_path().unwrap()).unwrap().contains("y.txt"), "D-359: and pruned from the file");
 
         ui.window.destroy();
@@ -36179,6 +36205,24 @@ Broken: Either state is wrong.\n";
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn config_save_does_not_stat_pins_d392() {
+        let dir = crate::native_core::scratch_root().join(format!("wf-d392-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let gone = dir.join("not-there").to_string_lossy().to_string();
+        update_config_at(&path, |c| c.pins = vec![gone.clone()]);
+        // An unrelated save must not look at the pin at all: a stat there blocks
+        // the GTK thread on a busy FUSE drive. The pin surviving proves no stat.
+        update_config_at(&path, |c| c.show_hidden = !c.show_hidden);
+        assert_eq!(read_config_at(&path).pins, vec![gone.clone()], "D-392: a save stat-ed the pin");
+        // The worker's pruning still removes it.
+        prune_missing_pins_at(&path);
+        assert!(read_config_at(&path).pins.is_empty(), "D-392: the worker prunes a missing pin");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// D-391: the GTK media pipeline of a video preview is built only after the
