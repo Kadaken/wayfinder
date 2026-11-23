@@ -5650,9 +5650,21 @@ fn build_ui_in(
         .max_width_chars(1)
         .hexpand(false)
         .build();
-    let ask_yes = gtk::Button::with_label("Ask for an update");
-    let ask_no = gtk::Button::with_label("Not now");
-    let ask_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // D-412: the two buttons side by side were wider than a narrow preview
+    // pane. The pane then scrolled sideways and its scroll bar lay over both
+    // buttons, so neither could be clicked. Stacked, with text that shortens,
+    // the bar never sets the pane's minimum width (the D-380 rule).
+    let ask_button = |text: &str| {
+        let b = gtk::Button::builder().label(text).halign(gtk::Align::Start).hexpand(false).build();
+        if let Some(inner) = b.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+            inner.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        }
+        b
+    };
+    let ask_yes = ask_button("Ask for an update");
+    let ask_no = ask_button("Not now");
+    let ask_buttons = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    ask_buttons.set_hexpand(false);
     ask_buttons.append(&ask_yes);
     ask_buttons.append(&ask_no);
     let ask_bar = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -28529,6 +28541,57 @@ Broken: Either state is wrong.\n";
         set(String::new());
     }
 
+    /// D-412 (22 Nov 2026): in a narrow preview pane (his was about 250 px)
+    /// both Ask-bar buttons must sit inside the pane, the pane must not scroll
+    /// sideways, and a pointer at each button's centre must land on the button,
+    /// not on a scroll bar lying over it. Fails on 0.9.33's side-by-side bar.
+    fn ask_bar_buttons_clickable_in_a_narrow_pane_d412() {
+        install_app_css();
+        let d = d362_open("askw", |dir| {
+            let noise: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            std::fs::write(dir.join("one.zzq"), &noise).unwrap();
+        }, 1);
+        let requests = crate::native_core::scratch_root().join(format!("wf-d362-askw-{}", std::process::id())).join("home").join("requests.md");
+        update_config(|c| {
+            c.preview_requests_file = requests.to_string_lossy().into_owned();
+            c.preview_requests_asked.clear();
+        });
+        d38x_preview_on(&d);
+        d38x_wait_ms(5000, || d.ui.file_preview.width() > 500);
+        d38x_spin_for(500);
+        let total = d.ui.file_preview.width();
+        d.ui.file_preview.set_position(total - 220);
+        d38x_spin_for(500);
+        d362_show(&d, "one.zzq");
+        d362_wait("the ask bar", 30, || d.ui.ask_bar.is_visible());
+        d38x_spin_for(800);
+        let pane: gtk::Widget = d.ui.preview_scroll.clone().upcast();
+        let pane_w = pane.width() as f32;
+        let h = d.ui.preview_scroll.hadjustment();
+        eprintln!("wf-test D-412 pane={pane_w} hadj upper={} page={}", h.upper(), h.page_size());
+        let mut failures: Vec<String> = Vec::new();
+        if pane_w > 260.0 { failures.push(format!("the preview pane is {pane_w} px, not narrow")); }
+        if h.upper() > h.page_size() + 0.5 { failures.push(format!("the pane scrolls sideways: {} > {}", h.upper(), h.page_size())); }
+        for (what, b) in [("Ask for an update", &d.ui.ask_yes), ("Not now", &d.ui.ask_no)] {
+            let bw: gtk::Widget = b.clone().upcast();
+            match bw.compute_bounds(&pane) {
+                Some(r) => {
+                    eprintln!("wf-test D-412 {what} x={:.0}..{:.0} y={:.0}..{:.0}", r.x(), r.x() + r.width(), r.y(), r.y() + r.height());
+                    if r.x() + r.width() > pane_w + 0.5 { failures.push(format!("{what} right edge {:.0} is past the pane {pane_w}", r.x() + r.width())); }
+                    let (cx, cy) = ((r.x() + r.width() / 2.0) as f64, (r.y() + r.height() / 2.0) as f64);
+                    let hit = pane.pick(cx, cy, gtk::PickFlags::DEFAULT);
+                    let on_button = hit.as_ref().is_some_and(|w| w == &bw || w.is_ancestor(&bw));
+                    if !on_button {
+                        failures.push(format!("a click on {what} lands on {:?}", hit.map(|w| w.type_().name().to_string())));
+                    }
+                }
+                None => failures.push(format!("{what} has no bounds")),
+            }
+        }
+        update_config(|c| c.preview_requests_file = String::new());
+        assert!(failures.is_empty(), "D-412: {failures:?}");
+    }
+
     /// D-362: new picture formats preview as pictures: tga, pnm, psd and dds,
     /// converted to a cached PNG when GTK cannot load them itself.
     fn new_image_formats_preview_as_pictures_d362() {
@@ -28793,6 +28856,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test tail-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("askw") {
+            ask_bar_buttons_clickable_in_a_narrow_pane_d412();
+            eprintln!("wf-test askw-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("gone") {
             gone_folder_moves_to_one_that_exists_d411();
             eprintln!("wf-test gone-only run done");
@@ -28935,6 +29003,7 @@ Broken: Either state is wrong.\n";
         mute_and_volume_carry_across_files_d409();
         unknown_type_asks_for_an_update_once_d410();
         gone_folder_moves_to_one_that_exists_d411();
+        ask_bar_buttons_clickable_in_a_narrow_pane_d412();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();

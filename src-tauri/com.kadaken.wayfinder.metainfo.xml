@@ -46,6 +46,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.34" date="2026-11-22">
+      <description>
+        <p>The Ask for an update buttons can be clicked in a narrow preview
+        pane, and the duplicate scan no longer walks into another drive
+        mounted inside a scanned folder.</p>
+      </description>
+    </release>
     <release version="0.9.33" date="2026-11-22">
       <description>
         <p>When the preview pane cannot show a file type, it can offer to

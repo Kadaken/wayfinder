@@ -4,6 +4,12 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.34 — 22 November 2026
+
+### Fixed
+- The Ask for an update bar could not be clicked in a narrow preview pane: its two buttons sat side by side, the pane scrolled sideways, and the scroll bar lay over both buttons. The buttons now stack and their text shortens to fit.
+- The background duplicate scan (Show original) stays on each folder's own drive. It used to walk into a drive mounted inside a scanned folder, and read errors on a failing disk mounted that way for checking.
+
 ## 0.9.33 — 22 November 2026
 
 ### Added

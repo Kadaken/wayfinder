@@ -42,7 +42,7 @@ and say why rather than leave you waiting.
 
 ## What I have and have not checked myself
 
-As of 0.9.33: `cargo audit` reports no vulnerable dependency, and the refusals
+As of 0.9.34: `cargo audit` reports no vulnerable dependency, and the refusals
 above all have tests behind them. What follows is everything in the release
 audit that is reasoned about but **not measured**. It is here, in the file that
 ships, because a gap nobody wrote down is a gap nobody fixes. One item that

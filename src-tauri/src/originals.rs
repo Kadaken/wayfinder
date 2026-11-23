@@ -130,9 +130,38 @@ pub fn is_skipped(path: &Path, skip: &[PathBuf], trash: &[PathBuf]) -> bool {
     skip.iter().any(|s| path.starts_with(s)) || is_trash_dir(path, trash)
 }
 
+/// Every mount point on the machine, from /proc/self/mountinfo (field 5, with
+/// the kernel's octal escapes such as `\040` for a space undone).
+pub fn mount_points() -> Vec<PathBuf> {
+    std::fs::read_to_string("/proc/self/mountinfo").map(|t| parse_mountinfo(&t)).unwrap_or_default()
+}
+
+fn parse_mountinfo(text: &str) -> Vec<PathBuf> {
+    let unescape = |field: &str| {
+        let bytes = field.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 3 < bytes.len() && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b)) {
+                out.push((bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0'));
+                i += 4;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(out))
+    };
+    text.lines().filter_map(|line| line.split(' ').nth(4).map(unescape)).collect()
+}
+
 /// Walk `roots`, returning every regular file. `on_open` is called with each
 /// directory immediately before it is opened; a skipped directory never gets
 /// that call. Symlinks are neither followed nor listed.
+///
+/// D-413 (22 Nov 2026): the walk stays on each root's own drive. A drive
+/// mounted inside a root (a failing disk mounted read-only under Storage for
+/// checking) is never opened; reading it gave I/O errors and could stress it.
 pub fn walk_roots(
     roots: &[PathBuf],
     skip: &[PathBuf],
@@ -140,6 +169,18 @@ pub fn walk_roots(
     on_open: &mut dyn FnMut(&Path),
     should_stop: &dyn Fn() -> bool,
 ) -> Vec<FileRec> {
+    walk_roots_within(roots, skip, trash, &mount_points(), on_open, should_stop)
+}
+
+fn walk_roots_within(
+    roots: &[PathBuf],
+    skip: &[PathBuf],
+    trash: &[PathBuf],
+    mounts: &[PathBuf],
+    on_open: &mut dyn FnMut(&Path),
+    should_stop: &dyn Fn() -> bool,
+) -> Vec<FileRec> {
+    let other_drive = |path: &Path| mounts.iter().any(|m| m == path) && !roots.iter().any(|r| r == path);
     let mut out = Vec::new();
     let mut stack: Vec<PathBuf> = roots.iter().filter(|r| !is_skipped(r, skip, trash)).cloned().collect();
     while let Some(dir) = stack.pop() {
@@ -155,7 +196,7 @@ pub fn walk_roots(
                 continue;
             }
             if kind.is_dir() {
-                if !is_skipped(&path, skip, trash) {
+                if !is_skipped(&path, skip, trash) && !other_drive(&path) {
                     stack.push(path);
                 }
             } else if kind.is_file() {
@@ -528,6 +569,31 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("keep/f"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drive_mounted_inside_a_root_is_never_opened_d413() {
+        let dir = fixture("mounted");
+        let keep = dir.join("keep");
+        let mounted = dir.join("check").join("disk-ro");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(mounted.join("deep")).unwrap();
+        std::fs::write(keep.join("f"), "data").unwrap();
+        std::fs::write(mounted.join("deep").join("g"), "data").unwrap();
+        let mut opened: Vec<PathBuf> = Vec::new();
+        let mounts = vec![PathBuf::from("/"), dir.clone(), mounted.clone()];
+        let files = walk_roots_within(&[dir.clone()], &[], &[], &mounts, &mut |d| opened.push(d.to_path_buf()), &|| false);
+        assert!(opened.contains(&dir), "the root itself is a mount point and is still walked");
+        assert!(opened.contains(&dir.join("check")), "the folder holding the mount is walked");
+        assert!(opened.iter().all(|d| !d.starts_with(&mounted)), "nothing on the other drive was opened: {opened:?}");
+        assert_eq!(files.len(), 1, "{:?}", files.iter().map(|f| &f.path).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mountinfo_names_mount_points_with_spaces_d413() {
+        let text = "36 25 8:1 / / rw - ext4 /dev/sda1 rw\n90 36 259:1 / /run/media/u/My\\040Drive rw - fuseblk /dev/x rw\n";
+        assert_eq!(parse_mountinfo(&text), vec![PathBuf::from("/"), PathBuf::from("/run/media/u/My Drive")]);
     }
 
     #[test]
