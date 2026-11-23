@@ -44675,6 +44675,21 @@ Broken: Either state is wrong.\n";
     struct ScratchCleanup(std::path::PathBuf);
     impl Drop for ScratchCleanup {
         fn drop(&mut self) {
+            // D-411: earlier tests' windows stay open for the whole suite. A
+            // window still showing this folder would move to the folder above
+            // once it is deleted and keep rescanning the shared scratch root
+            // for every later test; 40 of them starved a video test. Stop
+            // their watching first, as closing the test would.
+            let windows = WINDOWS.with(|w| w.try_borrow().map(|w| w.windows()).unwrap_or_default());
+            for (state, _) in windows {
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    let inside = matches!(&state.cwd, native_core::Location::RealDir(p) if p.starts_with(&self.0));
+                    if inside {
+                        state.directory_monitor = None;
+                        state.monitor_generation = state.monitor_generation.wrapping_add(1);
+                    }
+                }
+            }
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
