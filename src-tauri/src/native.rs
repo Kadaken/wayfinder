@@ -10924,8 +10924,17 @@ fn start_monitor_scan(
             state_ref.monitor_generation == monitor_generation && state_ref.cwd == path
         };
         if current {
-            if let Some(Ok(listing)) = result {
-                apply_monitor_scan(&state, &ui, listing);
+            match result {
+                Some(Ok(listing)) => apply_monitor_scan(&state, &ui, listing),
+                Some(Err(_)) => {
+                    if let native_core::Location::RealDir(gone) = &path {
+                        if std::fs::symlink_metadata(gone).is_err() {
+                            folder_went_away(&state, gone);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                None => {}
             }
             #[cfg(any(test))]
             SCAN_LOG.with(|log| {
@@ -10939,6 +10948,34 @@ fn start_monitor_scan(
         }
         glib::ControlFlow::Break
     });
+}
+
+/// D-411 (22 Nov 2026): the folder on screen is gone. A USB stick was pulled
+/// and Wayfinder kept listing its files; selecting one showed "cannot open ...
+/// No such file or directory" as if the file type were the problem. Now the
+/// window moves to the nearest folder that still exists (home, when the drive
+/// itself is gone) and the status line says why.
+fn folder_went_away(state: &Rc<RefCell<AppState>>, gone: &Path) {
+    let mounts_root = |p: &Path| {
+        p == Path::new("/")
+            || p == Path::new("/media")
+            || p == Path::new("/mnt")
+            || p == Path::new("/run/media")
+            || p.parent() == Some(Path::new("/run/media"))
+    };
+    let nearest = gone.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
+    let (target, message) = match nearest {
+        Some(p) if !mounts_root(&p) => {
+            let name = gone.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            (p, format!("{name} no longer exists"))
+        }
+        _ => (
+            std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")),
+            "That drive was removed".to_string(),
+        ),
+    };
+    eprintln!("wf-event: folder gone, moving to the nearest folder that exists");
+    navigate_to_with_message(state, native_core::Location::RealDir(target), NavMode::Record, Some(message));
 }
 
 /// Applies a monitor scan. Size/modified-only changes are merged in place so the
@@ -28403,6 +28440,36 @@ Broken: Either state is wrong.\n";
         stream().pause();
     }
 
+    /// D-411: when the folder on screen disappears (its drive pulled, or it is
+    /// deleted elsewhere), the window moves to the nearest folder that exists
+    /// and says why, instead of listing files that can no longer be opened.
+    fn gone_folder_moves_to_one_that_exists_d411() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("gone", |dir| {
+            std::fs::create_dir_all(dir.join("stick")).unwrap();
+            std::fs::write(dir.join("stick").join("notes.md"), "# notes").unwrap();
+        }, 1);
+        let top = match d.state.borrow().cwd.clone() {
+            native_core::Location::RealDir(p) => p,
+            _ => panic!("a real folder"),
+        };
+        let stick = top.join("stick");
+        navigate(&d.state, native_core::Location::RealDir(stick.clone()));
+        d362_wait("inside the folder", 20, || {
+            d.state.borrow().cwd == native_core::Location::RealDir(stick.clone())
+                && d.state.borrow().visible_entries.iter().any(|e| e.name == "notes.md")
+        });
+        std::fs::remove_dir_all(&stick).unwrap();
+        d362_wait("moved to the folder above", 20, || {
+            d.state.borrow().cwd == native_core::Location::RealDir(top.clone())
+        });
+        d362_wait("the reason shown", 10, || d.ui.status.label() == "stick no longer exists");
+        assert!(
+            !d.state.borrow().visible_entries.iter().any(|e| e.name == "notes.md"),
+            "no row from the gone folder is left"
+        );
+    }
+
     /// D-410: a file type the pane cannot show offers "Ask for an update" once.
     /// Yes writes one line to the requests file; Not now writes nothing; both
     /// are remembered; text files and a config with no requests file never ask.
@@ -28715,6 +28782,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test tail-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("gone") {
+            gone_folder_moves_to_one_that_exists_d411();
+            eprintln!("wf-test gone-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("ask") {
             unknown_type_asks_for_an_update_once_d410();
             eprintln!("wf-test ask-only run done");
@@ -28851,6 +28923,7 @@ Broken: Either state is wrong.\n";
         clearing_search_brings_the_folder_back_d402();
         mute_and_volume_carry_across_files_d409();
         unknown_type_asks_for_an_update_once_d410();
+        gone_folder_moves_to_one_that_exists_d411();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();

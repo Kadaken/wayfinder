@@ -50,7 +50,8 @@
       <description>
         <p>When the preview pane cannot show a file type, it can offer to
         ask for an update that adds it. Off unless a requests file is set in
-        the config.</p>
+        the config. Unplugging a drive no longer leaves its files listed:
+        the window moves to a folder that still exists and says why.</p>
       </description>
     </release>
     <release version="0.9.32" date="2026-11-22">

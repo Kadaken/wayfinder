@@ -9,6 +9,9 @@ change between releases.
 ### Added
 - **Ask for an update**: when the preview pane cannot show a file type, a bar under it offers to request support. Yes adds one line (type, `file` description, the sample file) to the Markdown file named by the config key `preview_requests_file`; Not now does nothing. Each type is asked about once (`preview_requests_asked`). Off while `preview_requests_file` is empty, which is the default.
 
+### Fixed
+- When the folder on screen disappears (a USB drive unplugged, or the folder deleted elsewhere), Wayfinder moves to the nearest folder that still exists, or home when the drive is gone, and says why. It used to keep listing the gone files, and their preview said "No such file or directory".
+
 ## 0.9.32 — 22 November 2026
 
 ### Added
