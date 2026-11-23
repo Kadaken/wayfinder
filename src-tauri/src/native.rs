@@ -1369,6 +1369,13 @@ struct AppConfig {
     media_volume: f64,
     #[serde(default)]
     media_muted: bool,
+    /// D-410: a Markdown file that "Ask for an update" adds a line to when the
+    /// pane cannot show a file type. Empty (the default) switches the bar off.
+    #[serde(default)]
+    preview_requests_file: String,
+    /// D-410: file types already asked about (sent or "Not now"), never asked again.
+    #[serde(default)]
+    preview_requests_asked: Vec<String>,
     /// Opt-in: ask Copy / Move / Link on every drag and drop instead of
     /// deciding from the modifier keys and the device. Off by default, so the
     /// Explorer habit (Ctrl copies, Shift moves) keeps working untouched for
@@ -2124,6 +2131,8 @@ impl Default for AppConfig {
             duplicate_index_skip: Vec::new(),
             media_volume: 1.0,
             media_muted: false,
+            preview_requests_file: String::new(),
+            preview_requests_asked: Vec::new(),
             drop_ask: false,
             sidebar_hidden: false,
             onboarded: false,
@@ -3202,6 +3211,13 @@ struct Ui {
     d383_label: gtk::Label,
     d383_button: gtk::Button,
     d383_target: Rc<RefCell<Option<(String, String)>>>,
+    /// D-410: the "Ask for an update" bar for a file type the pane cannot
+    /// show, and the (type, path, description) its buttons act on.
+    ask_bar: gtk::Box,
+    ask_label: gtk::Label,
+    ask_yes: gtk::Button,
+    ask_no: gtk::Button,
+    ask_target: Rc<RefCell<Option<(String, String, String)>>>,
     file_preview: gtk::Paned,
     preview_toggle: gtk::ToggleButton,
     /// Divider position remembered while the preview pane is hidden.
@@ -5626,10 +5642,33 @@ fn build_ui_in(
     d383_bar.append(&d383_label);
     d383_bar.append(&d383_button);
     d383_bar.set_visible(false);
+    // D-410: same shape as the D-383 bar: a wrapping line, then two buttons.
+    let ask_label = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .max_width_chars(1)
+        .hexpand(false)
+        .build();
+    let ask_yes = gtk::Button::with_label("Ask for an update");
+    let ask_no = gtk::Button::with_label("Not now");
+    let ask_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    ask_buttons.append(&ask_yes);
+    ask_buttons.append(&ask_no);
+    let ask_bar = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    ask_bar.set_margin_top(6);
+    ask_bar.set_margin_bottom(6);
+    ask_bar.set_margin_start(6);
+    ask_bar.set_margin_end(6);
+    ask_bar.set_hexpand(false);
+    ask_bar.append(&ask_label);
+    ask_bar.append(&ask_buttons);
+    ask_bar.set_visible(false);
     let preview_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     preview_stack.set_vexpand(true);
     preview_body.append(&preview_stack);
     preview_body.append(&d383_bar);
+    preview_body.append(&ask_bar);
     let preview_scroll = gtk::ScrolledWindow::builder()
         .child(&preview_body)
         .min_content_width(0)
@@ -5922,6 +5961,11 @@ fn build_ui_in(
         d383_label: d383_label.clone(),
         d383_button: d383_button.clone(),
         d383_target: Rc::new(RefCell::new(None)),
+        ask_bar: ask_bar.clone(),
+        ask_label: ask_label.clone(),
+        ask_yes: ask_yes.clone(),
+        ask_no: ask_no.clone(),
+        ask_target: Rc::new(RefCell::new(None)),
         file_preview: file_preview.clone(),
         preview_toggle: preview_toggle.clone(),
         preview_saved_position: Rc::new(std::cell::Cell::new(0)),
@@ -9165,6 +9209,12 @@ fn connect_actions(
         let state = state.clone();
         let ui_for_fix = ui.clone();
         ui.d383_button.connect_clicked(move |_| d383_fix_shown_file(state.clone(), ui_for_fix.clone()));
+    }
+    {
+        let ui_for_yes = ui.clone();
+        ui.ask_yes.connect_clicked(move |_| ask_answer(&ui_for_yes, true));
+        let ui_for_no = ui.clone();
+        ui.ask_no.connect_clicked(move |_| ask_answer(&ui_for_no, false));
     }
 }
 
@@ -21104,6 +21154,7 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     // dropped instead of painting over the newer preview.
     let generation = next_preview_generation(ui);
     d383_hide_bar(ui);
+    ask_hide_bar(ui);
 
     // D-325: the pane is about to swap pages and rebuild or empty children
     // (the folder rows, the audio and video controls). Focus left inside it
@@ -21234,7 +21285,8 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
-    if !native_viewers::is_archive_path(&path_str) {
+    let is_archive = native_viewers::is_archive_path(&path_str);
+    if !is_archive {
         if let Ok(text) = native_core::read_text_preview(&path_str) {
             set_preview_text(ui, &text);
             return;
@@ -21248,16 +21300,102 @@ fn update_preview(ui: &Ui, entry: &Entry) {
     let live = ui.preview_generation.clone();
     let words = ui.preview.clone();
     let source = path_str.clone();
+    let ui_for_ask = ui.clone();
     glib::MainContext::default().spawn_local(async move {
-        let made = gio::spawn_blocking(move || native_viewers::describe_file(&source)).await;
+        let made = gio::spawn_blocking({
+            let source = source.clone();
+            move || native_viewers::describe_file(&source)
+        })
+        .await;
         if live.get() != generation {
             return;
         }
         match made {
-            Ok(more) => words.set_label(&format!("{summary}\n\n{more}")),
+            Ok(more) => {
+                words.set_label(&format!("{summary}\n\n{more}"));
+                // D-410: nothing in the pane can show this type.
+                if !is_archive {
+                    ask_show_bar(&ui_for_ask, &source, more.trim_start_matches("Content: "));
+                }
+            }
             Err(_) => words.set_label(&summary),
         }
     });
+}
+
+/// D-410: the type a request is about: the extension, or for a file with
+/// none, the start of `file`'s description ("ELF 64-bit LSB executable").
+fn ask_type_key(path: &str, description: &str) -> String {
+    let name = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => format!(".{}", ext.to_lowercase()),
+        _ => description.split(',').next().unwrap_or("").trim().to_string(),
+    }
+}
+
+fn ask_hide_bar(ui: &Ui) {
+    ui.ask_bar.set_visible(false);
+    *ui.ask_target.borrow_mut() = None;
+}
+
+/// D-410: offers "Ask for an update" once per file type, and only when the
+/// config names a requests file.
+fn ask_show_bar(ui: &Ui, path: &str, description: &str) {
+    let config = load_config();
+    let key = ask_type_key(path, description);
+    if config.preview_requests_file.trim().is_empty()
+        || key.is_empty()
+        || config.preview_requests_asked.iter().any(|k| k == &key)
+    {
+        return;
+    }
+    let kind = if key.starts_with('.') { format!("{key} files") } else { format!("this kind of file ({key})") };
+    ui.ask_label.set_label(&format!("Wayfinder cannot show {kind} yet."));
+    ui.ask_yes.set_visible(true);
+    ui.ask_no.set_visible(true);
+    *ui.ask_target.borrow_mut() = Some((key, path.to_string(), description.to_string()));
+    ui.ask_bar.set_visible(true);
+}
+
+/// D-410: Yes adds one line to the requests file; either answer is remembered
+/// so the same type is never asked about again.
+fn ask_answer(ui: &Ui, send: bool) {
+    let Some((key, path, description)) = ui.ask_target.borrow_mut().take() else {
+        return;
+    };
+    let mut sent = Ok(());
+    if send {
+        let file = load_config().preview_requests_file;
+        sent = ask_append_request(Path::new(&file), &key, &description, &path);
+    }
+    if sent.is_ok() {
+        update_config(|config| {
+            if !config.preview_requests_asked.contains(&key) {
+                config.preview_requests_asked.push(key.clone());
+            }
+        });
+    }
+    ui.ask_yes.set_visible(false);
+    ui.ask_no.set_visible(false);
+    match (send, sent) {
+        (false, _) => ask_hide_bar(ui),
+        (true, Ok(())) => ui.ask_label.set_label("Sent. It is on the Wayfinder to-do list."),
+        (true, Err(why)) => ui.ask_label.set_label(&format!("Could not send the request: {why}")),
+    }
+}
+
+fn ask_append_request(file: &Path, key: &str, description: &str, path: &str) -> Result<(), String> {
+    use std::io::Write;
+    let fresh = !file.exists();
+    let mut out = fs::OpenOptions::new().create(true).append(true).open(file).map_err(|e| e.to_string())?;
+    let mut text = String::new();
+    if fresh {
+        text.push_str("# Wayfinder - preview requests\n\nFile types the preview pane could not show. Tick a line when the update that shows it ships.\n\n");
+    }
+    let today = glib::DateTime::now_local().ok().and_then(|d| d.format("%-d %b %Y").ok()).map(|d| d.to_string()).unwrap_or_default();
+    text.push_str(&format!("- [ ] `{key}` — {description} — sample: `{path}` — {today}\n"));
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    out.sync_all().map_err(|e| e.to_string())
 }
 
 fn preview_zoom_for(ui: &Ui) -> f64 {
@@ -28265,6 +28403,54 @@ Broken: Either state is wrong.\n";
         stream().pause();
     }
 
+    /// D-410: a file type the pane cannot show offers "Ask for an update" once.
+    /// Yes writes one line to the requests file; Not now writes nothing; both
+    /// are remembered; text files and a config with no requests file never ask.
+    fn unknown_type_asks_for_an_update_once_d410() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("ask", |dir| {
+            let noise: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            for n in ["one.zzq", "two.zzq", "one.yyq"] {
+                std::fs::write(dir.join(n), &noise).unwrap();
+            }
+            std::fs::write(dir.join("note.txt"), "words").unwrap();
+        }, 4);
+        let requests = crate::native_core::scratch_root().join(format!("wf-d362-ask-{}", std::process::id())).join("home").join("requests.md");
+        let set = |file: String| update_config(|c| {
+            c.preview_requests_file = file;
+            c.preview_requests_asked.clear();
+        });
+        let settled = |name: &str| {
+            d362_show(&d, name);
+            d362_wait(&format!("{name} described"), 30, || !d.ui.preview.label().contains("Reading\u{2026}"));
+            pump();
+        };
+        set(String::new());
+        settled("one.zzq");
+        assert!(!d.ui.ask_bar.is_visible(), "no requests file: no bar");
+        set(requests.to_string_lossy().into_owned());
+        settled("note.txt");
+        assert!(!d.ui.ask_bar.is_visible(), "a text file never asks");
+        settled("one.zzq");
+        assert!(d.ui.ask_bar.is_visible(), "an unknown type asks");
+        assert!(d.ui.ask_label.label().contains(".zzq"), "the bar names the type: {}", d.ui.ask_label.label());
+        d.ui.ask_yes.emit_clicked();
+        let text = std::fs::read_to_string(&requests).expect("the request was written");
+        assert_eq!(text.matches("- [ ] `.zzq`").count(), 1, "one line for .zzq: {text}");
+        assert!(text.contains("one.zzq"), "the line names the sample file");
+        assert!(d.ui.ask_label.label().starts_with("Sent"), "the bar says it was sent");
+        settled("two.zzq");
+        assert!(!d.ui.ask_bar.is_visible(), "the same type is never asked twice");
+        settled("one.yyq");
+        assert!(d.ui.ask_bar.is_visible(), "another unknown type asks");
+        d.ui.ask_no.emit_clicked();
+        assert!(!d.ui.ask_bar.is_visible(), "Not now hides the bar");
+        settled("one.yyq");
+        assert!(!d.ui.ask_bar.is_visible(), "Not now is remembered");
+        assert!(!std::fs::read_to_string(&requests).unwrap().contains(".yyq"), "Not now writes nothing");
+        set(String::new());
+    }
+
     /// D-362: new picture formats preview as pictures: tga, pnm, psd and dds,
     /// converted to a cached PNG when GTK cannot load them itself.
     fn new_image_formats_preview_as_pictures_d362() {
@@ -28529,6 +28715,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test tail-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("ask") {
+            unknown_type_asks_for_an_update_once_d410();
+            eprintln!("wf-test ask-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("sound") {
             mute_and_volume_carry_across_files_d409();
             eprintln!("wf-test sound-only run done");
@@ -28659,6 +28850,7 @@ Broken: Either state is wrong.\n";
         sidebar_drop_check_runs_off_the_gtk_thread_d400();
         clearing_search_brings_the_folder_back_d402();
         mute_and_volume_carry_across_files_d409();
+        unknown_type_asks_for_an_update_once_d410();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();

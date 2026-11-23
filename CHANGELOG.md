@@ -4,6 +4,11 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.33 — 22 November 2026
+
+### Added
+- **Ask for an update**: when the preview pane cannot show a file type, a bar under it offers to request support. Yes adds one line (type, `file` description, the sample file) to the Markdown file named by the config key `preview_requests_file`; Not now does nothing. Each type is asked about once (`preview_requests_asked`). Off while `preview_requests_file` is empty, which is the default.
+
 ## 0.9.32 — 22 November 2026
 
 ### Added

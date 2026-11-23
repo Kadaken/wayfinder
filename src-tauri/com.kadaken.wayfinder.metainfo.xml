@@ -46,6 +46,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.33" date="2026-11-22">
+      <description>
+        <p>When the preview pane cannot show a file type, it can offer to
+        ask for an update that adds it. Off unless a requests file is set in
+        the config.</p>
+      </description>
+    </release>
     <release version="0.9.32" date="2026-11-22">
       <description>
         <p>New "Show original" item in the file menu opens the original of a
