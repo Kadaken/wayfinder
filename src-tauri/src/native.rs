@@ -10956,6 +10956,10 @@ fn start_monitor_scan(
 /// window moves to the nearest folder that still exists (home, when the drive
 /// itself is gone) and the status line says why.
 fn folder_went_away(state: &Rc<RefCell<AppState>>, gone: &Path) {
+    // A closed window keeps its state alive; it must never move or write Recent.
+    if ui_for_state(state).is_none() {
+        return;
+    }
     let mounts_root = |p: &Path| {
         p == Path::new("/")
             || p == Path::new("/media")
@@ -12430,6 +12434,13 @@ fn unregister_window(state: &Rc<RefCell<AppState>>) {
     // only when the last Rc<RefCell<AppState>> clone goes away would leak
     // every cache root for the rest of the process's life.
     state.borrow_mut().zip_open_cache_roots.borrow_mut().clear();
+    // D-411: the same goes for the folder watcher. A closed window that kept
+    // watching would react to its folder disappearing long after it is gone.
+    {
+        let mut state = state.borrow_mut();
+        state.directory_monitor = None;
+        state.monitor_generation = state.monitor_generation.wrapping_add(1);
+    }
     let removed = WINDOWS.with(|windows| windows.borrow_mut().unregister(state));
     drop(removed);
 }
