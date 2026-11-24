@@ -4,6 +4,16 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.36 — 23 November 2026
+
+### Added
+- Windows shortcuts (.lnk) preview as text: where the shortcut points, its working folder, arguments, comment, and the target's size and date.
+- Outlook messages (.msg) preview as From, To, Cc, Date, Subject, the attachment names and the message text.
+- Windows metafile pictures (.wmf, .emf) preview through LibreOffice, the same way documents do.
+
+### Fixed
+- Five file-dialog tests that failed when the machine was busy: one no longer hits "Text file busy" when it starts its helper program, and the others wait longer for a real file picker to answer. A picker that never answers still fails them.
+
 ## 0.9.35 — 23 November 2026
 
 ### Changed

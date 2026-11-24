@@ -46,6 +46,12 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.36" date="2026-11-23">
+      <description>
+        <p>The preview pane shows Windows shortcuts, Outlook messages and
+        Windows metafile pictures.</p>
+      </description>
+    </release>
     <release version="0.9.35" date="2026-11-23">
       <description>
         <p>Wayfinder starts muted every time, folders can be added under

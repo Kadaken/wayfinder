@@ -21434,6 +21434,41 @@ fn update_preview(ui: &Ui, entry: &Entry) {
         return;
     }
 
+    // D-418 / D-419: a Windows shortcut or an Outlook message reads as plain
+    // lines. Parsed off the main thread; a failure shows the summary and why.
+    let mail_or_link = Path::new(&path_str)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    if mail_or_link == "lnk" || mail_or_link == "msg" {
+        set_preview_text(ui, "Reading\u{2026}");
+        let generation = ui.preview_generation.get();
+        let live = ui.preview_generation.clone();
+        let words = ui.preview.clone();
+        let source = path_str.clone();
+        let summary = native_core::entry_summary(entry);
+        glib::MainContext::default().spawn_local(async move {
+            let made = gio::spawn_blocking(move || {
+                if mail_or_link == "lnk" {
+                    native_viewers::lnk_preview(&source)
+                } else {
+                    native_viewers::msg_preview(&source)
+                }
+            })
+            .await;
+            if live.get() != generation {
+                return;
+            }
+            match made {
+                Ok(Ok(text)) => words.set_label(&text),
+                Ok(Err(why)) => words.set_label(&format!("{summary}\n\n{why}")),
+                Err(_) => words.set_label(&summary),
+            }
+        });
+        return;
+    }
+
     let is_archive = native_viewers::is_archive_path(&path_str);
     if !is_archive {
         if let Ok(text) = native_core::read_text_preview(&path_str) {
@@ -28710,6 +28745,52 @@ Broken: Either state is wrong.\n";
         set(String::new());
     }
 
+    /// D-418 / D-419: a Windows shortcut reads as lines naming where it
+    /// points; a damaged Outlook message shows the summary and the reason.
+    /// Neither offers "Ask for an update".
+    fn shortcut_and_message_read_as_lines_d418() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("lnkmsg", |dir| {
+            // A minimal shell link: the 76-byte header, then one Unicode
+            // NAME_STRING (HasName 0x04 | IsUnicode 0x80).
+            let mut lnk: Vec<u8> = Vec::new();
+            lnk.extend_from_slice(&0x4Cu32.to_le_bytes());
+            lnk.extend_from_slice(&[0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
+            lnk.extend_from_slice(&0x84u32.to_le_bytes());
+            lnk.resize(76, 0);
+            let words: Vec<u16> = "Mint transfer".encode_utf16().collect();
+            lnk.extend_from_slice(&(words.len() as u16).to_le_bytes());
+            for w in words {
+                lnk.extend_from_slice(&w.to_le_bytes());
+            }
+            std::fs::write(dir.join("go.lnk"), &lnk).unwrap();
+            let noise: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            std::fs::write(dir.join("broken.msg"), &noise).unwrap();
+        }, 2);
+        let requests = crate::native_core::scratch_root().join(format!("wf-d362-lnkmsg-{}", std::process::id())).join("home").join("requests.md");
+        update_config(|c| {
+            c.preview_requests_file = requests.to_string_lossy().into_owned();
+            c.preview_requests_asked.clear();
+        });
+        let settled = |name: &str| {
+            d362_show(&d, name);
+            d362_wait(&format!("{name} read"), 30, || !d.ui.preview.label().contains("Reading\u{2026}"));
+            pump();
+        };
+        settled("go.lnk");
+        let shown = d.ui.preview.label();
+        assert!(shown.starts_with("Windows shortcut"), "a shortcut says what it is: {shown}");
+        assert!(shown.contains("Mint transfer"), "its comment is shown: {shown}");
+        assert!(!d.ui.ask_bar.is_visible(), "a readable shortcut never asks");
+        settled("broken.msg");
+        let shown = d.ui.preview.label();
+        assert!(shown.contains("broken.msg"), "a damaged message still shows the summary: {shown}");
+        assert!(!shown.starts_with("Outlook message"), "noise is not passed off as a message: {shown}");
+        assert!(!d.ui.ask_bar.is_visible(), "a .msg never asks");
+        assert!(!requests.exists(), "nothing was sent");
+        update_config(|c| c.preview_requests_file = String::new());
+    }
+
     /// D-412 (22 Nov 2026): in a narrow preview pane (his was about 250 px)
     /// both Ask-bar buttons must sit inside the pane, the pane must not scroll
     /// sideways, and a pointer at each button's centre must land on the button,
@@ -29040,6 +29121,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test ask-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("lnkmsg") {
+            shortcut_and_message_read_as_lines_d418();
+            eprintln!("wf-test lnkmsg-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("network") {
             network_folder_sits_under_network_d416();
             eprintln!("wf-test network-only run done");
@@ -29179,6 +29265,7 @@ Broken: Either state is wrong.\n";
         gone_folder_moves_to_one_that_exists_d411();
         ask_bar_buttons_clickable_in_a_narrow_pane_d412();
         network_folder_sits_under_network_d416();
+        shortcut_and_message_read_as_lines_d418();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();

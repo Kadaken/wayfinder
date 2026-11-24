@@ -1891,9 +1891,18 @@ mod tests {
             ));
             fs::create_dir_all(&dir).expect("create fake native dir");
             let script = dir.join("fake-native.sh");
-            fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write fake native script");
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-                .expect("chmod fake native script executable");
+            // D-420: written by a child process, never through a file this
+            // test process holds open. A writable descriptor held here is
+            // copied into whatever another test thread forks at that moment,
+            // and running the script while that copy is open fails with
+            // "Text file busy" (ETXTBSY; seen 23 Nov 2026 under load).
+            let wrote = Command::new("/bin/sh")
+                .args(["-c", "printf '%s' \"$1\" > \"$2\" && chmod 700 \"$2\"", "sh"])
+                .arg(format!("#!/bin/sh\n{body}\n"))
+                .arg(&script)
+                .status()
+                .expect("run the fake native writer");
+            assert!(wrote.success(), "write fake native script");
             Self { dir, script }
         }
 
@@ -4455,8 +4464,11 @@ mod tests {
             "the primary Wayfinder must still be running for this test to mean anything"
         );
 
+        // D-420: 30 s ran out with the machine busy (23 Nov 2026: "did not
+        // answer within 30s"). A swallowed request never answers at all, so
+        // it still fails at 90 s.
         let chooser: Arc<dyn Chooser> =
-            Arc::new(ProcessChooser::for_test(driver.clone(), Duration::from_secs(30), base.clone()));
+            Arc::new(ProcessChooser::for_test(driver.clone(), Duration::from_secs(90), base.clone()));
         let server = bus.connect_server(chooser);
         let client = bus.connect_client();
 
@@ -6834,8 +6846,11 @@ mod tests {
                     "the backend bus name must have no owner before the first request"
                 );
                 let frontend = spawn_portal_frontend(&case.xvfb.display, case.bus.address());
-                wait_for_name_owner(&case.client, FRONTEND_BUS_NAME, Duration::from_secs(10));
-                let outcome = attempt_frontend_open_file_bounded(case.bus.address().to_string(), Duration::from_secs(10));
+                // D-420: a real pick starts a whole Wayfinder window; 10 s
+                // ran out on a busy machine (23 Nov 2026). Success is still
+                // required, only the wait for it is longer.
+                wait_for_name_owner(&case.client, FRONTEND_BUS_NAME, Duration::from_secs(30));
+                let outcome = attempt_frontend_open_file_bounded(case.bus.address().to_string(), Duration::from_secs(45));
                 let backend_pid = connection_unix_process_id(&case.client, BUS_NAME);
                 assert_real_pick(outcome, stringify!($bypass_name));
                 teardown_routing_case(case, frontend, backend_pid);

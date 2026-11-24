@@ -29,11 +29,13 @@ pub enum DocKind {
 /// Office, OpenDocument and other formats LibreOffice opens. `csv` stays a
 /// text preview on purpose; `epub` is absent because LibreOffice cannot open
 /// it here ("source file could not be loaded", checked 20 Nov 2026).
-const OFFICE_EXT: [&str; 36] = [
+const OFFICE_EXT: [&str; 38] = [
     "doc", "docx", "dot", "dotx", "odt", "ott", "rtf", "wpd", "wps", "abw", "sxw", "stw",
     "xls", "xlsx", "xlt", "xltx", "ods", "ots", "sxc", "xlsm",
     "ppt", "pptx", "pot", "potx", "pps", "ppsx", "odp", "otp", "sxi",
     "odg", "otg", "odf", "pages", "key", "numbers", "vsd",
+    // D-417: Windows and enhanced metafile pictures; LibreOffice renders them.
+    "wmf", "emf",
 ];
 const PS_EXT: [&str; 2] = ["ps", "eps"];
 const HTML_EXT: [&str; 2] = ["htm", "html"];
@@ -655,6 +657,424 @@ pub fn describe_file(path: &str) -> String {
     format!("Content: {}", file_description(path))
 }
 
+// ---- D-418 / D-419: Windows shortcuts and Outlook messages, pure Rust ----
+
+fn le16(d: &[u8], at: usize) -> Option<u16> {
+    d.get(at..at.checked_add(2)?).map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn le32(d: &[u8], at: usize) -> Option<u32> {
+    d.get(at..at.checked_add(4)?).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn le64(d: &[u8], at: usize) -> Option<u64> {
+    let b = d.get(at..at.checked_add(8)?)?;
+    let mut a = [0u8; 8];
+    a.copy_from_slice(b);
+    Some(u64::from_le_bytes(a))
+}
+
+fn read_limited(path: &str, cap: u64) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(cap).read_to_end(&mut buf))
+        .map_err(|e| format!("cannot read the file: {e}"))?;
+    Ok(buf)
+}
+
+fn utf16_lossy(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&units).trim_end_matches('\0').to_string()
+}
+
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
+}
+
+/// A NUL-terminated string at `at` (ANSI as latin-1, or UTF-16LE).
+fn cstr_at(d: &[u8], at: usize, wide: bool) -> Option<String> {
+    let rest = d.get(at..)?;
+    if wide {
+        let end = rest.chunks_exact(2).position(|c| c == [0, 0]).map_or(rest.len() & !1, |i| i * 2);
+        Some(utf16_lossy(&rest[..end]))
+    } else {
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        Some(latin1(&rest[..end]))
+    }
+}
+
+/// D-419: a Windows FILETIME as "YYYY-MM-DD HH:MM" in UTC. None for zero or
+/// a value outside years 1601..9999.
+fn filetime_text(ft: u64) -> Option<String> {
+    if ft == 0 {
+        return None;
+    }
+    let secs = (ft / 10_000_000) as i64;
+    let days = secs.div_euclid(86_400) - 134_774; // days from 1601-01-01 to 1970-01-01
+    let rem = secs.rem_euclid(86_400);
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    if !(1601..=9999).contains(&y) {
+        return None;
+    }
+    Some(format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60))
+}
+
+/// D-418: reads a Windows .lnk (MS-SHLLINK) and says where it points.
+/// Every offset is bounds-checked; a damaged file is an Err, never a panic.
+pub fn lnk_preview(path: &str) -> Result<String, String> {
+    let d = read_limited(path, 1 << 20)?;
+    if d.len() < 76 || le32(&d, 0) != Some(0x4C) {
+        return Err("not a Windows shortcut (bad header)".into());
+    }
+    const CLSID: [u8; 16] = [0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+    if d[4..20] != CLSID {
+        return Err("not a Windows shortcut (bad class id)".into());
+    }
+    let flags = le32(&d, 0x14).ok_or("truncated")?;
+    let size = le32(&d, 0x34).ok_or("truncated")?;
+    let written = le64(&d, 0x2C).ok_or("truncated")?;
+    let mut pos = 76usize;
+    if flags & 1 != 0 {
+        let n = le16(&d, pos).ok_or("truncated target list")? as usize;
+        pos = pos.checked_add(2 + n).filter(|&p| p <= d.len()).ok_or("truncated target list")?;
+    }
+    let mut target = String::new();
+    if flags & 2 != 0 {
+        let info = pos;
+        let total = le32(&d, info).ok_or("truncated link info")? as usize;
+        let end = info.checked_add(total).filter(|&e| e <= d.len() && total >= 0x1C).ok_or("truncated link info")?;
+        let blob = &d[info..end];
+        let head = le32(blob, 4).ok_or("truncated link info")? as usize;
+        let lf = le32(blob, 8).ok_or("truncated link info")?;
+        let uni = head >= 0x24;
+        let mut base = String::new();
+        if lf & 1 != 0 {
+            let off = if uni { le32(blob, 0x1C) } else { None }.filter(|&o| o != 0).map(|o| (o as usize, true));
+            let off = off.or_else(|| le32(blob, 0x10).map(|o| (o as usize, false)));
+            if let Some((o, w)) = off {
+                base = cstr_at(blob, o, w).unwrap_or_default();
+            }
+        }
+        let mut suffix_ansi = le32(blob, 0x18).and_then(|o| cstr_at(blob, o as usize, false));
+        if uni {
+            if let Some(o) = le32(blob, 0x20).filter(|&o| o != 0) {
+                suffix_ansi = cstr_at(blob, o as usize, true).or(suffix_ansi);
+            }
+        }
+        let suffix = suffix_ansi.unwrap_or_default();
+        if lf & 2 != 0 {
+            if let Some(cn) = le32(blob, 0x14).map(|o| o as usize) {
+                let cnrl = blob.get(cn..).unwrap_or(&[]);
+                let name_off = le32(cnrl, 8).unwrap_or(0) as usize;
+                let mut net = cstr_at(cnrl, name_off, false).unwrap_or_default();
+                if name_off > 0x14 {
+                    if let Some(o) = le32(cnrl, 20).filter(|&o| o != 0) {
+                        net = cstr_at(cnrl, o as usize, true).unwrap_or(net);
+                    }
+                }
+                if base.is_empty() {
+                    base = net;
+                }
+            }
+        }
+        target = base;
+        if !suffix.is_empty() {
+            if !target.is_empty() && !target.ends_with('\\') {
+                target.push('\\');
+            }
+            target.push_str(&suffix);
+        }
+        pos = end;
+    }
+    let wide = flags & 0x80 != 0;
+    let mut strings: Vec<(u32, &str, Option<String>)> = Vec::new();
+    for (bit, label) in [(4u32, "Comment"), (8, "Relative path"), (0x10, "Start in"), (0x20, "Arguments"), (0x40, "Icon")] {
+        let mut val = None;
+        if flags & bit != 0 {
+            let Some(n) = le16(&d, pos) else { break };
+            let bytes = n as usize * if wide { 2 } else { 1 };
+            let Some(s) = d.get(pos + 2..pos + 2 + bytes) else { break };
+            val = Some(if wide { utf16_lossy(s) } else { latin1(s) });
+            pos += 2 + bytes;
+        }
+        strings.push((bit, label, val));
+    }
+    let mut out = String::from("Windows shortcut");
+    let mut line = |label: &str, v: &str| {
+        if !v.is_empty() {
+            out.push_str(&format!("\n{label}: {v}"));
+        }
+    };
+    line("Points to", &target);
+    for want in ["Relative path", "Start in", "Arguments", "Comment"] {
+        if let Some((_, _, Some(v))) = strings.iter().find(|(_, l, _)| *l == want) {
+            line(want, v);
+        }
+    }
+    if size > 0 {
+        line("Target size", &crate::native_core::fmt_size(u64::from(size)));
+    }
+    if let Some(t) = filetime_text(written) {
+        line("Target modified", &t);
+    }
+    Ok(out)
+}
+
+const CFB_END: u32 = 0xFFFF_FFFE;
+const CFB_FREE: u32 = 0xFFFF_FFFF;
+
+struct CfbEntry {
+    name: String,
+    kind: u8,
+    left: u32,
+    right: u32,
+    child: u32,
+    start: u32,
+    size: u64,
+}
+
+struct Cfb {
+    d: Vec<u8>,
+    ss: usize,
+    sectors: usize,
+    fat: Vec<u32>,
+    dir: Vec<CfbEntry>,
+    minifat: Vec<u32>,
+    mini: Vec<u8>,
+    cutoff: u64,
+}
+
+impl Cfb {
+    fn chain(d: &[u8], ss: usize, fat: &[u32], start: u32, limit: usize) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let mut id = start;
+        let mut steps = 0usize;
+        while id != CFB_END {
+            steps += 1;
+            if steps > limit || id as usize >= fat.len().max(limit) {
+                return Err("sector chain loops or runs past the file".into());
+            }
+            let at = (id as usize + 1) * ss;
+            out.extend_from_slice(d.get(at..at + ss).ok_or("a sector lies beyond the end of the file")?);
+            id = *fat.get(id as usize).ok_or("sector chain leaves the table")?;
+            if id == CFB_FREE {
+                return Err("sector chain reaches a free sector".into());
+            }
+        }
+        Ok(out)
+    }
+
+    fn open(d: Vec<u8>) -> Result<Cfb, String> {
+        if d.len() < 512 || d[..8] != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+            return Err("not an Outlook message (no OLE2 header)".into());
+        }
+        let shift = le16(&d, 0x1E).ok_or("truncated")?;
+        let mshift = le16(&d, 0x20).ok_or("truncated")?;
+        if !(shift == 9 || shift == 12) || mshift != 6 {
+            return Err("unsupported sector size".into());
+        }
+        let ss = 1usize << shift;
+        let sectors = d.len() / ss;
+        let limit = sectors + 1;
+        let nfat = le32(&d, 0x2C).ok_or("truncated")? as usize;
+        let dir_start = le32(&d, 0x30).ok_or("truncated")?;
+        let cutoff = u64::from(le32(&d, 0x38).ok_or("truncated")?);
+        let mf_start = le32(&d, 0x3C).ok_or("truncated")?;
+        let mut difat_at = le32(&d, 0x44).ok_or("truncated")?;
+        if nfat > sectors {
+            return Err("more table sectors than the file holds".into());
+        }
+        let mut fat_ids: Vec<u32> = Vec::new();
+        for i in 0..109 {
+            let v = le32(&d, 0x4C + i * 4).ok_or("truncated")?;
+            if v != CFB_FREE && v != CFB_END {
+                fat_ids.push(v);
+            }
+        }
+        let mut hops = 0;
+        while difat_at != CFB_END && difat_at != CFB_FREE {
+            hops += 1;
+            if hops > limit {
+                return Err("the index chain loops".into());
+            }
+            let at = (difat_at as usize + 1) * ss;
+            let sec = d.get(at..at + ss).ok_or("an index sector lies beyond the end of the file")?;
+            for i in 0..ss / 4 - 1 {
+                let v = le32(sec, i * 4).ok_or("truncated")?;
+                if v != CFB_FREE && v != CFB_END {
+                    fat_ids.push(v);
+                }
+            }
+            difat_at = le32(sec, ss - 4).ok_or("truncated")?;
+        }
+        let mut fat = Vec::new();
+        for id in fat_ids.iter().take(limit) {
+            let at = (*id as usize + 1) * ss;
+            let sec = d.get(at..at + ss).ok_or("a table sector lies beyond the end of the file")?;
+            fat.extend(sec.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+        }
+        let dir_bytes = Self::chain(&d, ss, &fat, dir_start, limit)?;
+        let mut dir = Vec::new();
+        for e in dir_bytes.chunks_exact(128) {
+            let nlen = (le16(e, 64).unwrap_or(0) as usize).min(64);
+            dir.push(CfbEntry {
+                name: utf16_lossy(&e[..nlen.saturating_sub(2) & !1]),
+                kind: e[66],
+                left: le32(e, 68).unwrap_or(CFB_FREE),
+                right: le32(e, 72).unwrap_or(CFB_FREE),
+                child: le32(e, 76).unwrap_or(CFB_FREE),
+                start: le32(e, 116).unwrap_or(CFB_END),
+                size: le64(e, 120).unwrap_or(0),
+            });
+        }
+        if dir.is_empty() || dir[0].kind != 5 {
+            return Err("the message has no root entry".into());
+        }
+        let minifat = if mf_start == CFB_END || mf_start == CFB_FREE {
+            Vec::new()
+        } else {
+            Self::chain(&d, ss, &fat, mf_start, limit)?
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let mut mini = Vec::new();
+        let (rs, rsize) = (dir[0].start, dir[0].size);
+        if rs != CFB_END && rs != CFB_FREE && rsize > 0 {
+            mini = Self::chain(&d, ss, &fat, rs, limit)?;
+            mini.truncate(rsize.min(mini.len() as u64) as usize);
+        }
+        Ok(Cfb { d, ss, sectors, fat, dir, minifat, mini, cutoff })
+    }
+
+    /// Entry ids in the tree under `parent` (siblings only, loop-safe).
+    fn children(&self, parent: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.dir[parent].child];
+        while let Some(id) = stack.pop() {
+            let i = id as usize;
+            if id == CFB_FREE || i >= self.dir.len() || out.contains(&i) || out.len() > self.dir.len() {
+                continue;
+            }
+            out.push(i);
+            stack.push(self.dir[i].left);
+            stack.push(self.dir[i].right);
+        }
+        out
+    }
+
+    fn read(&self, i: usize) -> Result<Vec<u8>, String> {
+        let e = &self.dir[i];
+        if e.size > 64 << 20 {
+            return Err("stream too large".into());
+        }
+        let size = e.size as usize;
+        if e.size < self.cutoff {
+            let mut out = Vec::new();
+            let mut id = e.start;
+            let mut steps = 0;
+            while id != CFB_END && out.len() < size {
+                steps += 1;
+                if steps > self.minifat.len() + 1 {
+                    return Err("small-stream chain loops".into());
+                }
+                let at = (id as usize) * 64;
+                out.extend_from_slice(self.mini.get(at..at + 64).ok_or("small-stream sector out of range")?);
+                id = *self.minifat.get(id as usize).ok_or("small-stream chain leaves the table")?;
+            }
+            out.truncate(size);
+            Ok(out)
+        } else {
+            let mut out = Self::chain(&self.d, self.ss, &self.fat, e.start, self.sectors + 1)?;
+            out.truncate(size);
+            Ok(out)
+        }
+    }
+
+    fn find(&self, parent: usize, name: &str) -> Option<usize> {
+        self.children(parent).into_iter().find(|&i| self.dir[i].name.eq_ignore_ascii_case(name))
+    }
+
+    /// A text property of `parent`: tries UTF-16 (001F) then 8-bit (001E).
+    fn text(&self, parent: usize, id: &str) -> Option<String> {
+        if let Some(i) = self.find(parent, &format!("__substg1.0_{id}001F")) {
+            return self.read(i).ok().map(|b| utf16_lossy(&b));
+        }
+        let i = self.find(parent, &format!("__substg1.0_{id}001E"))?;
+        self.read(i).ok().map(|b| latin1(&b))
+    }
+}
+
+/// D-419: reads an Outlook .msg (a Compound File) and shows the headers,
+/// attachment names and the plain-text body. Damaged files are an Err.
+pub fn msg_preview(path: &str) -> Result<String, String> {
+    let cfb = Cfb::open(read_limited(path, 64 << 20)?)?;
+    let clean = |s: String| s.replace('\r', "").trim().to_string();
+    let get = |id: &str| cfb.text(0, id).map(clean).filter(|s| !s.is_empty());
+    let subject = get("0037");
+    let name = get("0C1A");
+    let email = get("5D01").or_else(|| get("0C1F"));
+    let to = get("0E04");
+    let cc = get("0E03");
+    let body = cfb.text(0, "1000").map(|s| s.replace('\r', ""));
+    let mut date = None;
+    if let Some(p) = cfb.find(0, "__properties_version1.0") {
+        let props = cfb.read(p)?;
+        for want in [0x0039_0040u32, 0x0E06_0040] {
+            for e in props.get(32..).unwrap_or(&[]).chunks_exact(16) {
+                if le32(e, 0) == Some(want) {
+                    date = le64(e, 8).and_then(filetime_text);
+                    break;
+                }
+            }
+            if date.is_some() {
+                break;
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for i in cfb.children(0) {
+        if cfb.dir[i].kind == 1 && cfb.dir[i].name.starts_with("__attach_version1.0_#") {
+            let n = cfb.text(i, "3707").or_else(|| cfb.text(i, "3704")).map(clean).filter(|s| !s.is_empty());
+            files.push(n.unwrap_or_else(|| "(unnamed)".into()));
+        }
+    }
+    if subject.is_none() && name.is_none() && body.is_none() && files.is_empty() {
+        return Err("this OLE2 file holds no message properties".into());
+    }
+    let mut out = String::from("Outlook message");
+    let from = match (name, email) {
+        (Some(n), Some(e)) if n != e => Some(format!("{n} <{e}>")),
+        (Some(n), _) => Some(n),
+        (None, e) => e,
+    };
+    for (label, v) in [("From", from), ("To", to), ("Cc", cc), ("Date", date.map(|d| format!("{d} UTC"))), ("Subject", subject)] {
+        if let Some(v) = v {
+            out.push_str(&format!("\n{label}: {v}"));
+        }
+    }
+    if !files.is_empty() {
+        out.push_str(&format!("\nAttachments: {}", files.join(", ")));
+    }
+    if let Some(b) = body {
+        let b: String = b.trim().chars().take(20_000).collect();
+        if !b.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&b);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1417,217 @@ mod tests {
             println!("{kind}\t{path}");
         }
     }
+
+    /// D-417: metafile pictures go through LibreOffice.
+    #[test]
+    fn metafiles_are_office_d417() {
+        assert_eq!(doc_kind("x.wmf"), Some(DocKind::Office));
+        assert_eq!(doc_kind("X.EMF"), Some(DocKind::Office));
+    }
+
+    fn d418_scratch(name: &str) -> PathBuf {
+        let dir = crate::native_core::scratch_root().join(format!("wf-d418-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn u16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    fn lnk_bytes() -> Vec<u8> {
+        let mut h = vec![0u8; 76];
+        h[0] = 0x4C;
+        h[4..20].copy_from_slice(&[0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+        // IDList + LinkInfo + Name + Relative + Arguments, Unicode
+        let flags: u32 = 1 | 2 | 4 | 8 | 0x20 | 0x80;
+        h[0x14..0x18].copy_from_slice(&flags.to_le_bytes());
+        h[0x34..0x38].copy_from_slice(&1_258_291u32.to_le_bytes());
+        // 2005-04-26 04:14 UTC
+        let ft: u64 = (1_114_488_840u64 + 11_644_473_600) * 10_000_000;
+        h[0x2C..0x34].copy_from_slice(&ft.to_le_bytes());
+        h.extend_from_slice(&[4, 0, 1, 2, 3, 4]); // IDList of 4 bytes
+        let base = b"C:\\Program Files\\App\\app.exe\0";
+        let mut info = vec![0u8; 0x1C];
+        let off = info.len() as u32;
+        info[0x08..0x0C].copy_from_slice(&1u32.to_le_bytes());
+        info[0x10..0x14].copy_from_slice(&off.to_le_bytes());
+        info.extend_from_slice(base);
+        let sfx = info.len() as u32;
+        info[0x18..0x1C].copy_from_slice(&sfx.to_le_bytes());
+        info.push(0);
+        info[0x04..0x08].copy_from_slice(&0x1Cu32.to_le_bytes());
+        let total = info.len() as u32;
+        info[0..4].copy_from_slice(&total.to_le_bytes());
+        h.extend(info);
+        for s in ["Runs the app", "..\\app.exe", "-x -y"] {
+            h.extend_from_slice(&(s.chars().count() as u16).to_le_bytes());
+            h.extend(u16le(s));
+        }
+        h
+    }
+
+    #[test]
+    fn lnk_reads_target_d418() {
+        let p = d418_scratch("a.lnk");
+        std::fs::write(&p, lnk_bytes()).unwrap();
+        let text = lnk_preview(p.to_str().unwrap()).unwrap();
+        eprintln!("{text}");
+        assert!(text.starts_with("Windows shortcut"));
+        assert!(text.contains("Points to: C:\\Program Files\\App\\app.exe"));
+        assert!(text.contains("Relative path: ..\\app.exe"));
+        assert!(text.contains("Arguments: -x -y"));
+        assert!(text.contains("Comment: Runs the app"));
+        assert!(text.contains("Target modified: 2005-04-26 04:14"), "{text}");
+        assert!(text.contains("Target size: "));
+    }
+
+    #[test]
+    fn lnk_damage_is_an_error_d418() {
+        let full = lnk_bytes();
+        for cut in (0..full.len()).step_by(3) {
+            let p = d418_scratch("cut.lnk");
+            std::fs::write(&p, &full[..cut]).unwrap();
+            let r = lnk_preview(p.to_str().unwrap());
+            if cut < 76 {
+                assert!(r.is_err(), "cut {cut}");
+            }
+        }
+        let p = d418_scratch("junk.lnk");
+        std::fs::write(&p, (0..500u32).map(|i| (i * 31 % 251) as u8).collect::<Vec<_>>()).unwrap();
+        assert!(lnk_preview(p.to_str().unwrap()).is_err());
+    }
+
+    /// A minimal CFB: every stream in the mini stream, one attachment storage.
+    fn msg_bytes(loop_fat: bool) -> Vec<u8> {
+        let streams: Vec<(&str, Vec<u8>)> = vec![
+            ("__substg1.0_0037001F", u16le("Quarterly report")),
+            ("__substg1.0_0C1A001F", u16le("Ann Lee")),
+            ("__substg1.0_5D01001F", u16le("ann@example.com")),
+            ("__substg1.0_1000001E", b"Hello there,\r\nsee attached.".to_vec()),
+            ("__properties_version1.0", {
+                let mut p = vec![0u8; 32];
+                p.extend_from_slice(&0x0039_0040u32.to_le_bytes());
+                p.extend_from_slice(&0u32.to_le_bytes());
+                p.extend_from_slice(&((1_078_136_520u64 + 11_644_473_600) * 10_000_000).to_le_bytes());
+                p
+            }),
+            ("__substg1.0_3707001F", u16le("report.xls")),
+        ];
+        // entries: 0 root, 1..=5 top streams, 6 attach storage, 7 attach stream
+        let mut mini = Vec::new();
+        let mut places = Vec::new();
+        for (_, data) in &streams {
+            places.push((mini.len() / 64, data.len()));
+            mini.extend_from_slice(data);
+            mini.resize(mini.len().div_ceil(64) * 64, 0);
+        }
+        let nmini = mini.len() / 64;
+        let msec = mini.len().div_ceil(512);
+        mini.resize(msec * 512, 0);
+        let ndir = 2usize; // 8 entries = 2 sectors
+        let mf_sector = 1 + ndir;
+        let first_mini = mf_sector + 1;
+        let total = first_mini + msec;
+        let mut fat = vec![CFB_FREE; 128];
+        fat[0] = 0xFFFF_FFFD;
+        fat[1] = 2;
+        fat[2] = CFB_END;
+        fat[mf_sector] = CFB_END;
+        for i in 0..msec {
+            fat[first_mini + i] = if i + 1 == msec { CFB_END } else { (first_mini + i + 1) as u32 };
+        }
+        if loop_fat {
+            fat[2] = 1;
+        }
+        let mut minifat = vec![CFB_FREE; 128];
+        for (i, v) in minifat.iter_mut().enumerate().take(nmini) {
+            *v = if i + 1 == nmini { CFB_END } else { (i + 1) as u32 };
+        }
+        // each stream's own chain: rebuild per stream
+        let mut k = 0;
+        for (_, data) in &streams {
+            let n = data.len().div_ceil(64);
+            for j in 0..n {
+                minifat[k + j] = if j + 1 == n { CFB_END } else { (k + j + 1) as u32 };
+            }
+            k += n;
+        }
+        let entry = |name: &str, kind: u8, l: u32, r: u32, c: u32, start: u32, size: u64| {
+            let mut e = vec![0u8; 128];
+            let n = u16le(name);
+            e[..n.len()].copy_from_slice(&n);
+            e[64..66].copy_from_slice(&((n.len() + 2) as u16).to_le_bytes());
+            e[66] = kind;
+            e[68..72].copy_from_slice(&l.to_le_bytes());
+            e[72..76].copy_from_slice(&r.to_le_bytes());
+            e[76..80].copy_from_slice(&c.to_le_bytes());
+            e[116..120].copy_from_slice(&start.to_le_bytes());
+            e[120..128].copy_from_slice(&size.to_le_bytes());
+            e
+        };
+        let mut dir = Vec::new();
+        dir.extend(entry("Root Entry", 5, CFB_FREE, CFB_FREE, 1, first_mini as u32, mini.len() as u64));
+        for i in 0..5 {
+            let right = if i < 4 { (i + 2) as u32 } else { 6 };
+            dir.extend(entry(streams[i].0, 2, CFB_FREE, right, CFB_FREE, places[i].0 as u32, places[i].1 as u64));
+        }
+        dir.extend(entry("__attach_version1.0_#00000000", 1, CFB_FREE, CFB_FREE, 7, 0, 0));
+        dir.extend(entry(streams[5].0, 2, CFB_FREE, CFB_FREE, CFB_FREE, places[5].0 as u32, places[5].1 as u64));
+        dir.resize(ndir * 512, 0);
+        let mut h = vec![0u8; 512];
+        h[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        h[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        h[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        h[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        h[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        h[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        h[0x3C..0x40].copy_from_slice(&(mf_sector as u32).to_le_bytes());
+        h[0x40..0x44].copy_from_slice(&1u32.to_le_bytes());
+        h[0x44..0x48].copy_from_slice(&CFB_END.to_le_bytes());
+        for i in 0..109 {
+            let v = if i == 0 { 0 } else { CFB_FREE };
+            h[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut out = h;
+        out.extend(fat.iter().flat_map(|v| v.to_le_bytes()));
+        out.extend(dir);
+        out.extend(minifat.iter().flat_map(|v| v.to_le_bytes()));
+        out.extend(mini);
+        assert_eq!(out.len(), (total + 1) * 512);
+        out
+    }
+
+    #[test]
+    fn msg_reads_headers_d419() {
+        let p = d418_scratch("a.msg");
+        std::fs::write(&p, msg_bytes(false)).unwrap();
+        let text = msg_preview(p.to_str().unwrap()).unwrap();
+        eprintln!("{text}");
+        assert!(text.starts_with("Outlook message"));
+        assert!(text.contains("From: Ann Lee <ann@example.com>"));
+        assert!(text.contains("Subject: Quarterly report"));
+        assert!(text.contains("Attachments: report.xls"));
+        assert!(text.contains("Date: 2004-03-01 10:22 UTC"), "{text}");
+        assert!(text.contains("Hello there,\nsee attached."));
+    }
+
+    #[test]
+    fn msg_damage_is_an_error_d419() {
+        let p = d418_scratch("loop.msg");
+        std::fs::write(&p, msg_bytes(true)).unwrap();
+        assert!(msg_preview(p.to_str().unwrap()).is_err());
+        let full = msg_bytes(false);
+        for cut in [0usize, 7, 100, 511, 600, 1500] {
+            std::fs::write(&p, &full[..cut]).unwrap();
+            let _ = msg_preview(p.to_str().unwrap());
+        }
+        std::fs::write(&p, &full[..511]).unwrap();
+        assert!(msg_preview(p.to_str().unwrap()).is_err());
+        std::fs::write(&p, (0..4000u32).map(|i| (i * 37 % 253) as u8).collect::<Vec<_>>()).unwrap();
+        assert!(msg_preview(p.to_str().unwrap()).is_err());
+    }
+
 }
 
 /// D-404: the rows of a cut-off PNG that still decode, as 8-bit RGBA.
