@@ -1330,6 +1330,11 @@ struct AppConfig {
     /// D-156: shares connected successfully; canonical URI and label only.
     #[serde(default)]
     remembered_networks: Vec<native_smb::RememberedNetwork>,
+    /// D-416: folders listed under the sidebar's Network heading, such as the
+    /// folder another computer drops files into. Plain folders, added and
+    /// removed with Add to Network / Remove from Network.
+    #[serde(default)]
+    network_folders: Vec<Bookmark>,
     favorites: Vec<Bookmark>,
     recents: Vec<Bookmark>,
     show_hidden: bool,
@@ -2125,6 +2130,7 @@ impl Default for AppConfig {
             pins: Vec::new(),
             columns: ColumnVisibility::default(),
             remembered_networks: Vec::new(),
+            network_folders: Vec::new(),
             trash_keep_days: 0,
             originals_lists: Vec::new(),
             duplicate_index_roots: Vec::new(),
@@ -2639,6 +2645,41 @@ fn remove_favorite_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
     ui.status.set_label("Removed from Favorites");
 }
 
+fn is_network_folder(state: &AppState, path: &str) -> bool {
+    state.network_folders.iter().any(|folder| folder.path == path)
+}
+
+/// D-416: lists a folder under the sidebar's Network heading.
+fn add_network_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
+    if !Path::new(&path).is_dir() {
+        ui.status.set_label("Only folders can be added to Network");
+        return;
+    }
+    {
+        let mut state_ref = state.borrow_mut();
+        if !is_network_folder(&state_ref, &path) {
+            match update_config(|config| add_favorite(&mut config.network_folders, &path)) {
+                Some(config) => state_ref.network_folders = config.network_folders,
+                None => add_favorite(&mut state_ref.network_folders, &path),
+            }
+        }
+    }
+    rebuild_sidebar(state, ui);
+    ui.status.set_label("Added to Network");
+}
+
+fn remove_network_path(state: &Rc<RefCell<AppState>>, ui: &Ui, path: String) {
+    {
+        let mut state_ref = state.borrow_mut();
+        match update_config(|config| remove_favorite(&mut config.network_folders, &path)) {
+            Some(config) => state_ref.network_folders = config.network_folders,
+            None => remove_favorite(&mut state_ref.network_folders, &path),
+        }
+    }
+    rebuild_sidebar(state, ui);
+    ui.status.set_label("Removed from Network");
+}
+
 /// True when the shared config on disk holds no recents. Read from disk, not
 /// from this window, because another window may have added visits since.
 fn recents_are_empty(state: &Rc<RefCell<AppState>>) -> bool {
@@ -2811,6 +2852,8 @@ struct AppState {
     /// which option is ticked without reading the config file.
     trash_keep_days: u32,
     favorites: Vec<Bookmark>,
+    /// D-416: mirror of `AppConfig::network_folders`.
+    network_folders: Vec<Bookmark>,
     recents: Vec<Bookmark>,
     /// D-246: files opened from the listing, newest first, for the Recent
     /// strip on the Home page.
@@ -5008,6 +5051,7 @@ fn build_ui_in(
         sidebar_active_key: None,
         trash_keep_days: config.trash_keep_days,
         favorites: config.favorites,
+        network_folders: config.network_folders,
         recents: config.recents,
         recent_files: config.recent_files,
         remembered_networks: config.remembered_networks,
@@ -7439,6 +7483,23 @@ fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     connect_row.set_tooltip_text(Some(SMB_CONNECT_ROW));
     connect_row.set_widget_name("wf-connect-server-row");
     ui.sidebar.append(&connect_row);
+    let network_folders = state.borrow().network_folders.clone();
+    for folder in network_folders {
+        let row = sidebar_row(&folder.name, "", "folder-remote-symbolic");
+        row.set_tooltip_text(Some(&folder.path));
+        row.set_widget_name("wf-network-folder-row");
+        connect_place_context(&row, state.clone(), ui.clone(), folder.path.clone());
+        connect_sidebar_drop(&row, state, ui, &folder.path);
+        mark_sidebar_active(
+            &row,
+            &cwd,
+            &folder.name,
+            &folder.path,
+            sidebar_active_key.as_deref(),
+            &mut active_target,
+        );
+        ui.sidebar.append(&row);
+    }
     for saved in state.borrow().remembered_networks.clone() {
         if native_smb::remembered_location(&saved).is_none() {
             continue;
@@ -7769,6 +7830,24 @@ fn open_connect_dialog(state: &Rc<RefCell<AppState>>, ui: &Ui, prefill: Option<&
     dialog
 }
 
+/// D-416: "Add to Network" or "Remove from Network" for a folder.
+fn network_toggle_button(
+    popover: &gtk::Popover,
+    state: Rc<RefCell<AppState>>,
+    ui: Ui,
+    path: String,
+) -> gtk::Button {
+    let listed = is_network_folder(&state.borrow(), &path);
+    let label = if listed { "Remove from Network" } else { "Add to Network" };
+    context_button(label, popover, move || {
+        if listed {
+            remove_network_path(&state, &ui, path.clone());
+        } else {
+            add_network_path(&state, &ui, path.clone());
+        }
+    })
+}
+
 /// Right-click on a Places or Favorites row in the sidebar.
 ///
 /// Until this existed the sidebar answered left-click only, so emptying the
@@ -7958,6 +8037,7 @@ fn show_place_context_menu(
                 add_favorite_path(&state_for_fav, &ui_for_fav, path_for_fav.clone());
             }
         }));
+        menu.append(&network_toggle_button(&popover, state.clone(), ui.clone(), path.clone()));
     }
 
     popover.set_child(Some(&menu));
@@ -19735,6 +19815,7 @@ fn show_item_context_menu(
         } else {
             "Add to Favorites"
         };
+        let path_for_net = path.clone();
         menu.append(&context_button(label, &popover, move || {
             if favorite {
                 remove_favorite_path(&state_for_fav, &ui_for_fav, path.clone());
@@ -19742,6 +19823,7 @@ fn show_item_context_menu(
                 add_favorite_path(&state_for_fav, &ui_for_fav, path.clone());
             }
         }));
+        menu.append(&network_toggle_button(&popover, state.clone(), ui.clone(), path_for_net));
     }
 
     menu.append(&context_separator());
@@ -25954,7 +26036,7 @@ Broken: Either state is wrong.\n";
                 "Cut", "Copy", "Copy Paths", "Paste", "Rename", "Compress to ZIP",
                 "Move to Trash", "Delete Permanently", "Open With", "Properties",
                 "Open Terminal Here", "Add to Favorites", "Remove from Favorites",
-                "Open in New Window",
+                "Add to Network", "Remove from Network", "Open in New Window",
             ] {
                 assert!(button_labelled(&menu_widget, forbidden).is_none(), "ZIP item menu must not offer {forbidden}");
             }
@@ -28508,6 +28590,78 @@ Broken: Either state is wrong.\n";
         );
     }
 
+    /// D-416: a folder added to Network is drawn under the Network heading,
+    /// opens on a click, is saved in the config, and goes away again on
+    /// Remove from Network. A file is refused.
+    fn network_folder_sits_under_network_d416() {
+        gtk::init().expect("gtk init on the virtual display");
+        let d = d362_open("network", |dir| {
+            std::fs::create_dir_all(dir.join("Transfers")).unwrap();
+            std::fs::write(dir.join("Transfers").join("from-mint.txt"), "hello").unwrap();
+            std::fs::write(dir.join("plain.txt"), "words").unwrap();
+        }, 2);
+        let top = match d.state.borrow().cwd.clone() {
+            native_core::Location::RealDir(p) => p,
+            _ => panic!("a real folder"),
+        };
+        let transfers = top.join("Transfers").to_string_lossy().into_owned();
+        // (heading text, or "" for a row) and the row's widget name, in order.
+        let sidebar = || {
+            let mut out = Vec::new();
+            let mut child = d.ui.sidebar.first_child();
+            while let Some(w) = child {
+                child = w.next_sibling();
+                let Ok(row) = w.downcast::<gtk::ListBoxRow>() else { continue };
+                let heading = row
+                    .child()
+                    .and_then(|c| c.downcast::<gtk::Label>().ok())
+                    .filter(|l| l.has_css_class("wf-sidebar-heading"))
+                    .map(|l| l.text().to_string());
+                out.push((heading.unwrap_or_default(), row));
+            }
+            out
+        };
+        let network_rows = || {
+            sidebar()
+                .into_iter()
+                .filter(|(_, r)| r.widget_name() == "wf-network-folder-row")
+                .map(|(_, r)| r)
+                .collect::<Vec<_>>()
+        };
+        assert!(network_rows().is_empty(), "no Network folder before one is added");
+
+        add_network_path(&d.state, &d.ui, top.join("plain.txt").to_string_lossy().into_owned());
+        assert_eq!(d.ui.status.label(), "Only folders can be added to Network");
+        assert!(network_rows().is_empty(), "a file is never listed");
+
+        add_network_path(&d.state, &d.ui, transfers.clone());
+        let rows = network_rows();
+        assert_eq!(rows.len(), 1, "one Network folder row");
+        assert_eq!(rows[0].tooltip_text().as_deref(), Some(transfers.as_str()));
+        assert_eq!(sidebar_row_label(&rows[0]).as_deref(), Some("Transfers"));
+        let all = sidebar();
+        let at = |pred: &dyn Fn(&(String, gtk::ListBoxRow)) -> bool| all.iter().position(|e| pred(e));
+        let network = at(&|(h, _)| h == "Network").expect("a Network heading");
+        let row_at = at(&|(_, r)| r.widget_name() == "wf-network-folder-row").unwrap();
+        let next_heading = all.iter().enumerate().skip(network + 1).find(|(_, (h, _))| !h.is_empty()).map(|(i, _)| i);
+        assert!(row_at > network, "the row sits below the Network heading");
+        assert!(next_heading.is_none_or(|n| row_at < n), "the row sits above the next heading");
+        assert!(
+            load_config().network_folders.iter().any(|b| b.path == transfers),
+            "the folder is saved in the config"
+        );
+
+        rows[0].emit_by_name::<()>("activate", &[]);
+        d362_wait("Transfers opened", 20, || {
+            d.state.borrow().cwd == native_core::Location::RealDir(PathBuf::from(&transfers))
+                && d.state.borrow().visible_entries.iter().any(|e| e.name == "from-mint.txt")
+        });
+
+        remove_network_path(&d.state, &d.ui, transfers.clone());
+        assert!(network_rows().is_empty(), "Remove from Network takes the row away");
+        assert!(load_config().network_folders.is_empty(), "and out of the config");
+    }
+
     /// D-410: a file type the pane cannot show offers "Ask for an update" once.
     /// Yes writes one line to the requests file; Not now writes nothing; both
     /// are remembered; text files and a config with no requests file never ask.
@@ -28886,6 +29040,11 @@ Broken: Either state is wrong.\n";
             eprintln!("wf-test ask-only run done");
             return;
         }
+        if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("network") {
+            network_folder_sits_under_network_d416();
+            eprintln!("wf-test network-only run done");
+            return;
+        }
         if std::env::var("WAYFINDER_SUITE_ONLY").as_deref() == Ok("sound") {
             mute_and_volume_carry_across_files_d409();
             eprintln!("wf-test sound-only run done");
@@ -29019,6 +29178,7 @@ Broken: Either state is wrong.\n";
         unknown_type_asks_for_an_update_once_d410();
         gone_folder_moves_to_one_that_exists_d411();
         ask_bar_buttons_clickable_in_a_narrow_pane_d412();
+        network_folder_sits_under_network_d416();
         avi_codecs_play_in_the_preview_d401();
         kinds_d404();
         icon_buttons_have_accessible_names_d294();

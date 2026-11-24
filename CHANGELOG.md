@@ -9,6 +9,9 @@ change between releases.
 ### Changed
 - Wayfinder starts muted every time. Unmuting lasts until Wayfinder closes; the volume level is kept. Videos and songs still play only when Play is pressed.
 
+### Added
+- The sidebar's Network heading can list folders, such as the folder another computer sends files to. Right-click a folder and choose Add to Network; Remove from Network takes it off.
+
 ### Fixed
 - Video thumbnails no longer open the sound output. Each thumbnail used to open it in the background, although a thumbnail never plays sound.
 
