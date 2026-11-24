@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder"
-version = "0.9.34"
+version = "0.9.35"
 dependencies = [
  "blake2",
  "blocking",

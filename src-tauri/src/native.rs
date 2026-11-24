@@ -2441,11 +2441,13 @@ thread_local! {
 }
 
 /// The shared volume (0.0 to 1.0) and mute, read from the config once.
+/// D-414: every start is muted, whatever was saved. The volume carries over;
+/// an unmute lasts until Wayfinder closes.
 fn media_sound() -> (f64, bool) {
     MEDIA_SOUND.with(|slot| {
         slot.get().unwrap_or_else(|| {
             let config = load_config();
-            let sound = (config.media_volume.clamp(0.0, 1.0), config.media_muted);
+            let sound = (config.media_volume.clamp(0.0, 1.0), true);
             slot.set(Some(sound));
             sound
         })
@@ -14694,6 +14696,11 @@ fn start_video_poster_jobs(queue: Rc<RefCell<VideoPosterQueue>>) {
             continue;
         };
         pipeline.set_property("video-sink", &sink_bin);
+        // D-415: a poster needs one picture and no sound. Without this playbin
+        // opened the sound output once per video poster.
+        if let Ok(silent) = gst::ElementFactory::make("fakesink").build() {
+            pipeline.set_property("audio-sink", &silent);
+        }
 
         // 0 = awaiting first preroll (paused at position 0); 1 = seek issued,
         // awaiting the preroll that follows it.
@@ -28431,7 +28438,10 @@ Broken: Either state is wrong.\n";
             });
         };
         show_video("a.mp4");
-        assert!(!stream().is_muted(), "the first video starts unmuted");
+        assert!(stream().is_muted(), "D-414: the first video after a start is muted");
+        assert!(!stream().is_playing(), "D-414: a video never plays by itself");
+        stream().set_muted(false);
+        assert!(!stream().is_muted(), "the mute button unmutes it");
         stream().set_muted(true);
         show_video("b.mp4");
         assert!(stream().is_muted(), "a mute on a.mp4 carries to b.mp4");
@@ -28445,6 +28455,11 @@ Broken: Either state is wrong.\n";
         d362_wait("the song player", 40, || d362_stack(&d) == "audio" && d.ui.preview_audio.borrow().is_some());
         assert!((d.ui.preview_audio_volume.value() - 0.3).abs() < 0.01, "song slider shows {}", d.ui.preview_audio_volume.value());
         let song_muted = || d.ui.preview_audio.borrow().as_ref().map(|p| p.muted());
+        assert_eq!(
+            d.ui.preview_audio.borrow().as_ref().map(|p| p.is_playing()),
+            Some(false),
+            "D-414: a song never plays by itself"
+        );
         assert_eq!(song_muted(), Some(false), "the song starts unmuted");
         d.ui.preview_audio_mute.emit_clicked();
         assert_eq!(song_muted(), Some(true), "the song's mute button mutes it");

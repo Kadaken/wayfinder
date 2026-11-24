@@ -46,6 +46,12 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.35" date="2026-11-23">
+      <description>
+        <p>Wayfinder starts muted every time, and video thumbnails no longer
+        open the sound output.</p>
+      </description>
+    </release>
     <release version="0.9.34" date="2026-11-22">
       <description>
         <p>The Ask for an update buttons can be clicked in a narrow preview

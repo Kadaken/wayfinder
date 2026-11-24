@@ -4,6 +4,14 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.35 — 23 November 2026
+
+### Changed
+- Wayfinder starts muted every time. Unmuting lasts until Wayfinder closes; the volume level is kept. Videos and songs still play only when Play is pressed.
+
+### Fixed
+- Video thumbnails no longer open the sound output. Each thumbnail used to open it in the background, although a thumbnail never plays sound.
+
 ## 0.9.34 — 22 November 2026
 
 ### Fixed

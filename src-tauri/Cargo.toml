@@ -1,6 +1,6 @@
 [package]
 name = "wayfinder"
-version = "0.9.34"
+version = "0.9.35"
 description = "A fast, native file manager for Linux with a docked preview pane"
 authors = ["Kadaken"]
 license = "GPL-3.0-or-later"
