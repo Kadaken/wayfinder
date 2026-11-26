@@ -10894,6 +10894,9 @@ fn navigate_listing(
     // The tab this request belongs to; a completion for any other tab is dropped.
     let tab_id = state.borrow().tabs.active().id;
     let ui = ui_for_state(state);
+    // D-424/D-433: the address check runs on a worker, so the person may have
+    // started typing a filter before this listing begins. Keep what they typed.
+    let keep_search = from_address && ui.as_ref().is_some_and(|ui| focus_within(&ui.window, &ui.search));
     // Refreshing the SAME folder (e.g. after a delete) should keep the scroll
     // position; only real navigation to a different folder resets to the top.
     let same_folder = state.borrow().cwd == path;
@@ -10934,7 +10937,9 @@ fn navigate_listing(
         // search still running must not land on top of the new listing.
         state.search_results = None;
         state.search_gen = state.search_gen.wrapping_add(1);
-        state.filter_text.clear();
+        if !keep_search {
+            state.filter_text.clear();
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         state.listing_cancel = Some(cancelled.clone());
         (state.listing_generation, cancelled)
@@ -10943,7 +10948,9 @@ fn navigate_listing(
     if let Some(ui) = &ui {
         set_breadcrumbs(state, ui, &path);
         ui.path_stack.set_visible_child_name("label");
-        ui.search.set_text("");
+        if !keep_search {
+            ui.search.set_text("");
+        }
         if !same_folder {
             // D-34: clearing removes the focused row; hand focus to the view root
             // before GTK's next-frame focus search can reach the preview label.
