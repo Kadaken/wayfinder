@@ -54,10 +54,10 @@ source produce byte-identical programs (checked again for 0.9.30).
    backend on a private bus: malformed byte arrays, a `current_name` of
    `../../.bashrc`, symlinks out of the chosen folder, absurd lengths, control
    characters and right-to-left overrides, wrong-typed options, and `Close()`
-   while a request was open. Nothing crashed and no path was handed back that
-   the person did not choose. Two weaknesses it found are fixed in 0.9.38
-   (wrong-typed options were read as "no"; the picker's done marker was read
-   without a size limit). It was a fixed list, not a fuzzer: inputs outside
+   while a request was open. Nothing crashed, and no path was handed back that
+   the request or the picker did not name. Two weaknesses it found are fixed
+   in 0.9.38 (wrong-typed options were read as "no"; the picker's done marker
+   was read without a size limit). It was a fixed list, not a fuzzer: inputs outside
    that list have not been tried.
 2. **Unsafe code per dependency is not counted.** The repository's own `unsafe`
    lines are counted by the audit script, but `cargo geiger` failed three times
