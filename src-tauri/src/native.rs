@@ -34537,6 +34537,85 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
+    fn delete_in_drive_trash_opens_permanent_confirmation_d443() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            const MOUNT_ENV: &str = "WF_D443_PRIVATE_MOUNT";
+            if let Some(mount) = std::env::var_os(MOUNT_ENV) {
+                assert_drive_trash_delete_dialog_d443(Path::new(&mount));
+                return;
+            }
+            private_session_guard_d232();
+            let mount = native_core::scratch_root().join("d443-drive");
+            fs::create_dir(&mount).unwrap();
+            let _cleanup = ScratchCleanup(mount.clone());
+            // Mount on a different device inside a private namespace so the
+            // production mount-root check finds the drive's own Trash.
+            let child = std::process::Command::new("unshare")
+                .args(["--map-root-user", "--mount", "--propagation", "private", "--", "sh", "-c"])
+                .arg(r#"mount -t tmpfs -o mode=0700,size=4m tmpfs "$WF_D443_PRIVATE_MOUNT" && exec "$@""#)
+                .arg("wayfinder-d443")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::delete_in_drive_trash_opens_permanent_confirmation_d443"])
+                .env(MOUNT_ENV, &mount)
+                .output().expect("run the GTK test in its own mount namespace");
+            assert!(
+                child.status.success(),
+                "the mounted-drive test failed:\n{}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr),
+            );
+        });
+    }
+
+    fn assert_drive_trash_delete_dialog_d443(mount: &Path) {
+        use glib::translate::ToGlibPtr;
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(fs::metadata(mount).unwrap().dev(), fs::metadata(mount.parent().unwrap()).unwrap().dev());
+        gtk::init().expect("GTK on the private display");
+        private_display_check_d232(&gdk::Display::default().unwrap());
+        let d = d362_open("trashondrive", |_| {}, 0);
+        d362_wait("the test window to map", 5, || d.ui.window.is_mapped());
+        set_view_mode(&d.state, &d.ui, ViewMode::Details);
+        let xdo = |args: &[&str]| {
+            let out = std::process::Command::new("xdotool").args(args).output().unwrap();
+            assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let surface = d.ui.window.surface().expect("the test window has an X11 surface");
+        // SAFETY: the private display check above confirms this is an X11 surface.
+        let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) }.to_string();
+        xdo(&["windowfocus", "--sync", &xid]);
+        // SAFETY: getuid has no arguments or memory requirements.
+        let uid = unsafe { libc::getuid() };
+        for layout in [format!(".Trash-{uid}/files"), format!(".Trash/{uid}/files")] {
+            let dir = mount.join(layout);
+            fs::create_dir_all(&dir).unwrap();
+            let payload = dir.join("drive-item.txt");
+            fs::write(&payload, b"drive trash payload").unwrap();
+            let location = native_core::Location::real(&dir);
+            navigate(&d.state, location.clone());
+            d362_wait("the drive's Trash to be listed", 10, || {
+                let state = d.state.borrow();
+                state.cwd == location && state.visible_entries.len() == 1
+            });
+            select_index(&d.state, &d.ui, 0);
+            assert!(d.ui.list.grab_focus());
+            xdo(&["key", "Delete"]);
+            d362_wait("the permanent-delete confirmation", 5, || d.ui.window.visible_dialog().is_some());
+            let dialog = d.ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+            assert_eq!(dialog.heading().as_deref(), Some("Delete permanently?"));
+            assert_eq!(dialog.body().as_str(), "1 item will be deleted without using Trash. This cannot be undone.");
+            assert_eq!(fs::read(&payload).unwrap(), b"drive trash payload");
+            dialog.close();
+            d362_wait("the delete dialog to close", 5, || d.ui.window.visible_dialog().is_none());
+            assert_eq!(fs::read(&payload).unwrap(), b"drive trash payload");
+        }
+    }
+
+    #[test]
     fn trash_move_without_receipt_explains_missing_undo_d442() {
         if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
             return;
@@ -38936,9 +39015,9 @@ Broken: Either state is wrong.\n";
         TEST_CHILD_FAILS.with(|f| f.set(false));
     }
 
-    #[cfg(feature = "guide")]
     extern "C" {
         fn gdk_x11_surface_get_xid(surface: *mut gdk::ffi::GdkSurface) -> std::os::raw::c_ulong;
+        #[cfg(feature = "guide")]
         fn gdk_x11_display_get_xdisplay(display: *mut gdk::ffi::GdkDisplay) -> *mut std::os::raw::c_void;
     }
 
