@@ -86,7 +86,8 @@ fi
 
 if [ "$check_only" = 1 ]; then
   wf_dep_report || true
-  wf_dep_advise "$with_codecs" || true
+  # D-426: --check reports the install command but never runs it.
+  wf_dep_advise 0 || true
   exit 0
 fi
 
@@ -103,6 +104,7 @@ icons="$d$datadir/icons/hicolor"
 
 conf_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 portals_conf="$conf_home/xdg-desktop-portal/portals.conf"
+portal_prev_choice="${XDG_DATA_HOME:-$HOME/.local/share}/wayfinder/previous-portal-filechooser"
 # KDE/Qt apps do not ask the portal at all unless Qt is told to use it. This
 # file is the switch, and it is written only when the user asks for it.
 qt_env_conf="$conf_home/environment.d/95-wayfinder-qt.conf"
@@ -212,7 +214,11 @@ take_folder_app() {
     mkdir -p "$(dirname "$prev_folder_app")"
     printf '%s\n' "$cur" > "$prev_folder_app"
   fi
-  xdg-mime default "$wf_desktop" inode/directory >/dev/null 2>&1 || true
+  mkdir -p "$conf_home"
+  # D-431: xdg-mime needs the user's config directory to exist on a fresh account.
+  if ! xdg-mime default "$wf_desktop" inode/directory >/dev/null 2>&1; then
+    say "Folder default was not set."
+  fi
 }
 
 # Uninstall: give folders back to the app recorded at install, or drop the
@@ -263,10 +269,24 @@ if [ "$uninstall" = 1 ]; then
     if [ "$dry" = 1 ]; then
       printf '  would: edit %s\n' "$portals_conf"
     else
-      cp -p "$portals_conf" "$portals_conf.bak"
-      grep -v '^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$' \
-        "$portals_conf.bak" > "$portals_conf"
-      say "  previous file kept as $portals_conf.bak"
+      if [ -s "$portal_prev_choice" ]; then
+        previous_line=""
+        previous_line="$(head -n1 "$portal_prev_choice")"
+        awk -v replacement="$previous_line" \
+          '!done && $0 ~ /^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$/ { print replacement; done=1; next } { print }' \
+          "$portals_conf" > "$portals_conf.new"
+      else
+        grep -v '^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$' \
+          "$portals_conf" > "$portals_conf.new"
+      fi
+      chmod --reference="$portals_conf" "$portals_conf.new" 2>/dev/null || true
+      mv "$portals_conf.new" "$portals_conf"
+      if [ -s "$portal_prev_choice" ]; then
+        say "  file dialog choice put back: $previous_line"
+      else
+        say "  Wayfinder removed as the file dialog in $portals_conf"
+      fi
+      rm -f "$portal_prev_choice"
     fi
   fi
 
@@ -360,20 +380,33 @@ if [ "$with_portal" = 1 ]; then
          && grep -q "^$key[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$" "$portals_conf"; then
       say "  $portals_conf already names Wayfinder as the file dialog"
     elif [ -f "$portals_conf" ]; then
-      cp -p "$portals_conf" "$portals_conf.bak"
-      if grep -q "^$key[[:space:]]*=" "$portals_conf.bak"; then
+      # D-434: keep the original backup and record the exact replaced line for uninstall.
+      if [ ! -e "$portals_conf.bak" ]; then
+        cp -p "$portals_conf" "$portals_conf.bak"
+      fi
+      mkdir -p "$(dirname "$portal_prev_choice")"
+      grep -m1 "^$key[[:space:]]*=" "$portals_conf" > "$portal_prev_choice" || : > "$portal_prev_choice"
+      if grep -q "^$key[[:space:]]*=" "$portals_conf"; then
         # A file dialog is already named: point that same line at Wayfinder.
-        sed "s|^$key[[:space:]]*=.*|$key=wayfinder|" "$portals_conf.bak" > "$portals_conf"
-      elif grep -q '^\[preferred\]' "$portals_conf.bak"; then
+        sed "s|^$key[[:space:]]*=.*|$key=wayfinder|" "$portals_conf" > "$portals_conf.new"
+        chmod --reference="$portals_conf" "$portals_conf.new" 2>/dev/null || true
+        mv "$portals_conf.new" "$portals_conf"
+      elif grep -q '^\[preferred\]' "$portals_conf"; then
         awk -v key="$key" '{ print } /^\[preferred\]/ && !done { print key"=wayfinder"; done=1 }' \
-          "$portals_conf.bak" > "$portals_conf"
+          "$portals_conf" > "$portals_conf.new"
+        chmod --reference="$portals_conf" "$portals_conf.new" 2>/dev/null || true
+        mv "$portals_conf.new" "$portals_conf"
       else
-        cat "$portals_conf.bak" > "$portals_conf"
+        cat "$portals_conf" > "$portals_conf.new"
+        chmod --reference="$portals_conf" "$portals_conf.new" 2>/dev/null || true
+        mv "$portals_conf.new" "$portals_conf"
         printf '[preferred]\n%s=wayfinder\n' "$key" >> "$portals_conf"
       fi
       say "  set $key=wayfinder in $portals_conf (previous file kept as $portals_conf.bak)"
     else
       install -d "$(dirname "$portals_conf")"
+      mkdir -p "$(dirname "$portal_prev_choice")"
+      : > "$portal_prev_choice"
       printf '[preferred]\ndefault=*\n%s=wayfinder\n' "$key" > "$portals_conf"
       say "  wrote $portals_conf"
     fi
