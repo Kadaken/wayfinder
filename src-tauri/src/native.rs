@@ -7984,9 +7984,7 @@ fn connect_place_context(row: &gtk::ListBoxRow, state: Rc<RefCell<AppState>>, ui
     row.add_controller(click);
 }
 
-/// Runs the Trash's keep-for rule once. Called when a window opens and again
-/// the moment the rule is changed, so choosing "after 30 days" clears what is
-/// already older than that instead of waiting for the next launch.
+/// Runs the Trash's saved keep-for rule when a window opens.
 ///
 /// Off (0 days) is the default and does nothing. A failure is reported in the
 /// status line and nothing else: an automatic sweep must never put a dialog in
@@ -8006,21 +8004,130 @@ fn sweep_expired_trash(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
 }
 
-/// Changes how long the Trash keeps things, writes it to the config, and
-/// applies it at once.
+struct ExpiredTrashItem {
+    info: PathBuf,
+    info_meta: fs::Metadata,
+    payload: PathBuf,
+    payload_meta: fs::Metadata,
+}
+
+impl ExpiredTrashItem {
+    fn delete(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let unchanged = |path: &Path, before: &fs::Metadata| {
+            fs::symlink_metadata(path).is_ok_and(|now| {
+                (now.dev(), now.ino(), now.ctime(), now.ctime_nsec())
+                    == (before.dev(), before.ino(), before.ctime(), before.ctime_nsec())
+            })
+        };
+        if !unchanged(&self.info, &self.info_meta) || !unchanged(&self.payload, &self.payload_meta) {
+            return false;
+        }
+        let removed = if self.payload_meta.is_dir() {
+            fs::remove_dir_all(&self.payload)
+        } else {
+            fs::remove_file(&self.payload)
+        };
+        removed.is_ok() && fs::remove_file(&self.info).is_ok()
+    }
+}
+
+/// Capture the entries covered by the confirmation. A later sweep could
+/// include items that arrived or aged into the window while the dialog was open.
+fn trash_retention_preview(days: u32) -> Result<Vec<ExpiredTrashItem>, String> {
+    if days == 0 {
+        return Ok(Vec::new());
+    }
+    let home = std::env::var("HOME").map_err(|err| err.to_string())?;
+    let trash = Path::new(&home).join(".local/share/Trash");
+    let records = match fs::read_dir(trash.join("info")) {
+        Ok(records) => records,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.to_string()),
+    };
+    let local = glib::TimeZone::local();
+    let now = glib::DateTime::now_local().map_err(|err| err.to_string())?.to_unix();
+    let cutoff = now - i64::from(days) * 86_400;
+    let mut expired = Vec::new();
+    for record in records.flatten() {
+        let info = record.path();
+        if info.extension().and_then(|ext| ext.to_str()) != Some("trashinfo") {
+            continue;
+        }
+        let Some(stem) = info.file_stem().and_then(|stem| stem.to_str()) else { continue };
+        if matches!(stem, "" | "." | "..") {
+            continue;
+        }
+        let Ok(info_meta) = fs::symlink_metadata(&info) else { continue };
+        if !info_meta.is_file() {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&info) else { continue };
+        if !contents.lines().any(|line| line.starts_with("Path=")) {
+            continue;
+        }
+        let Some(date) = contents.lines().filter_map(|line| line.strip_prefix("DeletionDate=")).last() else { continue };
+        let Ok(deleted) = glib::DateTime::from_iso8601(date.trim(), Some(&local)) else { continue };
+        if deleted.to_unix() > cutoff {
+            continue;
+        }
+        let payload = trash.join("files").join(stem);
+        let Ok(payload_meta) = fs::symlink_metadata(&payload) else { continue };
+        expired.push(ExpiredTrashItem { info, info_meta, payload, payload_meta });
+    }
+    Ok(expired)
+}
+
 fn set_trash_keep_days(state: &Rc<RefCell<AppState>>, ui: &Ui, days: u32) {
+    let expired = match trash_retention_preview(days) {
+        Ok(expired) => expired,
+        Err(err) => {
+            ui.status.set_label(&format!("Trash cleanup failed: {err}"));
+            return;
+        }
+    };
+    if expired.is_empty() {
+        apply_trash_keep_days(state, ui, days, &expired);
+        return;
+    }
+    let count = expired.len();
+    let state = state.clone();
+    let ui_for_action = ui.clone();
+    show_confirm_dialog(
+        ui,
+        "Change Trash retention?",
+        &format!(
+            "{count} item{} in Trash will be permanently deleted. This cannot be undone.",
+            plural(count)
+        ),
+        "Delete and Save",
+        move || apply_trash_keep_days(&state, &ui_for_action, days, &expired),
+    );
+}
+
+fn apply_trash_keep_days(state: &Rc<RefCell<AppState>>, ui: &Ui, days: u32, expired: &[ExpiredTrashItem]) {
     match update_config(|config| config_trash_keep_days(config, days)) {
         Some(config) => state.borrow_mut().trash_keep_days = config.trash_keep_days,
         None => state.borrow_mut().trash_keep_days = days,
     }
     if days == 0 {
         ui.status.set_label("Trash keeps items until you delete them");
+        return;
+    }
+    if expired.is_empty() {
+        return;
+    }
+    let count = expired.iter().filter(|item| item.delete()).count();
+    let message = if count == expired.len() {
+        format!("Deleted {count} item{} from Trash older than {days} days", plural(count))
     } else {
-        sweep_expired_trash(state, ui);
+        format!("Deleted {count} of {} expired items from Trash", expired.len())
+    };
+    if viewing_trash(state) {
         let cwd = state.borrow().cwd.clone();
-        if viewing_trash(state) {
-            navigate_without_history(state, cwd);
-        }
+        navigate_to_with_message(state, cwd, NavMode::Keep, Some(message));
+    } else {
+        ui.status.set_label(&message);
     }
 }
 
@@ -34426,6 +34533,81 @@ Broken: Either state is wrong.\n";
         let display = gdk::Display::default().expect("display");
         private_display_check_d232(&display);
         pointer_click_keeps_scroll_d364();
+    }
+
+    #[test]
+    fn sidebar_trash_retention_confirms_expired_items_d441() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("trashretention", |dir| {
+                let trash = dir.parent().unwrap().join("home/.local/share/Trash");
+                fs::create_dir_all(trash.join("files")).unwrap();
+                fs::create_dir_all(trash.join("info")).unwrap();
+            }, 0);
+            let trash = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/share/Trash");
+            let files = trash.join("files");
+            let info = trash.join("info");
+            let add = |name: &str, date: &str| {
+                fs::write(files.join(name), name).unwrap();
+                fs::write(
+                    info.join(format!("{name}.trashinfo")),
+                    format!("[Trash Info]\nPath=/original/{name}\nDeletionDate={date}\n"),
+                ).unwrap();
+            };
+            add("old.txt", "2000-01-01T00:00:00");
+            add("older.txt", "1999-01-01T00:00:00");
+            let now = glib::DateTime::now_local().unwrap().format("%Y-%m-%dT%H:%M:%S").unwrap();
+            add("recent.txt", &now);
+
+            let choose_thirty = || {
+                let row = all_widgets(d.ui.sidebar.upcast_ref())
+                    .into_iter()
+                    .find(|widget| widget.widget_name() == "wf-trash-place-row")
+                    .expect("the Trash sidebar row")
+                    .downcast::<gtk::ListBoxRow>().unwrap();
+                show_place_context_menu(
+                    &row, d.state.clone(), d.ui.clone(), files.to_string_lossy().into_owned(), 1.0, 1.0,
+                );
+                let button = |name: &str| {
+                    all_widgets(row.upcast_ref()).into_iter()
+                        .find(|widget| widget.widget_name() == name)
+                        .unwrap_or_else(|| panic!("the {name} menu button"))
+                        .downcast::<gtk::Button>().unwrap()
+                };
+                button("wf-trash-keep-for").emit_clicked();
+                button("wf-trash-keep-30").emit_clicked();
+                d.ui.window.visible_dialog()
+                    .expect("the retention choice asks before deleting anything")
+                    .downcast::<adw::AlertDialog>().unwrap()
+            };
+            let old_days = load_config().trash_keep_days;
+            assert_ne!(old_days, 30, "the test must change the setting");
+            let dialog = choose_thirty();
+            assert_eq!(
+                dialog.body().as_str(),
+                "2 items in Trash will be permanently deleted. This cannot be undone.",
+            );
+            assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+            dialog.close();
+            d362_wait("the cancelled retention dialog to close", 5, || d.ui.window.visible_dialog().is_none());
+            assert_eq!(d.state.borrow().trash_keep_days, old_days);
+            assert_eq!(load_config().trash_keep_days, old_days);
+            assert_eq!(dir_names(&files), ["old.txt", "older.txt", "recent.txt"]);
+
+            let dialog = choose_thirty();
+            add("arrived-after-prompt.txt", "2001-01-01T00:00:00");
+            dialog.emit_by_name::<()>("response", &[&"confirm"]);
+            dialog.close();
+            assert_eq!(dir_names(&files), ["arrived-after-prompt.txt", "recent.txt"]);
+            assert_eq!(dir_names(&info), ["arrived-after-prompt.txt.trashinfo", "recent.txt.trashinfo"]);
+            assert_eq!(d.state.borrow().trash_keep_days, 30);
+            assert_eq!(load_config().trash_keep_days, 30);
+            update_config(|config| config_trash_keep_days(config, old_days));
+        });
     }
 
     /// D-371 alone, on the private display, with real X input.
