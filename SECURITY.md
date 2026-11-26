@@ -49,14 +49,16 @@ ships, because a gap nobody wrote down is a gap nobody fixes. One item that
 used to be on this list is now measured: two clean builds of the release
 source produce byte-identical programs (checked again for 0.9.30).
 
-1. **A hostile run at the file dialog has never been written.** The portal
-   backend takes its input from other applications, not from the person at the
-   keyboard, so this is the largest gap in the release. Malformed byte arrays,
-   a `current_name` of `../../.bashrc`, a symlink pointing out of the chosen
-   folder, absurd lengths, control characters and right-to-left overrides in
-   the title and the accept button, and a `Close()` arriving while the request
-   is still open — none of it has been fired at it. If you want somewhere to
-   start, start there.
+1. **The hostile run at the file dialog covers one session's worth of input.**
+   For 0.9.37 the release audit fired 85 hostile requests at the portal
+   backend on a private bus: malformed byte arrays, a `current_name` of
+   `../../.bashrc`, symlinks out of the chosen folder, absurd lengths, control
+   characters and right-to-left overrides, wrong-typed options, and `Close()`
+   while a request was open. Nothing crashed and no path was handed back that
+   the person did not choose. Two weaknesses it found are fixed in 0.9.38
+   (wrong-typed options were read as "no"; the picker's done marker was read
+   without a size limit). It was a fixed list, not a fuzzer: inputs outside
+   that list have not been tried.
 2. **Unsafe code per dependency is not counted.** The repository's own `unsafe`
    lines are counted by the audit script, but `cargo geiger` failed three times
    on crate sources that were never extracted, so the dependency tree's own
@@ -93,6 +95,13 @@ source produce byte-identical programs (checked again for 0.9.30).
    test its own thread, and GTK refuses to start twice, so the GTK suite has to
    be run on its own. Both runs are reported in the release audit; a single
    `cargo test --bins` cannot pass by construction.
+
+11. **Two previews are Wayfinder's own parsers.** Windows shortcuts (`.lnk`)
+   and Outlook messages (`.msg`) are read by Wayfinder's own code, not an
+   outside tool, so a damaged or hostile file reaches Wayfinder itself. Both
+   read at most a fixed size (1 MiB and 64 MiB), check every offset, and turn a
+   damaged file into an error message; damaged-file tests cover that. No
+   hostile-file run or fuzzer has been fired at them.
 
 ## Supported versions
 
