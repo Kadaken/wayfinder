@@ -5764,6 +5764,25 @@ fn dir_apparent_bytes(dir: &Path) -> u64 {
     total
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_ARCHIVE_LANDLOCK_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn archive_landlock_abi() -> std::io::Result<libc::c_long> {
+    #[cfg(test)]
+    if FAIL_ARCHIVE_LANDLOCK_PROBE.get() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOSYS));
+    }
+    // SAFETY: a null attribute with size 0 and the VERSION flag only asks.
+    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u64>(), 0usize, 1u32) };
+    if abi < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(abi)
+    }
+}
+
 // D-437: restrict external extractors before they can write, move or link files.
 // A post-decode walk cannot see a file the tool already wrote outside its stage.
 fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, String> {
@@ -5791,16 +5810,11 @@ fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, St
         parent_fd: libc::c_int,
     }
 
-    // The kernel's Landlock version decides which rights it knows; naming an
-    // unknown one fails the whole ruleset. No Landlock at all (version below 1)
-    // still extracts into the private stage, and the staged tree is checked
-    // before anything is published, so only the write lock is missing.
-    // SAFETY: a null attribute with size 0 and the VERSION flag only asks.
-    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u64>(), 0usize, 1u32) };
+    // The kernel's Landlock version decides which rights the ruleset can use.
+    let abi = archive_landlock_abi()
+        .map_err(|e| format!("Cannot run archive extractor {cmd}: Landlock support check failed: {e}"))?;
     if abi < 1 {
-        let mut command = Command::new(cmd);
-        command.args(args).current_dir(stage).env("TMPDIR", stage).env_remove("TAR_OPTIONS");
-        return Ok(command);
+        return Err(format!("Cannot run archive extractor {cmd}: the kernel reported unsupported Landlock ABI {abi}"));
     }
     let mut allowed = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SYM | REFER | TRUNCATE;
     if abi < 3 {
@@ -5813,7 +5827,7 @@ fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, St
     let stage_fd = fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(stage).map_err(|e| format!("{}: {e}", stage.display()))?;
-    let sandbox_error = || format!("Cannot confine archive extractor to its staging folder: {}", std::io::Error::last_os_error());
+    let sandbox_error = || format!("Cannot confine archive extractor {cmd} with Landlock: {}", std::io::Error::last_os_error());
     // SAFETY: the first ruleset ABI field is a u64 containing the handled rights.
     let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &handled, size_of::<u64>(), 0u32) };
     if fd < 0 {
@@ -5941,6 +5955,11 @@ pub fn extract_archive_here_ctl(path: &str, dest_dir: &str, ctl: &ExtractCtl) ->
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ARCHIVE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn extract_here_dir(
     path: &str,
     dest_dir: &str,
@@ -5991,11 +6010,22 @@ fn extract_here_dir(
             });
         }
     };
+    let destination_identity = stage.as_ref().expect("decoded into a staging folder").destination_identity;
+    let publish = |from: &Path, to: &Path| {
+        #[cfg(test)]
+        if let Some(before) = BEFORE_ARCHIVE_PUBLISH.take() {
+            before();
+        }
+        if file_identity(dest) != Some(destination_identity) {
+            return Err(std::io::Error::other(format!("extraction destination changed: {}", dest.display())));
+        }
+        publish(from, to)
+    };
     let mut outcome = ExtractHereOutcome::default();
     for name in names {
         let (from, to) = (out.join(&name), dest.join(&name));
         let shown = name.to_string_lossy().into_owned();
-        match publish_staged_entry(&from, &to, publish) {
+        match publish_staged_entry(&from, &to, &publish) {
             Ok(()) => outcome.published.push(shown),
             // The name is taken, whether it was there all along or arrived a moment ago.
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
@@ -6015,6 +6045,7 @@ fn extract_here_dir(
 // D-437: inspect links without following them through filesystem lookups.
 fn validate_staged_archive(stage: &Path, dest: &Path) -> std::io::Result<()> {
     use std::collections::VecDeque;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Component;
 
     let mut dirs = vec![stage.to_path_buf()];
@@ -6071,6 +6102,8 @@ fn validate_staged_archive(stage: &Path, dest: &Path) -> std::io::Result<()> {
                 }
             } else if !kind.is_file() {
                 return Err(std::io::Error::other(format!("unsupported entry: {}", entry.path().display())));
+            } else if entry.metadata()?.nlink() > 1 {
+                return Err(std::io::Error::other(format!("archive contains a hard link: {}", entry.path().display())));
             }
         }
     }
@@ -6114,6 +6147,7 @@ static EXTRACT_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct ExtractStage {
     path: PathBuf,
     identity: (u64, u64),
+    destination_identity: (u64, u64),
 }
 
 impl ExtractStage {
@@ -6121,13 +6155,16 @@ impl ExtractStage {
     /// dangling link included, so nothing is ever adopted: the next name is tried.
     fn reserve(dest: &Path) -> Result<Self, String> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let destination = fs::metadata(dest)
+            .map_err(|e| format!("cannot inspect extraction destination {}: {e}", dest.display()))?;
+        let destination_identity = (destination.dev(), destination.ino());
         for _ in 0..10_000 {
             let n = EXTRACT_STAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
             let path = dest.join(format!(".wf-extract-{}-{n}", std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
                     return match fs::symlink_metadata(&path) {
-                        Ok(meta) => Ok(Self { path, identity: (meta.dev(), meta.ino()) }),
+                        Ok(meta) => Ok(Self { path, identity: (meta.dev(), meta.ino()), destination_identity }),
                         Err(e) => {
                             let _ = fs::remove_dir(&path);
                             Err(format!("{}: {e}", path.display()))
@@ -12193,6 +12230,80 @@ mod extract_here_tests_d230 {
         assert!(!output.status.success());
         assert!(stage.join("inside.txt").is_file());
         assert!(!outside.exists());
+    }
+
+    #[test]
+    fn failed_landlock_probe_refuses_outside_tools_and_keeps_builtin_zip_d445() {
+        let root = owned("d445-missing-landlock");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("inside.txt"), "fixture").unwrap();
+        let tar = root.0.join("archive.tar");
+        let zip = root.0.join("archive.zip");
+        pack("tar", &src, &["inside.txt"], &tar);
+        pack("zip", &src, &["inside.txt"], &zip);
+
+        FAIL_ARCHIVE_LANDLOCK_PROBE.set(true);
+        let tar_result = extract_here_d230(&tar, &dest);
+        let remaining_after_tar = fs::read_dir(&dest).unwrap().count();
+        let zip_result = extract_here_d230(&zip, &dest);
+        FAIL_ARCHIVE_LANDLOCK_PROBE.set(false);
+
+        let error = tar_result.unwrap_err();
+        let reason = std::io::Error::from_raw_os_error(libc::ENOSYS).to_string();
+        assert!(error.contains("Landlock") && error.contains(&reason), "{error}");
+        assert_eq!(remaining_after_tar, 0);
+        assert_eq!(zip_result.unwrap().0, ["inside.txt"]);
+        assert_eq!(fs::read_to_string(dest.join("inside.txt")).unwrap(), "fixture");
+    }
+
+    #[test]
+    fn archive_with_a_hard_link_is_refused_d446() {
+        let root = owned("d446-hard-link");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("nested/original.txt"), "fixture").unwrap();
+        fs::hard_link(src.join("nested/original.txt"), src.join("nested/alias.txt")).unwrap();
+        let tar = root.0.join("hard-links.tar");
+        pack("tar", &src, &["nested"], &tar);
+
+        let error = extract_here_d230(&tar, &dest).unwrap_err();
+        assert!(error.contains("Unsafe archive output") && error.contains("hard link"), "{error}");
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_destination_swapped_for_a_symlink_is_refused_d447() {
+        let root = owned("d447-swapped-destination");
+        let src = root.0.join("src");
+        let dest = root.0.join("dest");
+        let moved = root.0.join("moved");
+        let other = root.0.join("other");
+        for dir in [&src, &dest, &other] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::write(src.join("inside.txt"), "fixture").unwrap();
+        let zip = root.0.join("archive.zip");
+        pack("zip", &src, &["inside.txt"], &zip);
+        BEFORE_ARCHIVE_PUBLISH.replace(Some(Box::new({
+            let (dest, moved, other) = (dest.clone(), moved.clone(), other.clone());
+            move || {
+                fs::rename(&dest, &moved).unwrap();
+                symlink(&other, &dest).unwrap();
+            }
+        })));
+        let result = extract_archive_here(zip.to_str().unwrap(), dest.to_str().unwrap());
+        BEFORE_ARCHIVE_PUBLISH.take();
+
+        let outcome = result.unwrap();
+        assert!(outcome.published.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, "inside.txt");
+        assert!(outcome.failed[0].1.contains("extraction destination changed"), "{}", outcome.summary());
+        assert!(!moved.join("inside.txt").exists());
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
     }
 
     #[test]

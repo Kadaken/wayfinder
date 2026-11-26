@@ -14,7 +14,8 @@
 #
 # Other flags:
 #   --destdir DIR   stage the whole tree under DIR (for distribution packagers)
-#   --no-portal     do not install the file-dialog backend or touch portals.conf
+#   --no-portal     install the file manager only and remove an earlier Wayfinder
+#                   file-dialog backend from this prefix
 #   --kde-apps      also send KDE/Qt apps through the portal, so they use
 #                   Wayfinder too. Off by default: it makes Qt apps take their
 #                   theming from the portal as well, and some people would
@@ -83,6 +84,10 @@ fi
 # portal. Kept in its own file so it can be run on its own as well.
 # shellcheck source=packaging/dependencies.sh
 . "$here/dependencies.sh"
+if [ "$with_portal" = 0 ] && [ "$uninstall" = 0 ]; then
+  WF_DEPS=" $WF_DEPS "
+  WF_DEPS="${WF_DEPS/ portal / }"
+fi
 
 if [ "$check_only" = 1 ]; then
   wf_dep_report || true
@@ -100,6 +105,9 @@ d="$destdir"
 apps="$d$datadir/applications"
 dbus="$d$datadir/dbus-1/services"
 portals="$d$datadir/xdg-desktop-portal/portals"
+portal_bin="$bindir/wayfinder-portal"
+portal_service="$dbus/org.freedesktop.impl.portal.desktop.wayfinder.service"
+portal_removed=0
 icons="$d$datadir/icons/hicolor"
 
 conf_home="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -117,21 +125,25 @@ mimeapps="$conf_home/mimeapps.list"
 
 icon_sizes="32x32:32x32.png 64x64:64x64.png 128x128:128x128.png 256x256:128x128@2x.png 512x512:icon.png"
 
-installed_files() {
+file_manager_files() {
   printf '%s\n' \
     "$d$bindir/wayfinder" \
     "$d$bindir/wayfinder-native" \
-    "$d$bindir/wayfinder-portal" \
     "$d$bindir/wayfinder-new-window" \
     "$apps/com.kadaken.wayfinder.desktop" \
-    "$apps/com.kadaken.wayfinder.picker.desktop" \
-    "$dbus/org.freedesktop.FileManager1.service" \
-    "$dbus/org.freedesktop.impl.portal.desktop.wayfinder.service" \
-    "$portals/wayfinder.portal"
+    "$dbus/org.freedesktop.FileManager1.service"
   local pair
   for pair in $icon_sizes; do
     printf '%s\n' "$icons/${pair%%:*}/apps/com.kadaken.wayfinder.png"
   done
+}
+
+portal_files() {
+  printf '%s\n' \
+    "$d$portal_bin" \
+    "$apps/com.kadaken.wayfinder.picker.desktop" \
+    "$portal_service" \
+    "$portals/wayfinder.portal"
 }
 
 refresh_caches() {
@@ -147,21 +159,17 @@ restart_portal() {
   [ -n "$destdir" ] && return 0
   [ -n "${WAYFINDER_INSTALL_NO_RESTART:-}" ] && return 0
   say "Restarting the desktop portal so the change takes effect now."
-  # The backend first. D-Bus started it on demand and keeps it running, so
-  # after an upgrade it is still serving file dialogs from the binary this
-  # installer just replaced - the user gets the old build until they log out.
-  # Stopping it is safe: D-Bus starts the new one the next time an app asks
-  # for a dialog.
+  # Stop the backend first. D-Bus can keep it running after the installer
+  # replaces or removes its binary.
   # D-288: never match on the process name. Linux truncates comm to 15
   # characters and "wayfinder-portal" is 16, so `pkill -x wayfinder-portal`
   # can never match anything and the old backend kept running. Match the
   # full path of the binary this installer owns, and say what happened.
-  portal_bin="$prefix/bin/wayfinder-portal"
   if command -v pkill >/dev/null 2>&1; then
     if [ "$dry" = 1 ]; then
       printf '  would: stop any running %s\n' "$portal_bin"
     elif pkill -f -- "^${portal_bin}( |$)"; then
-      say "  stopped the running portal backend; D-Bus will start the new one."
+      say "  stopped the running portal backend."
     else
       say "  no portal backend was running."
     fi
@@ -201,7 +209,12 @@ remove_qt_env() {
 # A reinstall never overwrites the record with Wayfinder itself.
 take_folder_app() {
   command -v xdg-mime >/dev/null 2>&1 || return 0
-  [ "$dry" != 1 ] || return 0
+  # D-452: the dry run lists this step too; it writes the user's folder default.
+  if [ "$dry" = 1 ]; then
+    printf '  would: record the current folder app in %s\n' "$prev_folder_app"
+    printf '  would: xdg-mime default %s inode/directory\n' "$wf_desktop"
+    return 0
+  fi
   local cur=""
   # Only the user's own choice is recorded, read from their mimeapps.list, so
   # uninstall restores exactly that file and never writes a system default in.
@@ -254,29 +267,29 @@ give_back_folder_app() {
   return 0
 }
 
-# ---------------------------------------------------------------- uninstall
-if [ "$uninstall" = 1 ]; then
-  say "Removing Wayfinder from $prefix"
+remove_portal() {
+  local f previous_line
   while IFS= read -r f; do
     [ -e "$f" ] || [ -L "$f" ] || continue
     say "  $f"
     run rm -f "$f"
-  done < <(installed_files)
+    if [ "$dry" = 0 ]; then portal_removed=1; fi
+  done < <(portal_files)
 
-  if [ -z "$destdir" ] && [ -f "$portals_conf" ] \
+  [ -z "$destdir" ] || return 0
+  if [ -f "$portals_conf" ] \
      && grep -q '^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$' "$portals_conf"; then
     say "  dropping the file-dialog line from $portals_conf"
     if [ "$dry" = 1 ]; then
       printf '  would: edit %s\n' "$portals_conf"
     else
       if [ -s "$portal_prev_choice" ]; then
-        previous_line=""
         previous_line="$(head -n1 "$portal_prev_choice")"
         awk -v replacement="$previous_line" \
           '!done && $0 ~ /^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$/ { print replacement; done=1; next } { print }' \
           "$portals_conf" > "$portals_conf.new"
       else
-        grep -v '^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$' \
+        sed '/^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$/d' \
           "$portals_conf" > "$portals_conf.new"
       fi
       chmod --reference="$portals_conf" "$portals_conf.new" 2>/dev/null || true
@@ -287,20 +300,38 @@ if [ "$uninstall" = 1 ]; then
         say "  Wayfinder removed as the file dialog in $portals_conf"
       fi
       rm -f "$portal_prev_choice"
+      portal_removed=1
     fi
   fi
-
   remove_qt_env
+}
+
+# ---------------------------------------------------------------- uninstall
+if [ "$uninstall" = 1 ]; then
+  say "Removing Wayfinder from $prefix"
+  while IFS= read -r f; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    say "  $f"
+    run rm -f "$f"
+  done < <(file_manager_files)
+
+  remove_portal
   [ -n "$destdir" ] || give_back_folder_app
   refresh_caches
-  restart_portal
-  say "Done. Your own settings in ~/.config/wayfinder were left alone."
+  if [ "$portal_removed" = 1 ]; then restart_portal; fi
+  say ""
+  say "Uninstall keeps the following"
+  say "  Settings folder: $conf_home/wayfinder"
+  if [ -e "$portals_conf.bak" ] || [ -L "$portals_conf.bak" ]; then
+    say "  Portal settings backup: $portals_conf.bak"
+  fi
+  say "  Any codec packages installed with --with-codecs"
   exit 0
 fi
 
 # ------------------------------------------------------------------ install
 bin_src="$root/src-tauri/target/release"
-if [ ! -x "$bin_src/wayfinder-native" ] || [ ! -x "$bin_src/wayfinder-portal" ]; then
+if [ ! -x "$bin_src/wayfinder-native" ] || { [ "$with_portal" = 1 ] && [ ! -x "$bin_src/wayfinder-portal" ]; }; then
   [ "$build" = 1 ] || die "no release binaries in $bin_src and --no-build was given"
   command -v cargo >/dev/null 2>&1 || die "cargo is not installed, so the binaries cannot be built"
   say "Building the release binaries. This takes a minute or two."
@@ -333,10 +364,6 @@ say "Installing Wayfinder into $prefix"
 
 run install -d "$d$bindir" "$apps" "$dbus"
 run install -m 0755 "$bin_src/wayfinder-native" "$d$bindir/wayfinder-native"
-run install -m 0755 "$bin_src/wayfinder-portal" "$d$bindir/wayfinder-portal"
-# The file manager and the file dialog are the same binary under two names, and
-# the portal backend looks for wayfinder-native beside itself, so both names
-# have to sit in the same directory.
 run ln -sf wayfinder-native "$d$bindir/wayfinder"
 run install -m 0755 "$root/scripts/wayfinder-new-window" "$d$bindir/wayfinder-new-window"
 
@@ -351,7 +378,6 @@ subst() {
 }
 
 subst "$here/com.kadaken.wayfinder.desktop"        "$apps/com.kadaken.wayfinder.desktop"
-subst "$here/com.kadaken.wayfinder.picker.desktop" "$apps/com.kadaken.wayfinder.picker.desktop"
 subst "$here/org.freedesktop.FileManager1.service" "$dbus/org.freedesktop.FileManager1.service"
 
 for pair in $icon_sizes; do
@@ -361,9 +387,12 @@ for pair in $icon_sizes; do
 done
 
 if [ "$with_portal" = 1 ]; then
+  # The portal backend looks for wayfinder-native beside itself.
+  run install -m 0755 "$bin_src/wayfinder-portal" "$d$portal_bin"
+  subst "$here/com.kadaken.wayfinder.picker.desktop" "$apps/com.kadaken.wayfinder.picker.desktop"
   run install -d "$portals"
   subst "$here/org.freedesktop.impl.portal.desktop.wayfinder.service" \
-        "$dbus/org.freedesktop.impl.portal.desktop.wayfinder.service"
+        "$portal_service"
   if [ "$dry" = 1 ]; then
     printf '  would: write %s\n' "$portals/wayfinder.portal"
   else
@@ -411,12 +440,20 @@ if [ "$with_portal" = 1 ]; then
       say "  wrote $portals_conf"
     fi
   fi
+elif [ -e "$d$portal_bin" ] || [ -L "$d$portal_bin" ] \
+     || [ -e "$portal_service" ] || [ -L "$portal_service" ]; then
+  remove_portal
+  if [ "$dry" = 1 ]; then
+    say "  Would remove the earlier Wayfinder file dialog."
+  else
+    say "  Removed the earlier Wayfinder file dialog."
+  fi
 else
   say "  skipping the file-dialog backend (--no-portal)"
 fi
 
 # KDE/Qt apps: only ever on request, either way.
-if [ -z "$destdir" ]; then
+if [ -z "$destdir" ] && [ "$with_portal" = 1 ]; then
   case "$kde_apps" in
     1) write_qt_env ;;
     0) remove_qt_env ;;
@@ -427,12 +464,17 @@ refresh_caches
 
 if [ -z "$destdir" ]; then
   take_folder_app
-  restart_portal
+  if [ "$with_portal" = 1 ] || [ "$portal_removed" = 1 ]; then
+    restart_portal
+  fi
 fi
 
 say ""
 say "Installed:"
-installed_files | while IFS= read -r f; do [ -e "$f" ] || [ -L "$f" ] || continue; say "  $f"; done
+{
+  file_manager_files
+  if [ "$with_portal" = 1 ]; then portal_files; fi
+} | while IFS= read -r f; do [ -e "$f" ] || [ -L "$f" ] || continue; say "  $f"; done
 
 case ":${PATH}:" in
   *":$bindir:"*) ;;
@@ -451,11 +493,14 @@ else
 fi
 
 say ""
-say "Run 'wayfinder' to open it. Programs asking for a file will use Wayfinder"
-say "once the portal has restarted; log out and back in if an app still shows"
-say "the old dialog. Remove everything again with: $0 --uninstall"
+say "Run 'wayfinder' to open it."
+if [ "$with_portal" = 1 ]; then
+  say "Programs asking for a file will use Wayfinder once the portal has restarted."
+  say "Log out and back in if an app still shows the old dialog."
+fi
+say "Run '$0 --uninstall' to remove Wayfinder."
 
-if [ "$kde_apps" != 1 ] && [ "${XDG_CURRENT_DESKTOP:-}" = "KDE" ]; then
+if [ "$with_portal" = 1 ] && [ "$kde_apps" != 1 ] && [ "${XDG_CURRENT_DESKTOP:-}" = "KDE" ]; then
   say ""
   say "KDE apps (KWrite, Dolphin, Gwenview) draw their own file dialog and never"
   say "ask the portal, so they will not use Wayfinder. Run this installer again"

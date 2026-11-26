@@ -12,6 +12,14 @@ change between releases.
 - The status line says when an item reached Trash and Wayfinder cannot undo the move.
 - Added a test that Delete asks before removing items from a drive's Trash for good.
 - Added tests that thumbnail generation, startup logging and transfer reports remove the oldest entries first.
+- Outside archive tools run only when Linux can restrict where they write. The built-in ZIP reader still works without that restriction.
+- Archives containing hard links are refused before any files are moved into the destination.
+- Wayfinder refuses to move extracted files into a destination folder that changed during extraction.
+- Tests now cover HTTPS for update requests, refusal of manifest redirects, and rejection of downloads that end on another site.
+- Uninstall lists the settings, backup and codec packages it keeps.
+- Wayfinder checks each update redirect before contacting the next site and follows at most three redirects.
+- Installing with `--no-portal` removes an earlier Wayfinder file dialog and restores your previous chooser.
+- `install.sh --dry-run` now lists the folder-default step a real install performs.
 
 ## 0.9.38 — 25 November 2026
 
