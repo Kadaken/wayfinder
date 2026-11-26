@@ -3552,6 +3552,24 @@ fn trash_dir() -> Result<PathBuf, String> {
     Ok(Path::new(&home).join(".local/share/Trash"))
 }
 
+pub fn in_trash_files(path: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else { return false };
+    let home_files = trash_dir().ok().map(|home| home.join("files"));
+    let mount = mount_root_of(&path);
+    // SAFETY: getuid has no arguments or memory requirements.
+    let uid = unsafe { libc::getuid() };
+    in_trash_files_at(&path, home_files.as_deref(), mount.as_deref(), uid)
+}
+
+// D-428: match the home Trash and the current user's Trash layouts at the mount root.
+fn in_trash_files_at(path: &Path, home_files: Option<&Path>, mount: Option<&Path>, uid: u32) -> bool {
+    home_files.is_some_and(|home| path.starts_with(home))
+        || mount.is_some_and(|mount| {
+            path.starts_with(mount.join(format!(".Trash-{uid}")).join("files"))
+                || path.starts_with(mount.join(".Trash").join(uid.to_string()).join("files"))
+        })
+}
+
 /// D-271: Trash is per filesystem, not per user. GIO moves an item on another
 /// volume into that volume's own `.Trash-1000`, never into the home Trash, so
 /// listing the home Trash before and after the move saw no new entry and the
@@ -3871,6 +3889,33 @@ fn rename_no_replace_io(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// D-429: a move back that never replaces what sits at `to`. A rename that
+/// cannot cross drives (EXDEV) or that the filesystem cannot do without
+/// replacing (EINVAL, ENOSYS, ENOTSUP on some FUSE mounts) falls back to
+/// `mv -T -n`, and the result is checked: `from` still there means refused.
+fn move_back_no_replace(from: &Path, to: &Path) -> Result<(), String> {
+    match rename_no_replace_io(from, to) {
+        Ok(()) => return Ok(()),
+        Err(err) if matches!(
+            err.raw_os_error(),
+            Some(libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
+        ) => {}
+        Err(err) if err.raw_os_error() == Some(libc::EEXIST) => {
+            return Err(format!("already exists: {}", to.display()));
+        }
+        Err(err) => return Err(format!("{}: {err}", to.display())),
+    }
+    if entry_exists(to)? {
+        return Err(format!("already exists: {}", to.display()));
+    }
+    let (from_s, to_s) = (from.to_string_lossy(), to.to_string_lossy());
+    run_cmd_capture("mv", &["-T", "-n", "--", &from_s, &to_s])?;
+    if entry_exists(from)? {
+        return Err(format!("already exists: {}", to.display()));
+    }
+    Ok(())
+}
+
 fn restore_from_trash_in(trash: &Path, selector: &str) -> Result<(), String> {
     restore_with(trash, selector, &|info| fs::remove_file(info))
 }
@@ -4050,6 +4095,36 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
+// D-425: attach the operation and path while the filesystem error still has context.
+fn transfer_io_error(error: std::io::Error, action: &str, path: &Path) -> String {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        format!("No permission to {action} {}", path.display())
+    } else {
+        format!("{}: {error}", path.display())
+    }
+}
+
+fn move_permission_message(source: &str, destination: &str) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let blocked = |folder: &Path| {
+        let Ok(folder) = std::ffi::CString::new(folder.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: folder is a live NUL-terminated string for the duration of the call.
+        let rc = unsafe {
+            libc::faccessat(libc::AT_FDCWD, folder.as_ptr(), libc::W_OK | libc::X_OK, libc::AT_EACCESS)
+        };
+        rc != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+    };
+    let dest_dir = Path::new(destination);
+    let source_dir = Path::new(source).parent().filter(|p| !p.as_os_str().is_empty());
+    match (source_dir.filter(|dir| blocked(dir)), blocked(dest_dir)) {
+        (None, true) => format!("No permission to write in {destination}"),
+        (Some(dir), false) => format!("No permission to write in {}", dir.display()),
+        _ => format!("No permission to move {source} to {destination}"),
+    }
+}
+
 fn hash_file_bytes(
     hasher: &mut std::collections::hash_map::DefaultHasher,
     path: &Path,
@@ -4059,12 +4134,12 @@ fn hash_file_bytes(
 ) -> Result<(), String> {
     use std::hash::Hasher;
     use std::io::Read;
-    let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = fs::File::open(path).map_err(|e| transfer_io_error(e, "read", path))?;
     let mut buf = vec![0u8; 256 * 1024];
     let mut seen = 0u64;
     loop {
         check_cancel(cancel)?;
-        let got = file.read(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
+        let got = file.read(&mut buf).map_err(|e| transfer_io_error(e, "read", path))?;
         if got == 0 {
             break;
         }
@@ -4087,20 +4162,20 @@ fn hash_tree(
 ) -> Result<(), String> {
     use std::hash::Hasher;
     let mut names = fs::read_dir(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .map(|e| e.map(|e| e.file_name()).map_err(|e| e.to_string()))
+        .map_err(|e| transfer_io_error(e, "read", dir))?
+        .map(|e| e.map(|e| e.file_name()).map_err(|e| transfer_io_error(e, "read", dir)))
         .collect::<Result<Vec<_>, _>>()?;
     names.sort();
     for name in names {
         check_cancel(cancel)?;
         let path = dir.join(&name);
-        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let meta = fs::symlink_metadata(&path).map_err(|e| transfer_io_error(e, "read", &path))?;
         *entries += 1;
         hasher.write(name.to_string_lossy().as_bytes());
         hasher.write_u8(0);
         if meta.file_type().is_symlink() {
             hasher.write_u8(b'L');
-            let target = fs::read_link(&path).map_err(|e| e.to_string())?;
+            let target = fs::read_link(&path).map_err(|e| transfer_io_error(e, "read", &path))?;
             hasher.write(target.to_string_lossy().as_bytes());
         } else if meta.is_dir() {
             hasher.write_u8(b'D');
@@ -4128,10 +4203,10 @@ fn fingerprint_c(path: &str, cancel: &AtomicBool) -> Result<Fingerprint, String>
 fn fingerprint_tick(path: &str, cancel: &AtomicBool, tick: &dyn Fn(u64)) -> Result<Fingerprint, String> {
     use std::hash::Hasher;
     let p = Path::new(path);
-    let meta = fs::symlink_metadata(p).map_err(|e| format!("{path}: {e}"))?;
+    let meta = fs::symlink_metadata(p).map_err(|e| transfer_io_error(e, "read", p))?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     if meta.file_type().is_symlink() {
-        let target = fs::read_link(p).map_err(|e| e.to_string())?;
+        let target = fs::read_link(p).map_err(|e| transfer_io_error(e, "read", p))?;
         Ok(Fingerprint::Link(target.to_string_lossy().to_string()))
     } else if meta.is_dir() {
         let mut entries = 0;
@@ -4158,7 +4233,7 @@ fn snapshot_sources_tick(srcs: &[String], cancel: &AtomicBool, tick: &dyn Fn(u64
     use std::os::unix::fs::MetadataExt;
     srcs.iter()
         .map(|p| {
-            let meta = fs::symlink_metadata(p).map_err(|e| format!("cannot read {p}: {e}"))?;
+            let meta = fs::symlink_metadata(p).map_err(|e| transfer_io_error(e, "read", Path::new(p)))?;
             Ok(SourceSnapshot { path: p.clone(), ino: meta.ino(), fp: fingerprint_tick(p, cancel, tick)? })
         })
         .collect()
@@ -4266,7 +4341,7 @@ fn verify_transfer_tick(
             return Err(format!("transfer check: no record of {}", item.from));
         };
         let dest = fingerprint_tick(&item.to, cancel, tick).map_err(|e| {
-            if e == CANCELLED_MSG {
+            if e == CANCELLED_MSG || e.starts_with("No permission to ") {
                 e
             } else {
                 format!("transfer check: {} is missing after the transfer", item.to)
@@ -4357,10 +4432,14 @@ fn internal_sibling(dir: &Path, kind: &str) -> PathBuf {
 /// True when a directory entry exists at `path`, without following symlinks (a
 /// broken link is an entry). Only `NotFound` means absent; any other error is real.
 fn entry_exists(path: &Path) -> Result<bool, String> {
+    entry_exists_io(path).map_err(|e| format!("cannot inspect {}: {e}", path.display()))
+}
+
+fn entry_exists_io(path: &Path) -> std::io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("cannot inspect {}: {e}", path.display())),
+        Err(e) => Err(e),
     }
 }
 
@@ -4470,13 +4549,13 @@ fn add_bytes(total: u64, more: u64) -> Result<u64, String> {
 /// directory entries carry no bytes.
 fn count_bytes(path: &Path, cancel: &AtomicBool) -> Result<u64, String> {
     check_cancel(cancel)?;
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = fs::symlink_metadata(path).map_err(|e| transfer_io_error(e, "read", path))?;
     if meta.file_type().is_symlink() {
         Ok(0)
     } else if meta.is_dir() {
         let mut sum = 0;
-        for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
-            let entry = entry.map_err(|e| e.to_string())?;
+        for entry in fs::read_dir(path).map_err(|e| transfer_io_error(e, "read", path))? {
+            let entry = entry.map_err(|e| transfer_io_error(e, "read", path))?;
             sum = add_bytes(sum, count_bytes(&entry.path(), cancel)?)?;
         }
         Ok(sum)
@@ -4550,6 +4629,43 @@ pub fn brief_failure(text: &str, max_lines: usize) -> String {
 pub fn plain_failure_line(line: &str) -> String {
     let line = line.trim();
     let line = line.strip_prefix("cp: ").unwrap_or(line);
+    if line.starts_with("No permission to ") {
+        return line.to_string();
+    }
+    let quoted = line.find(['\'', '"']).and_then(|start| {
+        let quote = line.as_bytes()[start] as char;
+        let (path, suffix) = line[start + 1..].rsplit_once(quote)?;
+        Some((line[..start].trim_end(), Path::new(path), suffix))
+    });
+    if matches!(line.rsplit_once(": "), Some((_, "Permission denied" | "Operation not permitted"))) {
+        if let Some((operation, path, suffix)) = quoted {
+            // D-425: cp names the failing operation and its operand.
+            if operation.starts_with("cannot access")
+                || operation.starts_with("cannot stat")
+                || operation.starts_with("cannot read")
+                || operation.starts_with("error reading")
+                || (operation == "cannot open" && suffix.starts_with(" for reading:"))
+            {
+                return format!("No permission to read {}", path.display());
+            }
+            if operation.starts_with("cannot create")
+                || operation.starts_with("error writing")
+                || operation.starts_with("cannot remove")
+                || operation.starts_with("preserving")
+                || operation.starts_with("setting")
+                || (operation == "cannot open" && suffix.starts_with(" for writing:"))
+            {
+                let folder = path
+                    .ancestors()
+                    .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".wf-replace-")))
+                    .unwrap_or(path)
+                    .parent()
+                    .unwrap_or(path);
+                return format!("No permission to write in {}", folder.display());
+            }
+        }
+    }
+    let lower = line.to_ascii_lowercase();
     // The first quoted path, with an internal staging name replaced by its folder.
     let place = line.split('\'').nth(1).filter(|p| p.contains('/')).map(|p| {
         let path = Path::new(p);
@@ -4562,10 +4678,7 @@ pub fn plain_failure_line(line: &str) -> String {
             p.to_string()
         }
     });
-    let lower = line.to_ascii_lowercase();
-    let reason = if lower.contains("permission denied") || lower.contains("os error 13") || lower.contains("operation not permitted") {
-        Some("no permission to write here")
-    } else if lower.contains("read-only file system") || lower.contains("os error 30") {
+    let reason = if lower.contains("read-only file system") || lower.contains("os error 30") {
         Some("the drive is read-only")
     } else if lower.contains("transport endpoint is not connected") || lower.contains("os error 107") {
         Some("the drive or share is no longer connected")
@@ -4609,6 +4722,7 @@ fn copy_item(
     let mut child = Command::new(ctl.copy_program)
         .args(["-a", "-T", "--", src])
         .arg(stage)
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -4699,6 +4813,9 @@ fn plan_transfer_items(
     on_conflict: PasteConflict,
 ) -> Result<Vec<PlanItem>, String> {
     let mut plan: Vec<PlanItem> = Vec::new();
+    let target_exists = |path: &Path| {
+        entry_exists_io(path).map_err(|e| transfer_io_error(e, "write in", Path::new(dest_dir)))
+    };
     for src in srcs {
         let name = Path::new(src)
             .file_name()
@@ -4713,7 +4830,7 @@ fn plan_transfer_items(
             continue;
         }
         let planned = |p: &Path| plan.iter().any(|item| item.dest == p);
-        let (dest, kind) = if entry_exists(&target)? || planned(&target) {
+        let (dest, kind) = if target_exists(&target)? || planned(&target) {
             match on_conflict {
                 PasteConflict::KeepBoth | PasteConflict::KeepBothPlainNumber => {
                     let plain = on_conflict == PasteConflict::KeepBothPlainNumber;
@@ -4725,7 +4842,7 @@ fn plan_transfer_items(
                             Path::new(dest_dir).join(numbered_name(name, n, plain))
                         };
                         n += 1;
-                        if !entry_exists(&cand)? && !planned(&cand) {
+                        if !target_exists(&cand)? && !planned(&cand) {
                             break cand;
                         }
                     };
@@ -4788,12 +4905,13 @@ pub fn transfer_batch_ctl(
         Stop::Failed(message) => TransferFail::Failed(message),
     };
     (ctl.on_event)(TransferEvent::Preparing);
-    if !Path::new(dest_dir).is_dir() {
-        return Err(TransferFail::Failed(format!("not a folder: {dest_dir}")));
-    }
-    let dest_dev = fs::metadata(dest_dir)
-        .map_err(|e| TransferFail::Failed(e.to_string()))?
-        .dev();
+    let dest_dev = match fs::metadata(dest_dir) {
+        Ok(meta) if meta.is_dir() => meta.dev(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(TransferFail::Failed(transfer_io_error(e, "write in", Path::new(dest_dir))));
+        }
+        _ => return Err(TransferFail::Failed(format!("not a folder: {dest_dir}"))),
+    };
     let mut read_total = 0u64;
     for src in srcs {
         read_total = add_bytes(read_total, count_bytes(Path::new(src), cancel).map_err(|e| fail_of(e.into()))?)
@@ -4819,7 +4937,9 @@ pub fn transfer_batch_ctl(
 
     let cross = |item: &PlanItem| -> Result<bool, String> {
         Ok(force_cross_device
-            || fs::symlink_metadata(&item.src).map_err(|e| e.to_string())?.dev() != dest_dev)
+            || fs::symlink_metadata(&item.src)
+                .map_err(|e| transfer_io_error(e, "read", Path::new(&item.src)))?
+                .dev() != dest_dev)
     };
     // Bytes to stage for the whole batch, known before any copy starts.
     let mut total = 0u64;
@@ -4904,7 +5024,7 @@ pub fn transfer_batch_ctl(
                 phase("backup")?;
                 let dir = item.dest.parent().ok_or("bad target")?;
                 let backup = internal_sibling(dir, "old");
-                fs::rename(&item.dest, &backup).map_err(|e| e.to_string())?;
+                fs::rename(&item.dest, &backup).map_err(|e| transfer_io_error(e, "write in", dir))?;
                 journal.push(JournalOp::Backup { target: item.dest.clone(), backup: backup.clone() });
                 retire.push(backup);
                 mutated("backed-up")?;
@@ -4912,26 +5032,35 @@ pub fn transfer_batch_ctl(
             match (&item.stage, is_copy) {
                 (Some(stage), true) => {
                     phase("place")?;
-                    fs::rename(stage, &item.dest).map_err(|e| e.to_string())?;
+                    fs::rename(stage, &item.dest)
+                        .map_err(|e| transfer_io_error(e, "write in", Path::new(dest_dir)))?;
                     journal.push(JournalOp::Placed { dest: item.dest.clone() });
                     mutated("placed")?;
                 }
                 (Some(stage), false) => {
                     phase("hold")?;
                     let src = Path::new(&item.src);
-                    let hold = internal_sibling(src.parent().ok_or("bad source")?, "hold");
-                    fs::rename(src, &hold).map_err(|e| e.to_string())?;
+                    let dir = src.parent().ok_or("bad source")?;
+                    let hold = internal_sibling(dir, "hold");
+                    fs::rename(src, &hold).map_err(|e| transfer_io_error(e, "write in", dir))?;
                     journal.push(JournalOp::Hold { src: src.to_path_buf(), hold: hold.clone() });
                     retire.push(hold);
                     mutated("held")?;
                     phase("place")?;
-                    fs::rename(stage, &item.dest).map_err(|e| e.to_string())?;
+                    fs::rename(stage, &item.dest)
+                        .map_err(|e| transfer_io_error(e, "write in", Path::new(dest_dir)))?;
                     journal.push(JournalOp::Placed { dest: item.dest.clone() });
                     mutated("placed")?;
                 }
                 (None, _) => {
                     phase("place")?;
-                    fs::rename(&item.src, &item.dest).map_err(|e| e.to_string())?;
+                    fs::rename(&item.src, &item.dest).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            move_permission_message(&item.src, dest_dir)
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
                     journal.push(JournalOp::Moved {
                         src: PathBuf::from(&item.src),
                         dest: item.dest.clone(),
@@ -4996,12 +5125,25 @@ pub fn transfer_batch_ctl(
 pub fn restore_moved_items(items: &[ResolvedItem]) -> Result<Vec<ResolvedItem>, String> {
     for item in items {
         let original = Path::new(&item.from);
-        if original.exists() {
+        // D-429: a dangling symlink occupies the original name too.
+        if entry_exists(original)? {
             return Err(format!("undo target already exists: {}", item.from));
         }
     }
+    for (index, item) in items.iter().enumerate() {
+        // D-429: the destination can become occupied after the preflight.
+        if let Err(err) = move_back_no_replace(Path::new(&item.to), Path::new(&item.from)) {
+            let mut message = format!("cannot safely move {} back to {}: {err}", item.to, item.from);
+            for done in items[..index].iter().rev() {
+                if let Err(rollback) = move_back_no_replace(Path::new(&done.from), Path::new(&done.to)) {
+                    notify_path_changes(&[(done.to.clone(), Some(done.from.clone()))]);
+                    message.push_str(&format!("; could not move {} back to {}: {rollback}", done.from, done.to));
+                }
+            }
+            return Err(message);
+        }
+    }
     for item in items {
-        run_cmd_capture("mv", &["-T", "--", &item.to, &item.from])?;
         notify_path_changes(&[(item.to.clone(), Some(item.from.clone()))]);
     }
     Ok(items
@@ -7678,10 +7820,10 @@ mod tests {
     #[test]
     fn failure_text_is_plain_d405() {
         let raw = "cp: cannot create regular file '/media/ro/Folder/.wf-replace-new-4242-0': Permission denied";
-        assert_eq!(brief_failure(raw, 1), "no permission to write here: /media/ro/Folder");
+        assert_eq!(brief_failure(raw, 1), "No permission to write in /media/ro/Folder");
         assert_eq!(
             brief_failure("cannot inspect /media/ro/x.txt: Permission denied (os error 13)", 1),
-            "no permission to write here"
+            "cannot inspect /media/ro/x.txt: Permission denied"
         );
         assert_eq!(
             brief_failure("cp: cannot stat '/net/share/a.txt': Transport endpoint is not connected", 1),
@@ -7694,6 +7836,47 @@ mod tests {
         assert_eq!(brief_failure("rename /a/.wf-replace-old-9-1 failed (os error 39)", 1), "rename /a failed");
         let shown = brief_failure(raw, 1);
         assert!(!shown.contains(".wf-replace") && !shown.contains("os error") && !shown.starts_with("cp:"), "{shown}");
+    }
+
+    #[test]
+    fn transfer_permissions_name_unreadable_source_d425() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_case("d425-source");
+        let source = root.join("source.txt");
+        let dest = root.join("destination");
+        fs::write(&source, b"source").unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+
+        for is_copy in [true, false] {
+            let error = transfer_batch(&[source.display().to_string()], dest.to_str().unwrap(),
+                is_copy, PasteConflict::KeepBoth, &|_| Ok(()), false).unwrap_err();
+            assert_eq!(brief_failure(&error, 1), format!("No permission to read {}", source.display()));
+        }
+        assert_eq!(
+            brief_failure(r#"cp: cannot open "/source/it's here" for reading: Permission denied"#, 1),
+            "No permission to read /source/it's here",
+        );
+    }
+
+    #[test]
+    fn transfer_permissions_name_unwritable_destination_d425() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_case("d425-destination");
+        let source = root.join("source.txt");
+        let dest = root.join("destination");
+        fs::write(&source, b"source").unwrap();
+        fs::create_dir(&dest).unwrap();
+        for mode in [0o555, 0o444] {
+            for is_copy in [true, false] {
+                fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+                let result = transfer_batch(&[source.display().to_string()], dest.to_str().unwrap(),
+                    is_copy, PasteConflict::KeepBoth, &|_| Ok(()), false);
+                fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+                let error = result.unwrap_err();
+                assert_eq!(brief_failure(&error, 1), format!("No permission to write in {}", dest.display()));
+            }
+        }
     }
 
     /// D-313: the read of the sources before a copy reports its progress, so a
@@ -8836,6 +9019,34 @@ mod tests {
     }
 
     #[test]
+    fn trash_files_paths_match_home_and_current_uid_d428() {
+        let home_files = Some(Path::new("/home/user/.local/share/Trash/files"));
+        let mount = Some(Path::new("/media/usb"));
+        for path in [
+            "/home/user/.local/share/Trash/files",
+            "/home/user/.local/share/Trash/files/nested",
+            "/media/usb/.Trash-1000/files",
+            "/media/usb/.Trash-1000/files/nested",
+            "/media/usb/.Trash/1000/files",
+            "/media/usb/.Trash/1000/files/nested",
+        ] {
+            assert!(in_trash_files_at(Path::new(path), home_files, mount, 1000), "{path}");
+        }
+        for path in [
+            "/media/usb/Trash",
+            "/media/usb/Trash/files",
+            "/media/usb/.Trash-1000x/files",
+            "/media/usb/.Trash-1001/files",
+            "/media/usb/.Trash/1001/files",
+            "/media/usb/.Trash-1000/files-backup",
+            "/media/usb/.Trash/1000/info",
+            "/media/usb/ordinary/.Trash-1000/files",
+        ] {
+            assert!(!in_trash_files_at(Path::new(path), home_files, mount, 1000), "{path}");
+        }
+    }
+
+    #[test]
     fn trash_paths_batch_deletes_without_per_file_subprocess() {
         // Reproduces the batch-delete freeze: this used to spawn one `gio trash`
         // process per file and block the UI thread on each.
@@ -9834,6 +10045,74 @@ drive: /home/user/GoogleDrive fuse.rclone rw 0 0
         assert_eq!(fs::read(&a).unwrap(), b"a");
         assert_eq!(fs::read(&b).unwrap(), b"b");
         assert!(!d.join("dest/a.txt").exists() && !d.join("dest/b.txt").exists());
+    }
+
+    #[test]
+    fn move_undo_refuses_occupied_original_path_d429() {
+        let root = scratch_case("d429-occupied");
+        let original = root.join("original");
+        let moved = root.join("moved");
+        let missing = root.join("missing");
+        let items = [ResolvedItem { from: original.display().to_string(), to: moved.display().to_string() }];
+        fs::write(&moved, b"moved").unwrap();
+
+        std::os::unix::fs::symlink(&missing, &original).unwrap();
+        assert!(restore_moved_items(&items).unwrap_err().contains("already exists"));
+        assert_eq!(fs::read_link(&original).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(fs::read(&moved).unwrap(), b"moved");
+
+        fs::remove_file(&original).unwrap();
+        fs::write(&original, b"existing").unwrap();
+        assert!(restore_moved_items(&items).unwrap_err().contains("already exists"));
+        assert_eq!(fs::read(&original).unwrap(), b"existing");
+        assert_eq!(fs::read(&moved).unwrap(), b"moved");
+    }
+
+    #[test]
+    fn move_undo_refuses_name_taken_after_preflight_d429() {
+        let root = scratch_case("d429-late-collision");
+        let original = root.join("original");
+        let from = original.display().to_string();
+        let items = ["first", "second"].map(|name| {
+            let moved = root.join(name);
+            fs::write(&moved, name).unwrap();
+            ResolvedItem { from: from.clone(), to: moved.display().to_string() }
+        });
+        assert!(restore_moved_items(&items).unwrap_err().contains("already exists"));
+        assert!(!original.exists());
+        assert_eq!(fs::read(root.join("first")).unwrap(), b"first");
+        assert_eq!(fs::read(root.join("second")).unwrap(), b"second");
+    }
+
+    /// D-429: undo of a move between two drives still works, and still never
+    /// replaces what sits at the original name. Skipped when /dev/shm is on the
+    /// same device as the scratch folder (no second drive to cross).
+    #[test]
+    fn move_undo_across_drives_never_replaces_d429() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch_case("d429-cross");
+        let other = PathBuf::from(format!("/dev/shm/wf-d429-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&other);
+        if fs::create_dir(&other).is_err()
+            || fs::metadata(&other).unwrap().dev() == fs::metadata(&root).unwrap().dev()
+        {
+            let _ = fs::remove_dir_all(&other);
+            return;
+        }
+        let moved = other.join("item");
+        let original = root.join("item");
+        fs::write(&moved, b"moved").unwrap();
+        let items = [ResolvedItem { from: original.display().to_string(), to: moved.display().to_string() }];
+        restore_moved_items(&items).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"moved");
+        assert!(fs::symlink_metadata(&moved).is_err());
+
+        fs::write(&moved, b"second").unwrap();
+        assert!(move_back_no_replace(&moved, &original).unwrap_err().contains("already exists"));
+        assert_eq!(fs::read(&original).unwrap(), b"moved");
+        assert_eq!(fs::read(&moved).unwrap(), b"second");
+        fs::remove_dir_all(&other).unwrap();
     }
 
     #[test]
