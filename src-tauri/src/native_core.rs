@@ -7894,7 +7894,7 @@ mod tests {
         }
     }
 
-    /// Fixture for D-24: `src/{a.txt, b/, c.txt}` incoming, `dest/{a.txt, b/}` existing.
+    // Fixture for D-24: `src/{a.txt, b/, c.txt}` incoming, `dest/{a.txt, b/}` existing.
     // ---- D-155: progress and cancellation -------------------------------
 
     /// Stand-in for `cp -a -T -- SRC STAGE` that writes one 1 MiB chunk per
@@ -14499,6 +14499,20 @@ mod audit_log_cap_tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.ends_with("line 01999 padding padding\n"));
         assert!(text.starts_with("line "), "cut must fall on a line start");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_log_uses_the_same_cap_writer_d430() {
+        let dir = std::env::temp_dir().join(format!("wf-d430-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("startup.log");
+        let cap = 256u64;
+        for i in 0..200 {
+            append_capped_log(&log, &format!("pid 1 mark-{i}\n"), cap).unwrap();
+        }
+        assert!(std::fs::metadata(&log).unwrap().len() <= cap + 32);
+        assert!(std::fs::read_to_string(&log).unwrap().contains("mark-199"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

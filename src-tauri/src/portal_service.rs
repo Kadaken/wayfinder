@@ -3219,11 +3219,7 @@ mod tests {
         }));
         assert!(result.is_err(), "the deliberate panic must actually unwind");
 
-        let (pid, display_num) = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("pid and display number captured before the panic");
+        let (pid, display_num) = (*captured.lock().unwrap()).expect("pid and display number captured before the panic");
         let deadline = Instant::now() + Duration::from_secs(5);
         while PathBuf::from(format!("/proc/{pid}")).exists() {
             assert!(Instant::now() < deadline, "PrivateXvfb::drop must reap the exact process on unwind");
@@ -3296,7 +3292,6 @@ mod tests {
         message
             .body()
             .deserialize::<(u32, HashMap<String, OwnedValue>)>()
-            .map_err(Into::into)
     }
 
     /// Builds the `files` option the way the C portal does: one
@@ -3341,7 +3336,6 @@ mod tests {
         message
             .body()
             .deserialize::<(u32, HashMap<String, OwnedValue>)>()
-            .map_err(Into::into)
     }
 
     fn call_save_file(
@@ -3367,7 +3361,6 @@ mod tests {
         message
             .body()
             .deserialize::<(u32, HashMap<String, OwnedValue>)>()
-            .map_err(Into::into)
     }
 
     fn uris_of(results: &HashMap<String, OwnedValue>) -> Vec<String> {
@@ -4239,9 +4232,9 @@ mod tests {
         finish_private_bus(bus, server, client);
     }
 
-    /// A name that is not a plain name is refused before the picker ever
-    /// opens, so a `SaveFiles` request can never be steered out of the
-    /// folder the user chose.
+    // A name that is not a plain name is refused before the picker ever
+    // opens, so a `SaveFiles` request can never be steered out of the
+    // folder the user chose.
     // ---- W2 attack 8: the request handle and Request.Close() ----
 
     /// A chooser that shows a "dialog" until it is closed: it counts how many
@@ -4296,7 +4289,7 @@ mod tests {
         );
         let message =
             client.call_method(Some(BUS_NAME), OBJECT_PATH, Some(INTERFACE_NAME), "OpenFile", &body)?;
-        message.body().deserialize::<(u32, HashMap<String, OwnedValue>)>().map_err(Into::into)
+        message.body().deserialize::<(u32, HashMap<String, OwnedValue>)>()
     }
 
     fn close_request(client: &Connection, handle: &str) -> zbus::Result<()> {
@@ -5218,7 +5211,9 @@ mod tests {
     /// Browser-shaped `choices` value: `a(ssa(ss)s)` -- one enumerated
     /// choice (nonempty option list) and one boolean choice (empty option
     /// list, initial `"false"`).
-    fn browser_choices() -> Vec<(String, String, Vec<(String, String)>, String)> {
+    type BrowserChoice = (String, String, Vec<(String, String)>, String);
+
+    fn browser_choices() -> Vec<BrowserChoice> {
         vec![
             (
                 "encoding".to_string(),
@@ -6071,20 +6066,12 @@ mod tests {
             self.owner.as_ref().expect("owner present until finish").path()
         }
 
-        fn runtime_dir(&self) -> PathBuf {
-            self.env_root.join("run")
-        }
-
         fn portals_dir(&self) -> PathBuf {
             self.data_home.join("xdg-desktop-portal/portals")
         }
 
         fn services_dir(&self) -> PathBuf {
             self.data_home.join("dbus-1/services")
-        }
-
-        fn desktop_id(&self) -> &str {
-            &self.desktop_id
         }
 
         /// Points `DISPLAY` at the private Xvfb and clears `WAYLAND_DISPLAY`,
@@ -6886,7 +6873,7 @@ mod tests {
     #[derive(Debug)]
     enum FrontendAttempt {
         Responded(u32, HashMap<String, OwnedValue>),
-        CallFailed(String),
+        CallFailed,
         TimedOut,
     }
 
@@ -6901,7 +6888,7 @@ mod tests {
             let outcome = (|| -> FrontendAttempt {
                 let conn = match Builder::address(bus_address.as_str()).and_then(|b| b.build()) {
                     Ok(conn) => conn,
-                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                    Err(_e) => return FrontendAttempt::CallFailed,
                 };
                 let proxy = match zbus::blocking::Proxy::new(
                     &conn,
@@ -6910,30 +6897,30 @@ mod tests {
                     FRONTEND_INTERFACE,
                 ) {
                     Ok(p) => p,
-                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                    Err(_e) => return FrontendAttempt::CallFailed,
                 };
                 let options: HashMap<String, OwnedValue> = HashMap::new();
                 let handle: Result<zbus::zvariant::OwnedObjectPath, zbus::Error> =
                     proxy.call("OpenFile", &("", "d215 routing probe", options));
                 let handle = match handle {
                     Ok(h) => h,
-                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                    Err(_e) => return FrontendAttempt::CallFailed,
                 };
                 let request =
                     match zbus::blocking::Proxy::new(&conn, FRONTEND_BUS_NAME, handle.as_str(), REQUEST_INTERFACE) {
                         Ok(p) => p,
-                        Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                        Err(_e) => return FrontendAttempt::CallFailed,
                     };
                 let mut signals = match request.receive_signal("Response") {
                     Ok(s) => s,
-                    Err(e) => return FrontendAttempt::CallFailed(e.to_string()),
+                    Err(_e) => return FrontendAttempt::CallFailed,
                 };
                 match signals.next() {
                     Some(message) => match message.body().deserialize::<(u32, HashMap<String, OwnedValue>)>() {
                         Ok((response, results)) => FrontendAttempt::Responded(response, results),
-                        Err(e) => FrontendAttempt::CallFailed(e.to_string()),
+                        Err(_e) => FrontendAttempt::CallFailed,
                     },
-                    None => FrontendAttempt::CallFailed("no Response signal arrived".to_string()),
+                    None => FrontendAttempt::CallFailed,
                 }
             })();
             let _ = tx.send(outcome);
@@ -7286,7 +7273,7 @@ mod tests {
         }));
         assert!(result.is_err(), "the deliberate panic must actually unwind");
 
-        let daemon_pid = captured.lock().unwrap().clone().expect("daemon pid captured before the panic");
+        let daemon_pid = (*captured.lock().unwrap()).expect("daemon pid captured before the panic");
         let deadline = Instant::now() + Duration::from_secs(5);
         while PathBuf::from(format!("/proc/{daemon_pid}")).exists() {
             assert!(
@@ -7451,7 +7438,7 @@ mod hostile_w2 {
         assert_eq!(decode_current_name(&opt("current_name", Value::from(edge.as_str()))), Ok(edge));
 
         let mut path = b"/".to_vec();
-        path.extend(std::iter::repeat(b'a').take(131_072));
+        path.extend(std::iter::repeat_n(b'a', 131_072));
         assert!(decode_path_option(&opt("current_folder", ay(&path)), "current_folder").is_err());
 
         let rules: Vec<(u32, String)> = (0..5).map(|_| (0u32, "*.txt".to_string())).collect();
@@ -7463,7 +7450,8 @@ mod hostile_w2 {
             decode_filters(&opt("filters", Value::from(vec![("one".to_string(), long_rules)]))).is_err(),
             "5000 rules in one filter"
         );
-        let many_choices: Vec<(String, String, Vec<(String, String)>, String)> = (0..5_000)
+        type BrowserChoice = (String, String, Vec<(String, String)>, String);
+        let many_choices: Vec<BrowserChoice> = (0..5_000)
             .map(|i| (format!("c{i}"), "label".to_string(), Vec::new(), String::new()))
             .collect();
         assert!(decode_choices(&opt("choices", Value::from(many_choices))).is_err(), "5000 choices");
