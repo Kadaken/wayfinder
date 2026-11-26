@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# D-426, D-431, D-434: installer audit regressions, all in throwaway HOME trees.
+# D-426, D-431, D-434, D-449: installer audit regressions in throwaway HOME trees.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$here/.." && pwd)"
@@ -92,7 +92,48 @@ run_portal_test() {
   echo "PASS: D-434 restores chooser line and preserves backup"
 }
 
+run_no_portal_test_d449() {
+  local project="$fake/no-portal-project" home="$fake/no-portal-home" tool
+  local prefix="$home/.local" conf="$home/config/xdg-desktop-portal/portals.conf"
+  make_project "$project"
+  rm "$project/src-tauri/target/release/wayfinder-portal"
+  mkdir -p "$prefix/bin" "$home/config/xdg-desktop-portal" "$home/config/environment.d"
+  printf 'installed portal binary\n' > "$prefix/bin/wayfinder-portal"
+  printf 'existing portal config\n' > "$conf"
+  for tool in pkill systemctl busctl; do
+    cat > "$fake/bin/$tool" <<'SH'
+#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$WF_PORTAL_CALLS"
+SH
+    chmod +x "$fake/bin/$tool"
+  done
+
+  HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
+    PATH="$fake/bin:$PATH" WAYFINDER_INSTALL_NO_RESTART= WF_PORTAL_CALLS="$fake/portal.calls" \
+    bash "$project/packaging/install.sh" --no-build --no-portal --kde-apps > "$fake/no-portal.out"
+
+  [ ! -s "$fake/portal.calls" ] || { echo "FAIL: D-449 called portal tools"; cat "$fake/portal.calls"; return 1; }
+  grep -qx 'installed portal binary' "$prefix/bin/wayfinder-portal"
+  grep -qx 'existing portal config' "$conf"
+  [ ! -e "$prefix/share/xdg-desktop-portal/portals/wayfinder.portal" ]
+  [ ! -e "$prefix/share/dbus-1/services/org.freedesktop.impl.portal.desktop.wayfinder.service" ]
+  [ ! -e "$prefix/share/applications/com.kadaken.wayfinder.picker.desktop" ]
+  [ ! -e "$home/config/environment.d/95-wayfinder-qt.conf" ]
+  [ -x "$prefix/bin/wayfinder-native" ]
+  echo "PASS: D-449 --no-portal leaves the portal alone"
+}
+
+run_uninstall_summary_test_d449() {
+  local home="$fake/portal-home" output="$fake/portal-uninstall.out"
+  grep -Fxq "  Settings folder: $home/config/wayfinder" "$output"
+  grep -Fxq "  Portal settings backup: $home/config/xdg-desktop-portal/portals.conf.bak" "$output"
+  grep -Fxq '  Any codec packages installed with --with-codecs' "$output"
+  echo "PASS: D-449 uninstall lists settings, the portal backup, and codec packages it keeps"
+}
+
 run_check_test
 run_folder_test
 run_portal_test
-echo "ALL PASS (3 tests)"
+run_no_portal_test_d449
+run_uninstall_summary_test_d449
+echo "ALL PASS (5 tests)"
