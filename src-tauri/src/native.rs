@@ -6267,6 +6267,10 @@ fn build_ui_in(
         let entry = ui.path_entry.clone();
         entry.connect_activate(move |entry| {
             let path = entry.text().trim().to_string();
+            let from_address = focus_within(&ui.window, entry);
+            if from_address {
+                focus_files_after_address(&state, &ui);
+            }
             ui.path_stack.set_visible_child_name("label");
             if native_smb::looks_like_smb(&path) {
                 smb_flow(&state, &ui).connect(&path);
@@ -6276,18 +6280,22 @@ fn build_ui_in(
                 // a `~` or a file's own path all used to be handed straight
                 // to the lister, which silently did nothing.
                 match resolve_address_text(&state, &path) {
-                    Some(target) => navigate(&state, native_core::Location::real(&target)),
+                    Some(target) => navigate_listing(
+                        &state, native_core::Location::real(&target), NavMode::Record, None, from_address,
+                    ),
                     None => ui.status.set_label(&format!("No folder called \u{201c}{path}\u{201d}")),
                 }
             }
         });
     }
     {
-        let ui = ui.clone();
+        let state = state.clone();
         let key = gtk::EventControllerKey::new();
+        let address_ui = ui.clone();
         key.connect_key_pressed(move |_, key, _, _| {
             if key == gdk::Key::Escape {
-                ui.path_stack.set_visible_child_name("label");
+                focus_files_after_address(&state, &address_ui);
+                address_ui.path_stack.set_visible_child_name("label");
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -7392,6 +7400,25 @@ fn edit_path_action(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     ui.path_stack.set_visible_child_name("entry");
     ui.path_entry.grab_focus();
     ui.path_entry.select_region(0, -1);
+}
+
+// D-433: return keyboard control to the active file view before hiding the entry.
+fn focus_files_after_address(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let view: &gtk::Widget = if state.borrow().view_mode == ViewMode::Grid {
+        ui.grid.upcast_ref()
+    } else {
+        ui.list.upcast_ref()
+    };
+    let selected = ui.list_selection.selection();
+    if selected.size() > 0 {
+        scroll_files_to(state, ui, selected.minimum(), gtk::ListScrollFlags::FOCUS);
+    } else if ui.list_store.n_items() > 0 {
+        select_index(state, ui, 0);
+    }
+    if !focus_within(&ui.window, view) {
+        view.set_focusable(true);
+        view.grab_focus();
+    }
 }
 
 fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
@@ -10741,6 +10768,16 @@ fn navigate_to_with_message(
     mode: NavMode,
     done_message: Option<String>,
 ) {
+    navigate_listing(state, path, mode, done_message, false);
+}
+
+fn navigate_listing(
+    state: &Rc<RefCell<AppState>>,
+    path: native_core::Location,
+    mode: NavMode,
+    done_message: Option<String>,
+    from_address: bool,
+) {
     let show_hidden = state.borrow().show_hidden;
     // The tab this request belongs to; a completion for any other tab is dropped.
     let tab_id = state.borrow().tabs.active().id;
@@ -10823,6 +10860,9 @@ fn navigate_to_with_message(
             let metadata_unavailable = listing.metadata_unavailable;
             let unreadable_entries = listing.unreadable_entries;
             let path_str = path.real_path_string().unwrap_or_default();
+            let search_text = ui.as_ref()
+                .filter(|ui| from_address && focus_within(&ui.window, &ui.search))
+                .map(|ui| ui.search.text().trim().to_string());
             {
                 let mut state = state.borrow_mut();
                 state.listing_cancel = None;
@@ -10861,7 +10901,7 @@ fn navigate_to_with_message(
                 }
                 state.entries = listing.entries;
                 state.visible_entries.clear();
-                state.filter_text.clear();
+                state.filter_text = search_text.clone().unwrap_or_default();
                 // A virtual ZIP location never enters persistent Recent config (D-188).
                 if !path.is_zip() {
                     match update_config(|config| push_recent(&mut config.recents, &path_str)) {
@@ -10871,10 +10911,18 @@ fn navigate_to_with_message(
                 }
             }
             if let Some(ui) = &ui {
+                // D-433: finish the address handoff only while the files still
+                // own keyboard focus. The user can move it during a slow load.
+                let finish_address_focus = from_address && ui.window.is_active()
+                    && (focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid));
                 rebuild_tabs(&state, ui);
                 set_breadcrumbs(&state, ui, &path);
-                ui.path_stack.set_visible_child_name("label");
-                ui.search.set_text("");
+                if !from_address || !focus_within(&ui.window, &ui.path_entry) {
+                    ui.path_stack.set_visible_child_name("label");
+                }
+                if search_text.is_none() {
+                    ui.search.set_text("");
+                }
                 set_preview_text(ui, "Select a file");
                 state.borrow_mut().diff_refresh = same_folder;
                 repopulate_rows(&state, ui);
@@ -10892,6 +10940,9 @@ fn navigate_to_with_message(
                 let opened_on = state.borrow_mut().pinned_top.take();
                 if let Some(target) = opened_on {
                     select_entry_by_source(&state, ui, &native_core::EntrySource::real(&target));
+                }
+                if finish_address_focus {
+                    focus_files_after_address(&state, ui);
                 }
                 startup_mark("first folder listed");
                 ui.status.set_label(&listing_status(
@@ -23621,6 +23672,59 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    // D-422: observe the hide signals inside the picker, before process exit
+    // itself removes the windows from the display.
+    #[test]
+    fn audit_0938_d422_picker_hides_all_windows_before_exit() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        private_session_guard_d232();
+        const CHILD: &str = "WF_D422_HIDE_CHILD";
+        if let Some(out_file) = std::env::var_os(CHILD) {
+            gtk::init().expect("GTK on the private display");
+            private_display_check_d232(&gdk::Display::default().unwrap());
+            let windows = [gtk::Window::new(), gtk::Window::new()];
+            for (index, window) in windows.iter().enumerate() {
+                window.present();
+                assert!(window.is_visible());
+                window.connect_visible_notify(move |window| {
+                    if !window.is_visible() {
+                        println!("hid window {index}");
+                    }
+                });
+            }
+            let picker = PickerState {
+                config: PickerConfig {
+                    multiple: false,
+                    directory: false,
+                    save: false,
+                    starting_dir: None,
+                    filter: None,
+                    window: None,
+                    request: WireRequestNative::default(),
+                    parent_window: None,
+                },
+                out_file: out_file.into_string().unwrap(),
+                meta_path: None,
+                active_filter: Rc::default(),
+                choice_selections: Rc::default(),
+            };
+            picker_write_and_exit(&picker, Vec::new(), 1);
+        }
+        let root = owned_scratch_dir_225("d422-hide");
+        let _cleanup = ScratchCleanup(root.clone());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::audit_0938_d422_picker_hides_all_windows_before_exit", "--nocapture"])
+            .env(CHILD, root.join("result"))
+            .output()
+            .expect("run the picker exit in a subprocess");
+        assert_eq!(child.status.code(), Some(1), "{:?}", child);
+        let stdout = String::from_utf8(child.stdout).unwrap();
+        assert!(stdout.lines().any(|line| line == "hid window 0"), "{stdout}");
+        assert!(stdout.lines().any(|line| line == "hid window 1"), "{stdout}");
+    }
+
     #[test]
     fn save_onto_a_link_names_where_it_leads_d305() {
         let root = crate::native_core::scratch_root().join(format!("wf-w2-a4-{}", std::process::id()));
@@ -28748,6 +28852,66 @@ Broken: Either state is wrong.\n";
         stream().pause();
     }
 
+    mod sound_recorder_d421 {
+        use super::*;
+        use gtk::subclass::prelude::*;
+
+        #[derive(Default)]
+        pub struct SoundRecorder(pub RefCell<Vec<(bool, f64)>>);
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for SoundRecorder {
+            const NAME: &'static str = "WfSoundRecorderD421";
+            type Type = super::SoundRecorderD421;
+            type ParentType = gtk::MediaStream;
+        }
+
+        impl ObjectImpl for SoundRecorder {}
+
+        impl MediaStreamImpl for SoundRecorder {
+            fn update_audio(&self, muted: bool, volume: f64) {
+                self.0.borrow_mut().push((muted, volume));
+            }
+        }
+    }
+
+    glib::wrapper! {
+        pub struct SoundRecorderD421(ObjectSubclass<sound_recorder_d421::SoundRecorder>)
+            @extends gtk::MediaStream, @implements gdk::Paintable;
+    }
+
+    // D-421: observe GTK forwarding the nudge and the saved volume to
+    // the media backend even when the stream already has that volume.
+    #[test]
+    fn audit_0938_d421_resends_the_already_set_volume() {
+        use glib::subclass::types::ObjectSubclassIsExt;
+
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let media: SoundRecorderD421 = glib::Object::new();
+            media.stream_prepared(true, false, false, 0);
+            let volume = 0.6;
+            media.set_volume(volume);
+            let writes = &media.imp().0;
+            writes.borrow_mut().clear();
+
+            let sound = MEDIA_SOUND.with(|saved| saved.replace(Some((volume, false))));
+            let unmute = MEDIA_UNMUTE_AT.with(|at| at.replace(None));
+            push_media_sound(media.upcast_ref());
+            let start_writes = writes.take();
+            push_unmuted_volume(media.upcast_ref());
+            MEDIA_UNMUTE_AT.with(|at| at.set(unmute));
+            MEDIA_SOUND.with(|saved| saved.set(sound));
+
+            assert_eq!(start_writes, [(true, volume), (true, 0.59), (true, volume), (false, volume)]);
+            assert_eq!(writes.take(), [(false, 0.59), (false, volume)]);
+        });
+    }
+
     /// D-411: when the folder on screen disappears (its drive pulled, or it is
     /// deleted elsewhere), the window moves to the nearest folder that exists
     /// and says why, instead of listing files that can no longer be opened.
@@ -28776,6 +28940,47 @@ Broken: Either state is wrong.\n";
             !d.state.borrow().visible_entries.iter().any(|e| e.name == "notes.md"),
             "no row from the gone folder is left"
         );
+    }
+
+    // D-411: a vanished drive beneath a mount root sends the window home.
+    #[test]
+    fn audit_0938_d411_drive_root_falls_back_to_home() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("driveroot", |_| {}, 0);
+            let gone = Path::new("/media").join(format!("wf-d411-{}", std::process::id()));
+            assert!(Path::new("/media").is_dir() && !gone.exists());
+            folder_went_away(&d.state, &gone);
+            let home = native_core::Location::RealDir(PathBuf::from(std::env::var_os("HOME").unwrap()));
+            d362_wait("home and the drive-removal message", 10, || {
+                d.state.borrow().cwd == home && d.ui.status.label() == "That drive was removed"
+            });
+        });
+    }
+
+    // D-411: GTK retains state after close, including callbacks already queued
+    // by the watcher. Closing must detach the monitor and invalidate those jobs.
+    #[test]
+    fn audit_0938_d411_closed_window_invalidates_its_watcher() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("closewatcher", |dir| fs::write(dir.join("file"), b"").unwrap(), 1);
+            let generation = d.state.borrow().monitor_generation;
+            assert!(d.state.borrow().directory_monitor.is_some());
+            d.ui.window.close();
+            assert!(ui_for_state(&d.state).is_none());
+            let state = d.state.borrow();
+            assert!(state.directory_monitor.is_none(), "the closed window still has a watcher");
+            assert_eq!(state.monitor_generation, generation.wrapping_add(1));
+        });
     }
 
     /// D-416: a folder added to Network is drawn under the Network heading,
@@ -31244,6 +31449,38 @@ Broken: Either state is wrong.\n";
         }
     }
     const POSTER_PEAK_RSS_KB: u64 = 100 * 1024;
+
+    // D-415: a poster job routes audio to a discard sink in its own playbin.
+    #[test]
+    fn audit_0938_d415_poster_uses_a_silent_sink() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            gst::init().expect("GStreamer");
+            let root = owned_scratch_dir_225("d415-poster");
+            let _cleanup = ScratchCleanup(root.clone());
+            let path = root.join("frame.png");
+            let pixbuf = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 32, 32).unwrap();
+            pixbuf.fill(0x336699ff);
+            pixbuf.savev(&path, "png", &[]).unwrap();
+            let queue = Rc::new(RefCell::new(VideoPosterQueue {
+                cancelled: gio::Cancellable::new(),
+                pending: VecDeque::new(),
+                active: 0,
+                live: Vec::new(),
+            }));
+            queue_grid_video_poster(&queue, path.to_str().unwrap().into(), gtk::Picture::new(), 32);
+            let pipeline = queue.borrow().live.first().expect("a live poster job").0.clone();
+            let sink = pipeline.property::<Option<gst::Element>>("audio-sink");
+            queue.borrow().cancelled.cancel();
+            d362_wait("the poster job to release its pipeline", 10, || queue.borrow().live.is_empty());
+            let factory = sink.and_then(|sink| sink.factory()).map(|factory| gst::prelude::GstObjectExt::name(&factory));
+            assert_eq!(factory.as_deref(), Some("fakesink"));
+        });
+    }
 
     /// D-85: a disposable synthetic short H.264/mp4 clip (never an owner
     /// video) proves the poster queue actually paints a real decoded frame,
@@ -33785,6 +34022,39 @@ Broken: Either state is wrong.\n";
     }
 
     /// D-371 alone, on the private display, with real X input.
+    #[test]
+    fn audit_0938_partial_delete_reports_failure_and_stops() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("partialdelete", |dir| {
+                for name in ["a-first.txt", "b-missing.txt", "c-last.txt"] {
+                    fs::write(dir.join(name), name).unwrap();
+                }
+            }, 3);
+            let dir = PathBuf::from(d.state.borrow().cwd.real_path_string().unwrap());
+            d.ui.list_selection.select_all();
+            assert_eq!(
+                selected_entries(&d.state, &d.ui).into_iter().map(|e| e.name).collect::<Vec<_>>(),
+                ["a-first.txt", "b-missing.txt", "c-last.txt"],
+            );
+            permanent_delete_selection(d.state.clone(), d.ui.clone());
+            let dialog = d.ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+            fs::remove_file(dir.join("b-missing.txt")).unwrap();
+            dialog.emit_by_name::<()>("response", &[&"confirm"]);
+
+            let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
+            let expected = format!("Operation failed: {not_found}");
+            d362_wait("the permanent-delete error", 10, || d.ui.status.label() == expected);
+            assert!(!dir.join("a-first.txt").exists(), "the first deletion succeeded");
+            assert!(!dir.join("b-missing.txt").exists(), "the second item disappeared before confirmation");
+            assert_eq!(fs::read(dir.join("c-last.txt")).unwrap(), b"c-last.txt");
+        });
+    }
+
     #[test]
     fn delete_keeps_view_d371_alone() { gtk_thread::run(delete_keeps_view_d371_alone_on_gtk_thread); }
 
@@ -45189,6 +45459,32 @@ Broken: Either state is wrong.\n";
         }
     }
 
+    // D-411: deleting a test fixture must disarm its still-open window first.
+    #[test]
+    fn audit_0938_d411_test_cleanup_disarms_the_open_window() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("fixturewatcher", |dir| fs::write(dir.join("file"), b"").unwrap(), 1);
+            let native_core::Location::RealDir(dir) = d.state.borrow().cwd.clone() else {
+                panic!("the window must be browsing a real fixture directory");
+            };
+            let generation = d.state.borrow().monitor_generation;
+            assert!(d.state.borrow().directory_monitor.is_some());
+
+            drop(ScratchCleanup(dir.clone()));
+
+            assert!(!dir.exists());
+            assert!(ui_for_state(&d.state).is_some(), "the window is still registered");
+            let state = d.state.borrow();
+            assert!(state.directory_monitor.is_none(), "cleanup left the fixture watcher alive");
+            assert_eq!(state.monitor_generation, generation.wrapping_add(1));
+        });
+    }
+
     /// Restores `XDG_RUNTIME_DIR` to its exact prior state (present at that
     /// value, or absent) on drop — including on panic/unwind, unlike a manual
     /// tail restore that a mid-test assertion failure skips and that then
@@ -45611,6 +45907,83 @@ Broken: Either state is wrong.\n";
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn address_keyboard_returns_to_files_d433() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private Xvfb");
+            gst::init().expect("GStreamer");
+            let root = crate::native_core::scratch_root().join("d433");
+            let _cleanup = ScratchCleanup(root.clone());
+            let dest = root.join("destination");
+            std::fs::create_dir_all(&dest).unwrap();
+            for name in ["a.txt", "b.txt"] {
+                std::fs::write(dest.join(name), name).unwrap();
+            }
+
+            let app = adw::Application::builder()
+                .application_id("com.kadaken.wayfinder.d433test")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            build_ui(&app, Some(root.to_string_lossy().into_owned()), None);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            ui.window.set_title(Some("wf-d433-proof"));
+            wait_for("the initial folder", || ui.window.is_mapped() && ui.list_store.n_items() == 1);
+            set_view_mode(&state, &ui, ViewMode::Details);
+
+            let xdo = |args: &[&str]| {
+                let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().unwrap();
+                assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let xid = xdo(&["search", "--name", "^wf-d433-proof$"]);
+            xdo(&["windowfocus", "--sync", xid.trim()]);
+            assert!(ui.list.grab_focus());
+            wait_for("the file view and its X window have focus", || {
+                ui.window.is_active()
+                    && focus_within(&ui.window, &ui.list)
+                    && xdo(&["getwindowfocus"]).trim() == xid.trim()
+            });
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L focuses the address", || focus_within(&ui.window, &ui.path_entry));
+            ui.path_entry.set_text(&dest.to_string_lossy());
+            xdo(&["key", "Return"]);
+            wait_for("Enter lists the destination and focuses its first file", || {
+                state.borrow().cwd == native_core::Location::real(&dest)
+                    && focus_within(&ui.window, &ui.list)
+                    && ui.list_selection.is_selected(0)
+            });
+            xdo(&["key", "Down"]);
+            wait_for("Down selects the second row", || ui.list_selection.is_selected(1));
+
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L edits the destination address", || focus_within(&ui.window, &ui.path_entry));
+            xdo(&["key", "Escape"]);
+            wait_for("Escape returns to the selected row", || {
+                focus_within(&ui.window, &ui.list) && ui.list_selection.is_selected(1)
+            });
+
+            edit_path_action(&state, &ui);
+            ui.path_entry.set_text(&root.to_string_lossy());
+            ui.path_entry.emit_activate();
+            ui.search.grab_focus();
+            ui.search.set_text("destination");
+            wait_for("second navigation completes", || state.borrow().cwd == native_core::Location::real(&root));
+            assert!(focus_within(&ui.window, &ui.search), "the completed navigation preserves search focus");
+            assert_eq!(ui.search.text(), "destination");
+            navigate(&state, native_core::Location::real(&root));
+            wait_for("refresh completes", || state.borrow().listing_cancel.is_none());
+            assert!(focus_within(&ui.window, &ui.search), "refresh preserves search focus");
+            ui.window.destroy();
+        });
     }
 
     /// D-332: a crumb click navigates and never opens the text box; the edit

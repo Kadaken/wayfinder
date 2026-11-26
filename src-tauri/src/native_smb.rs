@@ -422,7 +422,8 @@ pub fn descend(root: &Path, subpath: &[String]) -> Option<PathBuf> {
     }
     let real_root = std::fs::canonicalize(root).ok()?;
     let real_target = std::fs::canonicalize(&target).ok()?;
-    (real_target.starts_with(&real_root) && real_target.is_dir()).then_some(target)
+    // D-437: hand the caller the resolved directory that passed the boundary check.
+    (real_target.starts_with(&real_root) && real_target.is_dir()).then_some(real_target)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -969,9 +970,11 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(share.join("file.txt"), "x").unwrap();
         std::os::unix::fs::symlink(&outside, share.join("escape")).unwrap();
+        std::os::unix::fs::symlink("Films", share.join("alias")).unwrap();
         let sub = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(descend(&share, &[]), Some(share.clone()));
         assert_eq!(descend(&share, &sub(&["Films", "2024"])), Some(share.join("Films/2024")));
+        assert_eq!(descend(&share, &sub(&["alias", "2024"])), Some(share.join("Films/2024")));
         assert_eq!(descend(&share, &sub(&["missing"])), None);
         assert_eq!(descend(&share, &sub(&["file.txt"])), None, "a file is not a folder");
         assert_eq!(descend(&share, &sub(&["escape"])), None, "a symlink out of the share is refused");

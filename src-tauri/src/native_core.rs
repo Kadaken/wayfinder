@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Kadaken
 
 use adw::gtk::gio;
-use adw::gtk::gio::prelude::FileExt;
+use adw::gtk::gio::prelude::{FileExt, VfsExt};
 use adw::gtk::glib;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -5213,9 +5213,8 @@ fn require_absolute(what: &str, path: &str) -> Result<(), String> {
     }
 }
 
-/// Decodes straight into `dest_dir` with whatever the tools do to what is
-/// already there. Only for a folder made for this call; Extract Here goes
-/// through `extract_archive_here`.
+/// Direct decode used by tests that compare the extractor's native behavior.
+#[cfg(test)]
 pub fn extract_archive(path: &str, dest_dir: &str) -> Result<(), String> {
     decode_archive(path, &run_cmd_capture, &mut || Ok(dest_dir.to_string())).map(|_| ())
 }
@@ -5281,7 +5280,35 @@ fn decode_archive(
 }
 
 pub fn empty_trash() -> Result<(), String> {
-    run_cmd_capture("gio", &["trash", "--empty"])
+    if gio::Vfs::default().supported_uri_schemes().iter().any(|scheme| scheme.as_str() == "trash") {
+        return run_cmd_capture("gio", &["trash", "--empty"]);
+    }
+
+    // GIO can move items into the local Trash even without a trash:// backend.
+    // Empty that home Trash directly when the backend is unavailable.
+    let trash = glib::user_data_dir().join("Trash");
+    let files = trash.join("files");
+    let info = trash.join("info");
+    for dir in [&trash, &files, &info] {
+        match fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("{} is not a Trash directory", dir.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("cannot inspect {}: {err}", dir.display())),
+        }
+    }
+    for dir in [files, info] {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("cannot read {}: {err}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry.map_err(|err| format!("cannot read {}: {err}", dir.display()))?.path();
+            remove_any(&path).map_err(|err| format!("cannot delete {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The keep-for options the Trash menu offers, newest first. 0 means never.
@@ -5518,10 +5545,12 @@ pub fn appimage_desktop_entry(exec: &str, name: &str) -> String {
 /// by hand. The folder name is uniquified, so extracting twice never overwrites.
 pub fn extract_archive_into_new_dir(path: &str, dest_dir: &str) -> Result<String, String> {
     let target = unique_target(dest_dir, &archive_stem(path));
-    fs::create_dir_all(&target).map_err(|err| err.to_string())?;
+    fs::create_dir(&target).map_err(|err| err.to_string())?;
     let target_str = target.to_string_lossy().to_string();
-    match extract_archive(path, &target_str) {
-        Ok(()) => Ok(target_str),
+    // D-437: Extract All uses the same validation and no-replace publication.
+    match extract_here_dir(path, &target_str, &run_cmd_capture, &rename_no_replace_io, &|_| Ok(())) {
+        Ok(outcome) if outcome.skipped.is_empty() && outcome.failed.is_empty() && outcome.leftover.is_none() => Ok(target_str),
+        Ok(outcome) => Err(outcome.summary()),
         Err(err) => {
             // Do not leave an empty folder behind after a failed extraction.
             let _ = fs::remove_dir(&target);
@@ -5716,8 +5745,14 @@ pub struct ExtractCtl<'a> {
 }
 
 fn dir_apparent_bytes(dir: &Path) -> u64 {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut total = 0;
-    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    // The extractor is still running during this walk.
+    let Ok(dir) = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir) else { return 0 };
+    let Ok(rd) = fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else { return 0 };
     for entry in rd.flatten() {
         let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
         if meta.is_dir() {
@@ -5729,6 +5764,94 @@ fn dir_apparent_bytes(dir: &Path) -> u64 {
     total
 }
 
+// D-437: restrict external extractors before they can write, move or link files.
+// A post-decode walk cannot see a file the tool already wrote outside its stage.
+fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+
+    const RULE_PATH_BENEATH: libc::c_int = 1;
+    const WRITE_FILE: u64 = 1 << 1;
+    const REMOVE_DIR: u64 = 1 << 4;
+    const REMOVE_FILE: u64 = 1 << 5;
+    const MAKE_CHAR: u64 = 1 << 6;
+    const MAKE_DIR: u64 = 1 << 7;
+    const MAKE_REG: u64 = 1 << 8;
+    const MAKE_SOCK: u64 = 1 << 9;
+    const MAKE_FIFO: u64 = 1 << 10;
+    const MAKE_BLOCK: u64 = 1 << 11;
+    const MAKE_SYM: u64 = 1 << 12;
+    const REFER: u64 = 1 << 13;
+    const TRUNCATE: u64 = 1 << 14;
+
+    #[repr(C, packed)]
+    struct PathBeneath {
+        allowed_access: u64,
+        parent_fd: libc::c_int,
+    }
+
+    // The kernel's Landlock version decides which rights it knows; naming an
+    // unknown one fails the whole ruleset. No Landlock at all (version below 1)
+    // still extracts into the private stage, and the staged tree is checked
+    // before anything is published, so only the write lock is missing.
+    // SAFETY: a null attribute with size 0 and the VERSION flag only asks.
+    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u64>(), 0usize, 1u32) };
+    if abi < 1 {
+        let mut command = Command::new(cmd);
+        command.args(args).current_dir(stage).env("TMPDIR", stage).env_remove("TAR_OPTIONS");
+        return Ok(command);
+    }
+    let mut allowed = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SYM | REFER | TRUNCATE;
+    if abi < 3 {
+        allowed &= !TRUNCATE;
+    }
+    if abi < 2 {
+        allowed &= !REFER;
+    }
+    let handled = allowed | MAKE_CHAR | MAKE_SOCK | MAKE_FIFO | MAKE_BLOCK;
+    let stage_fd = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+    let sandbox_error = || format!("Cannot confine archive extractor to its staging folder: {}", std::io::Error::last_os_error());
+    // SAFETY: the first ruleset ABI field is a u64 containing the handled rights.
+    let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &handled, size_of::<u64>(), 0u32) };
+    if fd < 0 {
+        return Err(sandbox_error());
+    }
+    // SAFETY: the successful syscall returned a new, owned descriptor.
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    let rule = PathBeneath { allowed_access: allowed, parent_fd: stage_fd.as_raw_fd() };
+    // SAFETY: the packed rule matches the kernel ABI and both descriptors are live.
+    if unsafe { libc::syscall(libc::SYS_landlock_add_rule, ruleset.as_raw_fd(), RULE_PATH_BENEATH, &rule, 0u32) } < 0 {
+        return Err(sandbox_error());
+    }
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(stage).env("TMPDIR", stage).env_remove("TAR_OPTIONS");
+    // SAFETY: the child calls only kernel interfaces before exec, using an owned
+    // ruleset descriptor kept live by this closure.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
+                || libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0u32) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(command)
+}
+
+fn archive_output<'a>(cmd: &str, args: &[&'a str]) -> Option<&'a Path> {
+    let output = match cmd {
+        "tar" | "unar" => args.windows(2).find(|pair| matches!(pair[0], "-C" | "-output-directory"))?[1],
+        "7z" => args.iter().find_map(|arg| arg.strip_prefix("-o"))?,
+        _ => return None,
+    };
+    Some(Path::new(output))
+}
+
 /// Runs one tool, and kills it the moment `cancel` is set. A cancelled run
 /// returns `CANCELLED_MSG`, which the caller never retries with another tool.
 fn run_cmd_cancellable_with(cmd: &str, args: &[&str], cancel: &AtomicBool, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
@@ -5737,8 +5860,8 @@ fn run_cmd_cancellable_with(cmd: &str, args: &[&str], cancel: &AtomicBool, on_by
     }
     use std::io::Read as _;
     use std::process::Stdio;
-    let mut child = Command::new(cmd)
-        .args(args)
+    let stage = archive_output(cmd, args).ok_or_else(|| format!("Missing staging folder for {cmd}"))?;
+    let mut child = archive_command(cmd, args, stage)?
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -5844,9 +5967,13 @@ fn extract_here_dir(
     let listed = decoded.and_then(|out| {
         use std::os::unix::fs::PermissionsExt;
         let out = PathBuf::from(out);
+        if !fs::symlink_metadata(&out).is_ok_and(|meta| meta.is_dir()) {
+            return Err(format!("Archive output is not a directory: {}", out.display()));
+        }
         // A tar of "." gives its folder's own mode to the folder it writes into.
         // That folder is ours: keep it listable and emptiable whatever it was given.
         let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o700));
+        validate_staged_archive(&out, dest).map_err(|e| format!("Unsafe archive output: {e}"))?;
         let mut names = Vec::new();
         for entry in fs::read_dir(&out).map_err(|e| format!("{}: {e}", out.display()))? {
             names.push(entry.map_err(|e| format!("{}: {e}", out.display()))?.file_name());
@@ -5883,6 +6010,71 @@ fn extract_here_dir(
         outcome.leftover = Some(left);
     }
     Ok(outcome)
+}
+
+// D-437: inspect links without following them through filesystem lookups.
+fn validate_staged_archive(stage: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    let mut dirs = vec![stage.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_symlink() {
+                let path = entry.path();
+                let parent = path.parent().unwrap().strip_prefix(stage).unwrap();
+                let invalid = || std::io::Error::other(format!("link leaves the extraction folder or loops: {}", path.display()));
+                let mut resolved = PathBuf::new();
+                let mut pending: VecDeque<_> = parent.iter().map(|part| part.to_os_string()).collect();
+                pending.push_back(entry.file_name());
+                let mut links = 0;
+                while let Some(part) = pending.pop_front() {
+                    match Path::new(&part).components().next() {
+                        Some(Component::ParentDir) if resolved.pop() => continue,
+                        Some(Component::CurDir) => continue,
+                        Some(Component::Normal(_)) => {}
+                        _ => return Err(invalid()),
+                    }
+                    let relative = resolved.join(&part);
+                    // A pre-existing top-level name wins the no-replace move.
+                    // Check the archive's own link first, then resolve its target
+                    // in the tree that would actually be visible after publishing.
+                    let candidate = if links == 0 {
+                        stage.join(&relative)
+                    } else {
+                        let top = relative.iter().next().unwrap();
+                        match fs::symlink_metadata(dest.join(top)) {
+                            Ok(_) => dest.join(&relative),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => stage.join(&relative),
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    match fs::symlink_metadata(&candidate) {
+                        Ok(meta) if meta.is_symlink() => {
+                            links += 1;
+                            let target = fs::read_link(&candidate)?;
+                            if links > 40 || target.is_absolute() {
+                                return Err(invalid());
+                            }
+                            for part in target.components().rev() {
+                                pending.push_front(part.as_os_str().to_os_string());
+                            }
+                        }
+                        Ok(_) => resolved.push(part),
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => resolved.push(part),
+                        Err(e) => return Err(e),
+                    }
+                }
+            } else if !kind.is_file() {
+                return Err(std::io::Error::other(format!("unsupported entry: {}", entry.path().display())));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Moves one decoded entry into place through `publish`. A folder can only
@@ -6889,10 +7081,14 @@ fn run_cmd_capture(cmd: &str, args: &[&str]) -> Result<(), String> {
     if cmd == BUILTIN_ZIP {
         return extract_zip_builtin(Path::new(args[0]), Path::new(args[1]), &AtomicBool::new(false), &|_| {});
     }
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
+    let mut command = if let Some(stage) = archive_output(cmd, args) {
+        archive_command(cmd, args, stage)?
+    } else {
+        let mut command = Command::new(cmd);
+        command.args(args);
+        command
+    };
+    let output = command.output().map_err(|err| err.to_string())?;
     if output.status.success() {
         return Ok(());
     }
@@ -9312,6 +9508,47 @@ mod tests {
     fn trash_left(root: &Path) -> usize {
         let count = |sub: &str| fs::read_dir(root.join("Trash").join(sub)).unwrap().count();
         count("files") + count("info")
+    }
+
+    #[test]
+    fn audit_0938_empty_trash_only_empties_the_private_trash() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        let _guard = real_trash_lock();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+        let scratch = PathBuf::from(std::env::var_os("WF_TEST_SCRATCH_ROOT").unwrap());
+        assert!(home.file_name().unwrap().to_string_lossy().starts_with("wf-home232-"));
+        assert!(scratch.starts_with(home.join("Projects/Scratch")));
+        assert_eq!(data, home.join(".local/share"));
+        assert_eq!(glib::user_data_dir(), data);
+        assert_eq!(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+            format!("unix:path={}/bus", home.display()),
+        );
+
+        assert!(
+            !gio::Vfs::default().supported_uri_schemes().iter().any(|scheme| scheme.as_str() == "trash"),
+            "the private bus must have no Trash backend",
+        );
+
+        let outside = home.join("Documents/keep.txt");
+        fs::write(&outside, b"outside the Trash").unwrap();
+        let folder = home.join("Documents/trashed-folder");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("nested.txt"), b"inside the Trash").unwrap();
+        let link = home.join("Documents/trashed-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        for item in [&folder, &link] {
+            gio::File::for_path(item).trash(gio::Cancellable::NONE).unwrap();
+        }
+        assert_eq!(trash_left(&data), 4);
+
+        empty_trash().expect("Empty Trash succeeds for the private home Trash");
+
+        assert_eq!(trash_left(&data), 0, "payloads and metadata were both removed");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside the Trash");
     }
 
     /// The keep-for rule: old entries go whole, young ones stay, and anything
@@ -11904,6 +12141,58 @@ mod extract_here_tests_d230 {
     #[test]
     fn extract_here_keeps_existing_entries_tar_d230() {
         clashes_are_kept_and_reported("tar");
+    }
+
+    #[test]
+    fn archive_with_parent_component_is_refused_d437() {
+        let root = owned("d437-parent-component");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("inside.txt"), "fixture").unwrap();
+        let archive = root.0.join("parent-component.tar");
+        let status = Command::new("tar").current_dir(&src)
+            .args(["-cf", archive.to_str().unwrap(),
+                "--transform=s|^inside.txt$|nested/../inside.txt|", "inside.txt"])
+            .status().unwrap();
+        assert!(status.success());
+
+        let error = extract_here_d230(&archive, &dest).unwrap_err();
+        assert!(error.contains(".."), "{error}");
+        assert_eq!(fs::read_dir(dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn archive_with_outside_link_is_refused_d437() {
+        let root = owned("d437-outside-link");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("ok.txt"), "fixture").unwrap();
+        symlink("../../missing.txt", src.join("nested/link")).unwrap();
+        let archive = root.0.join("outside-link.tar");
+        pack("tar", &src, &["nested", "ok.txt"], &archive);
+
+        let error = extract_here_d230(&archive, &dest).unwrap_err();
+        assert!(error.contains("link leaves the extraction folder"), "{error}");
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+
+        let error = extract_archive_into_new_dir(archive.to_str().unwrap(), dest.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("link leaves the extraction folder"), "{error}");
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn archive_tool_writes_only_in_its_stage_d437() {
+        let root = owned("d437-stage");
+        let stage = root.0.join("stage");
+        let outside = root.0.join("outside.txt");
+        fs::create_dir(&stage).unwrap();
+        let output = archive_command("touch", &["inside.txt", outside.to_str().unwrap()], &stage)
+            .unwrap().output().unwrap();
+        assert!(!output.status.success());
+        assert!(stage.join("inside.txt").is_file());
+        assert!(!outside.exists());
     }
 
     #[test]
