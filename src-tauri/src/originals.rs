@@ -14,6 +14,8 @@
 use blake2::{Blake2b512, Digest};
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -182,22 +184,33 @@ fn walk_roots_within(
 ) -> Vec<FileRec> {
     let other_drive = |path: &Path| mounts.iter().any(|m| m == path) && !roots.iter().any(|r| r == path);
     let mut out = Vec::new();
-    let mut stack: Vec<PathBuf> = roots.iter().filter(|r| !is_skipped(r, skip, trash)).cloned().collect();
-    while let Some(dir) = stack.pop() {
+    let mut stack: Vec<_> = roots.iter().filter(|r| !is_skipped(r, skip, trash))
+        .map(|root| (root.clone(), None)).collect();
+    while let Some((dir, parent)) = stack.pop() {
         if should_stop() {
             break;
         }
         on_open(&dir);
-        let Ok(read) = std::fs::read_dir(&dir) else { continue };
+        // D-437: open each child relative to its already-open parent and reject
+        // a symlink even if it replaced a directory after the parent was listed.
+        let source = match parent {
+            Some((ref parent, ref name)) => fd_path(Arc::as_ref(parent)).join(name),
+            None => dir.clone(),
+        };
+        let Ok(handle) = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(source) else { continue };
+        let handle = Arc::new(handle);
+        let Ok(read) = std::fs::read_dir(fd_path(&handle)) else { continue };
         for entry in read.flatten() {
             let Ok(kind) = entry.file_type() else { continue };
-            let path = entry.path();
+            let name = entry.file_name();
+            let path = dir.join(&name);
             if kind.is_symlink() {
                 continue;
             }
             if kind.is_dir() {
                 if !is_skipped(&path, skip, trash) && !other_drive(&path) {
-                    stack.push(path);
+                    stack.push((path, Some((handle.clone(), name))));
                 }
             } else if kind.is_file() {
                 // A skipped file is never stat-ed, read or hashed.
@@ -220,6 +233,10 @@ fn walk_roots_within(
         }
     }
     out
+}
+
+fn fd_path(file: &std::fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 // ---- grouping and hashing --------------------------------------------------
@@ -569,6 +586,30 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("keep/f"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symlink_is_not_opened_d437() {
+        let dir = fixture("swapped-directory");
+        let root = dir.join("root");
+        let child = root.join("child");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("outside.txt"), "data").unwrap();
+        std::fs::write(root.join("inside.txt"), "data").unwrap();
+        let mut swapped = false;
+        let files = walk_roots(&[root], &[], &[], &mut |opening| {
+            if opening == child {
+                std::fs::remove_dir(&child).unwrap();
+                std::os::unix::fs::symlink(&outside, &child).unwrap();
+                swapped = true;
+            }
+        }, &|| false);
+        assert!(swapped);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("/inside.txt"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

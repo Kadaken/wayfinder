@@ -6267,6 +6267,10 @@ fn build_ui_in(
         let entry = ui.path_entry.clone();
         entry.connect_activate(move |entry| {
             let path = entry.text().trim().to_string();
+            let from_address = focus_within(&ui.window, entry);
+            if from_address {
+                focus_files_after_address(&state, &ui);
+            }
             ui.path_stack.set_visible_child_name("label");
             if native_smb::looks_like_smb(&path) {
                 smb_flow(&state, &ui).connect(&path);
@@ -6276,18 +6280,22 @@ fn build_ui_in(
                 // a `~` or a file's own path all used to be handed straight
                 // to the lister, which silently did nothing.
                 match resolve_address_text(&state, &path) {
-                    Some(target) => navigate(&state, native_core::Location::real(&target)),
+                    Some(target) => navigate_listing(
+                        &state, native_core::Location::real(&target), NavMode::Record, None, from_address,
+                    ),
                     None => ui.status.set_label(&format!("No folder called \u{201c}{path}\u{201d}")),
                 }
             }
         });
     }
     {
-        let ui = ui.clone();
+        let state = state.clone();
         let key = gtk::EventControllerKey::new();
+        let address_ui = ui.clone();
         key.connect_key_pressed(move |_, key, _, _| {
             if key == gdk::Key::Escape {
-                ui.path_stack.set_visible_child_name("label");
+                focus_files_after_address(&state, &address_ui);
+                address_ui.path_stack.set_visible_child_name("label");
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -7392,6 +7400,25 @@ fn edit_path_action(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     ui.path_stack.set_visible_child_name("entry");
     ui.path_entry.grab_focus();
     ui.path_entry.select_region(0, -1);
+}
+
+// D-433: return keyboard control to the active file view before hiding the entry.
+fn focus_files_after_address(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    let view: &gtk::Widget = if state.borrow().view_mode == ViewMode::Grid {
+        ui.grid.upcast_ref()
+    } else {
+        ui.list.upcast_ref()
+    };
+    let selected = ui.list_selection.selection();
+    if selected.size() > 0 {
+        scroll_files_to(state, ui, selected.minimum(), gtk::ListScrollFlags::FOCUS);
+    } else if ui.list_store.n_items() > 0 {
+        select_index(state, ui, 0);
+    }
+    if !focus_within(&ui.window, view) {
+        view.set_focusable(true);
+        view.grab_focus();
+    }
 }
 
 fn rebuild_sidebar(state: &Rc<RefCell<AppState>>, ui: &Ui) {
@@ -10741,6 +10768,16 @@ fn navigate_to_with_message(
     mode: NavMode,
     done_message: Option<String>,
 ) {
+    navigate_listing(state, path, mode, done_message, false);
+}
+
+fn navigate_listing(
+    state: &Rc<RefCell<AppState>>,
+    path: native_core::Location,
+    mode: NavMode,
+    done_message: Option<String>,
+    from_address: bool,
+) {
     let show_hidden = state.borrow().show_hidden;
     // The tab this request belongs to; a completion for any other tab is dropped.
     let tab_id = state.borrow().tabs.active().id;
@@ -10823,6 +10860,9 @@ fn navigate_to_with_message(
             let metadata_unavailable = listing.metadata_unavailable;
             let unreadable_entries = listing.unreadable_entries;
             let path_str = path.real_path_string().unwrap_or_default();
+            let search_text = ui.as_ref()
+                .filter(|ui| from_address && focus_within(&ui.window, &ui.search))
+                .map(|ui| ui.search.text().trim().to_string());
             {
                 let mut state = state.borrow_mut();
                 state.listing_cancel = None;
@@ -10861,7 +10901,7 @@ fn navigate_to_with_message(
                 }
                 state.entries = listing.entries;
                 state.visible_entries.clear();
-                state.filter_text.clear();
+                state.filter_text = search_text.clone().unwrap_or_default();
                 // A virtual ZIP location never enters persistent Recent config (D-188).
                 if !path.is_zip() {
                     match update_config(|config| push_recent(&mut config.recents, &path_str)) {
@@ -10871,10 +10911,18 @@ fn navigate_to_with_message(
                 }
             }
             if let Some(ui) = &ui {
+                // D-433: finish the address handoff only while the files still
+                // own keyboard focus. The user can move it during a slow load.
+                let finish_address_focus = from_address && ui.window.is_active()
+                    && (focus_within(&ui.window, &ui.list) || focus_within(&ui.window, &ui.grid));
                 rebuild_tabs(&state, ui);
                 set_breadcrumbs(&state, ui, &path);
-                ui.path_stack.set_visible_child_name("label");
-                ui.search.set_text("");
+                if !from_address || !focus_within(&ui.window, &ui.path_entry) {
+                    ui.path_stack.set_visible_child_name("label");
+                }
+                if search_text.is_none() {
+                    ui.search.set_text("");
+                }
                 set_preview_text(ui, "Select a file");
                 state.borrow_mut().diff_refresh = same_folder;
                 repopulate_rows(&state, ui);
@@ -10892,6 +10940,9 @@ fn navigate_to_with_message(
                 let opened_on = state.borrow_mut().pinned_top.take();
                 if let Some(target) = opened_on {
                     select_entry_by_source(&state, ui, &native_core::EntrySource::real(&target));
+                }
+                if finish_address_focus {
+                    focus_files_after_address(&state, ui);
                 }
                 startup_mark("first folder listed");
                 ui.status.set_label(&listing_status(
@@ -45593,6 +45644,83 @@ Broken: Either state is wrong.\n";
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn address_keyboard_returns_to_files_d433() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private Xvfb");
+            gst::init().expect("GStreamer");
+            let root = crate::native_core::scratch_root().join("d433");
+            let _cleanup = ScratchCleanup(root.clone());
+            let dest = root.join("destination");
+            std::fs::create_dir_all(&dest).unwrap();
+            for name in ["a.txt", "b.txt"] {
+                std::fs::write(dest.join(name), name).unwrap();
+            }
+
+            let app = adw::Application::builder()
+                .application_id("com.kadaken.wayfinder.d433test")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            build_ui(&app, Some(root.to_string_lossy().into_owned()), None);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            ui.window.set_title(Some("wf-d433-proof"));
+            wait_for("the initial folder", || ui.window.is_mapped() && ui.list_store.n_items() == 1);
+            set_view_mode(&state, &ui, ViewMode::Details);
+
+            let xdo = |args: &[&str]| {
+                let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().unwrap();
+                assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let xid = xdo(&["search", "--name", "^wf-d433-proof$"]);
+            xdo(&["windowfocus", "--sync", xid.trim()]);
+            assert!(ui.list.grab_focus());
+            wait_for("the file view and its X window have focus", || {
+                ui.window.is_active()
+                    && focus_within(&ui.window, &ui.list)
+                    && xdo(&["getwindowfocus"]).trim() == xid.trim()
+            });
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L focuses the address", || focus_within(&ui.window, &ui.path_entry));
+            ui.path_entry.set_text(&dest.to_string_lossy());
+            xdo(&["key", "Return"]);
+            wait_for("Enter lists the destination and focuses its first file", || {
+                state.borrow().cwd == native_core::Location::real(&dest)
+                    && focus_within(&ui.window, &ui.list)
+                    && ui.list_selection.is_selected(0)
+            });
+            xdo(&["key", "Down"]);
+            wait_for("Down selects the second row", || ui.list_selection.is_selected(1));
+
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L edits the destination address", || focus_within(&ui.window, &ui.path_entry));
+            xdo(&["key", "Escape"]);
+            wait_for("Escape returns to the selected row", || {
+                focus_within(&ui.window, &ui.list) && ui.list_selection.is_selected(1)
+            });
+
+            edit_path_action(&state, &ui);
+            ui.path_entry.set_text(&root.to_string_lossy());
+            ui.path_entry.emit_activate();
+            ui.search.grab_focus();
+            ui.search.set_text("destination");
+            wait_for("second navigation completes", || state.borrow().cwd == native_core::Location::real(&root));
+            assert!(focus_within(&ui.window, &ui.search), "the completed navigation preserves search focus");
+            assert_eq!(ui.search.text(), "destination");
+            navigate(&state, native_core::Location::real(&root));
+            wait_for("refresh completes", || state.borrow().listing_cancel.is_none());
+            assert!(focus_within(&ui.window, &ui.search), "refresh preserves search focus");
+            ui.window.destroy();
+        });
     }
 
     /// D-332: a crumb click navigates and never opens the text box; the edit
