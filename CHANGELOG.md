@@ -7,6 +7,7 @@ change between releases.
 ## 0.9.39 — unreleased
 
 ### Fixed
+- Outside archive tools run only when Linux can restrict where they write. The built-in ZIP reader still works without that restriction.
 - Installing with `--no-portal` leaves the file dialog alone, and uninstall lists the settings, backup and codec packages it keeps.
 
 ## 0.9.38 — 25 November 2026

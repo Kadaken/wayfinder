@@ -5764,6 +5764,25 @@ fn dir_apparent_bytes(dir: &Path) -> u64 {
     total
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_ARCHIVE_LANDLOCK_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn archive_landlock_abi() -> std::io::Result<libc::c_long> {
+    #[cfg(test)]
+    if FAIL_ARCHIVE_LANDLOCK_PROBE.get() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOSYS));
+    }
+    // SAFETY: a null attribute with size 0 and the VERSION flag only asks.
+    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u64>(), 0usize, 1u32) };
+    if abi < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(abi)
+    }
+}
+
 // D-437: restrict external extractors before they can write, move or link files.
 // A post-decode walk cannot see a file the tool already wrote outside its stage.
 fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, String> {
@@ -5791,16 +5810,11 @@ fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, St
         parent_fd: libc::c_int,
     }
 
-    // The kernel's Landlock version decides which rights it knows; naming an
-    // unknown one fails the whole ruleset. No Landlock at all (version below 1)
-    // still extracts into the private stage, and the staged tree is checked
-    // before anything is published, so only the write lock is missing.
-    // SAFETY: a null attribute with size 0 and the VERSION flag only asks.
-    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u64>(), 0usize, 1u32) };
+    // The kernel's Landlock version decides which rights the ruleset can use.
+    let abi = archive_landlock_abi()
+        .map_err(|e| format!("Cannot run archive extractor {cmd}: Landlock support check failed: {e}"))?;
     if abi < 1 {
-        let mut command = Command::new(cmd);
-        command.args(args).current_dir(stage).env("TMPDIR", stage).env_remove("TAR_OPTIONS");
-        return Ok(command);
+        return Err(format!("Cannot run archive extractor {cmd}: the kernel reported unsupported Landlock ABI {abi}"));
     }
     let mut allowed = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SYM | REFER | TRUNCATE;
     if abi < 3 {
@@ -5813,7 +5827,7 @@ fn archive_command(cmd: &str, args: &[&str], stage: &Path) -> Result<Command, St
     let stage_fd = fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(stage).map_err(|e| format!("{}: {e}", stage.display()))?;
-    let sandbox_error = || format!("Cannot confine archive extractor to its staging folder: {}", std::io::Error::last_os_error());
+    let sandbox_error = || format!("Cannot confine archive extractor {cmd} with Landlock: {}", std::io::Error::last_os_error());
     // SAFETY: the first ruleset ABI field is a u64 containing the handled rights.
     let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &handled, size_of::<u64>(), 0u32) };
     if fd < 0 {
@@ -12193,6 +12207,32 @@ mod extract_here_tests_d230 {
         assert!(!output.status.success());
         assert!(stage.join("inside.txt").is_file());
         assert!(!outside.exists());
+    }
+
+    #[test]
+    fn failed_landlock_probe_refuses_outside_tools_and_keeps_builtin_zip_d445() {
+        let root = owned("d445-missing-landlock");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("inside.txt"), "fixture").unwrap();
+        let tar = root.0.join("archive.tar");
+        let zip = root.0.join("archive.zip");
+        pack("tar", &src, &["inside.txt"], &tar);
+        pack("zip", &src, &["inside.txt"], &zip);
+
+        FAIL_ARCHIVE_LANDLOCK_PROBE.set(true);
+        let tar_result = extract_here_d230(&tar, &dest);
+        let remaining_after_tar = fs::read_dir(&dest).unwrap().count();
+        let zip_result = extract_here_d230(&zip, &dest);
+        FAIL_ARCHIVE_LANDLOCK_PROBE.set(false);
+
+        let error = tar_result.unwrap_err();
+        let reason = std::io::Error::from_raw_os_error(libc::ENOSYS).to_string();
+        assert!(error.contains("Landlock") && error.contains(&reason), "{error}");
+        assert_eq!(remaining_after_tar, 0);
+        assert_eq!(zip_result.unwrap().0, ["inside.txt"]);
+        assert_eq!(fs::read_to_string(dest.join("inside.txt")).unwrap(), "fixture");
     }
 
     #[test]
