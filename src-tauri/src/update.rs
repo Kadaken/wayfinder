@@ -30,8 +30,9 @@
 // Copyright (C) 2026 Kadaken
 
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// Where the manifest lives. Served by kadaken.com beside the download it
 /// describes, and written by `scripts/make-update-manifest.sh` off the same
@@ -41,7 +42,7 @@ pub const MANIFEST_URL: &str = "https://kadaken.com/wayfinder-update.json";
 /// How long a check is allowed to take before it is abandoned. A file manager
 /// must never wait on a web server, so this is short and the whole check runs
 /// off the main thread anyway.
-const CHECK_TIMEOUT_SECS: u32 = 10;
+const CHECK_TIMEOUT_SECS: &str = "10";
 
 /// Seconds between checks. Once a day: often enough that a release is found
 /// within a day of shipping, rare enough that opening ten windows does not
@@ -136,38 +137,37 @@ pub fn validate(manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
+fn manifest_curl_args() -> &'static [&'static str] {
+    &[
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--fail",
+        // D-427: the manifest is served directly. Refuse redirects.
+        "--location",
+        "--max-redirs",
+        "0",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--max-time",
+        CHECK_TIMEOUT_SECS,
+        // A version number is all the server needs and all it is told.
+        "--user-agent",
+        concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
+        // D-278: a cached manifest can hide a newly published release.
+        "--header",
+        "Cache-Control: no-cache",
+        MANIFEST_URL,
+    ]
+}
+
 /// Fetches and parses the manifest. Blocking: callers run it off the main
 /// thread. Every failure is a plain `Err` -- a check that cannot reach the
 /// network is a normal Tuesday, not a fault to report to anybody.
 pub fn fetch_manifest() -> Result<Manifest, String> {
     let output = Command::new("curl")
-        .args([
-            "--disable",
-            "--silent",
-            "--show-error",
-            "--fail",
-            // D-427: the manifest is served directly. Refuse redirects.
-            "--location",
-            "--max-redirs",
-            "0",
-            "--proto",
-            "=https",
-            "--tlsv1.2",
-            "--max-time",
-            &CHECK_TIMEOUT_SECS.to_string(),
-            // Nothing identifying. A version number is all the server needs
-            // and all it is told.
-            "--user-agent",
-            concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
-            // D-278: ask for the manifest itself, not a copy of it. The file
-            // is served with `max-age=0, must-revalidate`, but a content
-            // delivery network still held the previous release's manifest for
-            // about a minute after 0.9.26 went up, so a check in that minute
-            // was told there was nothing new.
-            "--header",
-            "Cache-Control: no-cache",
-            MANIFEST_URL,
-        ])
+        .args(manifest_curl_args())
         .output()
         .map_err(|e| format!("could not run curl: {e}"))?;
     if !output.status.success() {
@@ -216,6 +216,50 @@ fn sha256_of(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn download_curl_args<'a>(archive: &'a Path, url: &'a str) -> impl Iterator<Item = &'a OsStr> {
+    [
+        "--disable",
+        "--globoff",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--tlsv1.2",
+        "--max-time",
+        "600",
+        "--user-agent",
+        concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
+        "--write-out",
+        "%{url_effective}",
+        "--output",
+    ]
+    .into_iter()
+    .map(OsStr::new)
+    .chain([archive.as_os_str(), OsStr::new(url)])
+}
+
+fn download_archive(
+    archive: &Path,
+    url: &str,
+    run: impl FnOnce(&mut Command) -> std::io::Result<Output>,
+) -> Result<(), String> {
+    let output = run(Command::new("curl").args(download_curl_args(archive, url)))
+        .map_err(|e| format!("could not run curl: {e}"))?;
+    if !output.status.success() {
+        return Err("the download did not finish".to_string());
+    }
+    // D-427: /get/ redirects to the archive. Use it only if the final URL
+    // is on an allowed HTTPS host.
+    if !std::str::from_utf8(&output.stdout).is_ok_and(url_is_allowed) {
+        return Err("the update download ended on an unapproved URL".to_string());
+    }
+    Ok(())
+}
+
 /// Downloads the release named by `manifest`, checks its size and checksum,
 /// and unpacks it. Returns the unpacked directory -- the one holding
 /// `packaging/install.sh`.
@@ -230,39 +274,7 @@ pub fn download_and_verify(manifest: &Manifest) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let archive = dir.join("wayfinder-update.tar.gz");
 
-    let output = Command::new("curl")
-        .args([
-            "--disable",
-            "--globoff",
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--tlsv1.2",
-            "--max-time",
-            "600",
-            "--user-agent",
-            concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
-            "--write-out",
-            "%{url_effective}",
-            "--output",
-        ])
-        .arg(&archive)
-        .arg(&manifest.url)
-        .output()
-        .map_err(|e| format!("could not run curl: {e}"))?;
-    if !output.status.success() {
-        return Err("the download did not finish".to_string());
-    }
-    // D-427: /get/ redirects to the archive. Use it only if the final URL
-    // is on an allowed HTTPS host.
-    if !std::str::from_utf8(&output.stdout).is_ok_and(url_is_allowed) {
-        return Err("the update download ended on an unapproved URL".to_string());
-    }
+    download_archive(&archive, &manifest.url, Command::output)?;
 
     let got = std::fs::metadata(&archive)
         .map_err(|e| format!("{}: {e}", archive.display()))?
@@ -400,6 +412,49 @@ mod tests {
         assert!(!url_is_allowed("https://kadaken.com.evil.net/x"));
         assert!(!url_is_allowed("https://evil.test/get/wayfinder"));
         assert!(!url_is_allowed(""));
+    }
+
+    #[test]
+    fn curl_arguments_enforce_https_and_the_manifest_redirect_limit_d448() {
+        let manifest_args = manifest_curl_args();
+        assert_eq!(manifest_args.first(), Some(&"--disable"));
+        assert!(manifest_args.contains(&"--location"));
+        assert!(manifest_args.windows(2).any(|args| args == ["--max-redirs", "0"]));
+        assert!(manifest_args.windows(2).any(|args| args == ["--proto", "=https"]));
+
+        let manifest = good();
+        let download: Vec<_> = download_curl_args(Path::new("update.tar.gz"), &manifest.url)
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(download[0], "--disable");
+        assert!(download.contains(&"--location"));
+        assert!(download.windows(2).any(|args| args == ["--proto", "=https"]));
+        assert!(download.windows(2).any(|args| args == ["--proto-redir", "=https"]));
+        assert!(download.windows(2).any(|args| args == ["--write-out", "%{url_effective}"]));
+    }
+
+    #[test]
+    fn a_successful_curl_with_an_unapproved_effective_url_is_refused_d448() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let archive = Path::new("update.tar.gz");
+        let url = good().url;
+        let curl_output = |effective_url: &str| Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: effective_url.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            download_archive(archive, &url, |_| {
+                Ok(curl_output("https://kadaken.com/download/wayfinder.tar.gz"))
+            }),
+            Ok(())
+        );
+        let error = download_archive(archive, &url, |_| {
+            Ok(curl_output("https://example.org/download/wayfinder.tar.gz"))
+        })
+        .unwrap_err();
+        assert_eq!(error, "the update download ended on an unapproved URL");
     }
 
     fn good() -> Manifest {
