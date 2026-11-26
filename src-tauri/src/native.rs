@@ -23614,6 +23614,59 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    // D-422: observe the hide signals inside the picker, before process exit
+    // itself removes the windows from the display.
+    #[test]
+    fn audit_0938_d422_picker_hides_all_windows_before_exit() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        private_session_guard_d232();
+        const CHILD: &str = "WF_D422_HIDE_CHILD";
+        if let Some(out_file) = std::env::var_os(CHILD) {
+            gtk::init().expect("GTK on the private display");
+            private_display_check_d232(&gdk::Display::default().unwrap());
+            let windows = [gtk::Window::new(), gtk::Window::new()];
+            for (index, window) in windows.iter().enumerate() {
+                window.present();
+                assert!(window.is_visible());
+                window.connect_visible_notify(move |window| {
+                    if !window.is_visible() {
+                        println!("hid window {index}");
+                    }
+                });
+            }
+            let picker = PickerState {
+                config: PickerConfig {
+                    multiple: false,
+                    directory: false,
+                    save: false,
+                    starting_dir: None,
+                    filter: None,
+                    window: None,
+                    request: WireRequestNative::default(),
+                    parent_window: None,
+                },
+                out_file: out_file.into_string().unwrap(),
+                meta_path: None,
+                active_filter: Rc::default(),
+                choice_selections: Rc::default(),
+            };
+            picker_write_and_exit(&picker, Vec::new(), 1);
+        }
+        let root = owned_scratch_dir_225("d422-hide");
+        let _cleanup = ScratchCleanup(root.clone());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::audit_0938_d422_picker_hides_all_windows_before_exit", "--nocapture"])
+            .env(CHILD, root.join("result"))
+            .output()
+            .expect("run the picker exit in a subprocess");
+        assert_eq!(child.status.code(), Some(1), "{:?}", child);
+        let stdout = String::from_utf8(child.stdout).unwrap();
+        assert!(stdout.lines().any(|line| line == "hid window 0"), "{stdout}");
+        assert!(stdout.lines().any(|line| line == "hid window 1"), "{stdout}");
+    }
+
     #[test]
     fn save_onto_a_link_names_where_it_leads_d305() {
         let root = crate::native_core::scratch_root().join(format!("wf-w2-a4-{}", std::process::id()));
@@ -28730,6 +28783,66 @@ Broken: Either state is wrong.\n";
         stream().pause();
     }
 
+    mod sound_recorder_d421 {
+        use super::*;
+        use gtk::subclass::prelude::*;
+
+        #[derive(Default)]
+        pub struct SoundRecorder(pub RefCell<Vec<(bool, f64)>>);
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for SoundRecorder {
+            const NAME: &'static str = "WfSoundRecorderD421";
+            type Type = super::SoundRecorderD421;
+            type ParentType = gtk::MediaStream;
+        }
+
+        impl ObjectImpl for SoundRecorder {}
+
+        impl MediaStreamImpl for SoundRecorder {
+            fn update_audio(&self, muted: bool, volume: f64) {
+                self.0.borrow_mut().push((muted, volume));
+            }
+        }
+    }
+
+    glib::wrapper! {
+        pub struct SoundRecorderD421(ObjectSubclass<sound_recorder_d421::SoundRecorder>)
+            @extends gtk::MediaStream, @implements gdk::Paintable;
+    }
+
+    // D-421: observe GTK forwarding the nudge and the saved volume to
+    // the media backend even when the stream already has that volume.
+    #[test]
+    fn audit_0938_d421_resends_the_already_set_volume() {
+        use glib::subclass::types::ObjectSubclassIsExt;
+
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let media: SoundRecorderD421 = glib::Object::new();
+            media.stream_prepared(true, false, false, 0);
+            let volume = 0.6;
+            media.set_volume(volume);
+            let writes = &media.imp().0;
+            writes.borrow_mut().clear();
+
+            let sound = MEDIA_SOUND.with(|saved| saved.replace(Some((volume, false))));
+            let unmute = MEDIA_UNMUTE_AT.with(|at| at.replace(None));
+            push_media_sound(media.upcast_ref());
+            let start_writes = writes.take();
+            push_unmuted_volume(media.upcast_ref());
+            MEDIA_UNMUTE_AT.with(|at| at.set(unmute));
+            MEDIA_SOUND.with(|saved| saved.set(sound));
+
+            assert_eq!(start_writes, [(true, volume), (true, 0.59), (true, volume), (false, volume)]);
+            assert_eq!(writes.take(), [(false, 0.59), (false, volume)]);
+        });
+    }
+
     /// D-411: when the folder on screen disappears (its drive pulled, or it is
     /// deleted elsewhere), the window moves to the nearest folder that exists
     /// and says why, instead of listing files that can no longer be opened.
@@ -28758,6 +28871,47 @@ Broken: Either state is wrong.\n";
             !d.state.borrow().visible_entries.iter().any(|e| e.name == "notes.md"),
             "no row from the gone folder is left"
         );
+    }
+
+    // D-411: a vanished drive beneath a mount root sends the window home.
+    #[test]
+    fn audit_0938_d411_drive_root_falls_back_to_home() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("driveroot", |_| {}, 0);
+            let gone = Path::new("/media").join(format!("wf-d411-{}", std::process::id()));
+            assert!(Path::new("/media").is_dir() && !gone.exists());
+            folder_went_away(&d.state, &gone);
+            let home = native_core::Location::RealDir(PathBuf::from(std::env::var_os("HOME").unwrap()));
+            d362_wait("home and the drive-removal message", 10, || {
+                d.state.borrow().cwd == home && d.ui.status.label() == "That drive was removed"
+            });
+        });
+    }
+
+    // D-411: GTK retains state after close, including callbacks already queued
+    // by the watcher. Closing must detach the monitor and invalidate those jobs.
+    #[test]
+    fn audit_0938_d411_closed_window_invalidates_its_watcher() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("closewatcher", |dir| fs::write(dir.join("file"), b"").unwrap(), 1);
+            let generation = d.state.borrow().monitor_generation;
+            assert!(d.state.borrow().directory_monitor.is_some());
+            d.ui.window.close();
+            assert!(ui_for_state(&d.state).is_none());
+            let state = d.state.borrow();
+            assert!(state.directory_monitor.is_none(), "the closed window still has a watcher");
+            assert_eq!(state.monitor_generation, generation.wrapping_add(1));
+        });
     }
 
     /// D-416: a folder added to Network is drawn under the Network heading,
@@ -31226,6 +31380,38 @@ Broken: Either state is wrong.\n";
         }
     }
     const POSTER_PEAK_RSS_KB: u64 = 100 * 1024;
+
+    // D-415: a poster job routes audio to a discard sink in its own playbin.
+    #[test]
+    fn audit_0938_d415_poster_uses_a_silent_sink() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            gst::init().expect("GStreamer");
+            let root = owned_scratch_dir_225("d415-poster");
+            let _cleanup = ScratchCleanup(root.clone());
+            let path = root.join("frame.png");
+            let pixbuf = Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 32, 32).unwrap();
+            pixbuf.fill(0x336699ff);
+            pixbuf.savev(&path, "png", &[]).unwrap();
+            let queue = Rc::new(RefCell::new(VideoPosterQueue {
+                cancelled: gio::Cancellable::new(),
+                pending: VecDeque::new(),
+                active: 0,
+                live: Vec::new(),
+            }));
+            queue_grid_video_poster(&queue, path.to_str().unwrap().into(), gtk::Picture::new(), 32);
+            let pipeline = queue.borrow().live.first().expect("a live poster job").0.clone();
+            let sink = pipeline.property::<Option<gst::Element>>("audio-sink");
+            queue.borrow().cancelled.cancel();
+            d362_wait("the poster job to release its pipeline", 10, || queue.borrow().live.is_empty());
+            let factory = sink.and_then(|sink| sink.factory()).map(|factory| gst::prelude::GstObjectExt::name(&factory));
+            assert_eq!(factory.as_deref(), Some("fakesink"));
+        });
+    }
 
     /// D-85: a disposable synthetic short H.264/mp4 clip (never an owner
     /// video) proves the poster queue actually paints a real decoded frame,
@@ -33767,6 +33953,39 @@ Broken: Either state is wrong.\n";
     }
 
     /// D-371 alone, on the private display, with real X input.
+    #[test]
+    fn audit_0938_partial_delete_reports_failure_and_stops() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("partialdelete", |dir| {
+                for name in ["a-first.txt", "b-missing.txt", "c-last.txt"] {
+                    fs::write(dir.join(name), name).unwrap();
+                }
+            }, 3);
+            let dir = PathBuf::from(d.state.borrow().cwd.real_path_string().unwrap());
+            d.ui.list_selection.select_all();
+            assert_eq!(
+                selected_entries(&d.state, &d.ui).into_iter().map(|e| e.name).collect::<Vec<_>>(),
+                ["a-first.txt", "b-missing.txt", "c-last.txt"],
+            );
+            permanent_delete_selection(d.state.clone(), d.ui.clone());
+            let dialog = d.ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+            fs::remove_file(dir.join("b-missing.txt")).unwrap();
+            dialog.emit_by_name::<()>("response", &[&"confirm"]);
+
+            let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
+            let expected = format!("Operation failed: {not_found}");
+            d362_wait("the permanent-delete error", 10, || d.ui.status.label() == expected);
+            assert!(!dir.join("a-first.txt").exists(), "the first deletion succeeded");
+            assert!(!dir.join("b-missing.txt").exists(), "the second item disappeared before confirmation");
+            assert_eq!(fs::read(dir.join("c-last.txt")).unwrap(), b"c-last.txt");
+        });
+    }
+
     #[test]
     fn delete_keeps_view_d371_alone() { gtk_thread::run(delete_keeps_view_d371_alone_on_gtk_thread); }
 
@@ -45169,6 +45388,32 @@ Broken: Either state is wrong.\n";
             }
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // D-411: deleting a test fixture must disarm its still-open window first.
+    #[test]
+    fn audit_0938_d411_test_cleanup_disarms_the_open_window() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("fixturewatcher", |dir| fs::write(dir.join("file"), b"").unwrap(), 1);
+            let native_core::Location::RealDir(dir) = d.state.borrow().cwd.clone() else {
+                panic!("the window must be browsing a real fixture directory");
+            };
+            let generation = d.state.borrow().monitor_generation;
+            assert!(d.state.borrow().directory_monitor.is_some());
+
+            drop(ScratchCleanup(dir.clone()));
+
+            assert!(!dir.exists());
+            assert!(ui_for_state(&d.state).is_some(), "the window is still registered");
+            let state = d.state.borrow();
+            assert!(state.directory_monitor.is_none(), "cleanup left the fixture watcher alive");
+            assert_eq!(state.monitor_generation, generation.wrapping_add(1));
+        });
     }
 
     /// Restores `XDG_RUNTIME_DIR` to its exact prior state (present at that

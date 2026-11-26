@@ -1953,6 +1953,46 @@ mod tests {
         }
     }
 
+    // D-420: trace which process opens the script for writing. Checking the
+    // opener directly avoids relying on a concurrent fork hitting a short race.
+    #[test]
+    fn audit_0938_d420_fixture_writer_owns_the_writable_descriptor() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        let _guard = env_lock();
+        const CHILD: &str = "WF_D420_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let thread = fs::read_link("/proc/thread-self").unwrap();
+            println!("fixture test TID: {}", thread.file_name().unwrap().to_string_lossy());
+            let fake = FakeNative::scripted("printf 'ready'");
+            let output = Command::new(fake.path()).output().expect("run the fixture");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"ready");
+            return;
+        }
+        let traced = Command::new("strace")
+            .args(["-f", "-qq", "-e", "trace=openat"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "portal_service::tests::audit_0938_d420_fixture_writer_owns_the_writable_descriptor", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("trace the fixture's script creation with strace");
+        assert!(traced.status.success(), "{:?}", traced);
+        let stdout = String::from_utf8(traced.stdout).unwrap();
+        let fixture_tid = stdout.lines().find_map(|line| line.split_once("fixture test TID: ").map(|(_, tid)| tid)).unwrap();
+        let stderr = String::from_utf8(traced.stderr).unwrap();
+        let writer = stderr.lines()
+            .find(|line| line.contains("fake-native.sh") && line.contains("O_WRONLY"))
+            .expect("the trace captured the writable script descriptor");
+        // strace prints a process/thread prefix with -f when it follows a fork.
+        let writer_pid = writer.strip_prefix("[pid ")
+            .and_then(|line| line.split_once(']'))
+            .map(|(pid, _)| pid.trim())
+            .expect("a traced fixture writer PID");
+        assert_ne!(writer_pid, fixture_tid, "the fixture test thread held the writable descriptor");
+    }
+
     impl Drop for FakeNative {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);

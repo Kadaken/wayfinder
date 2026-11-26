@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Kadaken
 
 use adw::gtk::gio;
-use adw::gtk::gio::prelude::FileExt;
+use adw::gtk::gio::prelude::{FileExt, VfsExt};
 use adw::gtk::glib;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -5139,7 +5139,35 @@ fn decode_archive(
 }
 
 pub fn empty_trash() -> Result<(), String> {
-    run_cmd_capture("gio", &["trash", "--empty"])
+    if gio::Vfs::default().supported_uri_schemes().iter().any(|scheme| scheme.as_str() == "trash") {
+        return run_cmd_capture("gio", &["trash", "--empty"]);
+    }
+
+    // GIO can move items into the local Trash even without a trash:// backend.
+    // Empty that home Trash directly when the backend is unavailable.
+    let trash = glib::user_data_dir().join("Trash");
+    let files = trash.join("files");
+    let info = trash.join("info");
+    for dir in [&trash, &files, &info] {
+        match fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("{} is not a Trash directory", dir.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("cannot inspect {}: {err}", dir.display())),
+        }
+    }
+    for dir in [files, info] {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("cannot read {}: {err}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry.map_err(|err| format!("cannot read {}: {err}", dir.display()))?.path();
+            remove_any(&path).map_err(|err| format!("cannot delete {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The keep-for options the Trash menu offers, newest first. 0 means never.
@@ -9101,6 +9129,47 @@ mod tests {
     fn trash_left(root: &Path) -> usize {
         let count = |sub: &str| fs::read_dir(root.join("Trash").join(sub)).unwrap().count();
         count("files") + count("info")
+    }
+
+    #[test]
+    fn audit_0938_empty_trash_only_empties_the_private_trash() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        let _guard = real_trash_lock();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+        let scratch = PathBuf::from(std::env::var_os("WF_TEST_SCRATCH_ROOT").unwrap());
+        assert!(home.file_name().unwrap().to_string_lossy().starts_with("wf-home232-"));
+        assert!(scratch.starts_with(home.join("Projects/Scratch")));
+        assert_eq!(data, home.join(".local/share"));
+        assert_eq!(glib::user_data_dir(), data);
+        assert_eq!(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+            format!("unix:path={}/bus", home.display()),
+        );
+
+        assert!(
+            !gio::Vfs::default().supported_uri_schemes().iter().any(|scheme| scheme.as_str() == "trash"),
+            "the private bus must have no Trash backend",
+        );
+
+        let outside = home.join("Documents/keep.txt");
+        fs::write(&outside, b"outside the Trash").unwrap();
+        let folder = home.join("Documents/trashed-folder");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("nested.txt"), b"inside the Trash").unwrap();
+        let link = home.join("Documents/trashed-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        for item in [&folder, &link] {
+            gio::File::for_path(item).trash(gio::Cancellable::NONE).unwrap();
+        }
+        assert_eq!(trash_left(&data), 4);
+
+        empty_trash().expect("Empty Trash succeeds for the private home Trash");
+
+        assert_eq!(trash_left(&data), 0, "payloads and metadata were both removed");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside the Trash");
     }
 
     /// The keep-for rule: old entries go whole, young ones stay, and anything
