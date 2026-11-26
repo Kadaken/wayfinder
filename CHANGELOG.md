@@ -11,6 +11,7 @@ change between releases.
 - Changing how long Trash keeps items asks before permanently deleting anything and says how many items will go.
 - The status line says when an item reached Trash and Wayfinder cannot undo the move.
 - Added a test that Delete asks before removing items from a drive's Trash for good.
+- Added tests that thumbnail generation, startup logging and transfer reports remove the oldest entries first.
 
 ## 0.9.38 — 25 November 2026
 

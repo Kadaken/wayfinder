@@ -4691,9 +4691,6 @@ static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// D-346: one line per startup milestone in ~/.cache/wayfinder/startup.log,
 /// each label once per process and only in the first minute.
 fn startup_mark(what: &'static str) {
-    if cfg!(test) {
-        return;
-    }
     thread_local! {
         static SEEN: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
@@ -4715,10 +4712,10 @@ fn startup_mark(what: &'static str) {
 /// D-346: the worker-thread form; logs only the first call per process.
 fn startup_mark_any_thread(what: &'static str) {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if cfg!(test) || DONE.swap(true, Ordering::Relaxed) {
+    let Some(start) = PROCESS_START.get() else { return };
+    if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let Some(start) = PROCESS_START.get() else { return };
     let dir = wayfinder_cache_dir();
     // D-430: startup diagnostics use the same bounded log writer as other logs.
     let _ = native_core::append_capped_log(
@@ -24096,6 +24093,130 @@ mod tests {
         assert_eq!(matching, 200);
         assert_eq!(super::fs::read_to_string(dir.join("notes.md")).unwrap(), "keep");
         let _ = super::fs::remove_dir_all(&dir);
+    }
+
+    /// Isolate HOME, GLib's cached XDG path and the production once-per-process
+    /// guards from any other test, including those that open Wayfinder windows.
+    fn with_private_cache_process(test: &str, exercise: impl FnOnce(&Path)) {
+        const FIXTURE: &str = "WF_D444_PRIVATE_HOME";
+        if let Some(home) = std::env::var_os(FIXTURE) {
+            exercise(Path::new(&home));
+            return;
+        }
+        let home = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".fixture-{test}-{}", std::process::id()));
+        fs::create_dir(&home).unwrap();
+        let _cleanup = ScratchCleanup(home.clone());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{test}")])
+            .env(FIXTURE, &home)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed; 0 failed"),
+            "{test} in its own process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&child.stderr),
+        );
+    }
+
+    fn set_fixture_mtime(file: &fs::File, seconds: u64) {
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)).unwrap();
+    }
+
+    #[test]
+    fn thumbnail_generation_prunes_oldest_cache_entry_d444() {
+        with_private_cache_process("thumbnail_generation_prunes_oldest_cache_entry_d444", |home| {
+            let cache = home.join(".cache/wayfinder/image-thumbs");
+            fs::create_dir_all(&cache).unwrap();
+            let oldest = cache.join("z-first.png");
+            let newer = cache.join("a-second.png");
+            // Sparse files exceed the real cap without writing hundreds of MiB.
+            for (path, time) in [(&oldest, 10), (&newer, 20)] {
+                let file = fs::File::create(path).unwrap();
+                file.set_len(THUMBNAIL_CACHE_CAP / 2 + 1).unwrap();
+                set_fixture_mtime(&file, time);
+            }
+            let source = home.join("sample.ppm");
+            fs::write(&source, b"P6\n2 2\n255\nabcdefghijkl").unwrap();
+            let generated = transcoded_thumbnail_file(source.to_str().unwrap(), 32)
+                .expect("the thumbnail generator decoded the source");
+            assert_eq!(generated.parent(), Some(cache.as_path()));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while oldest.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!oldest.exists(), "thumbnail generation must prune the oldest cache entry");
+            assert!(newer.is_file());
+            assert!(generated.is_file());
+        });
+    }
+
+    #[test]
+    fn startup_marks_prune_oldest_log_lines_d444() {
+        with_private_cache_process("startup_marks_prune_oldest_log_lines_d444", |home| {
+            PROCESS_START.set(Instant::now()).unwrap();
+            let log = home.join(".cache/wayfinder/startup.log");
+            fs::create_dir_all(log.parent().unwrap()).unwrap();
+            let oversized = format!(
+                "oldest startup line\n{}newest saved startup line\n",
+                "earlier startup line\n".repeat((DIAGNOSTIC_LOG_CAP / 16) as usize),
+            );
+            let check = |mark: &'static str, write_mark: fn(&'static str)| {
+                fs::write(&log, &oversized).unwrap();
+                write_mark(mark);
+                let text = fs::read_to_string(&log).unwrap();
+                assert!(!text.contains("oldest startup line"), "{mark} must drop the oldest log lines");
+                assert!(text.contains("newest saved startup line\n"));
+                assert!(text.lines().last().unwrap().contains(mark));
+                assert!(text.len() as u64 <= DIAGNOSTIC_LOG_CAP);
+            };
+            check("window built", startup_mark);
+            std::thread::scope(|threads| {
+                threads.spawn(|| check("drive scan finished", startup_mark_any_thread)).join().unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn transfer_report_writer_prunes_oldest_reports_d444() {
+        with_private_cache_process("transfer_report_writer_prunes_oldest_reports_d444", |home| {
+            let reports = home.join("Documents/Wayfinder Transfer Reports");
+            fs::create_dir_all(&reports).unwrap();
+            let oldest = ["2001-01-01 00.00.00 - Copy to Home.md", "2001-01-02 00.00.00 - Move to Home.md"];
+            for (order, name) in oldest.iter().enumerate() {
+                let file = fs::File::create(reports.join(name)).unwrap();
+                set_fixture_mtime(&file, 10 + order as u64);
+            }
+            let mut recent = Vec::new();
+            for i in 0..199 {
+                let path = reports.join(format!(
+                    "2000-01-{:02} 00.{:02}.00 - Copy to Home.md", 1 + i / 60, i % 60,
+                ));
+                let file = fs::File::create(&path).unwrap();
+                set_fixture_mtime(&file, 100 + i);
+                recent.push(path);
+            }
+            let notes = reports.join("notes.md");
+            fs::write(&notes, "unrelated notes").unwrap();
+            let written = write_transfer_report(true, &[native_core::ReportRow {
+                from: "/source/item.txt".into(),
+                to: "/destination/item.txt".into(),
+                kind: "file",
+                bytes: 4,
+                files_total: 1,
+                files: Vec::new(),
+                digest: "digest".into(),
+            }]).expect("write a verified transfer report");
+            assert_eq!(written.parent(), Some(reports.as_path()));
+            for name in oldest {
+                assert!(!reports.join(name).exists(), "{name} was among the oldest reports");
+            }
+            assert!(recent.iter().all(|path| path.is_file()));
+            assert!(fs::read_to_string(written).unwrap().contains("/destination/item.txt"));
+            assert_eq!(fs::read_to_string(notes).unwrap(), "unrelated notes");
+        });
     }
 
     /// D-224: committed `75ca650`'s `glob_match` treated `[`/`]` literally,
