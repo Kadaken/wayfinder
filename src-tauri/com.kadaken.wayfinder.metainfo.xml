@@ -46,6 +46,14 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.39" date="2026-11-26">
+      <description>
+        <p>Release-audit fixes: Overwrite and Trash settings warn before
+        anything is deleted for good, outside archive tools only run when their
+        writes can be locked to the destination, and each update redirect is
+        checked before it is followed.</p>
+      </description>
+    </release>
     <release version="0.9.38" date="2026-11-25">
       <description>
         <p>Release-audit fixes: a stuck network drive no longer freezes the
