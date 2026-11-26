@@ -209,6 +209,12 @@ impl RequestRoot {
     fn result_meta_path(&self) -> PathBuf {
         self.dir.join("result.meta.json")
     }
+
+    /// D-422: the picker writes its exit code here once the result and its
+    /// meta are complete. Always `result_path()` plus ".done".
+    fn result_done_path(&self) -> PathBuf {
+        self.dir.join("result.done")
+    }
 }
 
 /// The largest request/result-meta file either side will write or read.
@@ -453,16 +459,26 @@ impl ProcessChooser {
     /// shell's own child -- cannot outlive it as an orphan.
     #[cfg(test)]
     fn wait_with_deadline(&self, child: Child) -> ChildWait {
-        self.wait_with_deadline_or_cancel(child, &AtomicBool::new(false))
+        self.wait_with_deadline_or_cancel(child, &AtomicBool::new(false), None)
     }
 
-    fn wait_with_deadline_or_cancel(&self, mut child: Child, cancel: &AtomicBool) -> ChildWait {
+    /// D-422: `done` is the picker's done marker. Once it holds an exit code
+    /// that is the answer, even while the process is still dying: a picker
+    /// thread stuck in a slow network drive (seen 25 Nov 2026: rclone's
+    /// Google Drive, a folder read that did not return for minutes) kept the
+    /// process alive after its main thread exited, and the app that asked to
+    /// save waited on it the whole time.
+    fn wait_with_deadline_or_cancel(&self, mut child: Child, cancel: &AtomicBool, done: Option<&Path>) -> ChildWait {
         let pgid = child.id() as libc::pid_t;
         let start = Instant::now();
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return ChildWait::Exited(status),
                 Ok(None) => {
+                    if let Some(code) = done.and_then(read_done_marker) {
+                        reap_in_background(child, pgid);
+                        return ChildWait::Answered(code);
+                    }
                     if cancel.load(Ordering::SeqCst) {
                         kill_owned_process_group(pgid);
                         let _ = child.wait();
@@ -487,6 +503,27 @@ impl ProcessChooser {
     }
 }
 
+/// D-422: the exit code in a picker's done marker, once it is complete.
+fn read_done_marker(path: &Path) -> Option<i32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// D-422: a picker that has answered is left to finish exiting on its own
+/// thread. After a grace period its process group is killed, then reaped.
+fn reap_in_background(mut child: Child, pgid: libc::pid_t) {
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        kill_owned_process_group(pgid);
+        let _ = child.wait();
+    });
+}
+
 /// Why the picker process stopped being waited on.
 ///
 /// D-301: a child killed at the deadline and a child that exited with a
@@ -497,6 +534,9 @@ impl ProcessChooser {
 #[derive(Debug)]
 enum ChildWait {
     Exited(std::process::ExitStatus),
+    /// D-422: the picker wrote its done marker with this exit code; the
+    /// process is reaped in the background.
+    Answered(i32),
     /// The deadline expired and the child's process group was killed.
     TimedOut,
     /// `try_wait` itself failed; the child was killed and reaped.
@@ -509,6 +549,7 @@ impl ChildWait {
     fn exit_code(&self) -> Option<i32> {
         match self {
             ChildWait::Exited(status) => status.code(),
+            ChildWait::Answered(code) => Some(*code),
             _ => None,
         }
     }
@@ -518,7 +559,7 @@ impl ChildWait {
     /// an auditor can see this, so it is never silent.
     fn report(&self, deadline: Duration) {
         match self {
-            ChildWait::Exited(_) => {}
+            ChildWait::Exited(_) | ChildWait::Answered(_) => {}
             ChildWait::TimedOut => eprintln!(
                 "wayfinder-portal: the file picker did not answer within {}s and was killed; \
                  reporting the request as failed",
@@ -618,6 +659,7 @@ impl Chooser for ProcessChooser {
         let result_path = root.result_path();
         let request_path = root.request_path();
         let meta_path = root.result_meta_path();
+        let done_path = root.result_done_path();
 
         if write_request_file(&request_path, request).is_err() {
             return PickOutcome::from(ChooserOutcome::Failed);
@@ -681,7 +723,7 @@ impl Chooser for ProcessChooser {
             }
         };
 
-        let wait = self.wait_with_deadline_or_cancel(child, cancel);
+        let wait = self.wait_with_deadline_or_cancel(child, cancel, Some(&done_path));
         wait.report(self.deadline.unwrap_or_default());
         let exit_code = wait.exit_code();
         if matches!(wait, ChildWait::Cancelled) {
@@ -2072,6 +2114,48 @@ mod tests {
         assert_eq!(mode, 0o700, "the scratch base itself must be owner-only, not just its req-* subdir");
         fixture.remove();
         finish_base(base);
+    }
+
+    /// D-422: a picker that has written its answer and done marker but whose
+    /// process cannot finish exiting (seen 25 Nov 2026: a thread stuck in a
+    /// Google Drive folder read) must not hold the app that asked. The
+    /// answer comes back at once, not at the deadline.
+    #[test]
+    fn process_chooser_answers_on_done_marker_while_the_picker_is_still_alive_d422() {
+        let fixture = ScratchFile::create();
+        let native = FakeNative::scripted(&format!(
+            "printf '%s\\n' '{}' > \"$3\"\nprintf 0 > \"$3.done\"\nexec sleep 30\n",
+            fixture.path().display()
+        ));
+        let base = scratch_base("d422-done");
+        let chooser =
+            ProcessChooser::for_test(native.path().to_path_buf(), Duration::from_secs(20), base.clone());
+        let start = Instant::now();
+        let outcome = chooser.pick_single("app", "", "title");
+        let took = start.elapsed();
+        assert!(
+            matches!(&outcome, ChooserOutcome::Picked(paths) if paths == &vec![fixture.path().to_path_buf()]),
+            "got {outcome:?}"
+        );
+        assert!(took < Duration::from_secs(3), "answered after {took:?}; must not wait for the process to die");
+        fixture.remove();
+        finish_base(base);
+    }
+
+    /// D-422: a half-written marker is not an answer.
+    #[test]
+    fn done_marker_must_hold_a_whole_exit_code_d422() {
+        let dir = scratch_base("d422-marker");
+        fs::create_dir_all(&dir).expect("create marker dir");
+        let marker = dir.join("result.done");
+        assert_eq!(read_done_marker(&marker), None, "missing");
+        fs::write(&marker, "").unwrap();
+        assert_eq!(read_done_marker(&marker), None, "empty");
+        fs::write(&marker, "0").unwrap();
+        assert_eq!(read_done_marker(&marker), Some(0));
+        fs::write(&marker, "1\n").unwrap();
+        assert_eq!(read_done_marker(&marker), Some(1));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A real confirmed cancel: exit `1` *and* an exactly empty result
@@ -4204,7 +4288,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
         let wait = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| chooser.wait_with_deadline_or_cancel(child, &cancel));
+            let waiter = scope.spawn(|| chooser.wait_with_deadline_or_cancel(child, &cancel, None));
             std::thread::sleep(Duration::from_millis(150));
             cancel.store(true, Ordering::SeqCst);
             waiter.join().expect("waiter")

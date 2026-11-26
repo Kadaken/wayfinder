@@ -4,6 +4,11 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.37 — 25 November 2026
+
+### Fixed
+- Saving or opening a file from another app (for example Claude Desktop) no longer freezes after you press Replace or Save. The app gets its answer as soon as you choose, and the Wayfinder dialog closes at once, even when a slow network drive such as a Google Drive folder has stopped answering. Before, the app that asked waited until that drive answered, which could take minutes.
+
 ## 0.9.36 — 25 November 2026
 
 ### Changed

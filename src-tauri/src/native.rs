@@ -2092,6 +2092,22 @@ fn picker_write_result_meta(picker: &PickerState) {
     }
 }
 
+/// D-422: the result, then the done marker holding the exit code, renamed
+/// into place whole so the portal never reads half of it. The portal answers
+/// the app the moment the marker appears, without waiting for this process
+/// to finish exiting.
+fn picker_write_answer(out_file: &str, output: &str, code: i32) {
+    if out_file.is_empty() {
+        return;
+    }
+    let _ = fs::write(out_file, output);
+    let done = format!("{out_file}.done");
+    let tmp = format!("{done}.tmp");
+    if fs::write(&tmp, code.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, &done);
+    }
+}
+
 fn picker_write_and_exit(picker: &PickerState, paths: Vec<String>, code: i32) -> ! {
     let output = if code == 0 {
         paths
@@ -2111,7 +2127,17 @@ fn picker_write_and_exit(picker: &PickerState, paths: Vec<String>, code: i32) ->
     if code == 0 {
         picker_write_result_meta(picker);
     }
-    let _ = fs::write(&picker.out_file, output);
+    picker_write_answer(&picker.out_file, &output, code);
+    // D-422: hidden before exiting. A thread stuck in a slow network drive
+    // keeps the process, and its window, alive after the main thread exits.
+    if gtk::is_initialized_main_thread() {
+        for window in gtk::Window::list_toplevels() {
+            window.set_visible(false);
+        }
+        if let Some(display) = gdk::Display::default() {
+            display.flush();
+        }
+    }
     std::process::exit(code);
 }
 
@@ -23560,6 +23586,22 @@ mod tests {
     /// the real `glob_match` directly, not a copy.
     /// W2 attack 4: a Save onto a link must say where the link leads, and a
     /// dangling link must still ask.
+    #[test]
+    fn picker_answer_writes_the_result_then_the_done_marker_d422() {
+        let dir = std::env::temp_dir().join(format!("wf-d422-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("result");
+        let out = out.to_str().unwrap();
+        picker_write_answer(out, "/a/b.txt\n", 0);
+        assert_eq!(fs::read_to_string(out).unwrap(), "/a/b.txt\n");
+        assert_eq!(fs::read_to_string(format!("{out}.done")).unwrap(), "0", "the marker holds the exit code");
+        assert!(!Path::new(&format!("{out}.done.tmp")).exists(), "the marker is renamed into place");
+        picker_write_answer(out, "", 1);
+        assert_eq!(fs::read_to_string(format!("{out}.done")).unwrap(), "1", "a cancel says 1");
+        picker_write_answer("", "x", 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn save_onto_a_link_names_where_it_leads_d305() {
         let root = crate::native_core::scratch_root().join(format!("wf-w2-a4-{}", std::process::id()));

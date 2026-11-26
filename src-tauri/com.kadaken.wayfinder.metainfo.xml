@@ -46,6 +46,12 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.37" date="2026-11-25">
+      <description>
+        <p>Saving or opening from another app no longer freezes when a slow
+        network drive, such as a Google Drive folder, stops answering.</p>
+      </description>
+    </release>
     <release version="0.9.36" date="2026-11-25">
       <description>
         <p>Sound starts the way it was left instead of always muted, and an
