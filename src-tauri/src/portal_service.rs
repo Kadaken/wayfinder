@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -505,7 +505,23 @@ impl ProcessChooser {
 
 /// D-422: the exit code in a picker's done marker, once it is complete.
 fn read_done_marker(path: &Path) -> Option<i32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    // D-438: the picker writes a decimal i32. Reject special files and cap
+    // the read so checking for a completed answer cannot stall cancellation.
+    const MAX_MARKER_BYTES: u64 = 16;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut marker = String::new();
+    file.take(MAX_MARKER_BYTES + 1).read_to_string(&mut marker).ok()?;
+    if marker.len() as u64 > MAX_MARKER_BYTES {
+        return None;
+    }
+    marker.trim().parse().ok()
 }
 
 /// D-422: a picker that has answered is left to finish exiting on its own
@@ -787,11 +803,12 @@ fn refuse() -> (u32, HashMap<String, OwnedValue>) {
     (RESPONSE_OTHER, HashMap::new())
 }
 
-fn option_is_true(options: &HashMap<String, OwnedValue>, key: &str) -> bool {
-    options
-        .get(key)
-        .and_then(|v| bool::try_from(v.clone()).ok())
-        .unwrap_or(false)
+// D-439: only an absent option defaults to false. A wrong type is malformed.
+fn decode_bool_option(options: &HashMap<String, OwnedValue>, key: &str) -> Result<bool, ()> {
+    match options.get(key) {
+        Some(value) => bool::try_from(value).map_err(|_| ()),
+        None => Ok(false),
+    }
 }
 
 /// Builds the final `OpenFile` results map for one or more picked URIs,
@@ -1086,7 +1103,9 @@ pub fn decide_save_files(
 ) -> (u32, HashMap<String, OwnedValue>) {
     // `directory=true` is meaningless here -- this request is already a
     // folder pick -- so it is refused rather than silently ignored.
-    if option_is_true(options, "directory") {
+    if decode_bool_option(options, "directory") != Ok(false)
+        || decode_bool_option(options, "multiple").is_err()
+    {
         return refuse();
     }
     let Ok(names) = decode_save_files_names(options) else {
@@ -1231,14 +1250,18 @@ pub fn decide_with_shape(
     // `directory=true` asks for a folder. Open honors it; a Save names a
     // file, so the same option on a Save is meaningless and the request is
     // refused outright rather than quietly answered with a folder.
-    let directory = option_is_true(options, "directory");
+    let Ok(directory) = decode_bool_option(options, "directory") else {
+        return refuse();
+    };
     if save && directory {
         return refuse();
     }
 
     // A Save names exactly one file; `multiple` is meaningless there and is
     // never honored, so a caller cannot ask for several save targets.
-    let multiple = !save && option_is_true(options, "multiple");
+    let Ok(multiple) = decode_bool_option(options, "multiple") else {
+        return refuse();
+    };
     let (current_name, current_folder, current_file) = if save {
         let Ok(name) = decode_current_name(options) else {
             return refuse();
@@ -1264,7 +1287,7 @@ pub fn decide_with_shape(
     };
 
     let request = WireRequest {
-        multiple,
+        multiple: !save && multiple,
         filters,
         current_filter,
         choices,
@@ -2156,6 +2179,30 @@ mod tests {
         fs::write(&marker, "1\n").unwrap();
         assert_eq!(read_done_marker(&marker), Some(1));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn done_marker_requires_a_small_regular_file_d438() {
+        let fixture = ScratchFile::create();
+        let marker = fixture.dir.join("result.done");
+
+        fs::write(fixture.path(), "0").expect("write normal marker");
+        assert_eq!(read_done_marker(fixture.path()), Some(0));
+        std::os::unix::fs::symlink(fixture.path(), &marker).expect("symlink to valid marker");
+        assert_eq!(read_done_marker(&marker), None, "symlink");
+        fs::remove_file(&marker).expect("remove symlink");
+
+        fs::write(&marker, format!("0{}", " ".repeat(128))).expect("write oversized marker");
+        assert_eq!(read_done_marker(&marker), None, "oversized valid-looking marker");
+        fs::remove_file(&marker).expect("remove oversized marker");
+
+        let status = Command::new("mkfifo").arg(&marker).status().expect("run mkfifo");
+        assert!(status.success(), "create a FIFO with no writer");
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || send.send(read_done_marker(&marker)));
+        assert_eq!(receive.recv_timeout(Duration::from_secs(5)), Ok(None), "FIFO");
+        reader.join().expect("join marker reader").expect("send marker result");
+        fixture.remove();
     }
 
     /// A real confirmed cancel: exit `1` *and* an exactly empty result
@@ -3421,6 +3468,41 @@ mod tests {
         assert_eq!(response, RESPONSE_SUCCESS);
         assert_eq!(uris_of(&results), vec![expected_uri]);
         fixture.remove();
+    }
+
+    #[test]
+    fn file_dialogs_refuse_wrong_typed_boolean_options_d439() {
+        for key in ["multiple", "directory"] {
+            for value in [Value::from("true"), Value::from(1i32)] {
+                let mut options = files_option(&["out.txt"]);
+                options.insert(key.into(), OwnedValue::try_from(value).expect("encode option"));
+                let unexpected_picker = |_: &WireRequest| panic!("wrong-typed {key} reached the picker");
+                assert_eq!(decide(&options, unexpected_picker, GuardOverride::None), refuse());
+                assert_eq!(
+                    decide_with_shape(&options, unexpected_picker, GuardOverride::None, RequestShape::Save),
+                    refuse()
+                );
+                assert_eq!(decide_save_files(&options, unexpected_picker, GuardOverride::None), refuse());
+            }
+        }
+    }
+
+    #[test]
+    fn open_file_honors_boolean_options_d439() {
+        for key in ["multiple", "directory"] {
+            for value in [false, true] {
+                let (response, _) = decide(
+                    &with_option(key, value),
+                    |request| {
+                        assert_eq!(request.multiple, key == "multiple" && value);
+                        assert_eq!(request.directory, key == "directory" && value);
+                        ChooserOutcome::Cancelled.into()
+                    },
+                    GuardOverride::None,
+                );
+                assert_eq!(response, RESPONSE_CANCELLED);
+            }
+        }
     }
 
     /// [D-222 replacement for `decide_refuses_filters_present` /

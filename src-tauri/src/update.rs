@@ -142,15 +142,15 @@ pub fn validate(manifest: &Manifest) -> Result<(), String> {
 pub fn fetch_manifest() -> Result<Manifest, String> {
     let output = Command::new("curl")
         .args([
+            "--disable",
             "--silent",
             "--show-error",
             "--fail",
+            // D-427: the manifest is served directly. Refuse redirects.
             "--location",
-            // A redirect may not leave the download host, and the protocol is
-            // not up for negotiation.
+            "--max-redirs",
+            "0",
             "--proto",
-            "=https",
-            "--proto-redir",
             "=https",
             "--tlsv1.2",
             "--max-time",
@@ -230,8 +230,10 @@ pub fn download_and_verify(manifest: &Manifest) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let archive = dir.join("wayfinder-update.tar.gz");
 
-    let status = Command::new("curl")
+    let output = Command::new("curl")
         .args([
+            "--disable",
+            "--globoff",
             "--silent",
             "--show-error",
             "--fail",
@@ -245,14 +247,21 @@ pub fn download_and_verify(manifest: &Manifest) -> Result<PathBuf, String> {
             "600",
             "--user-agent",
             concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
+            "--write-out",
+            "%{url_effective}",
             "--output",
         ])
         .arg(&archive)
         .arg(&manifest.url)
-        .status()
+        .output()
         .map_err(|e| format!("could not run curl: {e}"))?;
-    if !status.success() {
+    if !output.status.success() {
         return Err("the download did not finish".to_string());
+    }
+    // D-427: /get/ redirects to the archive. Use it only if the final URL
+    // is on an allowed HTTPS host.
+    if !std::str::from_utf8(&output.stdout).is_ok_and(url_is_allowed) {
+        return Err("the update download ended on an unapproved URL".to_string());
     }
 
     let got = std::fs::metadata(&archive)
@@ -385,10 +394,12 @@ mod tests {
     #[test]
     fn only_the_download_host_is_accepted() {
         assert!(url_is_allowed("https://kadaken.com/get/wayfinder"));
+        assert!(url_is_allowed("https://kadaken.com/download/wayfinder-linux-x64.tar.gz"));
         assert!(url_is_allowed("https://www.kadaken.com/download/x.tar.gz"));
         assert!(!url_is_allowed("http://kadaken.com/get/wayfinder"));
-        assert!(!url_is_allowed("https://kadaken.com.evil.test/x"));
+        assert!(!url_is_allowed("https://kadaken.com.evil.net/x"));
         assert!(!url_is_allowed("https://evil.test/get/wayfinder"));
+        assert!(!url_is_allowed(""));
     }
 
     fn good() -> Manifest {
