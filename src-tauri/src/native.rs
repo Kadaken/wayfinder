@@ -2658,8 +2658,9 @@ fn bookmark_for_path(path: &str) -> Bookmark {
 }
 
 fn push_recent(recents: &mut Vec<Bookmark>, path: &str) {
+    // D-424: the successful listing already proved this is a directory.
     // D-247: a vault is never advertised in a Recent list.
-    if !Path::new(path).is_dir() || native_core::is_vault_content(path) {
+    if native_core::is_vault_content(path) {
         return;
     }
     recents.retain(|bookmark| bookmark.path != path);
@@ -2939,6 +2940,7 @@ struct AppState {
     /// D-246: files opened from the listing, newest first, for the Recent
     /// strip on the Home page.
     recent_files: Vec<Bookmark>,
+    recent_files_generation: u64,
     /// D-156 connect: saved shares, the one flow of this window and its dialog.
     remembered_networks: Vec<native_smb::RememberedNetwork>,
     smb_backend: Option<Rc<dyn native_smb::SmbBackend>>,
@@ -2990,9 +2992,10 @@ struct AppState {
     /// never overwrite the folder the user navigated to afterwards.
     listing_generation: u64,
     listing_cancel: Option<Arc<AtomicBool>>,
+    address_check_cancel: Option<Arc<AtomicBool>>,
     /// Keeps the active local-directory monitor alive and invalidates debounced
     /// notifications from the folder we just left.
-    directory_monitor: Option<gio::FileMonitor>,
+    directory_monitor: Option<Rc<DirectoryMonitor>>,
     monitor_generation: u64,
     /// Realized Size/Modified labels by path, kept by the list bind/unbind so a
     /// metadata-only refresh can update text without touching the rows.
@@ -5002,9 +5005,10 @@ fn select_path_from_files(files: &[gio::File]) -> Option<String> {
 }
 
 fn is_downloads_dir(path: &str) -> bool {
-    native_core::standard_dirs()
-        .iter()
-        .any(|(name, downloads)| name == "Downloads" && downloads == path)
+    // D-424: a successful listing needs only the name comparison. Probing
+    // every standard folder here could hang on an unrelated network mount.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    path == format!("{home}/Downloads")
 }
 
 fn install_app_css() {
@@ -5138,6 +5142,7 @@ fn build_ui_in(
         network_folders: config.network_folders,
         recents: config.recents,
         recent_files: config.recent_files,
+        recent_files_generation: 0,
         remembered_networks: config.remembered_networks,
         smb_backend: None,
         smb_flow: None,
@@ -5161,6 +5166,7 @@ fn build_ui_in(
         picker: picker.clone(),
         listing_generation: 0,
         listing_cancel: None,
+        address_check_cancel: None,
         directory_monitor: None,
         monitor_generation: 0,
         meta_labels: HashMap::new(),
@@ -6282,18 +6288,12 @@ fn build_ui_in(
             }
             ui.path_stack.set_visible_child_name("label");
             if native_smb::looks_like_smb(&path) {
+                cancel_address_check(&mut state.borrow_mut());
                 smb_flow(&state, &ui).connect(&path);
             } else if !path.is_empty() {
-                // D-262: the text is cleaned and resolved before anything is
-                // listed. A relative fragment, a file:// URI, a quoted paste,
-                // a `~` or a file's own path all used to be handed straight
-                // to the lister, which silently did nothing.
-                match resolve_address_text(&state, &path) {
-                    Some(target) => navigate_listing(
-                        &state, native_core::Location::real(&target), NavMode::Record, None, from_address,
-                    ),
-                    None => ui.status.set_label(&format!("No folder called \u{201c}{path}\u{201d}")),
-                }
+                // D-262 / D-424: resolved off the screen thread; D-433 carries
+                // whether the address bar sent it, for the focus handoff.
+                open_address_text(&state, path, from_address);
             }
         });
     }
@@ -6317,10 +6317,11 @@ fn build_ui_in(
         let search = ui.search.clone();
         search.connect_search_changed(move |entry| {
             let text = entry.text().trim().to_string();
-            let leave_results = {
+            let (leave_results, filter_changed) = {
                 let mut state = state.borrow_mut();
+                let changed = state.filter_text != text;
                 state.filter_text = text.clone();
-                text.is_empty() && state.search_results.is_some()
+                (text.is_empty() && state.search_results.is_some(), changed)
             };
             // D-402: the list holds the results of a search run with Enter.
             // Clearing the box goes back to the folder itself, as F5 did by
@@ -6335,8 +6336,10 @@ fn build_ui_in(
                 let mut state = state.borrow_mut();
                 state.search_gen = state.search_gen.wrapping_add(1);
             }
-            repopulate_rows(&state, &ui);
-            update_selection(&state, &ui);
+            if filter_changed {
+                repopulate_rows(&state, &ui);
+                update_selection(&state, &ui);
+            }
         });
     }
     {
@@ -7404,6 +7407,7 @@ fn close_tab_action(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 fn edit_path_action(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    cancel_address_check(&mut state.borrow_mut());
     let cwd = state.borrow().cwd.display_string();
     ui.path_entry.set_text(&cwd);
     ui.path_stack.set_visible_child_name("entry");
@@ -8861,26 +8865,39 @@ fn rebuild_quick_access(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     }
     // D-246: a remembered file can be deleted or moved between openings, and a
     // tile that opens nothing is worse than no tile, so the list is filtered
-    // against the disk every time the strip is drawn rather than trusted.
-    let recent_files: Vec<Bookmark> = state
-        .borrow()
-        .recent_files
-        .iter()
-        .filter(|file| {
-            // D-247: also filtered here, not only on the way in, so a vault
-            // path written by an older build disappears on the next draw
-            // instead of waiting for the list to age out.
-            Path::new(&file.path).is_file() && !native_core::is_vault_content(&file.path)
-        })
-        .take(6)
-        .cloned()
-        .collect();
-    if !at_home || recent_files.is_empty() {
-        ui.recent_files_strip.set_visible(false);
-        return;
-    }
+    // against the disk whenever the Home strip is drawn.
+    ui.recent_files_strip.set_visible(false);
+    let (generation, recent_files) = {
+        let mut state = state.borrow_mut();
+        state.recent_files_generation = state.recent_files_generation.wrapping_add(1);
+        if !at_home || state.recent_files.is_empty() {
+            return;
+        }
+        (state.recent_files_generation, state.recent_files.clone())
+    };
+    let state = Rc::downgrade(state);
+    // D-424: a Recent entry may point to an offline mount, even at Home.
+    glib::spawn_future_local(async move {
+        let deadline = Instant::now() + ADDRESS_CHECK_TIMEOUT;
+        let Ok(recent_files) = address_check_with_timeout(deadline, move || {
+            recent_files.into_iter()
+                .take_while(|_| Instant::now() < deadline)
+                .filter(|file| !native_core::is_vault_content(&file.path) && Path::new(&file.path).is_file())
+                .take(6)
+                .collect::<Vec<_>>()
+        }).await else { return };
+        let Some(state) = state.upgrade() else { return };
+        if state.borrow().recent_files_generation != generation || recent_files.is_empty() {
+            return;
+        }
+        let Some(ui) = ui_for_state(&state) else { return };
+        show_recent_file_tiles(&state, &ui, &home, recent_files);
+    });
+}
+
+fn show_recent_file_tiles(state: &Rc<RefCell<AppState>>, ui: &Ui, home: &str, recent_files: Vec<Bookmark>) {
     for file in recent_files {
-        let (tile, _) = tile_for(&file, "text-x-generic", &home);
+        let (tile, _) = tile_for(&file, "text-x-generic", home);
         let path = file.path.clone();
         let status = ui.status.clone();
         let name = file.name.clone();
@@ -9286,9 +9303,9 @@ fn connect_actions(
     {
         let state = state.clone();
         home.connect_clicked(move |_| {
-            if let Some((_, path)) = native_core::standard_dirs().into_iter().next() {
-                navigate(&state, native_core::Location::real(path));
-            }
+            // D-424: Home only needs its path, even if a standard folder is offline.
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            navigate(&state, native_core::Location::real(home));
         });
     }
     {
@@ -10692,11 +10709,81 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
     ui.body.add_controller(key);
 }
 
-/// D-262: the address bar's text turned into a folder to open. The rules live
-/// in `native_core::resolve_typed_path`; this supplies the three things only
-/// the running window knows — the folder on screen, home, and the sidebar's
-/// own folders as extra roots — and the one filesystem question the rules ask.
-fn resolve_address_text(state: &Rc<RefCell<AppState>>, text: &str) -> Option<String> {
+const ADDRESS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+enum AddressCheckError {
+    TimedOut,
+    WorkerFailed,
+}
+
+// D-424: race the worker with a main-loop deadline. Dropping the worker's
+// result receiver leaves a stuck syscall behind without letting it navigate.
+async fn address_check_with_timeout<T: Send + 'static>(
+    deadline: Instant,
+    check: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, AddressCheckError> {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let mut timeout = std::pin::pin!(glib::timeout_future(deadline.saturating_duration_since(Instant::now())));
+    let mut worker = std::pin::pin!(gio::spawn_blocking(check));
+    std::future::poll_fn(|cx| {
+        if Instant::now() >= deadline || timeout.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(AddressCheckError::TimedOut));
+        }
+        worker.as_mut().poll(cx).map(|result| result.map_err(|_| AddressCheckError::WorkerFailed))
+    }).await
+}
+
+fn cancel_address_check(state: &mut AppState) {
+    if let Some(check) = state.address_check_cancel.take() {
+        check.store(true, Ordering::Relaxed);
+    }
+}
+
+fn start_address_check(
+    state: &Rc<RefCell<AppState>>,
+    text: String,
+    timeout: Duration,
+    from_address: bool,
+    check: impl FnOnce(&str, &dyn Fn() -> bool) -> Option<String> + Send + 'static,
+) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let mut state = state.borrow_mut();
+        cancel_address_check(&mut state);
+        state.address_check_cancel = Some(cancelled.clone());
+    }
+    let deadline = Instant::now() + timeout;
+    let state = Rc::downgrade(state);
+    glib::spawn_future_local(async move {
+        let worker_text = text.clone();
+        let worker_cancelled = cancelled.clone();
+        let result = address_check_with_timeout(deadline, move || {
+            let stopped = || worker_cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline;
+            if stopped() { None } else { check(&worker_text, &stopped) }
+        }).await;
+        let Some(state) = state.upgrade() else { return };
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        state.borrow_mut().address_check_cancel = None;
+        let Some(ui) = ui_for_state(&state) else { return };
+        match result {
+            Ok(Some(target)) => navigate_listing(
+                &state, native_core::Location::real(target), NavMode::Record, None, from_address,
+            ),
+            Ok(None) => ui.status.set_label(&format!("No folder called \u{201c}{text}\u{201d}")),
+            Err(AddressCheckError::TimedOut) => ui.status.set_label("That location is not answering."),
+            Err(AddressCheckError::WorkerFailed) => ui.status.set_label("Could not check that location."),
+        }
+    });
+}
+
+/// D-262: resolve quoted paths, file URIs, and relative fragments using the
+/// folder on screen, home, and the sidebar's own folders as extra roots.
+fn open_address_text(state: &Rc<RefCell<AppState>>, text: String, from_address: bool) {
     let (cwd, mut roots) = {
         let st = state.borrow();
         let cwd = st.cwd.real_path_string().unwrap_or_default();
@@ -10711,29 +10798,45 @@ fn resolve_address_text(state: &Rc<RefCell<AppState>>, text: &str) -> Option<Str
     if !roots.contains(&home) {
         roots.push(home.clone());
     }
-    let kind = |candidate: &str| match std::fs::metadata(candidate) {
-        Ok(meta) if meta.is_dir() => native_core::PathKind::Dir,
-        Ok(_) => native_core::PathKind::File,
-        Err(_) => native_core::PathKind::Missing,
+    start_address_check(state, text, ADDRESS_CHECK_TIMEOUT, from_address, move |text, stopped| {
+        resolve_address_text(text, &cwd, &home, &roots, stopped)
+    });
+}
+
+fn resolve_address_text(
+    text: &str,
+    cwd: &str,
+    home: &str,
+    roots: &[String],
+    stopped: &dyn Fn() -> bool,
+) -> Option<String> {
+    let kind = |candidate: &str| match (!stopped()).then(|| std::fs::metadata(candidate)) {
+        Some(Ok(meta)) if meta.is_dir() => native_core::PathKind::Dir,
+        Some(Ok(_)) => native_core::PathKind::File,
+        _ => native_core::PathKind::Missing,
     };
-    if let Some(found) = native_core::resolve_typed_path(text, &cwd, &home, &roots, &kind) {
+    if let Some(found) = native_core::resolve_typed_path(text, cwd, home, roots, &kind) {
         return Some(found);
     }
     // Last resort: the fragment may name a tree that is neither below the
     // folder on screen nor below any of its parents — pasting
     // `project/art/anim` while standing in home. A bounded widest-first walk
-    // under the known places finds it; the caps keep the window responsive.
-    let fragment = native_core::clean_typed_path(text, &home);
-    let mut bases = vec![cwd.clone()];
-    for root in &roots {
+    // under the known places finds it.
+    let fragment = native_core::clean_typed_path(text, home);
+    let mut bases = vec![cwd.to_string()];
+    for root in roots {
         if !bases.contains(root) {
             bases.push(root.clone());
         }
     }
     native_core::search_for_fragment(&fragment, &bases, 5, 4000, &|dir| {
+        if stopped() {
+            return Vec::new();
+        }
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries
+                    .take_while(|_| !stopped())
                     .filter_map(|entry| entry.ok())
                     .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
                     .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -10814,6 +10917,7 @@ fn navigate_listing(
     // response cannot replace a folder the user has already left.
     let (generation, cancelled) = {
         let mut state = state.borrow_mut();
+        cancel_address_check(&mut state);
         if let Some(previous) = state.listing_cancel.take() {
             previous.store(true, Ordering::Relaxed);
         }
@@ -10830,6 +10934,7 @@ fn navigate_listing(
         // search still running must not land on top of the new listing.
         state.search_results = None;
         state.search_gen = state.search_gen.wrapping_add(1);
+        state.filter_text.clear();
         let cancelled = Arc::new(AtomicBool::new(false));
         state.listing_cancel = Some(cancelled.clone());
         (state.listing_generation, cancelled)
@@ -10856,7 +10961,10 @@ fn navigate_listing(
     let state = state.clone();
     // D-82: the worker's result wakes the main loop the moment it is ready
     // instead of waiting for a 40 ms poll tick.
-    let on_result = move |received: Result<Result<native_core::DirectoryListing, native_core::ListDirError>, ()>| -> glib::ControlFlow {
+    let on_result = move |received: Result<Result<native_core::DirectoryListing, native_core::ListDirError>, ()>, watch, settings: Option<ListingSettings>| -> glib::ControlFlow {
+        if ui.is_some() && ui_for_state(&state).is_none() {
+            return glib::ControlFlow::Break;
+        }
         match received {
         Ok(Ok(listing)) => {
             // The result is only valid for the newest navigation request.
@@ -10872,7 +10980,7 @@ fn navigate_listing(
             let search_text = ui.as_ref()
                 .filter(|ui| from_address && focus_within(&ui.window, &ui.search))
                 .map(|ui| ui.search.text().trim().to_string());
-            {
+            let (pins, save_error) = {
                 let mut state = state.borrow_mut();
                 state.listing_cancel = None;
                 // Downloads is a chronological inbox. New files belong at the
@@ -10912,13 +11020,18 @@ fn navigate_listing(
                 state.visible_entries.clear();
                 state.filter_text = search_text.clone().unwrap_or_default();
                 // A virtual ZIP location never enters persistent Recent config (D-188).
-                if !path.is_zip() {
-                    match update_config(|config| push_recent(&mut config.recents, &path_str)) {
-                        Some(config) => state.recents = config.recents,
-                        None => push_recent(&mut state.recents, &path_str),
+                if let Some(settings) = settings {
+                    if !path.is_zip() {
+                        state.recents = settings.recents;
                     }
+                    (settings.pins, settings.save_error)
+                } else {
+                    if !path.is_zip() {
+                        push_recent(&mut state.recents, &path_str);
+                    }
+                    (state.pins.clone(), None)
                 }
-            }
+            };
             if let Some(ui) = &ui {
                 // D-433: finish the address handoff only while the files still
                 // own keyboard focus. The user can move it during a slow load.
@@ -10934,12 +11047,14 @@ fn navigate_listing(
                 }
                 set_preview_text(ui, "Select a file");
                 state.borrow_mut().diff_refresh = same_folder;
-                repopulate_rows(&state, ui);
+                repopulate_rows_with_pins(&state, ui, pins);
                 update_selection(&state, ui);
                 update_nav_buttons(&state, ui);
                 update_command_bar_zip_state(&state, ui);
                 update_sidebar_active_rows(&state, ui);
-                install_directory_monitor(&state, ui, &path);
+                if let Some(watch) = watch {
+                    install_directory_monitor(&state, ui, &path, watch);
+                }
                 // The borrow must end before selecting: selecting scrolls the
                 // row into view, which binds rows, and a bind takes
                 // `borrow_mut` (a `state.borrow()` in the `if let` header would
@@ -10962,6 +11077,9 @@ fn navigate_listing(
                 if let Some(message) = &done_message {
                     ui.status.set_label(message);
                 }
+                if let Some(message) = save_error {
+                    ui.status.set_label(&message);
+                }
                 // D-226/D-233: a same-folder refresh keeps the view exactly
                 // where it was, in every view mode. The splice already stops the
                 // model from collapsing; what still moved the view was the list
@@ -10983,7 +11101,8 @@ fn navigate_listing(
                 if let Some(ui) = &ui {
                     let current_path = state.borrow().cwd.clone();
                     set_breadcrumbs(&state, ui, &current_path);
-                    repopulate_rows(&state, ui);
+                    let pins = state.borrow().pins.clone();
+                    repopulate_rows_with_pins(&state, ui, pins);
                     update_selection(&state, ui);
                     ui.status.set_label(&format!("Cannot open {}: {error}", path.display_string()));
                 }
@@ -11002,6 +11121,10 @@ fn navigate_listing(
         }
     };
     glib::spawn_future_local(async move {
+        let watch_path = path_for_worker.real_path().map(Path::to_path_buf);
+        let watch_cancelled = cancelled.clone();
+        let settings_cancelled = cancelled.clone();
+        let recent = path_for_worker.real_path_string();
         let received = gio::spawn_blocking(move || match &path_for_worker {
             native_core::Location::ZipDir { archive, internal } => {
                 native_core::list_zip_dir_cancellable(archive, internal, &cancelled)
@@ -11012,8 +11135,60 @@ fn navigate_listing(
         })
         .await
         .map_err(|_| ());
-        on_result(received);
+        let watch = match watch_path {
+            Some(path) if matches!(received, Ok(Ok(_))) && !watch_cancelled.load(Ordering::Relaxed) => {
+                let deadline = Instant::now() + ADDRESS_CHECK_TIMEOUT;
+                address_check_with_timeout(deadline, move || {
+                    if watch_cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        return None;
+                    }
+                    open_directory_watch(&path)
+                }).await.ok().flatten()
+            }
+            _ => None,
+        };
+        let settings = if matches!(received, Ok(Ok(_))) && !settings_cancelled.load(Ordering::Relaxed) {
+            let deadline = Instant::now() + ADDRESS_CHECK_TIMEOUT;
+            address_check_with_timeout(deadline, move || listing_settings(recent, &settings_cancelled, deadline))
+                .await.ok().flatten()
+        } else {
+            None
+        };
+        on_result(received, watch, settings);
     });
+}
+
+struct ListingSettings {
+    recents: Vec<Bookmark>,
+    pins: HashSet<String>,
+    save_error: Option<String>,
+}
+
+// D-424: a configured settings directory may also be mounted remotely. Read
+// the pins and update Recent here so applying a listing does no settings I/O.
+fn listing_settings(recent: Option<String>, cancelled: &AtomicBool, deadline: Instant) -> Option<ListingSettings> {
+    let is_current = || !cancelled.load(Ordering::Relaxed) && Instant::now() < deadline;
+    if !is_current() {
+        return None;
+    }
+    let path = config_path()?;
+    if !is_current() {
+        return None;
+    }
+    let (config, save_error) = if let Some(recent) = recent {
+        let (config, saved) = try_update_config_at(&path, |config| {
+            if is_current() {
+                push_recent(&mut config.recents, &recent);
+            }
+        });
+        if let Err(message) = &saved {
+            eprintln!("wayfinder: {message}");
+        }
+        (config, saved.err())
+    } else {
+        (read_config_at(&path), None)
+    };
+    Some(ListingSettings { recents: config.recents, pins: config.pins.into_iter().collect(), save_error })
 }
 
 fn clear_file_views(ui: &Ui) {
@@ -11021,58 +11196,79 @@ fn clear_file_views(ui: &Ui) {
     ui.list_store.remove_all();
 }
 
-fn install_directory_monitor(state: &Rc<RefCell<AppState>>, ui: &Ui, path: &native_core::Location) {
-    let monitor_generation = {
-        let mut state = state.borrow_mut();
-        state.directory_monitor = None;
-        state.monitor_generation = state.monitor_generation.wrapping_add(1);
-        state.monitor_generation
-    };
-    // A ZIP virtual location is not a real inode gio can watch, and the
-    // brief forbids installing one anyway (D-188).
-    let native_core::Location::RealDir(real_path) = path else {
-        return;
-    };
-    let file = gio::File::for_path(real_path);
-    let Ok(monitor) = file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
-    else {
-        // Some network/FUSE mounts do not implement file-change notifications.
-        // The folder remains usable and can still be refreshed with F5.
-        return;
-    };
+struct DirectoryMonitor(glib::Source);
+
+impl Drop for DirectoryMonitor {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+// D-424: installing a watch walks the path. Set it up on the worker and
+// transfer the fd so GTK only reads queued events. A separate fd avoids a
+// shared watch lock with a setup call stuck in the kernel.
+fn open_directory_watch(path: &Path) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: inotify_init1 returns a newly owned fd on success.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the successful init handed this fd to us exclusively.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mask = libc::IN_ONLYDIR | libc::IN_MODIFY | libc::IN_CLOSE_WRITE | libc::IN_ATTRIB
+        | libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO
+        | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+    // SAFETY: the fd is live and the path is NUL-terminated.
+    let watch = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) };
+    (watch >= 0).then_some(fd)
+}
+
+fn install_directory_monitor(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Ui,
+    path: &native_core::Location,
+    watch: std::os::fd::OwnedFd,
+) {
+    use glib::translate::from_glib_full;
+    use std::os::fd::IntoRawFd;
+
+    #[link(name = "gio-2.0")]
+    unsafe extern "C" {
+        fn g_unix_input_stream_new(fd: libc::c_int, close_fd: glib::ffi::gboolean) -> *mut gio::ffi::GInputStream;
+    }
+
+    // SAFETY: GUnixInputStream takes ownership when close_fd is true. The
+    // constructor returns a full GInputStream reference for the live fd.
+    let stream: gio::InputStream = unsafe { from_glib_full(g_unix_input_stream_new(watch.into_raw_fd(), 1)) };
+    let stream = stream.dynamic_cast::<gio::PollableInputStream>().expect("GUnixInputStream is pollable");
+    let monitor_generation = state.borrow().monitor_generation;
 
     let watched = path.clone();
     let coalescer = Rc::new(RefCell::new(native_core::RefreshCoalescer::default()));
     let state_weak = Rc::downgrade(state);
     let ui = ui.clone();
-    monitor.connect_changed(move |_, _, _, event| {
-        if !matches!(
-            event,
-            gio::FileMonitorEvent::Changed
-                | gio::FileMonitorEvent::ChangesDoneHint
-                | gio::FileMonitorEvent::Deleted
-                | gio::FileMonitorEvent::Created
-                | gio::FileMonitorEvent::AttributeChanged
-                | gio::FileMonitorEvent::Moved
-                | gio::FileMonitorEvent::Renamed
-                | gio::FileMonitorEvent::MovedIn
-                | gio::FileMonitorEvent::MovedOut
-                | gio::FileMonitorEvent::Unmounted
-        ) {
-            return;
-        }
+    let source = stream.create_source(gio::Cancellable::NONE, None, glib::Priority::DEFAULT, move |stream| {
         let Some(state) = state_weak.upgrade() else {
-            return;
+            return glib::ControlFlow::Break;
         };
         if state.borrow().monitor_generation != monitor_generation || state.borrow().cwd != watched {
-            return;
+            return glib::ControlFlow::Break;
         }
-        let Some(delay) = coalescer.borrow_mut().on_event(monotonic_ms()) else {
-            return;
-        };
-        arm_monitor_scan(&state, &ui, &coalescer, monitor_generation, &watched, delay);
+        // Every event in this watch calls for the same debounced rescan.
+        let mut events = [0; 4096];
+        if stream.read_nonblocking(&mut events, gio::Cancellable::NONE).is_ok_and(|n| n > 0) {
+            if let Some(delay) = coalescer.borrow_mut().on_event(monotonic_ms()) {
+                arm_monitor_scan(&state, &ui, &coalescer, monitor_generation, &watched, delay);
+            }
+        }
+        glib::ControlFlow::Continue
     });
-    state.borrow_mut().directory_monitor = Some(monitor);
+    source.attach(Some(&glib::MainContext::ref_thread_default()));
+    state.borrow_mut().directory_monitor = Some(Rc::new(DirectoryMonitor(source)));
 }
 
 #[cfg(any(test))]
@@ -11133,11 +11329,12 @@ fn start_monitor_scan(
         return;
     };
     std::thread::spawn(move || {
-        let _ = tx.send(native_core::list_dir_cancellable(
+        let result = native_core::list_dir_cancellable(
             &path_for_worker,
             show_hidden,
             &cancelled,
-        ));
+        ).map_err(|_| recovery_if_folder_gone(&path_for_worker));
+        let _ = tx.send(result);
     });
     let state = state.clone();
     let ui = ui.clone();
@@ -11155,15 +11352,15 @@ fn start_monitor_scan(
         if current {
             match result {
                 Some(Ok(listing)) => apply_monitor_scan(&state, &ui, listing),
-                Some(Err(_)) => {
-                    if let native_core::Location::RealDir(gone) = &path {
-                        if std::fs::symlink_metadata(gone).is_err() {
-                            folder_went_away(&state, gone);
-                            return glib::ControlFlow::Break;
-                        }
+                Some(Err(Some((target, message)))) => {
+                    // A closed window must never move or write Recent.
+                    if ui_for_state(&state).is_some() {
+                        eprintln!("wf-event: folder gone, moving to the nearest folder that exists");
+                        navigate_to_with_message(&state, native_core::Location::real(target), NavMode::Record, Some(message));
                     }
+                    return glib::ControlFlow::Break;
                 }
-                None => {}
+                Some(Err(None)) | None => {}
             }
             #[cfg(any(test))]
             SCAN_LOG.with(|log| {
@@ -11179,15 +11376,11 @@ fn start_monitor_scan(
     });
 }
 
-/// D-411 (22 Nov 2026): the folder on screen is gone. A USB stick was pulled
-/// and Wayfinder kept listing its files; selecting one showed "cannot open ...
-/// No such file or directory" as if the file type were the problem. Now the
-/// window moves to the nearest folder that still exists (home, when the drive
-/// itself is gone) and the status line says why.
-fn folder_went_away(state: &Rc<RefCell<AppState>>, gone: &Path) {
-    // A closed window keeps its state alive; it must never move or write Recent.
-    if ui_for_state(state).is_none() {
-        return;
+/// D-411: choose where to go after the watched folder disappears.
+fn recovery_if_folder_gone(gone: &Path) -> Option<(PathBuf, String)> {
+    // D-424: both the disappearance check and the parent stats run on the scan worker.
+    if std::fs::symlink_metadata(gone).is_ok() {
+        return None;
     }
     let mounts_root = |p: &Path| {
         p == Path::new("/")
@@ -11197,7 +11390,7 @@ fn folder_went_away(state: &Rc<RefCell<AppState>>, gone: &Path) {
             || p.parent() == Some(Path::new("/run/media"))
     };
     let nearest = gone.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
-    let (target, message) = match nearest {
+    Some(match nearest {
         Some(p) if !mounts_root(&p) => {
             let name = gone.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             (p, format!("{name} no longer exists"))
@@ -11206,9 +11399,7 @@ fn folder_went_away(state: &Rc<RefCell<AppState>>, gone: &Path) {
             std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")),
             "That drive was removed".to_string(),
         ),
-    };
-    eprintln!("wf-event: folder gone, moving to the nearest folder that exists");
-    navigate_to_with_message(state, native_core::Location::RealDir(target), NavMode::Record, Some(message));
+    })
 }
 
 /// Applies a monitor scan. Size/modified-only changes are merged in place so the
@@ -12704,6 +12895,10 @@ fn unregister_window(state: &Rc<RefCell<AppState>>) {
     // watching would react to its folder disappearing long after it is gone.
     {
         let mut state = state.borrow_mut();
+        cancel_address_check(&mut state);
+        if let Some(listing) = state.listing_cancel.take() {
+            listing.store(true, Ordering::Relaxed);
+        }
         state.directory_monitor = None;
         state.monitor_generation = state.monitor_generation.wrapping_add(1);
     }
@@ -13833,6 +14028,10 @@ fn update_list_model(store: &gio::ListStore, new: &[Entry], rebind: &[native_cor
 }
 
 fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
+    repopulate_rows_with_pins(state, ui, load_pins());
+}
+
+fn repopulate_rows_with_pins(state: &Rc<RefCell<AppState>>, ui: &Ui, pins: HashSet<String>) {
     // D-245: the strip belongs to the folder on screen, so it is rebuilt with
     // the rows, not left behind from the last folder.
     rebuild_quick_access(state, ui);
@@ -13881,7 +14080,6 @@ fn repopulate_rows(state: &Rc<RefCell<AppState>>, ui: &Ui) {
         apply_held_order(&mut visible_entries, held);
     }
     // D-359: pinned items go above everything else, under every sort.
-    let pins = load_pins();
     let pinned_count = pin_to_top(&mut visible_entries, &pins);
     state.borrow_mut().pins = pins;
 
@@ -29086,7 +29284,10 @@ Broken: Either state is wrong.\n";
             let d = d362_open("driveroot", |_| {}, 0);
             let gone = Path::new("/media").join(format!("wf-d411-{}", std::process::id()));
             assert!(Path::new("/media").is_dir() && !gone.exists());
-            folder_went_away(&d.state, &gone);
+            // D-424: the choice is made on the scan worker; the window then
+            // moves exactly as the scan callback does.
+            let (target, message) = recovery_if_folder_gone(&gone).expect("the drive is gone");
+            navigate_to_with_message(&d.state, native_core::Location::real(target), NavMode::Record, Some(message));
             let home = native_core::Location::RealDir(PathBuf::from(std::env::var_os("HOME").unwrap()));
             d362_wait("home and the drive-removal message", 10, || {
                 d.state.borrow().cwd == home && d.ui.status.label() == "That drive was removed"
@@ -31291,6 +31492,64 @@ Broken: Either state is wrong.\n";
             return;
         }
         a_pasted_address_opens_the_folder_d262();
+    }
+
+    #[test]
+    fn blocked_address_check_times_out_and_drops_late_results_d424() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() == Ok("1") {
+            gtk_thread::run(blocked_address_check_on_gtk_thread_d424);
+        }
+    }
+
+    fn blocked_address_check_on_gtk_thread_d424() {
+        let _session = private_session_guard_d232();
+        gtk::init().expect("gtk init on the virtual display");
+        private_display_check_d232(&gdk::Display::default().expect("display"));
+        let d = d362_open("address", |dir| fs::create_dir(dir.join("late")).unwrap(), 1);
+        let initial = d.state.borrow().cwd.clone();
+        let home = native_core::Location::real(std::env::var("HOME").unwrap());
+        let home_button = all_widgets(d.ui.window.upcast_ref()).into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Home"))
+            .expect("Home toolbar button");
+        let timeout_message = "That location is not answering.";
+
+        for go_home in [false, true] {
+            let timeout = Duration::from_secs(if go_home { 5 } else { 1 });
+            let (entered, worker_entered) = std::sync::mpsc::channel();
+            let (release, worker_release) = std::sync::mpsc::channel();
+            let (finished, worker_finished) = std::sync::mpsc::channel();
+            let late = initial.real_path().unwrap().join("late").to_string_lossy().into_owned();
+            let gtk_thread = std::thread::current().id();
+            let start = Instant::now();
+            start_address_check(&d.state, late, timeout, false, move |text, _| {
+                assert_ne!(std::thread::current().id(), gtk_thread);
+                entered.send(()).unwrap();
+                worker_release.recv_timeout(Duration::from_secs(10)).unwrap();
+                finished.send(()).unwrap();
+                Some(text.to_string())
+            });
+            assert!(start.elapsed() < timeout, "the GTK caller waited for the check");
+            wait_for("address check entered the worker", || worker_entered.try_recv().is_ok());
+
+            if go_home {
+                home_button.emit_clicked();
+                wait_for("Home opened while the address worker was blocked", || d.state.borrow().cwd == home);
+                assert!(start.elapsed() < timeout);
+            } else {
+                wait_for("the address check timed out", || d.ui.status.label() == timeout_message);
+                assert!(start.elapsed() < timeout + Duration::from_secs(1));
+                assert_eq!(d.state.borrow().cwd, initial);
+            }
+
+            let generation = d.state.borrow().listing_generation;
+            let status = d.ui.status.label();
+            release.send(()).unwrap();
+            worker_finished.recv_timeout(Duration::from_secs(2)).unwrap();
+            pump();
+            assert_eq!(d.state.borrow().listing_generation, generation, "a late answer started navigation");
+            assert_eq!(d.ui.status.label(), status);
+        }
     }
 
     /// D-261 on its own, under a private display, without the full suite.
@@ -41018,7 +41277,7 @@ Broken: Either state is wrong.\n";
         wait_for("home listing", || state.borrow().visible_entries.len() == 1);
         state.borrow_mut().recent_files = vec![bookmark_for_path(&file.to_string_lossy())];
         rebuild_quick_access(&state, &ui);
-        pump();
+        wait_for("the checked Recent file tile", || ui.recent_files_tiles.first_child().is_some());
         let cell = ui.recent_files_tiles.first_child().and_then(|c| c.first_child()).expect("a recent tile");
         let mut button = None;
         let mut child = cell.first_child();
@@ -51917,7 +52176,7 @@ Broken: Either state is wrong.\n";
     fn no_row_is_forced_out_of_its_sorted_place() {
         let all = include_str!("native.rs");
         let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
-        let repop = &app[app.find("fn repopulate_rows(").unwrap()..];
+        let repop = &app[app.find("fn repopulate_rows_with_pins(").unwrap()..];
         let repop = &repop[..repop.find("\nfn ").unwrap_or(repop.len())];
         assert!(!repop.contains("visible_entries.insert(0"), "no row may be moved to the top");
         assert!(!repop.contains("pinned_top"), "repopulate_rows must not read the pin");
@@ -52015,7 +52274,7 @@ Broken: Either state is wrong.\n";
         let app = &all[..all.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(app.contains(".wf-list .wf-group-boundary {"), "the stylesheet draws the divider");
         assert!(app.contains("line.add_css_class(\"wf-group-boundary\")"), "the row carries it");
-        let repop = &app[app.find("fn repopulate_rows(").unwrap()..];
+        let repop = &app[app.find("fn repopulate_rows_with_pins(").unwrap()..];
         let repop = &repop[..repop.find("\nfn ").unwrap_or(repop.len())];
         assert!(repop.contains("group_boundary"), "repopulate_rows decides where it goes");
     }
