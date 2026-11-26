@@ -55,7 +55,7 @@ Other ways to install:
 | `./packaging/install.sh --system` | For every user, under `/usr/local`. Needs root. |
 | `./packaging/install.sh --prefix /opt/wayfinder` | Somewhere else. |
 | `./packaging/install.sh --destdir /tmp/stage` | Stage the tree without touching the live system, for distribution packagers. |
-| `./packaging/install.sh --no-portal` | File manager only, leave the system file dialog alone. |
+| `./packaging/install.sh --no-portal` | Installs the file manager. Removes an earlier Wayfinder file dialog from the same prefix and restores your previous chooser. |
 | `./packaging/install.sh --dry-run` | Print every step, change nothing. |
 | `./packaging/install.sh --uninstall` | Remove everything it installed. Your settings in `~/.config/wayfinder` are kept. |
 
