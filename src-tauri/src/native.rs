@@ -1096,8 +1096,10 @@ enum UndoAction {
     },
 }
 
+#[derive(Default)]
 struct JobOutcome {
     message: String,
+    show_during_refresh: bool,
     undo: Option<UndoAction>,
     refresh_to: Option<String>,
     /// D-187: set only by `perform_undo`/`perform_redo`, never by a regular
@@ -1118,40 +1120,28 @@ impl JobOutcome {
     fn message(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            undo: None,
-            refresh_to: None,
-            reciprocal: None,
-            remainder: None,
+            ..Self::default()
         }
     }
 
     fn undo(message: impl Into<String>, undo: UndoAction) -> Self {
         Self {
-            message: message.into(),
             undo: Some(undo),
-            refresh_to: None,
-            reciprocal: None,
-            remainder: None,
+            ..Self::message(message)
         }
     }
 
     fn navigate(message: impl Into<String>, path: String) -> Self {
         Self {
-            message: message.into(),
-            undo: None,
             refresh_to: Some(path),
-            reciprocal: None,
-            remainder: None,
+            ..Self::message(message)
         }
     }
 
     fn reciprocal(message: impl Into<String>, reciprocal: UndoAction) -> Self {
         Self {
-            message: message.into(),
-            undo: None,
-            refresh_to: None,
             reciprocal: Some(reciprocal),
-            remainder: None,
+            ..Self::message(message)
         }
     }
 }
@@ -18168,9 +18158,13 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
                 trashed,
             )),
             TrashStep::Refused(why) => Err(why),
-            // D-231: one Undo entry for the items that did move.
-            TrashStep::Partial { entry: Some(trashed), message, .. } => Ok(JobOutcome::undo(message, trashed)),
-            TrashStep::Partial { entry: None, message, .. } => Ok(JobOutcome::message(message)),
+            // D-231/D-442: Undo covers the identified items. Tell the user
+            // about the partial move even if the listing is slow or cancelled.
+            TrashStep::Partial { entry, message, .. } => Ok(JobOutcome {
+                undo: entry,
+                show_during_refresh: true,
+                ..JobOutcome::message(message)
+            }),
         },
         |_, _, _| {},
     );
@@ -19105,7 +19099,11 @@ fn partial_trash_message(
     let (moved, stopped) = match stop {
         TrashStop::NotMoved { path, reason } => (done, format!("{} was not moved: {reason}", name(path))),
         TrashStop::MovedUnidentified { path, reason } => {
-            (done + 1, format!("{} is in Trash without an exact record: {reason}", name(path)))
+            let notice = format!("{} is in Trash and cannot be undone from here", name(path));
+            if total == 1 {
+                return format!("{notice}.");
+            }
+            (done + 1, format!("{notice}: {reason}"))
         }
     };
     let restores = match (done, moved) {
@@ -19359,6 +19357,9 @@ fn complete_job(
         .map(|p| native_core::Location::real(&p))
         .unwrap_or_else(|| refresh_path.clone());
     navigate_to_with_message(state, target, NavMode::Record, Some(outcome.message.clone()));
+    if outcome.show_during_refresh {
+        ui.status.set_label(&outcome.message);
+    }
 }
 
 /// Inline (in-row) rename state. Keyed by the ORIGINAL full path, never a row
@@ -34536,6 +34537,49 @@ Broken: Either state is wrong.\n";
     }
 
     #[test]
+    fn trash_move_without_receipt_explains_missing_undo_d442() {
+        if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private display");
+            let d = d362_open("trashreceipt", |dir| {
+                fs::write(dir.join("unidentified.txt"), b"selected payload").unwrap();
+            }, 1);
+            let dir = d.state.borrow().cwd.real_path().unwrap().to_path_buf();
+            let bin = dir.parent().unwrap().join("fixture-trash");
+            fs::create_dir(&bin).unwrap();
+            let trash = native_core::fixture_trash::install(&bin);
+            trash.twin("unidentified.txt");
+
+            let shown = Rc::new(RefCell::new(Vec::new()));
+            d.ui.status.connect_label_notify({
+                let shown = shown.clone();
+                let state = Rc::downgrade(&d.state);
+                move |label| {
+                    let text = label.label();
+                    if text.contains("unidentified.txt is in Trash") {
+                        let refreshing = state.upgrade().unwrap().borrow().listing_cancel.is_some();
+                        shown.borrow_mut().push((text.to_string(), refreshing));
+                    }
+                }
+            });
+            select_index(&d.state, &d.ui, 0);
+            d.ui.trash.emit_clicked();
+            d362_wait("the Trash result and refresh", 15, || {
+                !shown.borrow().is_empty() && d.state.borrow().listing_cancel.is_none()
+            });
+            let expected = "unidentified.txt is in Trash and cannot be undone from here.";
+            assert_eq!(shown.borrow().first(), Some(&(expected.to_string(), true)));
+            assert_eq!(d.ui.status.label(), expected);
+            assert!(d.state.borrow().undo_stack.is_empty());
+            assert!(!dir.join("unidentified.txt").exists());
+            assert_eq!(fs::read(bin.join("files/unidentified.txt")).unwrap(), b"selected payload");
+        });
+    }
+
+    #[test]
     fn sidebar_trash_retention_confirms_expired_items_d441() {
         if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
             return;
@@ -43824,7 +43868,7 @@ Broken: Either state is wrong.\n";
         frame("4-moved-without-a-record.png");
         assert_eq!(
             result,
-            "Moved 2 of 3 items to Trash; Undo restores 1 of them. b.txt is in Trash without an exact record: 2 new Trash entries, expected 1. 1 not attempted."
+            "Moved 2 of 3 items to Trash; Undo restores 1 of them. b.txt is in Trash and cannot be undone from here: 2 new Trash entries, expected 1. 1 not attempted."
         );
         assert_eq!(ui.status.label(), result);
         assert_eq!(dir_names(&dir), ["c.txt"]);
@@ -43925,7 +43969,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(
             step.expect("a step that moved items is not a refusal"),
             (
-                format!("Redo moved 2 of 3 items to Trash; Undo restores 1 of them. b2.txt is in Trash without an exact record: {twinned}. 1 not attempted."),
+                format!("Redo moved 2 of 3 items to Trash; Undo restores 1 of them. b2.txt is in Trash and cannot be undone from here: {twinned}. 1 not attempted."),
                 some(trashed(&p[..1], &g[..1])),
                 some(UndoAction::Pasted { items: copies(&p[2..]), was_copy: true, fps: g[2..].to_vec() }),
             )
@@ -43953,7 +43997,7 @@ Broken: Either state is wrong.\n";
         assert_eq!(
             history_step_d231(UndoAction::Created { paths: p.clone() }, true),
             Ok((
-                format!("Undo moved 1 of 1 item to Trash; Redo cannot restore it. f1.txt is in Trash without an exact record: {twinned}. 0 not attempted."),
+                "f1.txt is in Trash and cannot be undone from here.".to_string(),
                 none(),
                 none(),
             ))

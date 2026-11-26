@@ -9,6 +9,7 @@ change between releases.
 ### Fixed
 - Overwrite now warns that it permanently deletes the existing files when file names clash.
 - Changing how long Trash keeps items asks before permanently deleting anything and says how many items will go.
+- The status line says when an item reached Trash and Wayfinder cannot undo the move.
 
 ## 0.9.38 — 25 November 2026
 
