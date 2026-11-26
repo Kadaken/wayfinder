@@ -5955,6 +5955,11 @@ pub fn extract_archive_here_ctl(path: &str, dest_dir: &str, ctl: &ExtractCtl) ->
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ARCHIVE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn extract_here_dir(
     path: &str,
     dest_dir: &str,
@@ -6005,11 +6010,22 @@ fn extract_here_dir(
             });
         }
     };
+    let destination_identity = stage.as_ref().expect("decoded into a staging folder").destination_identity;
+    let publish = |from: &Path, to: &Path| {
+        #[cfg(test)]
+        if let Some(before) = BEFORE_ARCHIVE_PUBLISH.take() {
+            before();
+        }
+        if file_identity(dest) != Some(destination_identity) {
+            return Err(std::io::Error::other(format!("extraction destination changed: {}", dest.display())));
+        }
+        publish(from, to)
+    };
     let mut outcome = ExtractHereOutcome::default();
     for name in names {
         let (from, to) = (out.join(&name), dest.join(&name));
         let shown = name.to_string_lossy().into_owned();
-        match publish_staged_entry(&from, &to, publish) {
+        match publish_staged_entry(&from, &to, &publish) {
             Ok(()) => outcome.published.push(shown),
             // The name is taken, whether it was there all along or arrived a moment ago.
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
@@ -6131,6 +6147,7 @@ static EXTRACT_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct ExtractStage {
     path: PathBuf,
     identity: (u64, u64),
+    destination_identity: (u64, u64),
 }
 
 impl ExtractStage {
@@ -6138,13 +6155,16 @@ impl ExtractStage {
     /// dangling link included, so nothing is ever adopted: the next name is tried.
     fn reserve(dest: &Path) -> Result<Self, String> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let destination = fs::metadata(dest)
+            .map_err(|e| format!("cannot inspect extraction destination {}: {e}", dest.display()))?;
+        let destination_identity = (destination.dev(), destination.ino());
         for _ in 0..10_000 {
             let n = EXTRACT_STAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
             let path = dest.join(format!(".wf-extract-{}-{n}", std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
                     return match fs::symlink_metadata(&path) {
-                        Ok(meta) => Ok(Self { path, identity: (meta.dev(), meta.ino()) }),
+                        Ok(meta) => Ok(Self { path, identity: (meta.dev(), meta.ino()), destination_identity }),
                         Err(e) => {
                             let _ = fs::remove_dir(&path);
                             Err(format!("{}: {e}", path.display()))
@@ -12252,6 +12272,38 @@ mod extract_here_tests_d230 {
         let error = extract_here_d230(&tar, &dest).unwrap_err();
         assert!(error.contains("Unsafe archive output") && error.contains("hard link"), "{error}");
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_destination_swapped_for_a_symlink_is_refused_d447() {
+        let root = owned("d447-swapped-destination");
+        let src = root.0.join("src");
+        let dest = root.0.join("dest");
+        let moved = root.0.join("moved");
+        let other = root.0.join("other");
+        for dir in [&src, &dest, &other] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::write(src.join("inside.txt"), "fixture").unwrap();
+        let zip = root.0.join("archive.zip");
+        pack("zip", &src, &["inside.txt"], &zip);
+        BEFORE_ARCHIVE_PUBLISH.replace(Some(Box::new({
+            let (dest, moved, other) = (dest.clone(), moved.clone(), other.clone());
+            move || {
+                fs::rename(&dest, &moved).unwrap();
+                symlink(&other, &dest).unwrap();
+            }
+        })));
+        let result = extract_archive_here(zip.to_str().unwrap(), dest.to_str().unwrap());
+        BEFORE_ARCHIVE_PUBLISH.take();
+
+        let outcome = result.unwrap();
+        assert!(outcome.published.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, "inside.txt");
+        assert!(outcome.failed[0].1.contains("extraction destination changed"), "{}", outcome.summary());
+        assert!(!moved.join("inside.txt").exists());
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
     }
 
     #[test]
