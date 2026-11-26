@@ -24458,6 +24458,17 @@ mod tests {
         }
     }
 
+    /// D-423: a folder clash says Overwrite deletes, for one clash and for many.
+    #[test]
+    fn folder_clash_warns_overwrite_deletes_d423() {
+        let (_, d) = conflict_dialog_text(&["Photos".to_string()], true);
+        assert_eq!(d.as_deref(), Some(FOLDER_OVERWRITE_WARNING));
+        let (_, d) = conflict_dialog_text(&["Photos".to_string(), "b.txt".to_string()], true);
+        assert!(d.unwrap().ends_with(FOLDER_OVERWRITE_WARNING));
+        assert!(FOLDER_OVERWRITE_WARNING.contains("permanently deleted"));
+        assert!(!FOLDER_OVERWRITE_WARNING.contains("merge"));
+    }
+
     #[test]
     fn transfer_postcondition_rejects_a_bad_result() {
         let before = vec![native_core::SourceSnapshot {
