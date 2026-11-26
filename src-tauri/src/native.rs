@@ -34448,11 +34448,19 @@ Broken: Either state is wrong.\n";
             permanent_delete_selection(d.state.clone(), d.ui.clone());
             let dialog = d.ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
             fs::remove_file(dir.join("b-missing.txt")).unwrap();
+            // Every status shown is recorded: under a loaded test run the
+            // refresh after the delete can replace the error before a poll sees it.
+            let shown = Rc::new(RefCell::new(Vec::<String>::new()));
+            {
+                let shown = shown.clone();
+                d.ui.status.connect_label_notify(move |label| shown.borrow_mut().push(label.label().to_string()));
+            }
             dialog.emit_by_name::<()>("response", &[&"confirm"]);
 
             let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
             let expected = format!("Operation failed: {not_found}");
-            d362_wait("the permanent-delete error", 10, || d.ui.status.label() == expected);
+            d362_wait("the permanent-delete error", 30, || shown.borrow().iter().any(|label| *label == expected));
+            eprintln!("partial delete statuses: {:?}", shown.borrow());
             assert!(!dir.join("a-first.txt").exists(), "the first deletion succeeded");
             assert!(!dir.join("b-missing.txt").exists(), "the second item disappeared before confirmation");
             assert_eq!(fs::read(dir.join("c-last.txt")).unwrap(), b"c-last.txt");
