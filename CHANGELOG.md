@@ -4,7 +4,10 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
-## 0.9.36 — 23 November 2026
+## 0.9.36 — 25 November 2026
+
+### Changed
+- Wayfinder no longer starts muted every time. Sound starts the way you left it: muted stays muted, unmuted stays unmuted, at the same volume. Unmuting at volume 0 turns the volume up to full, and an unmute always reaches the speakers, even when the system had remembered a volume of 0 for Wayfinder.
 
 ### Added
 - Windows shortcuts (.lnk) preview as text: where the shortcut points, its working folder, arguments, comment, and the target's size and date.

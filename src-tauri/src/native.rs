@@ -2443,17 +2443,19 @@ fn full_media_volume() -> f64 {
 thread_local! {
     static MEDIA_SOUND: Cell<Option<(f64, bool)>> = const { Cell::new(None) };
     static MEDIA_SOUND_PUSHING: Cell<bool> = const { Cell::new(false) };
+    static MEDIA_UNMUTE_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     static MEDIA_SOUND_SAVE: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
 }
 
 /// The shared volume (0.0 to 1.0) and mute, read from the config once.
-/// D-414: every start is muted, whatever was saved. The volume carries over;
-/// an unmute lasts until Wayfinder closes.
+/// D-421 (23 Nov 2026) undoes D-414: a start uses what was saved. Whatever he
+/// leaves it on is what it stays on ("now i can't un mute it, thats takes my
+/// control away").
 fn media_sound() -> (f64, bool) {
     MEDIA_SOUND.with(|slot| {
         slot.get().unwrap_or_else(|| {
             let config = load_config();
-            let sound = (config.media_volume.clamp(0.0, 1.0), true);
+            let sound = (config.media_volume.clamp(0.0, 1.0), config.media_muted);
             slot.set(Some(sound));
             sound
         })
@@ -2490,13 +2492,50 @@ fn set_media_sound(volume: f64, muted: bool) {
 /// Puts the shared volume and mute on a video stream. Mute is flipped and
 /// set back so both values reach the sound server even when they equal what
 /// GTK already believes: the system's remembered mute is invisible to GTK.
+///
+/// D-421: the volume is moved 0.01 away and back for the same reason. The
+/// system remembers a stream volume of 0 for "Wayfinder" and puts it on each
+/// new stream; GTK still believes its own value and would skip setting it
+/// again, so that remembered 0 won and an unmute gave silence.
 fn push_media_sound(media: &gtk::MediaStream) {
     let (volume, muted) = media_sound();
     MEDIA_SOUND_PUSHING.with(|p| p.set(true));
     media.set_muted(!muted);
+    media.set_volume(nudged_volume(volume));
     media.set_volume(volume);
     media.set_muted(muted);
     MEDIA_SOUND_PUSHING.with(|p| p.set(false));
+}
+
+/// D-421: a value 0.01 away from `volume`, never 0, so setting it and then
+/// `volume` makes GTK send the volume even when it believes it is already set.
+fn nudged_volume(volume: f64) -> f64 {
+    if volume >= 0.5 { volume - 0.01 } else { volume + 0.01 }
+}
+
+/// D-421: an unmute on a video sends the volume to the stream again (0
+/// becomes full). Only the volume is set here, never the mute, so it cannot
+/// call itself: the 0.9.36 attempt set the mute from this handler, GTK
+/// reported each set back later as a new unmute, and it ran until the
+/// laptop ran out of memory. A second unmute within a second is not pushed.
+fn push_unmuted_volume(media: &gtk::MediaStream) {
+    let target = audible_volume(media.volume());
+    let now = Instant::now();
+    let recent = MEDIA_UNMUTE_AT.with(|at| at.get().is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)));
+    if !recent {
+        MEDIA_UNMUTE_AT.with(|at| at.set(Some(now)));
+        MEDIA_SOUND_PUSHING.with(|p| p.set(true));
+        media.set_volume(nudged_volume(target));
+        media.set_volume(target);
+        MEDIA_SOUND_PUSHING.with(|p| p.set(false));
+    }
+    set_media_sound(target, false);
+}
+
+/// D-421: an unmute is a request to hear it. With the volume at 0 it would
+/// stay silent, so it comes back at full volume.
+fn audible_volume(volume: f64) -> f64 {
+    if volume <= 0.0 { 1.0 } else { volume }
 }
 
 /// Every video player follows the shared setting: it starts with it once its
@@ -2511,7 +2550,17 @@ fn follow_media_sound(media: &gtk::MediaStream) {
         }
     });
     media.connect_volume_notify(|m| set_media_sound(m.volume(), m.is_muted()));
-    media.connect_muted_notify(|m| set_media_sound(m.volume(), m.is_muted()));
+    media.connect_muted_notify(|m| {
+        if MEDIA_SOUND_PUSHING.with(Cell::get) {
+            return;
+        }
+        if m.is_muted() {
+            set_media_sound(m.volume(), true);
+            return;
+        }
+        // D-421: the system's remembered 0 never wins, and 0 becomes full.
+        push_unmuted_volume(m);
+    });
 }
 
 /// The song player starts with the shared setting, and again on Play, in case
@@ -21787,7 +21836,13 @@ fn connect_preview_audio_controls(ui: &Ui) {
         let ui = ui.clone();
         ui.preview_audio_mute.clone().connect_clicked(move |_| {
             let state = ui.preview_audio.borrow().as_ref().map(|player| {
-                player.set_muted(!player.muted());
+                let unmute = player.muted();
+                if unmute {
+                    // D-421: the volume is set again on every unmute, so the
+                    // system's remembered 0 never wins; 0 becomes full.
+                    player.set_volume(audible_volume(player.volume()));
+                }
+                player.set_muted(!unmute);
                 (player.volume(), player.muted())
             });
             if let Some((volume, muted)) = state {
@@ -28554,18 +28609,32 @@ Broken: Either state is wrong.\n";
                     && d.ui.preview_media_controls.media_stream().is_some_and(|s| s.is_prepared())
             });
         };
+        // D-421: a start uses the saved setting, unmuted or muted.
+        let start_with = |volume: f64, muted: bool| {
+            update_config(|c| {
+                c.media_volume = volume;
+                c.media_muted = muted;
+            });
+            MEDIA_SOUND.with(|slot| slot.set(None));
+        };
+        start_with(0.6, false);
         show_video("a.mp4");
-        assert!(stream().is_muted(), "D-414: the first video after a start is muted");
-        assert!(!stream().is_playing(), "D-414: a video never plays by itself");
+        assert!(!stream().is_muted(), "D-421: a saved unmute starts unmuted");
+        assert!((stream().volume() - 0.6).abs() < 0.01, "D-421: the saved volume starts, got {}", stream().volume());
+        assert!(!stream().is_playing(), "a video never plays by itself");
+        start_with(0.0, true);
+        show_video("b.mp4");
+        assert!(stream().is_muted(), "D-421: a saved mute starts muted");
         stream().set_muted(false);
         assert!(!stream().is_muted(), "the mute button unmutes it");
+        assert!((stream().volume() - 1.0).abs() < 0.01, "D-421: an unmute at volume 0 comes back at full, got {}", stream().volume());
         stream().set_muted(true);
-        show_video("b.mp4");
-        assert!(stream().is_muted(), "a mute on a.mp4 carries to b.mp4");
+        show_video("a.mp4");
+        assert!(stream().is_muted(), "a mute on b.mp4 carries to a.mp4");
         stream().set_muted(false);
         stream().set_volume(0.3);
-        show_video("a.mp4");
-        assert!(!stream().is_muted(), "one unmute on b.mp4 unmutes a.mp4 too");
+        show_video("b.mp4");
+        assert!(!stream().is_muted(), "one unmute on a.mp4 unmutes b.mp4 too");
         assert!((stream().volume() - 0.3).abs() < 0.01, "volume carried as {}", stream().volume());
         stream().pause();
         d362_show(&d, "s.wav");
@@ -28575,11 +28644,23 @@ Broken: Either state is wrong.\n";
         assert_eq!(
             d.ui.preview_audio.borrow().as_ref().map(|p| p.is_playing()),
             Some(false),
-            "D-414: a song never plays by itself"
+            "a song never plays by itself"
         );
         assert_eq!(song_muted(), Some(false), "the song starts unmuted");
         d.ui.preview_audio_mute.emit_clicked();
         assert_eq!(song_muted(), Some(true), "the song's mute button mutes it");
+        let song_volume = || d.ui.preview_audio.borrow().as_ref().map(|p| p.volume()).unwrap_or(-1.0);
+        if let Some(p) = d.ui.preview_audio.borrow().as_ref() {
+            p.set_volume(0.0);
+        }
+        d.ui.preview_audio_mute.emit_clicked();
+        assert_eq!(song_muted(), Some(false), "the song's mute button unmutes it");
+        assert!((song_volume() - 1.0).abs() < 0.01, "D-421: a song unmuted at volume 0 comes back at full, got {}", song_volume());
+        if let Some(p) = d.ui.preview_audio.borrow().as_ref() {
+            p.set_volume(0.3);
+        }
+        d.ui.preview_audio_mute.emit_clicked();
+        assert_eq!(song_muted(), Some(true), "muted again for the next check");
         show_video("b.mp4");
         assert!(stream().is_muted(), "a mute on the song carries to the next video");
         d362_wait("the setting saved", 10, || {

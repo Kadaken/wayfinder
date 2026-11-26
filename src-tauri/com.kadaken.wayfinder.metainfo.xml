@@ -46,10 +46,11 @@
   </screenshots>
 
   <releases>
-    <release version="0.9.36" date="2026-11-23">
+    <release version="0.9.36" date="2026-11-25">
       <description>
-        <p>The preview pane shows Windows shortcuts, Outlook messages and
-        Windows metafile pictures.</p>
+        <p>Sound starts the way it was left instead of always muted, and an
+        unmute is always heard. The preview pane shows Windows shortcuts,
+        Outlook messages and Windows metafile pictures.</p>
       </description>
     </release>
     <release version="0.9.35" date="2026-11-23">
