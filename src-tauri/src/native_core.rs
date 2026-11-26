@@ -6029,6 +6029,7 @@ fn extract_here_dir(
 // D-437: inspect links without following them through filesystem lookups.
 fn validate_staged_archive(stage: &Path, dest: &Path) -> std::io::Result<()> {
     use std::collections::VecDeque;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Component;
 
     let mut dirs = vec![stage.to_path_buf()];
@@ -6085,6 +6086,8 @@ fn validate_staged_archive(stage: &Path, dest: &Path) -> std::io::Result<()> {
                 }
             } else if !kind.is_file() {
                 return Err(std::io::Error::other(format!("unsupported entry: {}", entry.path().display())));
+            } else if entry.metadata()?.nlink() > 1 {
+                return Err(std::io::Error::other(format!("archive contains a hard link: {}", entry.path().display())));
             }
         }
     }
@@ -12233,6 +12236,22 @@ mod extract_here_tests_d230 {
         assert_eq!(remaining_after_tar, 0);
         assert_eq!(zip_result.unwrap().0, ["inside.txt"]);
         assert_eq!(fs::read_to_string(dest.join("inside.txt")).unwrap(), "fixture");
+    }
+
+    #[test]
+    fn archive_with_a_hard_link_is_refused_d446() {
+        let root = owned("d446-hard-link");
+        let (src, dest) = (root.0.join("src"), root.0.join("dest"));
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("nested/original.txt"), "fixture").unwrap();
+        fs::hard_link(src.join("nested/original.txt"), src.join("nested/alias.txt")).unwrap();
+        let tar = root.0.join("hard-links.tar");
+        pack("tar", &src, &["nested"], &tar);
+
+        let error = extract_here_d230(&tar, &dest).unwrap_err();
+        assert!(error.contains("Unsafe archive output") && error.contains("hard link"), "{error}");
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
     }
 
     #[test]
