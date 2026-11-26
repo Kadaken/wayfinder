@@ -209,7 +209,12 @@ remove_qt_env() {
 # A reinstall never overwrites the record with Wayfinder itself.
 take_folder_app() {
   command -v xdg-mime >/dev/null 2>&1 || return 0
-  [ "$dry" != 1 ] || return 0
+  # D-452: the dry run lists this step too; it writes the user's folder default.
+  if [ "$dry" = 1 ]; then
+    printf '  would: record the current folder app in %s\n' "$prev_folder_app"
+    printf '  would: xdg-mime default %s inode/directory\n' "$wf_desktop"
+    return 0
+  fi
   local cur=""
   # Only the user's own choice is recorded, read from their mimeapps.list, so
   # uninstall restores exactly that file and never writes a system default in.

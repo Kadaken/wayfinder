@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# D-426, D-431, D-434, D-449, D-451: installer audit regressions in throwaway HOME trees.
+# D-426, D-431, D-434, D-449, D-451, D-452: installer audit regressions in throwaway HOME trees.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$here/.." && pwd)"
@@ -186,6 +186,20 @@ run_uninstall_summary_test_d449() {
   echo "PASS: D-449 uninstall lists settings, the portal backup, and codec packages it keeps"
 }
 
+run_dry_run_folder_test_d452() {
+  local project="$fake/dry-project" home="$fake/dry-home"
+  make_project "$project"
+  mkdir -p "$home"
+  HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
+    PATH="$fake/bin:$PATH" WAYFINDER_INSTALL_NO_RESTART=1 \
+    bash "$project/packaging/install.sh" --no-build --no-portal --dry-run > "$fake/dry.out"
+  grep -q 'would: xdg-mime default com.kadaken.wayfinder.desktop inode/directory' "$fake/dry.out" \
+    || { echo "FAIL: D-452 dry run did not list the folder default"; return 1; }
+  [ -z "$(find "$home" -mindepth 1 -print -quit)" ] \
+    || { echo "FAIL: D-452 dry run wrote into HOME"; return 1; }
+  echo "PASS: D-452 dry run lists the folder default and writes nothing"
+}
+
 run_check_test
 run_folder_test
 run_portal_test
@@ -193,4 +207,5 @@ stub_portal_tools
 run_no_portal_test_d449
 run_no_portal_upgrade_test_d451
 run_uninstall_summary_test_d449
-echo "ALL PASS (6 tests)"
+run_dry_run_folder_test_d452
+echo "ALL PASS (7 tests)"
