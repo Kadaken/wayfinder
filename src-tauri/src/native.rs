@@ -97,6 +97,8 @@ const APP_CSS: &str = r#"
 @define-color wf_text          #e3e5ea;
 @define-color wf_text_dim      #8b909a;
 @define-color wf_text_muted    #888d97;
+/* D-432: 5.98:1 against wf_control_hover for hovered sidebar details. */
+@define-color wf_text_hover_detail #b8bdc7;
 /* Disabled controls are exempt from the contrast minimum; keep their quiet look. */
 @define-color wf_text_disabled #6b7079;
 
@@ -417,6 +419,10 @@ entry.wf-search,
 
 .wf-sidebar row:hover {
     background: @wf_control_hover;
+}
+
+.wf-sidebar row:hover .wf-sidebar-detail {
+    color: @wf_text_hover_detail;
 }
 
 .wf-sidebar row.wf-sidebar-active {
@@ -4705,11 +4711,12 @@ fn startup_mark(what: &'static str) {
     }
     SEEN.with(|s| s.borrow_mut().push(what));
     let dir = wayfinder_cache_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
-        use std::io::Write as _;
-        let _ = writeln!(f, "pid {} {what}: {ms}ms", std::process::id());
-    }
+    // D-430: startup diagnostics use the same bounded log writer as other logs.
+    let _ = native_core::append_capped_log(
+        &dir.join("startup.log"),
+        &format!("pid {} {what}: {ms}ms\n", std::process::id()),
+        DIAGNOSTIC_LOG_CAP,
+    );
 }
 
 /// D-346: the worker-thread form; logs only the first call per process.
@@ -4720,10 +4727,12 @@ fn startup_mark_any_thread(what: &'static str) {
     }
     let Some(start) = PROCESS_START.get() else { return };
     let dir = wayfinder_cache_dir();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
-        use std::io::Write as _;
-        let _ = writeln!(f, "pid {} {what}: {}ms", std::process::id(), start.elapsed().as_millis());
-    }
+    // D-430: startup diagnostics use the same bounded log writer as other logs.
+    let _ = native_core::append_capped_log(
+        &dir.join("startup.log"),
+        &format!("pid {} {what}: {}ms\n", std::process::id(), start.elapsed().as_millis()),
+        DIAGNOSTIC_LOG_CAP,
+    );
 }
 
 fn main() {
@@ -12391,6 +12400,43 @@ fn scroll_trace_lines(max: usize) -> Vec<String> {
 /// Audit #13: the cap for every diagnostic log under the cache folder.
 const DIAGNOSTIC_LOG_CAP: u64 = 256 * 1024;
 
+const THUMBNAIL_CACHE_CAP: u64 = 512 * 1024 * 1024;
+static THUMBNAIL_PRUNE_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+// D-430: prune only direct regular files in the thumbnail cache, oldest first.
+fn prune_thumbnail_cache(dir: &Path, cap: u64) -> std::io::Result<()> {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            files.push((entry.path(), metadata.modified().ok(), metadata.len()));
+        }
+    }
+    if total <= cap {
+        return Ok(());
+    }
+    files.sort_by_key(|(_, modified, _)| *modified);
+    for (path, _, len) in files {
+        if total <= cap {
+            break;
+        }
+        fs::remove_file(path)?;
+        total = total.saturating_sub(len);
+    }
+    Ok(())
+}
+
+fn start_thumbnail_cache_prune(dir: PathBuf) {
+    if THUMBNAIL_PRUNE_STARTED.set(()).is_ok() {
+        let _ = std::thread::Builder::new().name("wf-thumb-prune".into()).spawn(move || {
+            let _ = prune_thumbnail_cache(&dir, THUMBNAIL_CACHE_CAP);
+        });
+    }
+}
+
 /// Audit #25: the one place that names Wayfinder's cache folder.
 fn wayfinder_cache_dir() -> PathBuf {
     glib::user_cache_dir().join("wayfinder")
@@ -14697,6 +14743,7 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
         .join("wayfinder")
         .join("image-thumbs");
     fs::create_dir_all(&dir).ok()?;
+    start_thumbnail_cache_prune(dir.clone());
     let cached = dir.join(format!("{key:016x}.png"));
     if cached.is_file() {
         return Some(cached);
@@ -21201,7 +21248,49 @@ fn write_transfer_report(is_copy: bool, report: &[native_core::ReportRow]) -> Op
     let verb = if is_copy { "Copy" } else { "Move" };
     let path = dir.join(format!("{stamp} - {verb} to {dest_name}.md"));
     std::fs::write(&path, transfer_report_markdown(is_copy, report)).ok()?;
+    // D-430: retain only this app's newest 200 report names.
+    let _ = prune_transfer_reports(&dir, 200);
     Some(path)
+}
+
+// D-430: recognize exactly the timestamp, verb and suffix this writer emits.
+fn is_transfer_report_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 10 + 1 + 8 + 3 + 4 + 4 + 3 {
+        return false;
+    }
+    let digit = |b: u8| b.is_ascii_digit();
+    bytes[0..4].iter().all(|b| digit(*b))
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|b| digit(*b))
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|b| digit(*b))
+        && bytes[10] == b' '
+        && bytes[11..13].iter().all(|b| digit(*b))
+        && bytes[13] == b'.'
+        && bytes[14..16].iter().all(|b| digit(*b))
+        && bytes[16] == b'.'
+        && bytes[17..19].iter().all(|b| digit(*b))
+        && (name[19..].starts_with(" - Copy to ") || name[19..].starts_with(" - Move to "))
+        && name.ends_with(".md")
+}
+
+fn prune_transfer_reports(dir: &Path, keep: usize) -> std::io::Result<()> {
+    let mut reports = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if metadata.is_file() && is_transfer_report_name(&name) {
+            reports.push((entry.path(), metadata.modified().ok(), name));
+        }
+    }
+    reports.sort_by_key(|(_, modified, name)| (*modified, name.clone()));
+    let remove = reports.len().saturating_sub(keep);
+    for (path, _, _) in reports.into_iter().take(remove) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// D-320: after a verified transfer, a saved list AND a window naming every
@@ -23591,6 +23680,49 @@ mod tests {
             icon: String::new(),
             metadata_error: None,
         }
+    }
+
+    #[test]
+    fn thumbnail_prune_caps_direct_files_without_following_links_d430() {
+        let dir = std::env::temp_dir().join(format!("wf-d430-thumbs-{}", std::process::id()));
+        let _ = super::fs::remove_dir_all(&dir);
+        super::fs::create_dir_all(dir.join("nested")).unwrap();
+        super::fs::write(dir.join("a.png"), [0u8; 80]).unwrap();
+        super::fs::write(dir.join("b.png"), [0u8; 80]).unwrap();
+        super::fs::write(dir.join("nested/keep.png"), [0u8; 80]).unwrap();
+        std::os::unix::fs::symlink(dir.join("a.png"), dir.join("link.png")).unwrap();
+        super::prune_thumbnail_cache(&dir, 100).unwrap();
+        let direct_bytes: u64 = super::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| super::fs::symlink_metadata(e.path()).ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        assert!(direct_bytes <= 100);
+        assert!(dir.join("nested/keep.png").exists());
+        assert!(super::fs::symlink_metadata(dir.join("link.png")).is_ok());
+        let _ = super::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transfer_report_prune_keeps_newest_cap_and_other_files_d430() {
+        let dir = std::env::temp_dir().join(format!("wf-d430-reports-{}", std::process::id()));
+        let _ = super::fs::remove_dir_all(&dir);
+        super::fs::create_dir_all(&dir).unwrap();
+        for i in 0..201 {
+            super::fs::write(dir.join(format!("2026-11-{day:02} 12.00.{second:02} - Copy to Home.md", day = 1 + i / 100, second = i % 100)), "report").unwrap();
+        }
+        super::fs::write(dir.join("notes.md"), "keep").unwrap();
+        super::prune_transfer_reports(&dir, 200).unwrap();
+        let matching = super::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_str().is_some_and(super::is_transfer_report_name))
+            .count();
+        assert_eq!(matching, 200);
+        assert_eq!(super::fs::read_to_string(dir.join("notes.md")).unwrap(), "keep");
+        let _ = super::fs::remove_dir_all(&dir);
     }
 
     /// D-224: committed `75ca650`'s `glob_match` treated `[`/`]` literally,
@@ -30562,8 +30694,8 @@ Broken: Either state is wrong.\n";
         let mut rows: std::collections::BTreeMap<i32, Vec<i32>> = std::collections::BTreeMap::new();
         for index in 0..8 {
             let child = grid_child_at(&ui, (index) as u32).expect("grid child");
-            let alloc = child.allocation();
-            rows.entry(alloc.y()).or_default().push(alloc.width());
+            let alloc = child.compute_bounds(&ui.grid).expect("grid child bounds");
+            rows.entry(alloc.y() as i32).or_default().push(alloc.width() as i32);
         }
         eprintln!("d267 grid pane width: {}", ui.grid.width());
         for (y, widths) in &rows {
@@ -30654,8 +30786,8 @@ Broken: Either state is wrong.\n";
             let shown = pstate.borrow().visible_entries.len().min(24);
             for index in 0..shown as i32 {
                 if let Some(child) = grid_child_at(&pui, (index) as u32) {
-                    let alloc = child.allocation();
-                    prows.entry(alloc.y()).or_default().push(alloc.width());
+                    let alloc = child.compute_bounds(&pui.grid).expect("picker grid child bounds");
+                    prows.entry(alloc.y() as i32).or_default().push(alloc.width() as i32);
                 }
             }
             // Which tile is forcing the column width: homogeneous means the
@@ -35396,7 +35528,7 @@ Broken: Either state is wrong.\n";
             let (px, py) = (wx + cx as i32, wy + cy as i32);
             let picked = ui.window.pick(cx, cy, gtk::PickFlags::DEFAULT).map(|w| w.type_().name().to_string());
             eprintln!("wf-test D-364 {label}: cut row {path:?} y={:.1} h={:.1} bottom={bottom:.1} click=({px},{py}) picked={picked:?} value={:.1}", b.y(), b.height(), adj.value());
-            let mut click_and_check = |what: &str, px: i32, py: i32, want: &str, problems: &mut Vec<String>| {
+            let click_and_check = |what: &str, px: i32, py: i32, want: &str, problems: &mut Vec<String>| {
                 let before = adj.value();
                 xdo(&["mousemove", &px.to_string(), &py.to_string()]);
                 settle(100);
@@ -35426,7 +35558,7 @@ Broken: Either state is wrong.\n";
                 let sb = scroller.compute_bounds(&ui.window).expect("scroller bounds");
                 rows(ui).iter().any(|(w, b)| path_of(w) == want && b.y() >= sb.y() - 1.0 && b.y() + b.height() <= sb.y() + sb.height() + 1.0)
             };
-            let mut key_step = |keys: &[&str], expect: usize, what: &str, problems: &mut Vec<String>| {
+            let key_step = |keys: &[&str], expect: usize, what: &str, problems: &mut Vec<String>| {
                 for k in keys {
                     xdo(&["key", k]);
                     settle(250);
@@ -40413,7 +40545,7 @@ Broken: Either state is wrong.\n";
         pump();
 
         assert!(
-            !gtk::Window::list_toplevels().iter().any(|w| w.is::<gtk::Dialog>() && w.is_visible()),
+            !gtk::Window::list_toplevels().iter().any(|w| w.type_().name() == "GtkDialog" && w.is_visible()),
             "Open With opens no dialog or separate window"
         );
         assert!(item_menu.is_mapped(), "the parent item menu stays open behind the side menu");
@@ -51819,5 +51951,9 @@ mod audit_config_save_tests {
             let r = ratio(muted, colour(bg));
             assert!(r >= 4.5, "wf_text_muted on {bg} is {r:.2}:1, needs 4.5:1");
         }
+        let hover_detail = colour("wf_text_hover_detail");
+        let hover_ratio = ratio(hover_detail, colour("wf_control_hover"));
+        assert!(hover_ratio >= 4.5, "hover detail is {hover_ratio:.2}:1, needs 4.5:1");
+        assert!(APP_CSS.contains(".wf-sidebar row:hover .wf-sidebar-detail"));
     }
 }

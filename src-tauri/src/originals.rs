@@ -55,6 +55,8 @@ pub fn parse_originals_tsv(text: &str) -> Vec<ListedRow> {
 }
 
 type ListCache = HashMap<PathBuf, (SystemTime, Arc<HashMap<String, ListedRow>>)>;
+// D-435: name the process-wide index slot type so clippy can read its shape.
+type IndexSlot = Mutex<Option<Arc<HashMap<String, String>>>>;
 
 fn list_cache() -> &'static Mutex<ListCache> {
     static CACHE: OnceLock<Mutex<ListCache>> = OnceLock::new();
@@ -369,8 +371,8 @@ pub fn build_index(
 
 // ---- process-wide state ------------------------------------------------------
 
-fn index_slot() -> &'static Mutex<Option<Arc<HashMap<String, String>>>> {
-    static SLOT: OnceLock<Mutex<Option<Arc<HashMap<String, String>>>>> = OnceLock::new();
+fn index_slot() -> &'static IndexSlot {
+    static SLOT: OnceLock<IndexSlot> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
