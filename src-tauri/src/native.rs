@@ -16894,8 +16894,8 @@ fn cut_consumes_offer(cut_offer: Option<u64>, succeeded: bool, now: u64) -> bool
 }
 
 /// Replace / Duplicate / Add 2 / Cancel. Escape or closing the window is Cancel.
-/// Heading and optional detail. One clash: heading only. Several: the names and
-/// the one-choice-applies-to-all statement, and no explanation of the buttons.
+/// The heading names the clash count. The detail warns what Overwrite does
+/// and, for several clashes, lists the names and says the choice applies to all.
 /// D-423: Overwrite on a folder swaps the whole folder; anything only in the
 /// one already here is permanently deleted. The dialog says so before the
 /// choice, never "merges".
@@ -16904,9 +16904,15 @@ const FOLDER_OVERWRITE_WARNING: &str =
 
 fn conflict_dialog_text(conflicts: &[String], any_folder: bool) -> (String, Option<String>) {
     let count = conflicts.len();
+    let warning = if any_folder {
+        FOLDER_OVERWRITE_WARNING
+    } else if count == 1 {
+        "Overwrite permanently deletes the file already here."
+    } else {
+        "Overwrite permanently deletes the files already here."
+    };
     if count == 1 {
-        let detail = any_folder.then(|| FOLDER_OVERWRITE_WARNING.to_string());
-        return (format!("\"{}\" already exists here.", conflicts[0]), detail);
+        return (format!("\"{}\" already exists here.", conflicts[0]), Some(warning.to_string()));
     }
     let sample: Vec<&str> = conflicts.iter().take(5).map(String::as_str).collect();
     let more = count.saturating_sub(sample.len());
@@ -16914,11 +16920,7 @@ fn conflict_dialog_text(conflicts: &[String], any_folder: bool) -> (String, Opti
     let names = if more > 0 { format!("{listed}, and {more} more.") } else { listed };
     (
         format!("{count} items already exist here."),
-        Some(if any_folder {
-            format!("{names}\n\nYour choice applies to all of them.\n\n{FOLDER_OVERWRITE_WARNING}")
-        } else {
-            format!("{names}\n\nYour choice applies to all of them.")
-        }),
+        Some(format!("{names}\n\nYour choice applies to all of them.\n\n{warning}")),
     )
 }
 
@@ -24892,14 +24894,15 @@ mod tests {
     }
 
     #[test]
-    fn conflict_dialog_wording_is_short() {
+    fn file_clash_warns_overwrite_deletes_d440() {
         let (h, d) = conflict_dialog_text(&["a.txt".to_string()], false);
         assert_eq!(h, "\"a.txt\" already exists here.");
-        assert!(d.is_none(), "a single clash shows only the heading");
+        assert_eq!(d.as_deref(), Some("Overwrite permanently deletes the file already here."));
         let (h, d) = conflict_dialog_text(&["a".to_string(), "b".to_string()], false);
         assert_eq!(h, "2 items already exist here.");
         let d = d.unwrap();
         assert!(d.contains("a, b") && d.contains("applies to all"));
+        assert!(d.ends_with("Overwrite permanently deletes the files already here."));
         for banned in ["Undo", "overwrites", "Replace", "keeps both"] {
             assert!(!d.contains(banned));
         }

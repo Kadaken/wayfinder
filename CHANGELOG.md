@@ -4,6 +4,11 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.39 — unreleased
+
+### Fixed
+- Overwrite now warns that it permanently deletes the existing files when file names clash.
+
 ## 0.9.38 — 25 November 2026
 
 ### Fixed
