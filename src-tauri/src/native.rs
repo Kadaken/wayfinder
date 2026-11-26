@@ -10294,7 +10294,7 @@ fn show_options_popover(parent: &gtk::Button, state: Rc<RefCell<AppState>>, ui: 
         let state = state.clone();
         let ui = ui.clone();
         menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
-            trash_selection(state.clone(), ui.clone())
+            trash_or_delete_selection(state.clone(), ui.clone())
         }));
     }
     {
@@ -17769,7 +17769,14 @@ fn trash_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
 /// already trashed destroyed it with no warning at all (he hit this). In the
 /// Trash both therefore mean permanent delete, which asks first.
 fn trash_or_delete_selection(state: Rc<RefCell<AppState>>, ui: Ui) {
-    if viewing_trash(&state) {
+    // D-428: Delete also asks before removing items from a mounted drive's Trash.
+    // The name check comes first so an ordinary folder on a stuck network
+    // drive never reaches the file-system lookups on the screen thread.
+    let in_trash = state.borrow().cwd.real_path().is_some_and(|path| {
+        let text = path.to_string_lossy();
+        (text.contains("/Trash/files") || text.contains("/.Trash")) && native_core::in_trash_files(path)
+    });
+    if in_trash {
         permanent_delete_selection(state, ui);
     } else {
         trash_selection(state, ui);
@@ -19805,7 +19812,7 @@ fn show_item_context_menu(
                     "Move to Trash",
                     Box::new({
                         let (state, ui) = (state.clone(), ui.clone());
-                        move || trash_selection(state.clone(), ui.clone())
+                        move || trash_or_delete_selection(state.clone(), ui.clone())
                     }) as Box<dyn Fn()>,
                 )
             },
@@ -20009,7 +20016,7 @@ fn show_item_context_menu(
             let state = state.clone();
             let ui = ui.clone();
             menu.append(&context_item("user-trash-symbolic", "Move to Trash", "Delete", &popover, move || {
-                trash_selection(state.clone(), ui.clone())
+                trash_or_delete_selection(state.clone(), ui.clone())
             }));
         }
         {
