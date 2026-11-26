@@ -13148,7 +13148,9 @@ mod partial_trash_tests_d231 {
         assert_eq!(case.in_trash(), ["a.txt = a.txt bytes"]);
         let a = case.receipt("a.txt", "a.txt");
         assert_eq!(seen.done, [(a.clone(), guard_a)], "the item already in Trash lost its record: {seen:?}");
-        assert_eq!(seen.stop, Some(("not moved", case.path("b.txt"), denied())));
+        // D-425: the message names the side that failed and the file.
+        let read_denied = format!("No permission to read {}", case.path("b.txt"));
+        assert_eq!(seen.stop, Some(("not moved", case.path("b.txt"), read_denied)));
         assert_eq!(seen.left, [case.path("c.txt")]);
         fs::set_permissions(&b, fs::Permissions::from_mode(0o600)).unwrap();
         restore_from_trash_exact(&[a]).unwrap();

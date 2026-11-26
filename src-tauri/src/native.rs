@@ -24016,6 +24016,12 @@ mod tests {
         if std::env::var_os("WAYFINDER_HEADLESS_GTK_TEST").is_none() {
             return;
         }
+        // Runs on the shared GTK test thread, so no other test has HOME
+        // changed while the session guard reads it.
+        gtk_thread::run(audit_0938_d422_picker_hides_on_gtk_thread);
+    }
+
+    fn audit_0938_d422_picker_hides_on_gtk_thread() {
         private_session_guard_d232();
         const CHILD: &str = "WF_D422_HIDE_CHILD";
         if let Some(out_file) = std::env::var_os(CHILD) {
