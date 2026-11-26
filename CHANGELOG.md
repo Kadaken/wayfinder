@@ -12,6 +12,7 @@ change between releases.
 - Wayfinder refuses to move extracted files into a destination folder that changed during extraction.
 - Tests now cover HTTPS for update requests, refusal of manifest redirects, and rejection of downloads that end on another site.
 - Installing with `--no-portal` leaves the file dialog alone, and uninstall lists the settings, backup and codec packages it keeps.
+- Wayfinder checks each update redirect before contacting the next site and follows at most three redirects.
 
 ## 0.9.38 — 25 November 2026
 

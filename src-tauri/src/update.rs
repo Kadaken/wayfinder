@@ -33,6 +33,7 @@ use serde::Deserialize;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// Where the manifest lives. Served by kadaken.com beside the download it
 /// describes, and written by `scripts/make-update-manifest.sh` off the same
@@ -43,6 +44,8 @@ pub const MANIFEST_URL: &str = "https://kadaken.com/wayfinder-update.json";
 /// must never wait on a web server, so this is short and the whole check runs
 /// off the main thread anyway.
 const CHECK_TIMEOUT_SECS: &str = "10";
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_DOWNLOAD_REDIRECTS: usize = 3;
 
 /// Seconds between checks. Once a day: often enough that a release is found
 /// within a day of shipping, rare enough that opening ten windows does not
@@ -216,25 +219,28 @@ fn sha256_of(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn download_curl_args<'a>(archive: &'a Path, url: &'a str) -> impl Iterator<Item = &'a OsStr> {
+fn download_curl_args<'a>(
+    archive: &'a Path,
+    url: &'a str,
+    max_time: &'a str,
+) -> impl Iterator<Item = &'a OsStr> {
     [
         "--disable",
         "--globoff",
         "--silent",
         "--show-error",
         "--fail",
-        "--location",
+        "--max-redirs",
+        "0",
         "--proto",
-        "=https",
-        "--proto-redir",
         "=https",
         "--tlsv1.2",
         "--max-time",
-        "600",
+        max_time,
         "--user-agent",
         concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
         "--write-out",
-        "%{url_effective}",
+        "%{url_effective}\n%{redirect_url}",
         "--output",
     ]
     .into_iter()
@@ -245,19 +251,39 @@ fn download_curl_args<'a>(archive: &'a Path, url: &'a str) -> impl Iterator<Item
 fn download_archive(
     archive: &Path,
     url: &str,
-    run: impl FnOnce(&mut Command) -> std::io::Result<Output>,
+    mut run: impl FnMut(&mut Command) -> std::io::Result<Output>,
 ) -> Result<(), String> {
-    let output = run(Command::new("curl").args(download_curl_args(archive, url)))
-        .map_err(|e| format!("could not run curl: {e}"))?;
-    if !output.status.success() {
-        return Err("the download did not finish".to_string());
+    let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
+    let mut url = url.to_owned();
+    // curl resolves relative Location headers. Check the resolved URL
+    // before starting each request, including the first one.
+    for _ in 0..=MAX_DOWNLOAD_REDIRECTS {
+        if !url_is_allowed(&url) {
+            return Err("the update download was directed to an unapproved URL".to_string());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.as_millis() == 0 {
+            return Err("the update download timed out".to_string());
+        }
+        let max_time = format!("{:.3}", remaining.as_secs_f64());
+        let output = run(Command::new("curl").args(download_curl_args(archive, &url, &max_time)))
+            .map_err(|e| format!("could not run curl: {e}"))?;
+        if !output.status.success() {
+            return Err("the download did not finish".to_string());
+        }
+        let (effective_url, redirect_url) = std::str::from_utf8(&output.stdout)
+            .ok()
+            .and_then(|urls| urls.split_once('\n'))
+            .ok_or("could not read the update download URLs from curl")?;
+        if !url_is_allowed(effective_url) {
+            return Err("the update download ended on an unapproved URL".to_string());
+        }
+        if redirect_url.is_empty() {
+            return Ok(());
+        }
+        url = redirect_url.to_owned();
     }
-    // D-427: /get/ redirects to the archive. Use it only if the final URL
-    // is on an allowed HTTPS host.
-    if !std::str::from_utf8(&output.stdout).is_ok_and(url_is_allowed) {
-        return Err("the update download ended on an unapproved URL".to_string());
-    }
-    Ok(())
+    Err(format!("the update download exceeded {MAX_DOWNLOAD_REDIRECTS} redirects"))
 }
 
 /// Downloads the release named by `manifest`, checks its size and checksum,
@@ -423,38 +449,97 @@ mod tests {
         assert!(manifest_args.windows(2).any(|args| args == ["--proto", "=https"]));
 
         let manifest = good();
-        let download: Vec<_> = download_curl_args(Path::new("update.tar.gz"), &manifest.url)
+        let download: Vec<_> = download_curl_args(Path::new("update.tar.gz"), &manifest.url, "600")
             .map(|arg| arg.to_str().unwrap())
             .collect();
         assert_eq!(download[0], "--disable");
-        assert!(download.contains(&"--location"));
+        assert!(!download.contains(&"--location"));
+        assert!(download.windows(2).any(|args| args == ["--max-redirs", "0"]));
         assert!(download.windows(2).any(|args| args == ["--proto", "=https"]));
-        assert!(download.windows(2).any(|args| args == ["--proto-redir", "=https"]));
-        assert!(download.windows(2).any(|args| args == ["--write-out", "%{url_effective}"]));
+        assert!(download
+            .windows(2)
+            .any(|args| args == ["--write-out", "%{url_effective}\n%{redirect_url}"]));
+    }
+
+    fn curl_download_output(effective_url: &str, redirect_url: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: format!("{effective_url}\n{redirect_url}").into_bytes(),
+            stderr: Vec::new(),
+        }
     }
 
     #[test]
     fn a_successful_curl_with_an_unapproved_effective_url_is_refused_d448() {
-        use std::os::unix::process::ExitStatusExt;
-
         let archive = Path::new("update.tar.gz");
         let url = good().url;
-        let curl_output = |effective_url: &str| Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: effective_url.as_bytes().to_vec(),
-            stderr: Vec::new(),
-        };
         assert_eq!(
             download_archive(archive, &url, |_| {
-                Ok(curl_output("https://kadaken.com/download/wayfinder.tar.gz"))
+                Ok(curl_download_output("https://kadaken.com/download/wayfinder.tar.gz", ""))
             }),
             Ok(())
         );
         let error = download_archive(archive, &url, |_| {
-            Ok(curl_output("https://example.org/download/wayfinder.tar.gz"))
+            Ok(curl_download_output("https://example.org/download/wayfinder.tar.gz", ""))
         })
         .unwrap_err();
         assert_eq!(error, "the update download ended on an unapproved URL");
+    }
+
+    fn download_with_redirects(
+        initial_url: &str,
+        redirects: &[&str],
+    ) -> (Result<(), String>, Vec<String>) {
+        let mut fetched = Vec::new();
+        let result = download_archive(Path::new("update.tar.gz"), initial_url, |command| {
+            let url = command.get_args().last().unwrap().to_str().unwrap();
+            let redirect = redirects.get(fetched.len()).copied().unwrap_or_default();
+            fetched.push(url.to_string());
+            Ok(curl_download_output(url, redirect))
+        });
+        (result, fetched)
+    }
+
+    #[test]
+    fn three_allowed_download_redirects_are_followed_d450() {
+        let urls = [
+            "https://kadaken.com/get/wayfinder",
+            "https://www.kadaken.com/get/wayfinder",
+            "https://www.kadaken.com/download/current",
+            "https://kadaken.com/download/wayfinder.tar.gz",
+        ];
+        let (result, fetched) = download_with_redirects(urls[0], &urls[1..]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(fetched, urls);
+    }
+
+    #[test]
+    fn an_off_list_download_redirect_is_refused_before_fetching_d450() {
+        let urls = [
+            "https://kadaken.com/get/wayfinder",
+            "https://www.kadaken.com/get/wayfinder",
+            "https://example.org/redirect",
+            "https://kadaken.com/download/wayfinder.tar.gz",
+        ];
+        let (result, fetched) = download_with_redirects(urls[0], &urls[1..]);
+        assert_eq!(result.unwrap_err(), "the update download was directed to an unapproved URL");
+        assert_eq!(fetched, urls[..2]);
+    }
+
+    #[test]
+    fn a_fourth_download_redirect_is_refused_before_fetching_d450() {
+        let urls = [
+            "https://kadaken.com/get/wayfinder",
+            "https://www.kadaken.com/get/wayfinder",
+            "https://www.kadaken.com/download/current",
+            "https://kadaken.com/download/current",
+            "https://kadaken.com/download/wayfinder.tar.gz",
+        ];
+        let (result, fetched) = download_with_redirects(urls[0], &urls[1..]);
+        assert_eq!(result.unwrap_err(), "the update download exceeded 3 redirects");
+        assert_eq!(fetched, urls[..4]);
     }
 
     fn good() -> Manifest {
