@@ -4,6 +4,30 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.38 — 25 November 2026
+
+### Fixed
+- Typing a folder on a network drive that stopped answering no longer freezes the window. Wayfinder waits 3 seconds, then says "That location is not answering." Other folder checks that could hang on such a drive also left the main window.
+- The Overwrite choice for folders now says plainly that it replaces the whole folder and that files only in the old folder are deleted. It used to say it merges.
+- Permission errors name the side that failed: "No permission to read" for the file being copied, "No permission to write" for the place it goes.
+- Delete inside a USB drive's trash folder deletes for good, as it already did in your own Trash. It used to send the file to the trash again.
+- Undoing a move never overwrites a file that now has the same name, including a broken shortcut link, and works for moves between drives.
+- The update download only accepts files from kadaken.com. It used to follow a redirect to any secure site.
+- `install.sh --check` only reports what is missing; with `--with-codecs` it no longer installs anything.
+- On a new account, the installer creates `~/.config` so Wayfinder becomes the folder opener, and says so if that still fails.
+- Uninstall gives back the file-dialog choice you had before Wayfinder, such as the KDE one.
+- After you type an address and press Enter, the keyboard lands on the file list, and Escape in the address bar returns to the files.
+- Drive details on a highlighted sidebar row are easier to read.
+- Archives that try to write outside their own folder, or carry links that point outside it, are refused. The extract tools can only write inside a private staging folder.
+- A network share and the duplicate finder now use the exact folder they checked, so a folder swapped for a link in between is not followed.
+- A file dialog reading its done marker never hangs on a special file and reads at most 16 bytes. A file dialog given a wrong-typed "multiple" or "directory" option now refuses it.
+
+### Changed
+- The thumbnail cache is capped at 512 MB; the oldest thumbnails go first.
+- The startup log is capped in size.
+- Transfer reports keep the newest 200; older ones are removed.
+- Empty Trash works on systems without a trash service by emptying your own Trash folder directly.
+
 ## 0.9.37 — 25 November 2026
 
 ### Fixed

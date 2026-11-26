@@ -46,6 +46,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.38" date="2026-11-25">
+      <description>
+        <p>Release-audit fixes: a stuck network drive no longer freezes the
+        window, folder Overwrite warns that it replaces the folder, Move undo
+        never overwrites, and the update download cannot be redirected.</p>
+      </description>
+    </release>
     <release version="0.9.37" date="2026-11-25">
       <description>
         <p>Saving or opening from another app no longer freezes when a slow
