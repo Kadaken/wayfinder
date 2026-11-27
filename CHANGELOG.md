@@ -21,6 +21,7 @@ change between releases.
 - Installing with `--no-portal` removes an earlier Wayfinder file dialog and restores your previous chooser.
 - `install.sh --dry-run` now lists the folder-default step a real install performs.
 - The file dialog refuses a batch save when a proposed file name is already a symbolic link.
+- If a folder listing stalls, Wayfinder says the location is not answering after 3 seconds and lets you open another folder.
 
 ## 0.9.38 — 25 November 2026
 
