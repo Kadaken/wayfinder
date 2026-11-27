@@ -4,6 +4,27 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.40 — 26 November 2026
+
+### Fixed
+- Wayfinder no longer crashes when the desktop session's message bus closes under it (D-458).
+- The installer says plainly when it cannot reach the desktop session to restart the file dialog service, instead of printing a raw systemctl error (D-459).
+- A copy that fails because the disk is full names the real folder, not Wayfinder's temporary one (D-460).
+- A copy or move that finished but could not record its Undo now still says it finished, refreshes the folder and says why Undo is missing; before, nothing happened on screen (D-461).
+- A rename that worked but could not record its Undo is reported as done, not as "Operation failed" (D-462).
+- A program asking the Wayfinder file dialog to save with the "multiple" option set can save under a new name again (D-463).
+- The optional test Guide shows a step number from its session file as plain text and never uses it in a file path (D-464).
+- `install.sh --dry-run` only says it would record your previous folder app when the real install would (D-465).
+- When files and folders clash together, Overwrite's warning names the files' loss as well as the folders' (D-466).
+- `install.sh --no-portal` now also removes a leftover Wayfinder file-dialog setting when the dialog's own files are already gone, so other programs' Open and Save boxes keep working (D-467).
+- `install.sh --kde-apps` never overwrites a settings file of the same name that it did not write (D-468).
+- One transfer report has a size limit: at most 5,000 items and 500 folder lists, then a line saying how many more were checked (D-469).
+- The file dialog service refuses a request named outside the portal's request path at once; before, the asking program waited for its own time limit (D-471).
+- The file dialog only accepts a Save into a folder, or onto a file, that you are allowed to write (D-472).
+
+### Tests
+- New tests pin the 3-second "not answering" limit, check the extraction destination before every entry, and check that `--no-portal` leaves the file dialog out of the dependency report (D-470).
+
 ## 0.9.39 — 26 November 2026
 
 ### Fixed

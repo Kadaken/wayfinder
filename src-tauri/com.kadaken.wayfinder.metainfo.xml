@@ -46,6 +46,14 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.40" date="2026-11-26">
+      <description>
+        <p>Release-audit fixes: no crash when the session bus closes, a finished
+        copy, move or rename always reports itself even when Undo cannot be
+        recorded, the installer never overwrites settings it did not write, and
+        transfer reports have a size limit.</p>
+      </description>
+    </release>
     <release version="0.9.39" date="2026-11-26">
       <description>
         <p>Release-audit fixes: Overwrite and Trash settings warn before
