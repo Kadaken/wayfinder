@@ -421,7 +421,8 @@ entry.wf-search,
     background: @wf_control_hover;
 }
 
-.wf-sidebar row:hover .wf-sidebar-detail {
+.wf-sidebar row:hover .wf-sidebar-detail,
+.wf-quick-tile:hover .wf-sidebar-detail {
     color: @wf_text_hover_detail;
 }
 
@@ -429,7 +430,8 @@ entry.wf-search,
     background: @wf_accent;
 }
 
-.wf-sidebar row.wf-sidebar-active label {
+.wf-sidebar row.wf-sidebar-active label,
+.wf-sidebar row.wf-sidebar-active:hover .wf-sidebar-detail {
     color: #ffffff;
 }
 
@@ -6245,7 +6247,9 @@ fn build_ui_in(
     connect_column_chooser(&state, &ui);
     apply_column_visibility(&state, &ui);
     update_sort_header_labels(&state, &ui);
-    connect_shortcuts(state.clone(), ui.clone());
+    if !embedded {
+        connect_shortcuts(state.clone(), ui.clone());
+    }
     connect_picker_actions(&state, &ui);
 
     if let Some(picker_state) = picker {
@@ -10506,16 +10510,6 @@ fn nearest_real_dir(loc: &native_core::Location) -> String {
 /// `(state, ui)` works inside it unchanged, with no "which pane" argument
 /// threaded through the window. Closing the split drops its widgets, and with
 /// them its state.
-/// The pane that owns the split this `ui` sits in, or None when `ui` is that
-/// owner (or there is no split).
-fn split_owner_of(ui: &Ui) -> Option<(Rc<RefCell<AppState>>, Ui)> {
-    WINDOWS.with(|windows| {
-        windows.borrow().windows().into_iter().find(|(_, other)| {
-            other.window == ui.window && other.list != ui.list && other.split.borrow().is_some()
-        })
-    })
-}
-
 fn toggle_split(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let open = ui.split.borrow_mut().take();
     if let Some(pane) = open {
@@ -10628,9 +10622,15 @@ fn open_new_window(ui: &Ui, path: String) {
 
 fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
     let key = gtk::EventControllerKey::new();
-    let state_for_keys = state.clone();
-    let ui_for_keys = ui.clone();
+    let window = ui.window.clone();
+    // Let the focused widget handle its own keys before window shortcuts.
+    key.set_propagation_phase(gtk::PropagationPhase::Bubble);
     key.connect_key_pressed(move |_, key, _, mods| {
+        let in_left_pane = focus_within(&ui.window, &ui.body);
+        // When focus leaves the panes for the title bar, use the last active pane.
+        let right = (!in_left_pane && ui.split_right_active.get()).then(|| split_target(&state, &ui));
+        let (state_for_keys, ui_for_keys) = right.as_ref()
+            .map_or((&state, &ui), |(state, ui)| (state, ui));
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let alt = mods.contains(gdk::ModifierType::ALT_MASK);
@@ -10638,11 +10638,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         // D-292: the keyboard way to the right-click menu.
         let menu_key = (key == gdk::Key::Menu && !ctrl && !alt)
             || (key == gdk::Key::F10 && shift && !ctrl && !alt);
-        if menu_key && open_context_menu_from_key(&state_for_keys, &ui_for_keys) {
+        if menu_key && open_context_menu_from_key(state_for_keys, ui_for_keys) {
             return glib::Propagation::Stop;
         }
         if ctrl && shift && (key == gdk::Key::C || key == gdk::Key::c) {
-            copy_paths_to_system_clipboard(&state_for_keys, &ui_for_keys);
+            copy_paths_to_system_clipboard(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if ctrl && shift && (key == gdk::Key::N || key == gdk::Key::n) {
@@ -10650,7 +10650,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if is_new_window_shortcut(ctrl, shift, alt, key) {
-            open_new_window(&ui_for_keys, nearest_real_dir(&state_for_keys.borrow().cwd));
+            open_new_window(ui_for_keys, nearest_real_dir(&state_for_keys.borrow().cwd));
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::D || key == gdk::Key::d) {
@@ -10666,14 +10666,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         if key == gdk::Key::F3 {
             // Pressed inside the second pane it still closes the split, which
             // is the one thing F3 means; it never nests a split in a split.
-            match split_owner_of(&ui_for_keys) {
-                Some((owner_state, owner_ui)) => toggle_split(&owner_state, &owner_ui),
-                None => toggle_split(&state_for_keys, &ui_for_keys),
-            }
+            toggle_split(&state, &ui);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F4 || (alt && (key == gdk::Key::D || key == gdk::Key::d)) {
-            edit_path_action(&state_for_keys, &ui_for_keys);
+            edit_path_action(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F11 {
@@ -10686,7 +10683,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Return {
-            let selection = selected_entries(&state_for_keys, &ui_for_keys);
+            let selection = selected_entries(state_for_keys, ui_for_keys);
             let path = match selection.first() {
                 Some(entry) => entry.source.real_path_string(),
                 None => state_for_keys.borrow().cwd.real_path_string(),
@@ -10697,7 +10694,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         }
         if alt && key == gdk::Key::Up {
             let parent = state_for_keys.borrow().cwd.parent();
-            navigate(&state_for_keys, parent);
+            navigate(state_for_keys, parent);
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::A || key == gdk::Key::a) {
@@ -10705,11 +10702,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::C || key == gdk::Key::c) {
-            copy_selection(&state_for_keys, &ui_for_keys);
+            copy_selection(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::X || key == gdk::Key::x) {
-            cut_selection(&state_for_keys, &ui_for_keys);
+            cut_selection(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::V || key == gdk::Key::v) {
@@ -10741,15 +10738,15 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::L || key == gdk::Key::l) {
-            edit_path_action(&state_for_keys, &ui_for_keys);
+            edit_path_action(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Left {
-            history_step(&state_for_keys, false);
+            history_step(state_for_keys, false);
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Right {
-            history_step(&state_for_keys, true);
+            history_step(state_for_keys, true);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F2 {
@@ -10764,43 +10761,44 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             trash_or_delete_selection(state_for_keys.clone(), ui_for_keys.clone());
             return glib::Propagation::Stop;
         }
+        if key == gdk::Key::F5 {
+            let cwd = state_for_keys.borrow().cwd.clone();
+            navigate(state_for_keys, cwd);
+            return glib::Propagation::Stop;
+        }
+        // File-list navigation and typeahead only apply inside a pane.
+        if !in_left_pane && !focus_within(&ui.window, &ui_for_keys.body) {
+            return glib::Propagation::Proceed;
+        }
         if key == gdk::Key::Return {
-            open_selected(&state_for_keys, &ui_for_keys);
+            open_selected(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         // Only handle plain arrows. With Shift held, let the event through so the
         // list's own selection model extends the range — intercepting it here
         // forced a single selection and made Shift+Arrow impossible.
         if !alt && !shift && key == gdk::Key::Down {
-            move_selection(&state_for_keys, &ui_for_keys, 1);
+            move_selection(state_for_keys, ui_for_keys, 1);
             return glib::Propagation::Stop;
         }
         if !alt && !shift && key == gdk::Key::Up {
-            move_selection(&state_for_keys, &ui_for_keys, -1);
+            move_selection(state_for_keys, ui_for_keys, -1);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::BackSpace {
-            history_step(&state_for_keys, false);
-            return glib::Propagation::Stop;
-        }
-        if key == gdk::Key::F5 {
-            let cwd = state_for_keys.borrow().cwd.clone();
-            navigate(&state_for_keys, cwd);
+            history_step(state_for_keys, false);
             return glib::Propagation::Stop;
         }
         if !ctrl && !alt {
             if let Some(ch) = key.to_unicode().filter(|ch| !ch.is_control()) {
-                typeahead_select(&state_for_keys, &ui_for_keys, ch);
+                typeahead_select(state_for_keys, &ui_for_keys, ch);
                 return glib::Propagation::Stop;
             }
         }
 
         glib::Propagation::Proceed
     });
-    // Per PANE. Attached to the window, a split's two panes would both act on
-    // one press and the wrong pane would answer. `body` holds everything a
-    // pane can focus, so the press reaches exactly the pane the user is in.
-    ui.body.add_controller(key);
+    window.add_controller(key);
 }
 
 const ADDRESS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -12744,18 +12742,31 @@ fn scroll_trace_lines(max: usize) -> Vec<String> {
 const DIAGNOSTIC_LOG_CAP: u64 = 256 * 1024;
 
 const THUMBNAIL_CACHE_CAP: u64 = 512 * 1024 * 1024;
-static THUMBNAIL_PRUNE_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+const THUMBNAIL_CACHE_PRUNE_INTERVAL: u64 = 64 * 1024 * 1024;
+static THUMBNAIL_CACHE_PRUNER: std::sync::LazyLock<ThumbnailCachePruner> =
+    std::sync::LazyLock::new(|| {
+        ThumbnailCachePruner::new(THUMBNAIL_CACHE_CAP, THUMBNAIL_CACHE_PRUNE_INTERVAL)
+    });
 
 // D-430: prune only direct regular files in the thumbnail cache, oldest first.
-fn prune_thumbnail_cache(dir: &Path, cap: u64) -> std::io::Result<()> {
+fn prune_thumbnail_cache(dir: &Path, cap: u64, active_parts: &HashSet<PathBuf>) -> std::io::Result<()> {
+    use std::io::ErrorKind::NotFound;
+
     let mut files = Vec::new();
     let mut total = 0u64;
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let path = entry?.path();
+        if active_parts.contains(&path) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if metadata.is_file() {
             total = total.saturating_add(metadata.len());
-            files.push((entry.path(), metadata.modified().ok(), metadata.len()));
+            files.push((path, metadata.modified().ok(), metadata.len()));
         }
     }
     if total <= cap {
@@ -12766,17 +12777,81 @@ fn prune_thumbnail_cache(dir: &Path, cap: u64) -> std::io::Result<()> {
         if total <= cap {
             break;
         }
-        fs::remove_file(path)?;
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != NotFound {
+                return Err(error);
+            }
+        }
         total = total.saturating_sub(len);
     }
     Ok(())
 }
 
-fn start_thumbnail_cache_prune(dir: PathBuf) {
-    if THUMBNAIL_PRUNE_STARTED.set(()).is_ok() {
-        let _ = std::thread::Builder::new().name("wf-thumb-prune".into()).spawn(move || {
-            let _ = prune_thumbnail_cache(&dir, THUMBNAIL_CACHE_CAP);
-        });
+#[derive(Default)]
+struct ThumbnailCacheSession {
+    bytes_since_prune: Option<u64>,
+    active_parts: HashSet<PathBuf>,
+    next_part: u64,
+}
+
+struct ThumbnailCachePruner {
+    cap: u64,
+    interval: u64,
+    session: std::sync::Mutex<ThumbnailCacheSession>,
+}
+
+impl ThumbnailCachePruner {
+    fn new(cap: u64, interval: u64) -> Self {
+        Self {
+            cap,
+            interval,
+            session: std::sync::Mutex::new(ThumbnailCacheSession::default()),
+        }
+    }
+
+    // D-453: the transcode workers prune and publish under the same lock.
+    // Decodes still run in parallel, and scans skip their in-progress files.
+    fn get_or_write(&self, dir: &Path, key: u64, decode: impl FnOnce(&Path) -> bool) -> Option<PathBuf> {
+        let cached = dir.join(format!("{key:016x}.png"));
+        let part = {
+            let mut session = self.session.lock().unwrap();
+            if session.bytes_since_prune.is_none()
+                && prune_thumbnail_cache(dir, self.cap, &session.active_parts).is_ok()
+            {
+                session.bytes_since_prune = Some(0);
+            }
+            if cached.is_file() {
+                return Some(cached);
+            }
+            // Keep .png last for ffmpeg's format detection. Concurrent jobs
+            // for the same cache key each write their own temporary file.
+            let part = dir.join(format!(
+                "{key:016x}.{}.{}.part.png",
+                std::process::id(),
+                session.next_part,
+            ));
+            session.next_part += 1;
+            session.active_parts.insert(part.clone());
+            part
+        };
+
+        let decoded = decode(&part);
+        let mut session = self.session.lock().unwrap();
+        session.active_parts.remove(&part);
+        // Publish atomically so readers only see a finished PNG.
+        if !decoded || fs::rename(&part, &cached).is_err() {
+            let _ = fs::remove_file(&part);
+            return None;
+        }
+        let written = fs::metadata(&cached).map_or(self.interval, |metadata| metadata.len());
+        let pending = session.bytes_since_prune.unwrap_or(self.interval).saturating_add(written);
+        session.bytes_since_prune = Some(pending);
+        if pending >= self.interval
+            && prune_thumbnail_cache(dir, self.cap, &session.active_parts).is_ok()
+        {
+            session.bytes_since_prune = Some(0);
+        }
+        Some(cached)
     }
 }
 
@@ -15093,23 +15168,16 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
         .join("wayfinder")
         .join("image-thumbs");
     fs::create_dir_all(&dir).ok()?;
-    start_thumbnail_cache_prune(dir.clone());
-    let cached = dir.join(format!("{key:016x}.png"));
-    if cached.is_file() {
-        return Some(cached);
-    }
-    // The half-written name still ends in .png: ffmpeg picks the output
-    // format from the extension, and a name ending ".part" made it refuse
-    // with "Unable to choose an output format" every single time, so no
-    // AVIF ever decoded (7 Nov 2026, found on the owner's screen).
-    let part = dir.join(format!("{key:016x}.part.png"));
+    THUMBNAIL_CACHE_PRUNER.get_or_write(&dir, key, |part| decode_thumbnail_to_png(source, part, want_w))
+}
+
+fn decode_thumbnail_to_png(source: &str, part: &Path, want_w: i32) -> bool {
     // D-362: raw camera files, PSD and XCF are not something ffmpeg reads, so
     // ImageMagick goes first for them; everything else tries ffmpeg first and
     // ImageMagick second.
     let magick_first = native_core::prefers_magick(source);
-    if magick_first && native_viewers::magick_to_png(source, &part, want_w) {
-        fs::rename(&part, &cached).ok()?;
-        return Some(cached);
+    if magick_first && native_viewers::magick_to_png(source, part, want_w) {
+        return true;
     }
     // D-404: a HEIC made of tiles (every phone photo) reaches ffmpeg as a
     // complex filtergraph, and ffmpeg refuses a -vf on top of it ("Simple and
@@ -15135,7 +15203,7 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
             cmd.arg("-vf")
                 .arg(format!("scale={}:-1:flags=bilinear", want_w.clamp(16, 1024)));
         }
-        cmd.arg(&part).status()
+        cmd.arg(part).status()
     };
     let heif = native_core::is_heif_like(source);
     let mut status = run_ffmpeg(!heif);
@@ -15143,20 +15211,14 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
         status = run_ffmpeg(false);
     }
     match status {
-        Ok(code) if code.success() && part.is_file() => {
-            // Rename last, so a half-written file is never read as a thumbnail.
-            fs::rename(&part, &cached).ok()?;
-            Some(cached)
-        }
+        Ok(code) if code.success() && part.is_file() => true,
         other => {
-            let _ = fs::remove_file(&part);
-            if !magick_first && native_viewers::magick_to_png(source, &part, want_w) {
-                fs::rename(&part, &cached).ok()?;
-                return Some(cached);
+            let _ = fs::remove_file(part);
+            if !magick_first && native_viewers::magick_to_png(source, part, want_w) {
+                return true;
             }
-            let _ = fs::remove_file(&part);
             eprintln!("wf-event: no preview for {source:?}, ffmpeg said {other:?}");
-            None
+            false
         }
     }
 }
@@ -24061,7 +24123,7 @@ mod tests {
         super::fs::write(dir.join("b.png"), [0u8; 80]).unwrap();
         super::fs::write(dir.join("nested/keep.png"), [0u8; 80]).unwrap();
         std::os::unix::fs::symlink(dir.join("a.png"), dir.join("link.png")).unwrap();
-        super::prune_thumbnail_cache(&dir, 100).unwrap();
+        super::prune_thumbnail_cache(&dir, 100, &HashSet::new()).unwrap();
         let direct_bytes: u64 = super::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -24123,6 +24185,54 @@ mod tests {
 
     fn set_fixture_mtime(file: &fs::File, seconds: u64) {
         file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)).unwrap();
+    }
+
+    #[test]
+    fn thumbnail_cache_prunes_again_after_new_writes_d453() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".fixture-d453-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let _cleanup = ScratchCleanup(dir.clone());
+        let cap = 100;
+        let cache = ThumbnailCachePruner::new(cap, 50);
+        let oldest = dir.join("z-oldest.png");
+        let newer = dir.join("a-newer.png");
+        for (path, bytes, time) in [(&oldest, 35, 10), (&newer, 40, 20)] {
+            let file = fs::File::create(path).unwrap();
+            file.set_len(bytes).unwrap();
+            set_fixture_mtime(&file, time);
+        }
+        let write = |key| {
+            cache.get_or_write(&dir, key, |part| {
+                let file = fs::File::create(part).unwrap();
+                file.set_len(30).unwrap();
+                set_fixture_mtime(&file, 30 + key);
+                true
+            }).unwrap()
+        };
+        let total = || {
+            fs::read_dir(&dir).unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
+        };
+
+        let first = write(1);
+        assert!(oldest.is_file() && total() > cap, "one write is below the prune interval");
+        assert_eq!(
+            cache.get_or_write(&dir, 1, |_| panic!("cache hit must not decode")),
+            Some(first.clone()),
+        );
+        let second = write(2);
+        assert!(!oldest.exists(), "crossing the interval must remove the oldest file");
+        assert!(newer.is_file() && first.is_file() && second.is_file());
+        assert!(total() <= cap);
+
+        let third = write(3);
+        assert!(newer.is_file() && total() > cap, "each prune resets the write count");
+        let fourth = write(4);
+        assert!(!newer.exists() && !first.exists(), "the next prune also removes the oldest files");
+        assert!(second.is_file() && third.is_file() && fourth.is_file());
+        assert!(total() <= cap);
     }
 
     #[test]
@@ -46827,6 +46937,74 @@ Broken: Either state is wrong.\n";
         });
     }
 
+    #[test]
+    fn titlebar_focus_keeps_address_shortcut_d454() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private Xvfb");
+            gst::init().expect("GStreamer");
+            let root = crate::native_core::scratch_root().join("d454");
+            let _cleanup = ScratchCleanup(root.clone());
+            std::fs::create_dir_all(&root).unwrap();
+
+            let app = adw::Application::builder()
+                .application_id("com.kadaken.wayfinder.d454test")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            build_ui(&app, Some(root.to_string_lossy().into_owned()), None);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            ui.window.set_title(Some("wf-d454-proof"));
+            wait_for("the initial folder", || ui.window.is_mapped() && state.borrow().listing_cancel.is_none());
+
+            let minimize = all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.icon_name().as_deref() == Some("window-minimize-symbolic"))
+                .expect("the title bar's Minimize button");
+            let xdo = |args: &[&str]| {
+                let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().unwrap();
+                assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let xid = xdo(&["search", "--name", "^wf-d454-proof$"]);
+            xdo(&["windowfocus", "--sync", xid.trim()]);
+            assert!(minimize.grab_focus());
+            wait_for("focus on Minimize", || ui.window.is_active() && minimize.has_focus());
+            assert_eq!(ui.path_stack.visible_child_name().as_deref(), Some("label"));
+
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L opens and focuses the address field", || {
+                ui.path_stack.visible_child_name().as_deref() == Some("entry")
+                    && focus_within(&ui.window, &ui.path_entry)
+            });
+            ui.path_entry.set_text("sample");
+            ui.path_entry.set_position(-1);
+            xdo(&["key", "ctrl+a", "BackSpace"]);
+            wait_for("the address field handles Ctrl+A and Backspace", || ui.path_entry.text().is_empty());
+
+            xdo(&["key", "Escape", "F3"]);
+            wait_for("split opens", || ui.split.borrow().is_some());
+            let right_state = ui.split.borrow().as_ref().unwrap().state.clone();
+            let right = ui_for_state(&right_state).expect("right pane");
+            assert!(right.search.grab_focus());
+            assert!(minimize.grab_focus());
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L from Minimize focuses the last active pane's address", || {
+                right.path_stack.visible_child_name().as_deref() == Some("entry")
+                    && focus_within(&right.window, &right.path_entry)
+            });
+            xdo(&["key", "F3"]);
+            wait_for("F3 closes the split from the right pane", || ui.split.borrow().is_none());
+            ui.window.close();
+        });
+    }
+
     /// D-332: a crumb click navigates and never opens the text box; the edit
     /// button at the front of the address field is what opens it.
     fn address_crumbs_navigate_and_edit_button_edits_d332() {
@@ -53027,33 +53205,73 @@ mod audit_config_save_tests {
         assert!(ok.is_ok());
         let _ = fs::remove_dir_all(&root);
     }
+    fn css_luminance(colour: &str) -> f64 {
+        let value = match colour.strip_prefix('@') {
+            Some(name) => APP_CSS.lines().find_map(|line| {
+                let mut tokens = line.split_whitespace();
+                (tokens.next() == Some("@define-color") && tokens.next() == Some(name))
+                    .then(|| tokens.next().unwrap().trim_end_matches(';'))
+            }).expect(name),
+            None => colour,
+        };
+        let hex = value.strip_prefix('#').expect("hex colour");
+        let linear = |i: usize| {
+            let x = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(0) + 0.7152 * linear(2) + 0.0722 * linear(4)
+    }
+
+    fn css_contrast(foreground: &str, background: &str) -> f64 {
+        let (a, b) = (css_luminance(foreground), css_luminance(background));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
     /// D-293: the muted text colour must reach 4.5:1 (WCAG 1.4.3) on the listing
     /// and raised-pane backgrounds.
     #[test]
     fn muted_text_contrast_meets_wcag_aa_d293() {
-        fn colour(name: &str) -> [f64; 3] {
-            let key = format!("@define-color {name}");
-            let line = APP_CSS.lines().find(|l| l.starts_with(&key) && l[key.len()..].starts_with(' ')).expect(name);
-            let hex = line.trim_end_matches(';').rsplit('#').next().unwrap().trim();
-            let n = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
-            [n(0), n(2), n(4)]
-        }
-        fn lum(c: [f64; 3]) -> f64 {
-            let f = |x: f64| if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
-            0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
-        }
-        fn ratio(a: [f64; 3], b: [f64; 3]) -> f64 {
-            let (x, y) = (lum(a), lum(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        }
-        let muted = colour("wf_text_muted");
         for bg in ["wf_base", "wf_raised"] {
-            let r = ratio(muted, colour(bg));
+            let r = css_contrast("@wf_text_muted", &format!("@{bg}"));
             assert!(r >= 4.5, "wf_text_muted on {bg} is {r:.2}:1, needs 4.5:1");
         }
-        let hover_detail = colour("wf_text_hover_detail");
-        let hover_ratio = ratio(hover_detail, colour("wf_control_hover"));
+        let hover_ratio = css_contrast("@wf_text_hover_detail", "@wf_control_hover");
         assert!(hover_ratio >= 4.5, "hover detail is {hover_ratio:.2}:1, needs 4.5:1");
         assert!(APP_CSS.contains(".wf-sidebar row:hover .wf-sidebar-detail"));
+    }
+
+    fn css_declaration(selectors: &[&str], property: &str) -> Option<&'static str> {
+        APP_CSS.rsplit('}').find_map(|rule| {
+            let (rule_selectors, declarations) = rule.split_once('{')?;
+            let rule_selectors = rule_selectors.rsplit("*/").next().unwrap();
+            if !rule_selectors.split(',').any(|part| selectors.contains(&part.trim())) {
+                return None;
+            }
+            declarations.split(';').find_map(|declaration| {
+                let (name, value) = declaration.trim().split_once(':')?;
+                (name == property).then(|| value.trim())
+            })
+        })
+    }
+
+    #[test]
+    fn hovered_sidebar_and_home_detail_contrast_meets_wcag_aa_d455() {
+        // The active background wins the tie with the hover background by source order.
+        // For the detail text, the most specific matching rule wins.
+        let sidebar_bg = css_declaration(&[".wf-sidebar row.wf-sidebar-active:hover"], "background")
+            .or_else(|| css_declaration(&[".wf-sidebar row.wf-sidebar-active", ".wf-sidebar row:hover"], "background"))
+            .unwrap();
+        let sidebar_fg = css_declaration(&[".wf-sidebar row.wf-sidebar-active:hover .wf-sidebar-detail"], "color")
+            .or_else(|| css_declaration(&[".wf-sidebar row:hover .wf-sidebar-detail"], "color"))
+            .or_else(|| css_declaration(&[".wf-sidebar row.wf-sidebar-active label"], "color"))
+            .unwrap();
+        let tile_bg = css_declaration(&[".wf-quick-tile:hover"], "background").unwrap();
+        let tile_fg = css_declaration(&[".wf-quick-tile:hover .wf-sidebar-detail"], "color")
+            .or_else(|| css_declaration(&[".wf-sidebar-detail"], "color"))
+            .unwrap();
+        let sidebar = css_contrast(sidebar_fg, sidebar_bg);
+        let tile = css_contrast(tile_fg, tile_bg);
+        assert!(sidebar >= 4.5 && tile >= 4.5,
+            "active hovered sidebar detail is {sidebar:.2}:1 and hovered Home tile detail is {tile:.2}:1, both need 4.5:1");
     }
 }
