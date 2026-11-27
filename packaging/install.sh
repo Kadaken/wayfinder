@@ -191,6 +191,12 @@ restart_portal() {
 # Writes or removes the one line that sends KDE/Qt apps through the portal.
 # Only a file this installer wrote is ever removed.
 write_qt_env() {
+  # S14 0.9.39: a file of the same name that this installer did not write is
+  # the user's own; it is never overwritten, just as remove_qt_env never removes it.
+  if [ -e "$qt_env_conf" ] && ! head -n1 "$qt_env_conf" 2>/dev/null | grep -qF -- "$qt_env_marker"; then
+    say "  leaving $qt_env_conf alone: this installer did not write it"
+    return 0
+  fi
   if [ "$dry" = 1 ]; then
     printf '  would: write %s\n' "$qt_env_conf"
     return 0
@@ -218,12 +224,6 @@ remove_qt_env() {
 # A reinstall never overwrites the record with Wayfinder itself.
 take_folder_app() {
   command -v xdg-mime >/dev/null 2>&1 || return 0
-  # D-452: the dry run lists this step too; it writes the user's folder default.
-  if [ "$dry" = 1 ]; then
-    printf '  would: record the current folder app in %s\n' "$prev_folder_app"
-    printf '  would: xdg-mime default %s inode/directory\n' "$wf_desktop"
-    return 0
-  fi
   local cur=""
   # Only the user's own choice is recorded, read from their mimeapps.list, so
   # uninstall restores exactly that file and never writes a system default in.
@@ -232,6 +232,15 @@ take_folder_app() {
     indef && index($0, "inode/directory=") == 1 { print substr($0, 17); exit }
   ' "$mimeapps")"
   cur="${cur%;}"
+  # D-452: the dry run lists this step too; it writes the user's folder default.
+  # W5.4 0.9.39: it names the record only when the real run would write one.
+  if [ "$dry" = 1 ]; then
+    if [ -n "$cur" ] && [ "$cur" != "$wf_desktop" ]; then
+      printf '  would: record the current folder app (%s) in %s\n' "$cur" "$prev_folder_app"
+    fi
+    printf '  would: xdg-mime default %s inode/directory\n' "$wf_desktop"
+    return 0
+  fi
   if [ -n "$cur" ] && [ "$cur" != "$wf_desktop" ]; then
     mkdir -p "$(dirname "$prev_folder_app")"
     printf '%s\n' "$cur" > "$prev_folder_app"
@@ -449,8 +458,13 @@ if [ "$with_portal" = 1 ]; then
       say "  wrote $portals_conf"
     fi
   fi
+# S13 0.9.39: a chooser line still naming Wayfinder counts as an earlier
+# install even when every portal file is already gone; left alone it sends
+# every program's file dialog to a backend that no longer exists.
 elif [ -e "$d$portal_bin" ] || [ -L "$d$portal_bin" ] \
-     || [ -e "$portal_service" ] || [ -L "$portal_service" ]; then
+     || [ -e "$portal_service" ] || [ -L "$portal_service" ] \
+     || { [ -z "$destdir" ] && [ -f "$portals_conf" ] \
+          && grep -q '^org\.freedesktop\.impl\.portal\.FileChooser[[:space:]]*=[[:space:]]*wayfinder[[:space:]]*$' "$portals_conf"; }; then
   remove_portal
   if [ "$dry" = 1 ]; then
     say "  Would remove the earlier Wayfinder file dialog."
