@@ -97,7 +97,13 @@ else
   if git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
     tc="$(git rev-parse "v$VER^{commit}")"
     hc="$(git rev-parse HEAD)"
+    # After the tag, only the audit ledger, the audit scripts and Markdown docs may change: the
+    # answers are written once the release is out. Anything else means the
+    # code being audited is not the code that shipped.
+    after_tag="$(git merge-base --is-ancestor "$tc" HEAD 2>/dev/null && git diff --name-only "$tc" HEAD)"
     if [[ "$tc" == "$hc" ]]; then pass S8.3 "tag v$VER^{commit} == HEAD ($(git rev-parse --short HEAD))"
+    elif git merge-base --is-ancestor "$tc" HEAD && [[ -n "$after_tag" ]] && ! grep -qvE '^(audit/.*|scripts/audit-[^/]*|[^/]+\.md)$' <<<"$after_tag"; then
+      pass S8.3 "tag v$VER is ${tc:0:7}; HEAD adds only docs, ledger or audit scripts: $(tr '\n' ' ' <<<"$after_tag")"
     else fail S8.3 "tag v$VER points at ${tc:0:7}, HEAD is ${hc:0:7} — artifact and tag disagree"; fi
     td="$(git log -1 --format=%ct "v$VER^{commit}")"; hd="$(git log -1 --format=%ct HEAD)"
     if (( td > hd )); then fail S8.4 "tag commit is newer than HEAD"

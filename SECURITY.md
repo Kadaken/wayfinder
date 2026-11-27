@@ -103,6 +103,25 @@ source produce byte-identical programs (checked again for 0.9.30).
    damaged file into an error message; damaged-file tests cover that. No
    hostile-file run or fuzzer has been fired at them.
 
+12. **Archive extraction is locked, previews are not.** Since 0.9.38, Extract
+   Here and Extract All run 7-Zip, `unar` or `tar` into a private staging
+   folder that the tool can write to and nothing else (Landlock), then check
+   every staged entry (no special files, no link leaving the folder) and move
+   it into place without replacing anything. Two gaps in 0.9.38: where the
+   kernel has no Landlock the tool runs without the lock, and a hard link in
+   the staged output is not refused. Archive listing and previews are not
+   locked at all.
+13. **Updates are checksummed, not signed.** The update manifest is fetched
+   from kadaken.com over HTTPS with no redirects. The download may follow
+   HTTPS redirects, is used only if it ends on kadaken.com, and must match the
+   manifest's size and SHA-256. A proxy set in the environment is used. The manifest itself is not
+   signed: whoever controls what kadaken.com serves controls the update.
+14. **"No other connections" is read from the source, not measured.**
+   Wayfinder's own code talks only to kadaken.com, for the update check. GIO,
+   GStreamer, the apps a file is opened with, and Ruffle can make their own
+   connections, and no run has recorded every connection the installed
+   program makes.
+
 ## Supported versions
 
 The newest release, and only the newest. There is no long-term branch yet.
