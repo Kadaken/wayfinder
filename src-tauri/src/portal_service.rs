@@ -1199,7 +1199,22 @@ fn save_target_is_writable(candidate: &Path) -> bool {
         Some(name) if !name.is_empty() => {}
         _ => return false,
     }
-    candidate.parent().is_some_and(|parent| parent.is_dir())
+    let Some(parent) = candidate.parent().filter(|parent| parent.is_dir()) else {
+        return false;
+    };
+    // W2 0.9.39: "can actually be written" includes permission. The file
+    // itself when it is already there, else the folder it will be made in.
+    let probe = if candidate.symlink_metadata().is_ok() { candidate } else { parent };
+    writable_by_this_user(probe)
+}
+
+fn writable_by_this_user(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
 }
 
 /// Every remaining stage-one option/result refusal is named here so a
@@ -1321,7 +1336,9 @@ pub fn decide_with_shape(
     match pick_outcome.outcome {
         ChooserOutcome::Cancelled => (RESPONSE_CANCELLED, HashMap::new()),
         ChooserOutcome::Failed => refuse(),
-        ChooserOutcome::Picked(paths) if multiple => {
+        // K4 0.9.39: the request's own `multiple` (always false for a Save),
+        // never the caller's raw option, picks the many-files branch.
+        ChooserOutcome::Picked(paths) if request.multiple => {
             if paths.is_empty() {
                 return refuse();
             }
@@ -1446,6 +1463,8 @@ impl RequestObject {
     }
 }
 
+const REQUEST_PATH_PREFIX: &str = "/org/freedesktop/portal/desktop/request/";
+
 /// Runs one request: exports its `Request` object at `handle`, runs `work`
 /// (the blocking pick) off the bus thread so `Close()` and other apps'
 /// requests are still answered while a dialog is open, then removes the
@@ -1459,6 +1478,12 @@ async fn run_request<F>(
 where
     F: FnOnce(Arc<AtomicBool>) -> (u32, HashMap<String, OwnedValue>) + Send + 'static,
 {
+    // W2 0.9.39: the portal front end always names a handle under its request
+    // path. Any other path (job E sent "/") was exported, never answered and
+    // panicked zbus when removed, so the caller waited out its own timeout.
+    if !handle.as_str().starts_with(REQUEST_PATH_PREFIX) {
+        return refuse();
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     match server.at(handle.clone(), RequestObject { cancel: cancel.clone() }).await {
         Ok(true) => {}
@@ -3510,6 +3535,31 @@ mod tests {
         fixture.remove();
     }
 
+    /// K4 0.9.39: SaveFile with `multiple=true` is still a one-file Save.
+    /// It used to take the open-many branch, which refuses any path that is
+    /// not an existing file, so saving under a new name failed.
+    #[test]
+    fn save_file_with_multiple_true_saves_one_new_file_k4_0939() {
+        let dir = std::env::temp_dir().join(format!("wf-k4-0939-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("make save folder");
+        let target = dir.join("new-name.txt");
+        let expected_uri = gio::File::for_path(&target).uri().to_string();
+        let picked = target.clone();
+        let (response, results) = decide_with_shape(
+            &with_option("multiple", true),
+            move |request| {
+                assert!(!request.multiple, "a Save never asks the picker for several files");
+                ChooserOutcome::Picked(vec![picked.clone()]).into()
+            },
+            GuardOverride::None,
+            RequestShape::Save,
+        );
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(uris_of(&results), vec![expected_uri]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn file_dialogs_refuse_wrong_typed_boolean_options_d439() {
         for key in ["multiple", "directory"] {
@@ -4363,6 +4413,49 @@ mod tests {
             assert_eq!(response, RESPONSE_CANCELLED);
         }
         finish_private_bus(bus, server, client);
+    }
+
+    /// W2 0.9.39: a handle outside the request path is refused at once and
+    /// never reaches the picker.
+    #[test]
+    fn dbus_a_handle_outside_the_request_path_is_refused_w2_0939() {
+        let _guard = env_lock();
+        let bus = PrivateBus::start();
+        let chooser = WaitingChooser::new();
+        let server = bus.connect_server(chooser.clone());
+        let client = bus.connect_client();
+        for handle in ["/", OBJECT_PATH, "/org/freedesktop/portal/desktop/requestx/a/b"] {
+            let caller = client.clone();
+            let call = std::thread::spawn(move || open_file_at(&caller, handle));
+            wait_until("a refusal for an outside handle", || call.is_finished());
+            let (response, results) = call.join().expect("thread").expect("reply");
+            assert_eq!(response, RESPONSE_OTHER, "{handle}");
+            assert!(uris_of(&results).is_empty(), "{handle}");
+        }
+        assert_eq!(chooser.started(), 0, "an outside handle must never open the picker");
+        finish_private_bus(bus, server, client);
+    }
+
+    /// W2 0.9.39: a Save into a folder this user cannot write, or onto a
+    /// file this user cannot write, is refused (job E was granted /proc).
+    #[test]
+    fn save_target_must_be_writable_by_this_user_w2_0939() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("wf-w2-0939-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(root.join("ro.txt"), b"x").unwrap();
+        fs::write(root.join("rw.txt"), b"x").unwrap();
+        fs::set_permissions(root.join("ro.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(save_target_is_writable(&root.join("new.txt")));
+        assert!(save_target_is_writable(&root.join("rw.txt")));
+        assert!(!save_target_is_writable(&locked.join("new.txt")));
+        assert!(!save_target_is_writable(&root.join("ro.txt")));
+        assert!(!save_target_is_writable(Path::new("/proc/wf-w2-0939.txt")));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
