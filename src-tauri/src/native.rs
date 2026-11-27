@@ -12742,18 +12742,31 @@ fn scroll_trace_lines(max: usize) -> Vec<String> {
 const DIAGNOSTIC_LOG_CAP: u64 = 256 * 1024;
 
 const THUMBNAIL_CACHE_CAP: u64 = 512 * 1024 * 1024;
-static THUMBNAIL_PRUNE_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+const THUMBNAIL_CACHE_PRUNE_INTERVAL: u64 = 64 * 1024 * 1024;
+static THUMBNAIL_CACHE_PRUNER: std::sync::LazyLock<ThumbnailCachePruner> =
+    std::sync::LazyLock::new(|| {
+        ThumbnailCachePruner::new(THUMBNAIL_CACHE_CAP, THUMBNAIL_CACHE_PRUNE_INTERVAL)
+    });
 
 // D-430: prune only direct regular files in the thumbnail cache, oldest first.
-fn prune_thumbnail_cache(dir: &Path, cap: u64) -> std::io::Result<()> {
+fn prune_thumbnail_cache(dir: &Path, cap: u64, active_parts: &HashSet<PathBuf>) -> std::io::Result<()> {
+    use std::io::ErrorKind::NotFound;
+
     let mut files = Vec::new();
     let mut total = 0u64;
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let path = entry?.path();
+        if active_parts.contains(&path) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if metadata.is_file() {
             total = total.saturating_add(metadata.len());
-            files.push((entry.path(), metadata.modified().ok(), metadata.len()));
+            files.push((path, metadata.modified().ok(), metadata.len()));
         }
     }
     if total <= cap {
@@ -12764,17 +12777,81 @@ fn prune_thumbnail_cache(dir: &Path, cap: u64) -> std::io::Result<()> {
         if total <= cap {
             break;
         }
-        fs::remove_file(path)?;
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != NotFound {
+                return Err(error);
+            }
+        }
         total = total.saturating_sub(len);
     }
     Ok(())
 }
 
-fn start_thumbnail_cache_prune(dir: PathBuf) {
-    if THUMBNAIL_PRUNE_STARTED.set(()).is_ok() {
-        let _ = std::thread::Builder::new().name("wf-thumb-prune".into()).spawn(move || {
-            let _ = prune_thumbnail_cache(&dir, THUMBNAIL_CACHE_CAP);
-        });
+#[derive(Default)]
+struct ThumbnailCacheSession {
+    bytes_since_prune: Option<u64>,
+    active_parts: HashSet<PathBuf>,
+    next_part: u64,
+}
+
+struct ThumbnailCachePruner {
+    cap: u64,
+    interval: u64,
+    session: std::sync::Mutex<ThumbnailCacheSession>,
+}
+
+impl ThumbnailCachePruner {
+    fn new(cap: u64, interval: u64) -> Self {
+        Self {
+            cap,
+            interval,
+            session: std::sync::Mutex::new(ThumbnailCacheSession::default()),
+        }
+    }
+
+    // D-453: the transcode workers prune and publish under the same lock.
+    // Decodes still run in parallel, and scans skip their in-progress files.
+    fn get_or_write(&self, dir: &Path, key: u64, decode: impl FnOnce(&Path) -> bool) -> Option<PathBuf> {
+        let cached = dir.join(format!("{key:016x}.png"));
+        let part = {
+            let mut session = self.session.lock().unwrap();
+            if session.bytes_since_prune.is_none()
+                && prune_thumbnail_cache(dir, self.cap, &session.active_parts).is_ok()
+            {
+                session.bytes_since_prune = Some(0);
+            }
+            if cached.is_file() {
+                return Some(cached);
+            }
+            // Keep .png last for ffmpeg's format detection. Concurrent jobs
+            // for the same cache key each write their own temporary file.
+            let part = dir.join(format!(
+                "{key:016x}.{}.{}.part.png",
+                std::process::id(),
+                session.next_part,
+            ));
+            session.next_part += 1;
+            session.active_parts.insert(part.clone());
+            part
+        };
+
+        let decoded = decode(&part);
+        let mut session = self.session.lock().unwrap();
+        session.active_parts.remove(&part);
+        // Publish atomically so readers only see a finished PNG.
+        if !decoded || fs::rename(&part, &cached).is_err() {
+            let _ = fs::remove_file(&part);
+            return None;
+        }
+        let written = fs::metadata(&cached).map_or(self.interval, |metadata| metadata.len());
+        let pending = session.bytes_since_prune.unwrap_or(self.interval).saturating_add(written);
+        session.bytes_since_prune = Some(pending);
+        if pending >= self.interval
+            && prune_thumbnail_cache(dir, self.cap, &session.active_parts).is_ok()
+        {
+            session.bytes_since_prune = Some(0);
+        }
+        Some(cached)
     }
 }
 
@@ -15091,23 +15168,16 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
         .join("wayfinder")
         .join("image-thumbs");
     fs::create_dir_all(&dir).ok()?;
-    start_thumbnail_cache_prune(dir.clone());
-    let cached = dir.join(format!("{key:016x}.png"));
-    if cached.is_file() {
-        return Some(cached);
-    }
-    // The half-written name still ends in .png: ffmpeg picks the output
-    // format from the extension, and a name ending ".part" made it refuse
-    // with "Unable to choose an output format" every single time, so no
-    // AVIF ever decoded (7 Nov 2026, found on the owner's screen).
-    let part = dir.join(format!("{key:016x}.part.png"));
+    THUMBNAIL_CACHE_PRUNER.get_or_write(&dir, key, |part| decode_thumbnail_to_png(source, part, want_w))
+}
+
+fn decode_thumbnail_to_png(source: &str, part: &Path, want_w: i32) -> bool {
     // D-362: raw camera files, PSD and XCF are not something ffmpeg reads, so
     // ImageMagick goes first for them; everything else tries ffmpeg first and
     // ImageMagick second.
     let magick_first = native_core::prefers_magick(source);
-    if magick_first && native_viewers::magick_to_png(source, &part, want_w) {
-        fs::rename(&part, &cached).ok()?;
-        return Some(cached);
+    if magick_first && native_viewers::magick_to_png(source, part, want_w) {
+        return true;
     }
     // D-404: a HEIC made of tiles (every phone photo) reaches ffmpeg as a
     // complex filtergraph, and ffmpeg refuses a -vf on top of it ("Simple and
@@ -15133,7 +15203,7 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
             cmd.arg("-vf")
                 .arg(format!("scale={}:-1:flags=bilinear", want_w.clamp(16, 1024)));
         }
-        cmd.arg(&part).status()
+        cmd.arg(part).status()
     };
     let heif = native_core::is_heif_like(source);
     let mut status = run_ffmpeg(!heif);
@@ -15141,20 +15211,14 @@ fn transcoded_thumbnail_file(source: &str, want_w: i32) -> Option<PathBuf> {
         status = run_ffmpeg(false);
     }
     match status {
-        Ok(code) if code.success() && part.is_file() => {
-            // Rename last, so a half-written file is never read as a thumbnail.
-            fs::rename(&part, &cached).ok()?;
-            Some(cached)
-        }
+        Ok(code) if code.success() && part.is_file() => true,
         other => {
-            let _ = fs::remove_file(&part);
-            if !magick_first && native_viewers::magick_to_png(source, &part, want_w) {
-                fs::rename(&part, &cached).ok()?;
-                return Some(cached);
+            let _ = fs::remove_file(part);
+            if !magick_first && native_viewers::magick_to_png(source, part, want_w) {
+                return true;
             }
-            let _ = fs::remove_file(&part);
             eprintln!("wf-event: no preview for {source:?}, ffmpeg said {other:?}");
-            None
+            false
         }
     }
 }
@@ -24059,7 +24123,7 @@ mod tests {
         super::fs::write(dir.join("b.png"), [0u8; 80]).unwrap();
         super::fs::write(dir.join("nested/keep.png"), [0u8; 80]).unwrap();
         std::os::unix::fs::symlink(dir.join("a.png"), dir.join("link.png")).unwrap();
-        super::prune_thumbnail_cache(&dir, 100).unwrap();
+        super::prune_thumbnail_cache(&dir, 100, &HashSet::new()).unwrap();
         let direct_bytes: u64 = super::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -24121,6 +24185,54 @@ mod tests {
 
     fn set_fixture_mtime(file: &fs::File, seconds: u64) {
         file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)).unwrap();
+    }
+
+    #[test]
+    fn thumbnail_cache_prunes_again_after_new_writes_d453() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".fixture-d453-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let _cleanup = ScratchCleanup(dir.clone());
+        let cap = 100;
+        let cache = ThumbnailCachePruner::new(cap, 50);
+        let oldest = dir.join("z-oldest.png");
+        let newer = dir.join("a-newer.png");
+        for (path, bytes, time) in [(&oldest, 35, 10), (&newer, 40, 20)] {
+            let file = fs::File::create(path).unwrap();
+            file.set_len(bytes).unwrap();
+            set_fixture_mtime(&file, time);
+        }
+        let write = |key| {
+            cache.get_or_write(&dir, key, |part| {
+                let file = fs::File::create(part).unwrap();
+                file.set_len(30).unwrap();
+                set_fixture_mtime(&file, 30 + key);
+                true
+            }).unwrap()
+        };
+        let total = || {
+            fs::read_dir(&dir).unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
+        };
+
+        let first = write(1);
+        assert!(oldest.is_file() && total() > cap, "one write is below the prune interval");
+        assert_eq!(
+            cache.get_or_write(&dir, 1, |_| panic!("cache hit must not decode")),
+            Some(first.clone()),
+        );
+        let second = write(2);
+        assert!(!oldest.exists(), "crossing the interval must remove the oldest file");
+        assert!(newer.is_file() && first.is_file() && second.is_file());
+        assert!(total() <= cap);
+
+        let third = write(3);
+        assert!(newer.is_file() && total() > cap, "each prune resets the write count");
+        let fourth = write(4);
+        assert!(!newer.exists() && !first.exists(), "the next prune also removes the oldest files");
+        assert!(second.is_file() && third.is_file() && fourth.is_file());
+        assert!(total() <= cap);
     }
 
     #[test]

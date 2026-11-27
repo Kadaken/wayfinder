@@ -22,6 +22,7 @@ change between releases.
 - `install.sh --dry-run` now lists the folder-default step a real install performs.
 - Detail text stays readable when hovering over the active sidebar row or a Home tile.
 - Ctrl+L and other window shortcuts work when a title bar button has focus.
+- The thumbnail cache clears out its oldest files during long sessions to keep disk use in check.
 
 ## 0.9.38 — 25 November 2026
 
