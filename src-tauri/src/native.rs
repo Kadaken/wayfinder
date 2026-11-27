@@ -16554,11 +16554,7 @@ fn rename_entries(state: Rc<RefCell<AppState>>, ui: Ui, entries: Vec<Entry>) {
             move || {
                 let from = path.clone();
                 let to = native_core::rename_path(&from, &name)?;
-                let fp = native_core::fingerprint(&to)?;
-                Ok(JobOutcome::undo(
-                    format!("Renamed to {to}"),
-                    UndoAction::Renamed { from, to, fp },
-                ))
+                Ok(renamed_outcome(format!("Renamed to {to}"), from, to))
             },
             |_, _, _| {},
         );
@@ -17120,10 +17116,16 @@ fn cut_consumes_offer(cut_offer: Option<u64>, succeeded: bool, now: u64) -> bool
 /// choice, never "merges".
 const FOLDER_OVERWRITE_WARNING: &str =
     "Overwrite replaces a folder completely. Anything only in the folder already here is permanently deleted.";
+const MIXED_OVERWRITE_WARNING: &str = "Overwrite permanently deletes the files already here and replaces each folder completely. Anything only in a folder already here is permanently deleted.";
 
-fn conflict_dialog_text(conflicts: &[String], any_folder: bool) -> (String, Option<String>) {
+/// `folders` is how many of the clashes involve a folder. S13 0.9.39: a
+/// clash of files AND folders used to get only the folder wording, so the
+/// files' loss went unsaid; it now names both.
+fn conflict_dialog_text(conflicts: &[String], folders: usize) -> (String, Option<String>) {
     let count = conflicts.len();
-    let warning = if any_folder {
+    let warning = if folders > 0 && folders < count {
+        MIXED_OVERWRITE_WARNING
+    } else if folders > 0 {
         FOLDER_OVERWRITE_WARNING
     } else if count == 1 {
         "Overwrite permanently deletes the file already here."
@@ -17163,8 +17165,8 @@ fn show_conflict_dialog<F>(
 ) where
     F: Fn(native_core::PasteConflict) + 'static,
 {
-    let any_folder = pairs.iter().any(|(incoming, existing)| incoming.is_dir() || existing.is_dir());
-    let (heading, detail) = conflict_dialog_text(conflicts, any_folder);
+    let folders = pairs.iter().filter(|(incoming, existing)| incoming.is_dir() || existing.is_dir()).count();
+    let (heading, detail) = conflict_dialog_text(conflicts, folders);
 
     let dialog = adw::AlertDialog::new(Some(&heading), detail.as_deref());
     // D-351: a button inside the dialog, not a response, so comparing leaves
@@ -17555,11 +17557,26 @@ fn transfer_outcome(
     if !warnings.is_empty() {
         message.push_str(&format!(" (warning: {})", warnings.join("; ")));
     }
-    let fps = items
-        .iter()
-        .map(|item| native_core::fingerprint(&item.to))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(JobOutcome::undo(message, UndoAction::Pasted { items, was_copy: is_copy, fps }))
+    // S4/W3 0.9.39: the transfer has already committed here. A destination
+    // that cannot be fingerprinted only costs the Undo; the job still
+    // completes, refreshes and says why Undo is missing.
+    match items.iter().map(|item| native_core::fingerprint(&item.to)).collect::<Result<Vec<_>, _>>() {
+        Ok(fps) => Ok(JobOutcome::undo(message, UndoAction::Pasted { items, was_copy: is_copy, fps })),
+        Err(err) => {
+            message.push_str(&format!(" (Undo not available: {err})"));
+            Ok(JobOutcome::message(message))
+        }
+    }
+}
+
+/// S4 0.9.39: a rename that has already happened is reported as done even
+/// when its fingerprint cannot be taken; only the Undo is lost, and the
+/// message says so instead of "Operation failed".
+fn renamed_outcome(message: String, from: String, to: String) -> JobOutcome {
+    match native_core::fingerprint(&to) {
+        Ok(fp) => JobOutcome::undo(message, UndoAction::Renamed { from, to, fp }),
+        Err(err) => JobOutcome::message(format!("{message} (Undo not available: {err})")),
+    }
 }
 
 /// True when keyboard focus is `root` or somewhere inside it.
@@ -21688,6 +21705,11 @@ fn drop_confirm_text(txn: &DropTxn) -> (String, String, &'static str) {
 /// Asks before a dropped transfer starts. The tuple was consumed on the drop,
 /// so answering cannot start it twice.
 /// D-320: what the final check verified, as Markdown the person can keep.
+/// S19 0.9.39: one report is capped too, not only how many are kept. Each
+/// folder section already lists a capped sample of its files.
+const REPORT_MAX_ROWS: usize = 5_000;
+const REPORT_MAX_FOLDERS: usize = 500;
+
 fn transfer_report_markdown(is_copy: bool, report: &[native_core::ReportRow]) -> String {
     let verb = if is_copy { "Copy" } else { "Move" };
     let total_files: u64 = report.iter().map(|r| r.files_total).sum();
@@ -21707,7 +21729,7 @@ fn transfer_report_markdown(is_copy: bool, report: &[native_core::ReportRow]) ->
     });
     md.push_str("Check used: a 64-bit content fingerprint of every byte (folders: every name, size and byte). It is not a cryptographic hash.\n\n");
     md.push_str("| Item | From | To | Type | Files | Size | Fingerprint |\n|---|---|---|---|---|---|---|\n");
-    for r in report {
+    for r in report.iter().take(REPORT_MAX_ROWS) {
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} |\n",
             Path::new(&r.to).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -21719,7 +21741,14 @@ fn transfer_report_markdown(is_copy: bool, report: &[native_core::ReportRow]) ->
             r.digest
         ));
     }
-    for r in report.iter().filter(|r| r.kind == "folder") {
+    if report.len() > REPORT_MAX_ROWS {
+        md.push_str(&format!(
+            "\n... and {} more items, verified the same way but not listed, so this file stays a readable size.\n",
+            report.len() - REPORT_MAX_ROWS
+        ));
+    }
+    let folders = report.iter().filter(|r| r.kind == "folder").count();
+    for r in report.iter().filter(|r| r.kind == "folder").take(REPORT_MAX_FOLDERS) {
         md.push_str(&format!("\n## {}\n\n", r.to));
         for (name, size) in &r.files {
             md.push_str(&format!("- {name} ({})\n", native_core::fmt_size(*size)));
@@ -21727,6 +21756,9 @@ fn transfer_report_markdown(is_copy: bool, report: &[native_core::ReportRow]) ->
         if r.files_total as usize > r.files.len() {
             md.push_str(&format!("- ... and {} more files, all covered by the folder fingerprint\n", r.files_total as usize - r.files.len()));
         }
+    }
+    if folders > REPORT_MAX_FOLDERS {
+        md.push_str(&format!("\n... and {} more folders, each verified by its folder fingerprint but not listed here.\n", folders - REPORT_MAX_FOLDERS));
     }
     md
 }
@@ -21924,12 +21956,8 @@ fn d383_fix_shown_file(state: Rc<RefCell<AppState>>, ui: Ui) {
         label,
         move || {
             let to = native_core::rename_path(&path, &new_name)?;
-            let fp = native_core::fingerprint(&to)?;
             let old = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            Ok(JobOutcome::undo(
-                format!("Renamed {old} to {new_name}"),
-                UndoAction::Renamed { from: path, to, fp },
-            ))
+            Ok(renamed_outcome(format!("Renamed {old} to {new_name}"), path, to))
         },
         |_, _, _| {},
     );
@@ -21951,14 +21979,11 @@ fn d383_fix_folder(state: Rc<RefCell<AppState>>, ui: Ui) {
                 return Ok(JobOutcome::message(format!("Fixed 0 extensions ({skipped} skipped)")));
             }
             let items = native_core::batch_rename(&requests)?;
-            let fps = items
-                .iter()
-                .map(|item| native_core::fingerprint(&item.to))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(JobOutcome::undo(
-                format!("Fixed {} extension{} ({skipped} skipped)", items.len(), plural(items.len())),
-                UndoAction::BatchRenamed { items, fps },
-            ))
+            let message = format!("Fixed {} extension{} ({skipped} skipped)", items.len(), plural(items.len()));
+            Ok(match items.iter().map(|item| native_core::fingerprint(&item.to)).collect::<Result<Vec<_>, _>>() {
+                Ok(fps) => JobOutcome::undo(message, UndoAction::BatchRenamed { items, fps }),
+                Err(err) => JobOutcome::message(format!("{message} (Undo not available: {err})")),
+            })
         },
         |_, _, _| {},
     );
@@ -25296,11 +25321,32 @@ mod tests {
     }
 
     #[test]
+    fn a_done_rename_without_a_fingerprint_is_still_done_s4_0939() {
+        let gone = std::env::temp_dir().join(format!("wf-s4-0939-gone-{}", std::process::id()));
+        let _ = std::fs::remove_file(&gone);
+        let outcome = renamed_outcome("Renamed to x".into(), "/s/x".into(), gone.to_string_lossy().into_owned());
+        assert!(outcome.undo.is_none());
+        assert!(outcome.message.starts_with("Renamed to x (Undo not available:"), "{}", outcome.message);
+        std::fs::write(&gone, b"here").unwrap();
+        let outcome = renamed_outcome("Renamed to x".into(), "/s/x".into(), gone.to_string_lossy().into_owned());
+        assert!(matches!(outcome.undo, Some(UndoAction::Renamed { .. })));
+        std::fs::remove_file(&gone).ok();
+    }
+
+    #[test]
+    fn location_stall_limit_is_three_seconds_s13_0939() {
+        // S13 0.9.39: D-424 and D-456 promise "not answering" after 3 s; the
+        // GTK test runs on the shared constant, so the number itself is pinned here.
+        assert_eq!(ADDRESS_CHECK_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(LOCATION_NOT_ANSWERING, "That location is not answering.");
+    }
+
+    #[test]
     fn file_clash_warns_overwrite_deletes_d440() {
-        let (h, d) = conflict_dialog_text(&["a.txt".to_string()], false);
+        let (h, d) = conflict_dialog_text(&["a.txt".to_string()], 0);
         assert_eq!(h, "\"a.txt\" already exists here.");
         assert_eq!(d.as_deref(), Some("Overwrite permanently deletes the file already here."));
-        let (h, d) = conflict_dialog_text(&["a".to_string(), "b".to_string()], false);
+        let (h, d) = conflict_dialog_text(&["a".to_string(), "b".to_string()], 0);
         assert_eq!(h, "2 items already exist here.");
         let d = d.unwrap();
         assert!(d.contains("a, b") && d.contains("applies to all"));
@@ -25313,10 +25359,15 @@ mod tests {
     /// D-423: a folder clash says Overwrite deletes, for one clash and for many.
     #[test]
     fn folder_clash_warns_overwrite_deletes_d423() {
-        let (_, d) = conflict_dialog_text(&["Photos".to_string()], true);
+        let (_, d) = conflict_dialog_text(&["Photos".to_string()], 1);
         assert_eq!(d.as_deref(), Some(FOLDER_OVERWRITE_WARNING));
-        let (_, d) = conflict_dialog_text(&["Photos".to_string(), "b.txt".to_string()], true);
+        let (_, d) = conflict_dialog_text(&["Photos".to_string(), "Music".to_string()], 2);
         assert!(d.unwrap().ends_with(FOLDER_OVERWRITE_WARNING));
+        // S13 0.9.39: a file clash next to a folder clash names the files too.
+        let (_, d) = conflict_dialog_text(&["Photos".to_string(), "b.txt".to_string()], 1);
+        let d = d.unwrap();
+        assert!(d.ends_with(MIXED_OVERWRITE_WARNING), "{d}");
+        assert!(d.contains("deletes the files already here") && d.contains("replaces each folder completely"));
         assert!(FOLDER_OVERWRITE_WARNING.contains("permanently deleted"));
         assert!(!FOLDER_OVERWRITE_WARNING.contains("merge"));
     }
@@ -46643,6 +46694,16 @@ Broken: Either state is wrong.\n";
         assert!(outcome.message.contains("warning"));
         assert!(matches!(outcome.undo, Some(UndoAction::Pasted { was_copy: true, ref items, .. }) if items.len() == 1));
         assert!(transfer_outcome("Pasted", true, Err("rolled back".into())).is_err());
+        // W3 0.9.39: a committed transfer whose destination is gone before
+        // the fingerprint still completes, with no Undo and a reason.
+        let gone = native_core::TransferResult {
+            items: vec![native_core::ResolvedItem { from: "/s/b".into(), to: root.join("gone").to_string_lossy().to_string() }],
+            warnings: Vec::new(),
+            report: Vec::new(),
+        };
+        let outcome = transfer_outcome("Pasted", true, Ok(gone)).expect("a committed transfer must complete");
+        assert!(outcome.undo.is_none());
+        assert!(outcome.message.contains("Undo not available"), "{}", outcome.message);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -51446,6 +51507,25 @@ Broken: Either state is wrong.\n";
         assert!(md.contains("- a.jpg (10 B)") && md.contains("- x/b.jpg (20 B)"), "{md}");
         assert!(md.contains("the source is gone"));
         assert!(transfer_report_markdown(true, &rows).contains("is unchanged"));
+        // S19 0.9.39: a huge transfer gives a bounded report that says what it left out.
+        let many: Vec<_> = (0..REPORT_MAX_ROWS + 7)
+            .map(|i| native_core::ReportRow {
+                from: format!("/s/d{i}"),
+                to: format!("/t/d{i}"),
+                kind: "folder",
+                bytes: 1,
+                files_total: 1,
+                files: vec![("f".into(), 1)],
+                digest: "0011223344556677".into(),
+            })
+            .collect();
+        let md = transfer_report_markdown(true, &many);
+        assert!(md.starts_with(&format!("# Copy verified: {} items", REPORT_MAX_ROWS + 7)), "{}", &md[..80]);
+        assert!(md.contains("... and 7 more items, verified the same way but not listed"));
+        assert_eq!(md.lines().filter(|l| l.starts_with("| d")).count(), REPORT_MAX_ROWS);
+        assert_eq!(md.matches("\n## ").count(), REPORT_MAX_FOLDERS);
+        assert!(md.contains(&format!("... and {} more folders", REPORT_MAX_ROWS + 7 - REPORT_MAX_FOLDERS)));
+        assert!(md.len() < 2_000_000, "{} bytes", md.len());
     }
 
     #[test]

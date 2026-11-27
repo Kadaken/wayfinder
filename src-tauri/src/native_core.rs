@@ -5960,7 +5960,7 @@ pub fn extract_archive_here_ctl(path: &str, dest_dir: &str, ctl: &ExtractCtl) ->
 
 #[cfg(test)]
 thread_local! {
-    static BEFORE_ARCHIVE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_ARCHIVE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn extract_here_dir(
@@ -6016,9 +6016,11 @@ fn extract_here_dir(
     let destination_identity = stage.as_ref().expect("decoded into a staging folder").destination_identity;
     let publish = |from: &Path, to: &Path| {
         #[cfg(test)]
-        if let Some(before) = BEFORE_ARCHIVE_PUBLISH.take() {
-            before();
-        }
+        BEFORE_ARCHIVE_PUBLISH.with_borrow_mut(|before| {
+            if let Some(before) = before {
+                before();
+            }
+        });
         if file_identity(dest) != Some(destination_identity) {
             return Err(std::io::Error::other(format!("extraction destination changed: {}", dest.display())));
         }
@@ -12286,6 +12288,46 @@ mod extract_here_tests_d230 {
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
     }
 
+    /// S13 0.9.39: D-447's check runs before EVERY entry, not once. The
+    /// destination is swapped after the first entry lands; the second must
+    /// be refused and nothing may reach the swapped-in folder.
+    #[test]
+    fn a_destination_swapped_between_entries_is_refused_d447() {
+        let root = owned("d447-swapped-between");
+        let (src, dest, moved, other) =
+            (root.0.join("src"), root.0.join("dest"), root.0.join("moved"), root.0.join("other"));
+        for dir in [&src, &dest, &other] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::write(src.join("one.txt"), "1").unwrap();
+        fs::write(src.join("two.txt"), "2").unwrap();
+        let zip = root.0.join("two-entries.zip");
+        pack("zip", &src, &["one.txt", "two.txt"], &zip);
+        BEFORE_ARCHIVE_PUBLISH.replace(Some(Box::new({
+            let (dest, moved, other) = (dest.clone(), moved.clone(), other.clone());
+            let mut calls = 0;
+            move || {
+                calls += 1;
+                if calls == 2 {
+                    fs::rename(&dest, &moved).unwrap();
+                    symlink(&other, &dest).unwrap();
+                }
+            }
+        })));
+        let result = extract_archive_here(zip.to_str().unwrap(), dest.to_str().unwrap());
+        BEFORE_ARCHIVE_PUBLISH.take();
+
+        let outcome = result.unwrap();
+        assert_eq!(outcome.published.len(), 1, "{}", outcome.summary());
+        assert_eq!(outcome.failed.len(), 1, "{}", outcome.summary());
+        assert!(outcome.failed[0].1.contains("extraction destination changed"), "{}", outcome.summary());
+        // The staging folder sits inside the destination and moved with it,
+        // so only the archive's own two names are counted.
+        let landed = ["one.txt", "two.txt"].iter().filter(|n| moved.join(n).exists()).count();
+        assert_eq!(landed, 1);
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+    }
+
     #[test]
     fn a_destination_swapped_for_a_symlink_is_refused_d447() {
         let root = owned("d447-swapped-destination");
@@ -12301,9 +12343,12 @@ mod extract_here_tests_d230 {
         pack("zip", &src, &["inside.txt"], &zip);
         BEFORE_ARCHIVE_PUBLISH.replace(Some(Box::new({
             let (dest, moved, other) = (dest.clone(), moved.clone(), other.clone());
+            let mut done = false;
             move || {
-                fs::rename(&dest, &moved).unwrap();
-                symlink(&other, &dest).unwrap();
+                if !std::mem::replace(&mut done, true) {
+                    fs::rename(&dest, &moved).unwrap();
+                    symlink(&other, &dest).unwrap();
+                }
             }
         })));
         let result = extract_archive_here(zip.to_str().unwrap(), dest.to_str().unwrap());
