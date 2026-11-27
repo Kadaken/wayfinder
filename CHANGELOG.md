@@ -20,6 +20,7 @@ change between releases.
 - Wayfinder checks each update redirect before contacting the next site and follows at most three redirects.
 - Installing with `--no-portal` removes an earlier Wayfinder file dialog and restores your previous chooser.
 - `install.sh --dry-run` now lists the folder-default step a real install performs.
+- Detail text stays readable when hovering over the active sidebar row or a Home tile.
 
 ## 0.9.38 — 25 November 2026
 

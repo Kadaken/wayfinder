@@ -421,7 +421,8 @@ entry.wf-search,
     background: @wf_control_hover;
 }
 
-.wf-sidebar row:hover .wf-sidebar-detail {
+.wf-sidebar row:hover .wf-sidebar-detail,
+.wf-quick-tile:hover .wf-sidebar-detail {
     color: @wf_text_hover_detail;
 }
 
@@ -429,7 +430,8 @@ entry.wf-search,
     background: @wf_accent;
 }
 
-.wf-sidebar row.wf-sidebar-active label {
+.wf-sidebar row.wf-sidebar-active label,
+.wf-sidebar row.wf-sidebar-active:hover .wf-sidebar-detail {
     color: #ffffff;
 }
 
@@ -53027,33 +53029,73 @@ mod audit_config_save_tests {
         assert!(ok.is_ok());
         let _ = fs::remove_dir_all(&root);
     }
+    fn css_luminance(colour: &str) -> f64 {
+        let value = match colour.strip_prefix('@') {
+            Some(name) => APP_CSS.lines().find_map(|line| {
+                let mut tokens = line.split_whitespace();
+                (tokens.next() == Some("@define-color") && tokens.next() == Some(name))
+                    .then(|| tokens.next().unwrap().trim_end_matches(';'))
+            }).expect(name),
+            None => colour,
+        };
+        let hex = value.strip_prefix('#').expect("hex colour");
+        let linear = |i: usize| {
+            let x = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(0) + 0.7152 * linear(2) + 0.0722 * linear(4)
+    }
+
+    fn css_contrast(foreground: &str, background: &str) -> f64 {
+        let (a, b) = (css_luminance(foreground), css_luminance(background));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
     /// D-293: the muted text colour must reach 4.5:1 (WCAG 1.4.3) on the listing
     /// and raised-pane backgrounds.
     #[test]
     fn muted_text_contrast_meets_wcag_aa_d293() {
-        fn colour(name: &str) -> [f64; 3] {
-            let key = format!("@define-color {name}");
-            let line = APP_CSS.lines().find(|l| l.starts_with(&key) && l[key.len()..].starts_with(' ')).expect(name);
-            let hex = line.trim_end_matches(';').rsplit('#').next().unwrap().trim();
-            let n = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
-            [n(0), n(2), n(4)]
-        }
-        fn lum(c: [f64; 3]) -> f64 {
-            let f = |x: f64| if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
-            0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
-        }
-        fn ratio(a: [f64; 3], b: [f64; 3]) -> f64 {
-            let (x, y) = (lum(a), lum(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        }
-        let muted = colour("wf_text_muted");
         for bg in ["wf_base", "wf_raised"] {
-            let r = ratio(muted, colour(bg));
+            let r = css_contrast("@wf_text_muted", &format!("@{bg}"));
             assert!(r >= 4.5, "wf_text_muted on {bg} is {r:.2}:1, needs 4.5:1");
         }
-        let hover_detail = colour("wf_text_hover_detail");
-        let hover_ratio = ratio(hover_detail, colour("wf_control_hover"));
+        let hover_ratio = css_contrast("@wf_text_hover_detail", "@wf_control_hover");
         assert!(hover_ratio >= 4.5, "hover detail is {hover_ratio:.2}:1, needs 4.5:1");
         assert!(APP_CSS.contains(".wf-sidebar row:hover .wf-sidebar-detail"));
+    }
+
+    fn css_declaration(selectors: &[&str], property: &str) -> Option<&'static str> {
+        APP_CSS.rsplit('}').find_map(|rule| {
+            let (rule_selectors, declarations) = rule.split_once('{')?;
+            let rule_selectors = rule_selectors.rsplit("*/").next().unwrap();
+            if !rule_selectors.split(',').any(|part| selectors.contains(&part.trim())) {
+                return None;
+            }
+            declarations.split(';').find_map(|declaration| {
+                let (name, value) = declaration.trim().split_once(':')?;
+                (name == property).then(|| value.trim())
+            })
+        })
+    }
+
+    #[test]
+    fn hovered_sidebar_and_home_detail_contrast_meets_wcag_aa_d455() {
+        // The active background wins the tie with the hover background by source order.
+        // For the detail text, the most specific matching rule wins.
+        let sidebar_bg = css_declaration(&[".wf-sidebar row.wf-sidebar-active:hover"], "background")
+            .or_else(|| css_declaration(&[".wf-sidebar row.wf-sidebar-active", ".wf-sidebar row:hover"], "background"))
+            .unwrap();
+        let sidebar_fg = css_declaration(&[".wf-sidebar row.wf-sidebar-active:hover .wf-sidebar-detail"], "color")
+            .or_else(|| css_declaration(&[".wf-sidebar row:hover .wf-sidebar-detail"], "color"))
+            .or_else(|| css_declaration(&[".wf-sidebar row.wf-sidebar-active label"], "color"))
+            .unwrap();
+        let tile_bg = css_declaration(&[".wf-quick-tile:hover"], "background").unwrap();
+        let tile_fg = css_declaration(&[".wf-quick-tile:hover .wf-sidebar-detail"], "color")
+            .or_else(|| css_declaration(&[".wf-sidebar-detail"], "color"))
+            .unwrap();
+        let sidebar = css_contrast(sidebar_fg, sidebar_bg);
+        let tile = css_contrast(tile_fg, tile_bg);
+        assert!(sidebar >= 4.5 && tile >= 4.5,
+            "active hovered sidebar detail is {sidebar:.2}:1 and hovered Home tile detail is {tile:.2}:1, both need 4.5:1");
     }
 }
