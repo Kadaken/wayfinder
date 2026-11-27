@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# D-426, D-431, D-434, D-449, D-451, D-452: installer audit regressions in throwaway HOME trees.
+# D-426, D-431, D-434, D-449, D-451, D-452, S7 @ 0.9.39: installer audit regressions in throwaway HOME trees.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$here/.." && pwd)"
@@ -200,6 +200,24 @@ run_dry_run_folder_test_d452() {
   echo "PASS: D-452 dry run lists the folder default and writes nothing"
 }
 
+run_no_session_bus_test_s7() {
+  local project="$fake/nobus-project" home="$fake/nobus-home" bin="$fake/nobus-bin"
+  make_project "$project"
+  mkdir -p "$home" "$bin"
+  printf '#!/bin/sh\necho "Failed to connect to user scope bus via local transport" >&2\nexit 1\n' > "$bin/systemctl"
+  printf '#!/bin/sh\nexit 1\n' > "$bin/pkill"
+  chmod +x "$bin/systemctl" "$bin/pkill"
+  HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" \
+    PATH="$bin:$fake/bin:$PATH" \
+    bash "$project/packaging/install.sh" --no-build > "$fake/nobus.out" 2>&1 \
+    || { echo "FAIL: S7 install with no session bus exited non-zero"; return 1; }
+  ! grep -q 'Failed to connect' "$fake/nobus.out" \
+    || { echo "FAIL: S7 raw systemctl error shown"; return 1; }
+  grep -q 'next login' "$fake/nobus.out" \
+    || { echo "FAIL: S7 did not say the change waits for the next login"; return 1; }
+  echo "PASS: S7 no session bus gets a plain message"
+}
+
 run_check_test
 run_folder_test
 run_portal_test
@@ -208,4 +226,5 @@ run_no_portal_test_d449
 run_no_portal_upgrade_test_d451
 run_uninstall_summary_test_d449
 run_dry_run_folder_test_d452
-echo "ALL PASS (7 tests)"
+run_no_session_bus_test_s7
+echo "ALL PASS (8 tests)"

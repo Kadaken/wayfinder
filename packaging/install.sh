@@ -174,8 +174,17 @@ restart_portal() {
       say "  no portal backend was running."
     fi
   fi
+  # S7 @ 0.9.39: with no session bus (a container, ssh, a TTY) systemctl prints
+  # a raw "Failed to connect to user scope bus"; say it plainly instead.
   if command -v systemctl >/dev/null 2>&1; then
-    run systemctl --user try-restart xdg-desktop-portal.service || true
+    if [ "$dry" = 1 ]; then
+      printf '  would: systemctl --user try-restart xdg-desktop-portal.service\n'
+    elif systemctl --user try-restart xdg-desktop-portal.service 2>/dev/null; then
+      say "  the portal restarted."
+    else
+      say "  could not reach your desktop session to restart the portal;"
+      say "  it picks up the change at your next login."
+    fi
   fi
 }
 
