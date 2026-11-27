@@ -42,7 +42,7 @@ and say why rather than leave you waiting.
 
 ## What I have and have not checked myself
 
-As of 0.9.38: `cargo audit` reports no vulnerable dependency, and the refusals
+As of 0.9.39: `cargo audit` reports no vulnerable dependency, and the refusals
 above all have tests behind them. What follows is everything in the release
 audit that is reasoned about but **not measured**. It is here, in the file that
 ships, because a gap nobody wrote down is a gap nobody fixes. One item that
@@ -107,14 +107,15 @@ source produce byte-identical programs (checked again for 0.9.30).
    Here and Extract All run 7-Zip, `unar` or `tar` into a private staging
    folder that the tool can write to and nothing else (Landlock), then check
    every staged entry (no special files, no link leaving the folder) and move
-   it into place without replacing anything. Two gaps in 0.9.38: where the
-   kernel has no Landlock the tool runs without the lock, and a hard link in
-   the staged output is not refused. Archive listing and previews are not
-   locked at all.
+   it into place without replacing anything. Since 0.9.39 an outside tool is
+   not run at all where the kernel has no Landlock (the built-in ZIP reader
+   still works), a hard link in the staged output is refused, and the
+   destination is checked again before each entry is moved. Archive listing
+   and previews are not locked at all.
 13. **Updates are checksummed, not signed.** The update manifest is fetched
-   from kadaken.com over HTTPS with no redirects. The download may follow
-   HTTPS redirects, is used only if it ends on kadaken.com, and must match the
-   manifest's size and SHA-256. A proxy set in the environment is used. The manifest itself is not
+   from kadaken.com over HTTPS with no redirects. Since 0.9.39 the download
+   checks each redirect before following it (at most three, each one HTTPS on
+   kadaken.com), and the file must match the manifest's size and SHA-256. A proxy set in the environment is used. The manifest itself is not
    signed: whoever controls what kadaken.com serves controls the update.
 14. **"No other connections" is read from the source, not measured.**
    Wayfinder's own code talks only to kadaken.com, for the update check. GIO,
