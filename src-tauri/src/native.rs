@@ -6247,7 +6247,9 @@ fn build_ui_in(
     connect_column_chooser(&state, &ui);
     apply_column_visibility(&state, &ui);
     update_sort_header_labels(&state, &ui);
-    connect_shortcuts(state.clone(), ui.clone());
+    if !embedded {
+        connect_shortcuts(state.clone(), ui.clone());
+    }
     connect_picker_actions(&state, &ui);
 
     if let Some(picker_state) = picker {
@@ -10508,16 +10510,6 @@ fn nearest_real_dir(loc: &native_core::Location) -> String {
 /// `(state, ui)` works inside it unchanged, with no "which pane" argument
 /// threaded through the window. Closing the split drops its widgets, and with
 /// them its state.
-/// The pane that owns the split this `ui` sits in, or None when `ui` is that
-/// owner (or there is no split).
-fn split_owner_of(ui: &Ui) -> Option<(Rc<RefCell<AppState>>, Ui)> {
-    WINDOWS.with(|windows| {
-        windows.borrow().windows().into_iter().find(|(_, other)| {
-            other.window == ui.window && other.list != ui.list && other.split.borrow().is_some()
-        })
-    })
-}
-
 fn toggle_split(state: &Rc<RefCell<AppState>>, ui: &Ui) {
     let open = ui.split.borrow_mut().take();
     if let Some(pane) = open {
@@ -10630,9 +10622,15 @@ fn open_new_window(ui: &Ui, path: String) {
 
 fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
     let key = gtk::EventControllerKey::new();
-    let state_for_keys = state.clone();
-    let ui_for_keys = ui.clone();
+    let window = ui.window.clone();
+    // Let the focused widget handle its own keys before window shortcuts.
+    key.set_propagation_phase(gtk::PropagationPhase::Bubble);
     key.connect_key_pressed(move |_, key, _, mods| {
+        let in_left_pane = focus_within(&ui.window, &ui.body);
+        // When focus leaves the panes for the title bar, use the last active pane.
+        let right = (!in_left_pane && ui.split_right_active.get()).then(|| split_target(&state, &ui));
+        let (state_for_keys, ui_for_keys) = right.as_ref()
+            .map_or((&state, &ui), |(state, ui)| (state, ui));
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let alt = mods.contains(gdk::ModifierType::ALT_MASK);
@@ -10640,11 +10638,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         // D-292: the keyboard way to the right-click menu.
         let menu_key = (key == gdk::Key::Menu && !ctrl && !alt)
             || (key == gdk::Key::F10 && shift && !ctrl && !alt);
-        if menu_key && open_context_menu_from_key(&state_for_keys, &ui_for_keys) {
+        if menu_key && open_context_menu_from_key(state_for_keys, ui_for_keys) {
             return glib::Propagation::Stop;
         }
         if ctrl && shift && (key == gdk::Key::C || key == gdk::Key::c) {
-            copy_paths_to_system_clipboard(&state_for_keys, &ui_for_keys);
+            copy_paths_to_system_clipboard(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if ctrl && shift && (key == gdk::Key::N || key == gdk::Key::n) {
@@ -10652,7 +10650,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if is_new_window_shortcut(ctrl, shift, alt, key) {
-            open_new_window(&ui_for_keys, nearest_real_dir(&state_for_keys.borrow().cwd));
+            open_new_window(ui_for_keys, nearest_real_dir(&state_for_keys.borrow().cwd));
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::D || key == gdk::Key::d) {
@@ -10668,14 +10666,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         if key == gdk::Key::F3 {
             // Pressed inside the second pane it still closes the split, which
             // is the one thing F3 means; it never nests a split in a split.
-            match split_owner_of(&ui_for_keys) {
-                Some((owner_state, owner_ui)) => toggle_split(&owner_state, &owner_ui),
-                None => toggle_split(&state_for_keys, &ui_for_keys),
-            }
+            toggle_split(&state, &ui);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F4 || (alt && (key == gdk::Key::D || key == gdk::Key::d)) {
-            edit_path_action(&state_for_keys, &ui_for_keys);
+            edit_path_action(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F11 {
@@ -10688,7 +10683,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Return {
-            let selection = selected_entries(&state_for_keys, &ui_for_keys);
+            let selection = selected_entries(state_for_keys, ui_for_keys);
             let path = match selection.first() {
                 Some(entry) => entry.source.real_path_string(),
                 None => state_for_keys.borrow().cwd.real_path_string(),
@@ -10699,7 +10694,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         }
         if alt && key == gdk::Key::Up {
             let parent = state_for_keys.borrow().cwd.parent();
-            navigate(&state_for_keys, parent);
+            navigate(state_for_keys, parent);
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::A || key == gdk::Key::a) {
@@ -10707,11 +10702,11 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::C || key == gdk::Key::c) {
-            copy_selection(&state_for_keys, &ui_for_keys);
+            copy_selection(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::X || key == gdk::Key::x) {
-            cut_selection(&state_for_keys, &ui_for_keys);
+            cut_selection(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::V || key == gdk::Key::v) {
@@ -10743,15 +10738,15 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             return glib::Propagation::Stop;
         }
         if ctrl && (key == gdk::Key::L || key == gdk::Key::l) {
-            edit_path_action(&state_for_keys, &ui_for_keys);
+            edit_path_action(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Left {
-            history_step(&state_for_keys, false);
+            history_step(state_for_keys, false);
             return glib::Propagation::Stop;
         }
         if alt && key == gdk::Key::Right {
-            history_step(&state_for_keys, true);
+            history_step(state_for_keys, true);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F2 {
@@ -10766,43 +10761,44 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
             trash_or_delete_selection(state_for_keys.clone(), ui_for_keys.clone());
             return glib::Propagation::Stop;
         }
+        if key == gdk::Key::F5 {
+            let cwd = state_for_keys.borrow().cwd.clone();
+            navigate(state_for_keys, cwd);
+            return glib::Propagation::Stop;
+        }
+        // File-list navigation and typeahead only apply inside a pane.
+        if !in_left_pane && !focus_within(&ui.window, &ui_for_keys.body) {
+            return glib::Propagation::Proceed;
+        }
         if key == gdk::Key::Return {
-            open_selected(&state_for_keys, &ui_for_keys);
+            open_selected(state_for_keys, ui_for_keys);
             return glib::Propagation::Stop;
         }
         // Only handle plain arrows. With Shift held, let the event through so the
         // list's own selection model extends the range — intercepting it here
         // forced a single selection and made Shift+Arrow impossible.
         if !alt && !shift && key == gdk::Key::Down {
-            move_selection(&state_for_keys, &ui_for_keys, 1);
+            move_selection(state_for_keys, ui_for_keys, 1);
             return glib::Propagation::Stop;
         }
         if !alt && !shift && key == gdk::Key::Up {
-            move_selection(&state_for_keys, &ui_for_keys, -1);
+            move_selection(state_for_keys, ui_for_keys, -1);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::BackSpace {
-            history_step(&state_for_keys, false);
-            return glib::Propagation::Stop;
-        }
-        if key == gdk::Key::F5 {
-            let cwd = state_for_keys.borrow().cwd.clone();
-            navigate(&state_for_keys, cwd);
+            history_step(state_for_keys, false);
             return glib::Propagation::Stop;
         }
         if !ctrl && !alt {
             if let Some(ch) = key.to_unicode().filter(|ch| !ch.is_control()) {
-                typeahead_select(&state_for_keys, &ui_for_keys, ch);
+                typeahead_select(state_for_keys, &ui_for_keys, ch);
                 return glib::Propagation::Stop;
             }
         }
 
         glib::Propagation::Proceed
     });
-    // Per PANE. Attached to the window, a split's two panes would both act on
-    // one press and the wrong pane would answer. `body` holds everything a
-    // pane can focus, so the press reaches exactly the pane the user is in.
-    ui.body.add_controller(key);
+    window.add_controller(key);
 }
 
 const ADDRESS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -46826,6 +46822,74 @@ Broken: Either state is wrong.\n";
             wait_for("refresh completes", || state.borrow().listing_cancel.is_none());
             assert!(focus_within(&ui.window, &ui.search), "refresh preserves search focus");
             ui.window.destroy();
+        });
+    }
+
+    #[test]
+    fn titlebar_focus_keeps_address_shortcut_d454() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        gtk_thread::run(|| {
+            private_session_guard_d232();
+            gtk::init().expect("GTK on the private Xvfb");
+            gst::init().expect("GStreamer");
+            let root = crate::native_core::scratch_root().join("d454");
+            let _cleanup = ScratchCleanup(root.clone());
+            std::fs::create_dir_all(&root).unwrap();
+
+            let app = adw::Application::builder()
+                .application_id("com.kadaken.wayfinder.d454test")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            build_ui(&app, Some(root.to_string_lossy().into_owned()), None);
+            let (state, ui) = WINDOWS
+                .with(|w| w.borrow().active(|ui| ui.window.application().as_ref() == Some(app.upcast_ref())))
+                .expect("the test window is registered");
+            ui.window.set_title(Some("wf-d454-proof"));
+            wait_for("the initial folder", || ui.window.is_mapped() && state.borrow().listing_cancel.is_none());
+
+            let minimize = all_widgets(ui.window.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.icon_name().as_deref() == Some("window-minimize-symbolic"))
+                .expect("the title bar's Minimize button");
+            let xdo = |args: &[&str]| {
+                let out = std::process::Command::new("/usr/bin/xdotool").args(args).output().unwrap();
+                assert!(out.status.success(), "xdotool {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let xid = xdo(&["search", "--name", "^wf-d454-proof$"]);
+            xdo(&["windowfocus", "--sync", xid.trim()]);
+            assert!(minimize.grab_focus());
+            wait_for("focus on Minimize", || ui.window.is_active() && minimize.has_focus());
+            assert_eq!(ui.path_stack.visible_child_name().as_deref(), Some("label"));
+
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L opens and focuses the address field", || {
+                ui.path_stack.visible_child_name().as_deref() == Some("entry")
+                    && focus_within(&ui.window, &ui.path_entry)
+            });
+            ui.path_entry.set_text("sample");
+            ui.path_entry.set_position(-1);
+            xdo(&["key", "ctrl+a", "BackSpace"]);
+            wait_for("the address field handles Ctrl+A and Backspace", || ui.path_entry.text().is_empty());
+
+            xdo(&["key", "Escape", "F3"]);
+            wait_for("split opens", || ui.split.borrow().is_some());
+            let right_state = ui.split.borrow().as_ref().unwrap().state.clone();
+            let right = ui_for_state(&right_state).expect("right pane");
+            assert!(right.search.grab_focus());
+            assert!(minimize.grab_focus());
+            xdo(&["key", "ctrl+l"]);
+            wait_for("Ctrl+L from Minimize focuses the last active pane's address", || {
+                right.path_stack.visible_child_name().as_deref() == Some("entry")
+                    && focus_within(&right.window, &right.path_entry)
+            });
+            xdo(&["key", "F3"]);
+            wait_for("F3 closes the split from the right pane", || ui.split.borrow().is_none());
+            ui.window.close();
         });
     }
 
