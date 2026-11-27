@@ -952,8 +952,13 @@ pub struct CardUi {
     cell: SittingCell,
 }
 
+/// A step's number as shown and as used in widget and screenshot names. The
+/// session file is outside data: K5 0.9.39 found `n` reaching Pango markup
+/// unescaped and a screenshot file name (`step{n}-…png`), so only letters,
+/// digits, `.`, `-` and `_` are kept, at most 16 of them.
 fn n_str(v: &Value) -> String {
-    v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())
+    let raw = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+    raw.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).take(16).collect()
 }
 
 fn label(text: &str, wrap: bool) -> gtk::Label {
@@ -2891,5 +2896,23 @@ mod protocol_tests {
             (json!("submitted"), json!("submitted"), json!([]), json!(""))
         );
         assert_eq!(s.error, "");
+    }
+}
+
+#[cfg(test)]
+mod step_number_tests_k5_0939 {
+    use super::n_str;
+    use serde_json::Value;
+
+    /// K5 0.9.39: a hostile session `n` can neither carry Pango markup into
+    /// the heading nor a path into the screenshot file name.
+    #[test]
+    fn step_number_keeps_only_plain_name_characters_k5_0939() {
+        assert_eq!(n_str(&Value::from(3)), "3");
+        assert_eq!(n_str(&Value::from("2a")), "2a");
+        assert_eq!(n_str(&Value::from("3.1")), "3.1");
+        let hostile = n_str(&Value::from("<span size='99999'>x</span>/../../etc"));
+        assert!(!hostile.contains(['<', '>', '\'', '/', '&']), "{hostile}");
+        assert!(hostile.len() <= 16, "{hostile}");
     }
 }
