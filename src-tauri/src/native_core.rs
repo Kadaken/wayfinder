@@ -4623,6 +4623,16 @@ pub fn brief_failure(text: &str, max_lines: usize) -> String {
 }
 
 /// D-405: one failure line in words a person reads. The copy tool's own prefix,
+fn is_staging_name(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".wf-replace-"))
+}
+
+/// The outermost `.wf-replace-…` staging entry in `path`, or `path` itself when
+/// none. S17 @ 0.9.39: a file inside a staged folder showed the staging name.
+fn outside_staging(path: &Path) -> &Path {
+    path.ancestors().filter(|p| is_staging_name(p)).last().unwrap_or(path)
+}
+
 /// Wayfinder's internal staging names (`.wf-replace-…`, shown as the folder
 /// they sit in) and the "(os error N)" codes are taken out; the common causes
 /// get a plain sentence with the place they happened.
@@ -4655,12 +4665,7 @@ pub fn plain_failure_line(line: &str) -> String {
                 || operation.starts_with("setting")
                 || (operation == "cannot open" && suffix.starts_with(" for writing:"))
             {
-                let folder = path
-                    .ancestors()
-                    .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".wf-replace-")))
-                    .unwrap_or(path)
-                    .parent()
-                    .unwrap_or(path);
+                let folder = outside_staging(path).parent().unwrap_or(path);
                 return format!("No permission to write in {}", folder.display());
             }
         }
@@ -4669,13 +4674,11 @@ pub fn plain_failure_line(line: &str) -> String {
     // The first quoted path, with an internal staging name replaced by its folder.
     let place = line.split('\'').nth(1).filter(|p| p.contains('/')).map(|p| {
         let path = Path::new(p);
-        let internal = path
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with(".wf-replace-"));
-        if internal {
-            path.parent().map(|d| d.display().to_string()).unwrap_or_default()
-        } else {
+        let staging = outside_staging(path);
+        if staging == path && !is_staging_name(path) {
             p.to_string()
+        } else {
+            staging.parent().map(|d| d.display().to_string()).unwrap_or_default()
         }
     });
     let reason = if lower.contains("read-only file system") || lower.contains("os error 30") {
@@ -8067,6 +8070,15 @@ mod tests {
             "not enough free space on the drive: /mnt/usb"
         );
         assert_eq!(brief_failure("rename /a/.wf-replace-old-9-1 failed (os error 39)", 1), "rename /a failed");
+        // S17 @ 0.9.39: the disk filling inside a staged folder copy.
+        assert_eq!(
+            brief_failure("cp: error writing '/mnt/usb/.wf-replace-new-77-5/f3.bin': No space left on device", 1),
+            "not enough free space on the drive: /mnt/usb"
+        );
+        assert_eq!(
+            brief_failure("cp: error writing '/mnt/usb/.wf-replace-new-77-5/sub/f3.bin': Permission denied", 1),
+            "No permission to write in /mnt/usb"
+        );
         let shown = brief_failure(raw, 1);
         assert!(!shown.contains(".wf-replace") && !shown.contains("os error") && !shown.starts_with("cp:"), "{shown}");
     }
