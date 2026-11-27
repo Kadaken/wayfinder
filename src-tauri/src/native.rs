@@ -8057,7 +8057,7 @@ fn trash_retention_preview(days: u32) -> Result<Vec<ExpiredTrashItem>, String> {
         if !contents.lines().any(|line| line.starts_with("Path=")) {
             continue;
         }
-        let Some(date) = contents.lines().filter_map(|line| line.strip_prefix("DeletionDate=")).last() else { continue };
+        let Some(date) = contents.lines().filter_map(|line| line.strip_prefix("DeletionDate=")).next_back() else { continue };
         let Ok(deleted) = glib::DateTime::from_iso8601(date.trim(), Some(&local)) else { continue };
         if deleted.to_unix() > cutoff {
             continue;
@@ -10791,7 +10791,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
         }
         if !ctrl && !alt {
             if let Some(ch) = key.to_unicode().filter(|ch| !ch.is_control()) {
-                typeahead_select(state_for_keys, &ui_for_keys, ch);
+                typeahead_select(state_for_keys, ui_for_keys, ch);
                 return glib::Propagation::Stop;
             }
         }
@@ -35700,7 +35700,7 @@ Broken: Either state is wrong.\n";
             std::fs::write(dir.join("b.txt"), "y").unwrap();
         }, 2);
         let press = |key: gdk::Key, mods: gdk::ModifierType| -> bool {
-            d.ui.body
+            d.ui.window
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -47337,7 +47337,7 @@ Broken: Either state is wrong.\n";
 
         // ---- Ctrl+Shift+N through the window's real key controller.
         let handled = ui
-            .body
+            .window
             .observe_controllers()
             .into_iter()
             .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -47464,7 +47464,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .body
+                .window
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -47571,7 +47571,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .body
+                .window
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -47660,7 +47660,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .body
+                .window
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -47751,7 +47751,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .body
+                .window
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
@@ -47853,7 +47853,7 @@ Broken: Either state is wrong.\n";
 
         let press = |key: gdk::Key, mods: gdk::ModifierType| {
             let handled = ui
-                .body
+                .window
                 .observe_controllers()
                 .into_iter()
                 .filter_map(|c| c.ok()?.downcast::<gtk::EventControllerKey>().ok())
