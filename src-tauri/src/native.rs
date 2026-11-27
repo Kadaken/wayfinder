@@ -3531,12 +3531,30 @@ fn export_file_manager1(app: &adw::Application) {
 
     // Claim the well-known name last, so the object is already answering by the
     // time anything can address us.
-    gio::bus_own_name_on_connection(
-        &connection,
-        "org.freedesktop.FileManager1",
-        gio::BusNameOwnerFlags::NONE,
-        |_, _| {},
-        |_, _| {},
+    claim_file_manager1_name(&connection);
+}
+
+/// Ask the bus for org.freedesktop.FileManager1 with a plain RequestName call.
+/// gio's bus_own_name wrappers are not used on purpose: when the session bus
+/// closes (logout, a bus that died), GLib calls their name-lost handler with no
+/// connection and gio-rs unwraps it, so Wayfinder panicked and left a crash log
+/// (found by S7 @ 0.9.39). A plain call has no handler left to call.
+fn claim_file_manager1_name(connection: &gio::DBusConnection) {
+    connection.call(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "RequestName",
+        Some(&("org.freedesktop.FileManager1", 0u32).to_variant()),
+        None,
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        |result| {
+            if let Err(error) = result {
+                eprintln!("wayfinder: could not claim FileManager1: {error}");
+            }
+        },
     );
 }
 
@@ -53256,6 +53274,77 @@ Broken: Either state is wrong.\n";
 
         ui.window.destroy();
         pump();
+    }
+}
+
+#[cfg(test)]
+mod audit_0939_bus_close_tests {
+    use super::{gio, glib};
+    use gio::prelude::*;
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+
+    /// S7 @ 0.9.39: the session bus closing under a running Wayfinder must not
+    /// panic. A private dbus-daemon stands in for the session bus and is killed.
+    #[test]
+    fn file_manager1_claim_survives_the_bus_closing_s7_0939() {
+        let dir = std::env::temp_dir().join(format!("wf-s7bus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut daemon = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .arg(format!("--address=unix:dir={}", dir.display()))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("dbus-daemon runs");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().unwrap()).read_line(&mut address).unwrap();
+        let context = glib::MainContext::new();
+        let survived = context.with_thread_default(|| {
+            let connection = gio::DBusConnection::for_address_sync(
+                address.trim(),
+                gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+                    | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+                None::<&gio::DBusAuthObserver>,
+                gio::Cancellable::NONE,
+            )
+            .expect("connects to the private bus");
+            super::claim_file_manager1_name(&connection);
+            let owner = |c: &gio::DBusConnection| {
+                c.call_sync(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "GetNameOwner",
+                    Some(&("org.freedesktop.FileManager1",).to_variant()),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    2000,
+                    gio::Cancellable::NONE,
+                )
+                .is_ok()
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !owner(&connection) && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(owner(&connection), "Wayfinder owns FileManager1 on the bus");
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !connection.is_closed() && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(connection.is_closed(), "the bus closing reaches the connection");
+            for _ in 0..50 {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(survived.unwrap());
     }
 }
 
