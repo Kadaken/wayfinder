@@ -1093,9 +1093,8 @@ fn decode_save_files_names(options: &HashMap<String, OwnedValue>) -> Result<Vec<
 /// the pick and the answer, and they are the same ones the other two
 /// methods use: exactly one path comes back (`SkipCardinality`), it is a
 /// real directory (`SkipDirectory`), and every joined target is writable
-/// as a file (`SkipSaveTarget`). Nothing here can return a path outside
-/// the chosen folder: the names were refused earlier unless they were
-/// plain names.
+/// as a file (`SkipSaveTarget`). The names must be plain names, and a
+/// target's leaf must not be a symbolic link.
 pub fn decide_save_files(
     options: &HashMap<String, OwnedValue>,
     pick: impl FnOnce(&WireRequest) -> PickOutcome,
@@ -1153,6 +1152,12 @@ pub fn decide_save_files(
     let mut uris = Vec::with_capacity(names.len());
     for name in &names {
         let target = folder.join(name);
+        // A folder pick never asks the user to replace a link's target.
+        match target.symlink_metadata() {
+            Ok(metadata) if !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return refuse(),
+        }
         if override_guard != GuardOverride::SkipSaveTarget && !save_target_is_writable(&target) {
             return refuse();
         }
@@ -1810,13 +1815,15 @@ mod tests {
     impl ScratchFile {
         fn create() -> Self {
             let home = std::env::var("HOME").expect("HOME must be set");
+            Self::create_in(&Path::new(&home).join("Projects/Scratch"))
+        }
+
+        fn create_in(root: &Path) -> Self {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_nanos();
-            let dir = PathBuf::from(home)
-                .join("Projects/Scratch")
-                .join(format!("d202-fixture-{}-{}", std::process::id(), stamp));
+            let dir = root.join(format!("d202-fixture-{}-{}", std::process::id(), stamp));
             fs::create_dir_all(&dir).expect("create scratch fixture dir");
             let path = dir.join("picked.txt");
             fs::write(&path, b"d202 fixture").expect("write scratch fixture file");
@@ -4232,9 +4239,7 @@ mod tests {
         finish_private_bus(bus, server, client);
     }
 
-    // A name that is not a plain name is refused before the picker ever
-    // opens, so a `SaveFiles` request can never be steered out of the
-    // folder the user chose.
+    // Names that are not plain names are refused before the picker opens.
     // ---- W2 attack 8: the request handle and Request.Close() ----
 
     /// A chooser that shows a "dialog" until it is closed: it counts how many
@@ -4529,6 +4534,40 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).expect("remove exact folder fixture");
+    }
+
+    #[test]
+    fn save_files_refuses_leaf_symlinks_d457() {
+        let worktree = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let outside = ScratchFile::create_in(worktree);
+        let folder = outside.dir.join("chosen");
+        fs::create_dir(&folder).unwrap();
+        std::os::unix::fs::symlink(outside.path(), folder.join("linked.txt")).unwrap();
+        std::os::unix::fs::symlink(outside.dir.join("missing.txt"), folder.join("dangling.txt")).unwrap();
+        fs::write(folder.join("ordinary.txt"), b"existing file").unwrap();
+        let pick = |_: &WireRequest| PickOutcome::from(ChooserOutcome::Picked(vec![folder.clone()]));
+
+        let (response, results) = decide_save_files(
+            &files_option(&["ordinary.txt", "new.txt"]),
+            pick,
+            GuardOverride::None,
+        );
+        assert_eq!(response, RESPONSE_SUCCESS);
+        assert_eq!(uris_of(&results), vec![
+            gio::File::for_path(folder.join("ordinary.txt")).uri().to_string(),
+            gio::File::for_path(folder.join("new.txt")).uri().to_string(),
+        ]);
+
+        for link in ["linked.txt", "dangling.txt"] {
+            let (response, results) = decide_save_files(
+                &files_option(&["ordinary.txt", link]),
+                pick,
+                GuardOverride::None,
+            );
+            assert_eq!(response, RESPONSE_OTHER, "SaveFiles must refuse {link}");
+            assert!(results.is_empty(), "refusal must grant no files");
+        }
+        outside.remove();
     }
 
     /// The request handed to the picker must be a folder pick, or the

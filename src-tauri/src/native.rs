@@ -10802,6 +10802,7 @@ fn connect_shortcuts(state: Rc<RefCell<AppState>>, ui: Ui) {
 }
 
 const ADDRESS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCATION_NOT_ANSWERING: &str = "That location is not answering.";
 
 #[derive(Debug)]
 enum AddressCheckError {
@@ -10867,7 +10868,7 @@ fn start_address_check(
                 &state, native_core::Location::real(target), NavMode::Record, None, from_address,
             ),
             Ok(None) => ui.status.set_label(&format!("No folder called \u{201c}{text}\u{201d}")),
-            Err(AddressCheckError::TimedOut) => ui.status.set_label("That location is not answering."),
+            Err(AddressCheckError::TimedOut) => ui.status.set_label(LOCATION_NOT_ANSWERING),
             Err(AddressCheckError::WorkerFailed) => ui.status.set_label("Could not check that location."),
         }
     });
@@ -10982,6 +10983,27 @@ fn navigate_listing(
     done_message: Option<String>,
     from_address: bool,
 ) {
+    navigate_listing_with(state, path, mode, done_message, from_address, |path, show_hidden, cancelled| {
+        match path {
+            native_core::Location::ZipDir { archive, internal } => {
+                native_core::list_zip_dir_cancellable(archive, internal, cancelled)
+            }
+            native_core::Location::RealDir(real) => {
+                native_core::list_dir_cancellable(real, show_hidden, cancelled)
+            }
+        }
+    });
+}
+
+fn navigate_listing_with(
+    state: &Rc<RefCell<AppState>>,
+    path: native_core::Location,
+    mode: NavMode,
+    done_message: Option<String>,
+    from_address: bool,
+    list: impl FnOnce(&native_core::Location, bool, &AtomicBool) -> Result<native_core::DirectoryListing, native_core::ListDirError>
+        + Send + 'static,
+) {
     let show_hidden = state.borrow().show_hidden;
     // The tab this request belongs to; a completion for any other tab is dropped.
     let tab_id = state.borrow().tabs.active().id;
@@ -11056,7 +11078,9 @@ fn navigate_listing(
         ui.status.set_label(&format!("Loading {}", path.display_string()));
     }
 
+    let listing_deadline = Instant::now() + ADDRESS_CHECK_TIMEOUT;
     let path_for_worker = path.clone();
+    let timeout_state = Rc::downgrade(state);
     let state = state.clone();
     // D-82: the worker's result wakes the main loop the moment it is ready
     // instead of waiting for a 40 ms poll tick.
@@ -11220,20 +11244,41 @@ fn navigate_listing(
         }
     };
     glib::spawn_future_local(async move {
+        use std::future::Future;
+        use std::task::Poll;
+
         let watch_path = path_for_worker.real_path().map(Path::to_path_buf);
         let watch_cancelled = cancelled.clone();
         let settings_cancelled = cancelled.clone();
         let recent = path_for_worker.real_path_string();
-        let received = gio::spawn_blocking(move || match &path_for_worker {
-            native_core::Location::ZipDir { archive, internal } => {
-                native_core::list_zip_dir_cancellable(archive, internal, &cancelled)
+        let mut worker = std::pin::pin!(gio::spawn_blocking(move || {
+            list(&path_for_worker, show_hidden, &cancelled)
+        }));
+        let before_deadline = {
+            let mut timeout = std::pin::pin!(glib::timeout_future(
+                listing_deadline.saturating_duration_since(Instant::now()),
+            ));
+            std::future::poll_fn(|cx| {
+                if let Poll::Ready(result) = worker.as_mut().poll(cx) {
+                    return Poll::Ready(Some(result));
+                }
+                timeout.as_mut().poll(cx).map(|()| None)
+            }).await
+        };
+        let received = match before_deadline {
+            Some(result) => result,
+            None => {
+                if let Some(state) = timeout_state.upgrade() {
+                    if !watch_cancelled.load(Ordering::Relaxed) && state.borrow().tabs.active().id == tab_id {
+                        if let Some(ui) = ui_for_state(&state) {
+                            ui.status.set_label(LOCATION_NOT_ANSWERING);
+                        }
+                    }
+                }
+                // A late listing can still open the folder while this request is current.
+                worker.await
             }
-            native_core::Location::RealDir(real) => {
-                native_core::list_dir_cancellable(real, show_hidden, &cancelled)
-            }
-        })
-        .await
-        .map_err(|_| ());
+        }.map_err(|_| ());
         let watch = match watch_path {
             Some(path) if matches!(received, Ok(Ok(_))) && !watch_cancelled.load(Ordering::Relaxed) => {
                 let deadline = Instant::now() + ADDRESS_CHECK_TIMEOUT;
@@ -31904,6 +31949,75 @@ Broken: Either state is wrong.\n";
             pump();
             assert_eq!(d.state.borrow().listing_generation, generation, "a late answer started navigation");
             assert_eq!(d.ui.status.label(), status);
+        }
+    }
+
+    #[test]
+    fn stalled_listing_warns_and_only_applies_a_current_result_d456() {
+        if std::env::var("WAYFINDER_HEADLESS_GTK_TEST").as_deref() == Ok("1") {
+            gtk_thread::run(stalled_listing_on_gtk_thread_d456);
+        }
+    }
+
+    fn stalled_listing_on_gtk_thread_d456() {
+        let _session = private_session_guard_d232();
+        gtk::init().expect("gtk init on the virtual display");
+        private_display_check_d232(&gdk::Display::default().expect("display"));
+        let d = d362_open("slowlisting", |dir| {
+            let slow = dir.join("slow");
+            fs::create_dir(&slow).unwrap();
+            fs::write(slow.join("late.txt"), b"late").unwrap();
+        }, 1);
+        let initial = d.state.borrow().cwd.clone();
+        let slow = native_core::Location::real(initial.real_path().unwrap().join("slow"));
+        let home = native_core::Location::real(std::env::var("HOME").unwrap());
+        let home_button = all_widgets(d.ui.window.upcast_ref()).into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Home"))
+            .expect("Home toolbar button");
+
+        for go_home in [false, true] {
+            let (entered, worker_entered) = std::sync::mpsc::channel();
+            let (release, worker_release) = std::sync::mpsc::channel();
+            let (finished, worker_finished) = std::sync::mpsc::channel();
+            let gtk_thread = std::thread::current().id();
+            let start = Instant::now();
+            let before = d.state.borrow().cwd.clone();
+            navigate_listing_with(&d.state, slow.clone(), NavMode::Record, None, false, move |path, show_hidden, _| {
+                assert_ne!(std::thread::current().id(), gtk_thread);
+                entered.send(()).unwrap();
+                if worker_release.recv_timeout(Duration::from_secs(15)).is_err() {
+                    return Err(native_core::ListDirError::Cancelled);
+                }
+                // A blocked syscall can return a successful result after cancellation.
+                let listing = native_core::list_dir_cancellable(path.real_path().unwrap(), show_hidden, &AtomicBool::new(false));
+                finished.send(()).unwrap();
+                listing
+            });
+            assert!(start.elapsed() < ADDRESS_CHECK_TIMEOUT, "the GTK caller waited for the listing");
+            assert_eq!(d.ui.status.label(), format!("Loading {}", slow.display_string()));
+            wait_for("the listing entered the worker", || worker_entered.try_recv().is_ok());
+            d362_wait("the listing timeout", 6, || d.ui.status.label() == "That location is not answering.");
+            assert!(start.elapsed() >= ADDRESS_CHECK_TIMEOUT);
+            assert_eq!(d.state.borrow().cwd, before);
+
+            if go_home {
+                home_button.emit_clicked();
+                wait_for("Home opened while the listing was blocked", || d.state.borrow().cwd == home);
+                let status = d.ui.status.label();
+                release.send(()).unwrap();
+                worker_finished.recv_timeout(Duration::from_secs(2)).unwrap();
+                pump();
+                assert_eq!(d.state.borrow().cwd, home, "the stale listing replaced Home");
+                assert_eq!(d.ui.status.label(), status);
+            } else {
+                release.send(()).unwrap();
+                worker_finished.recv_timeout(Duration::from_secs(2)).unwrap();
+                wait_for("the late current listing appeared", || {
+                    d.state.borrow().cwd == slow && d.ui.status.label() == "1 item shown"
+                });
+                assert_eq!(d.state.borrow().visible_entries[0].name, "late.txt");
+            }
         }
     }
 
