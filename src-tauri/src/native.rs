@@ -9698,7 +9698,9 @@ fn set_details_thumbnails(state: &Rc<RefCell<AppState>>, value: bool) {
 /// Skip never silently changes a setting, and the setup never appears twice
 /// whichever button was pressed.
 /// The menu's "Check for Updates...". Unlike the daily check this ignores the
-/// throttle and the skipped version. Signature failures go to the log.
+/// throttle and the skipped version, and always says what it found: a check
+/// the user asked for that answers with silence reads as a broken button.
+/// A signature failure gets a plain note here; the daily check only logs it.
 fn check_for_update_now() {
     let now = unix_now();
     update_config(|config| config.update_last_check = now);
@@ -9715,7 +9717,10 @@ fn check_for_update_now() {
                 "Wayfinder is up to date",
                 &format!("You have {}, which is the newest there is.", update::current_version()),
             ),
-            Err(update::ManifestError::SignatureFailed(_)) => (),
+            Err(update::ManifestError::SignatureFailed(_)) => show_update_note(
+                "Could not check for updates",
+                "The update file did not carry a valid Kadaken signature, so no update is offered.\n\nNothing was changed.",
+            ),
             Err(update::ManifestError::CheckFailed(message)) => show_update_note(
                 "Could not check for updates",
                 &format!("{message}\n\nNothing was changed."),
