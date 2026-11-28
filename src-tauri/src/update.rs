@@ -7,13 +7,9 @@
 // kadaken.com sat at 0.9.11 while 0.9.23 was current, and every single person
 // who had installed it was twelve releases behind with no way to find out.
 //
-// Three things are deliberately NOT done here.
-//
-// No new crate. The check is one small HTTPS GET, and `curl` is in Fedora's
-// base install, so shelling out to it costs nothing and leaves no TLS stack
-// vendored into this binary to keep patched. `--proto =https --tlsv1.2` and
-// an explicit `--max-time` are passed every time rather than trusted to a
-// default.
+// The manifest and its detached Ed25519 signature are fetched over HTTPS
+// with `curl`, which is in Fedora's base install. Verify the exact manifest
+// bytes before parsing the release metadata.
 //
 // No install over a running binary. `packaging/install.sh` uses
 // `install -m 0755`, which opens the destination with O_TRUNC, and Linux
@@ -29,6 +25,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Kadaken
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -40,12 +38,23 @@ use std::time::{Duration, Instant};
 /// tarball, so the two cannot disagree about a version or a checksum.
 pub const MANIFEST_URL: &str = "https://kadaken.com/wayfinder-update.json";
 
-/// How long a check is allowed to take before it is abandoned. A file manager
-/// must never wait on a web server, so this is short and the whole check runs
-/// off the main thread anyway.
+/// The timeout for each of the two check requests. Both run off the main thread.
 const CHECK_TIMEOUT_SECS: &str = "10";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_DOWNLOAD_REDIRECTS: usize = 3;
+
+const SIGNATURE_VERSION: &str = "kadaken-update-sig-v1";
+const APP_NAME: &str = "wayfinder";
+const SIGNING_KEYS: [(&str, &str); 2] = [
+    (
+        "3431bb8676c9a022",
+        "QgxiYIxdo8lUUi+HMfwTXlPtldNMPrLPXt3D5nyw9ZA=",
+    ),
+    (
+        "fa394dba75c7471e",
+        "US2y0VMuIycqmqoKjF7ZMrVb0yUSP8Dr1vNrF/JEz5M=",
+    ),
+];
 
 /// Seconds between checks. Once a day: often enough that a release is found
 /// within a day of shipping, rare enough that opening ten windows does not
@@ -146,7 +155,7 @@ fn manifest_curl_args() -> &'static [&'static str] {
         "--silent",
         "--show-error",
         "--fail",
-        // D-427: the manifest is served directly. Refuse redirects.
+        // D-427: both files are served directly. Refuse redirects.
         "--location",
         "--max-redirs",
         "0",
@@ -161,28 +170,102 @@ fn manifest_curl_args() -> &'static [&'static str] {
         // D-278: a cached manifest can hide a newly published release.
         "--header",
         "Cache-Control: no-cache",
-        MANIFEST_URL,
     ]
 }
 
-/// Fetches and parses the manifest. Blocking: callers run it off the main
-/// thread. Every failure is a plain `Err` -- a check that cannot reach the
-/// network is a normal Tuesday, not a fault to report to anybody.
-pub fn fetch_manifest() -> Result<Manifest, String> {
-    let output = Command::new("curl")
-        .args(manifest_curl_args())
-        .output()
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManifestError {
+    CheckFailed(String),
+    SignatureFailed(String),
+}
+
+/// Fetches and verifies the manifest before parsing it. Runs off the main thread.
+pub fn fetch_manifest() -> Result<Manifest, ManifestError> {
+    let result = fetch_signed_manifest(Command::output);
+    if let Err(ManifestError::CheckFailed(message) | ManifestError::SignatureFailed(message)) =
+        &result
+    {
+        eprintln!("wayfinder: update check failed: {message}");
+    }
+    result
+}
+
+fn fetch_manifest_file(
+    url: &str,
+    name: &str,
+    run: impl FnOnce(&mut Command) -> std::io::Result<Output>,
+) -> Result<Vec<u8>, String> {
+    let output = run(Command::new("curl").args(manifest_curl_args()).arg(url))
         .map_err(|e| format!("could not run curl: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "fetching the manifest failed: {}",
+            "fetching the {name} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let manifest: Manifest = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("the manifest is not the shape it should be: {e}"))?;
-    validate(&manifest)?;
+    Ok(output.stdout)
+}
+
+fn fetch_signed_manifest(
+    mut run: impl FnMut(&mut Command) -> std::io::Result<Output>,
+) -> Result<Manifest, ManifestError> {
+    let bytes = fetch_manifest_file(MANIFEST_URL, "manifest", &mut run)
+        .map_err(ManifestError::CheckFailed)?;
+    let signature = fetch_manifest_file(
+        &format!("{MANIFEST_URL}.sig"),
+        "manifest signature",
+        &mut run,
+    )
+    .map_err(ManifestError::SignatureFailed)?;
+    verify_manifest_signature(APP_NAME, &bytes, &signature)
+        .map_err(|error| ManifestError::SignatureFailed(error.to_owned()))?;
+    let manifest = serde_json::from_slice(&bytes).map_err(|error| {
+        ManifestError::CheckFailed(format!(
+            "the manifest is not the shape it should be: {error}"
+        ))
+    })?;
+    validate(&manifest).map_err(ManifestError::CheckFailed)?;
     Ok(manifest)
+}
+
+fn verify_manifest_signature(app: &str, bytes: &[u8], sidecar: &[u8]) -> Result<(), &'static str> {
+    const BAD_FORMAT: &str = "invalid manifest signature format";
+    let text = std::str::from_utf8(sidecar).map_err(|_| BAD_FORMAT)?;
+    let mut lines = text.strip_suffix('\n').ok_or(BAD_FORMAT)?.split('\n');
+    if lines.next() != Some(SIGNATURE_VERSION) {
+        return Err(BAD_FORMAT);
+    }
+    let key_id = lines
+        .next()
+        .and_then(|line| line.strip_prefix("key: "))
+        .ok_or(BAD_FORMAT)?;
+    let signature = lines
+        .next()
+        .and_then(|line| line.strip_prefix("sig: "))
+        .ok_or(BAD_FORMAT)?;
+    if lines.next().is_some()
+        || key_id.len() != 16
+        || !key_id.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(BAD_FORMAT);
+    }
+    let (_, public_key) = SIGNING_KEYS
+        .iter()
+        .find(|(id, _)| *id == key_id)
+        .ok_or("unknown manifest signing key")?;
+    let public_key = STANDARD
+        .decode(public_key)
+        .map_err(|_| "invalid pinned manifest signing key")?;
+    let signature = STANDARD.decode(signature).map_err(|_| BAD_FORMAT)?;
+    if signature.len() != 64 {
+        return Err(BAD_FORMAT);
+    }
+
+    let mut message = format!("{SIGNATURE_VERSION}\n{app}\n").into_bytes();
+    message.extend_from_slice(bytes);
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&message, &signature)
+        .map_err(|_| "manifest signature did not verify")
 }
 
 /// The version this binary is.
@@ -401,6 +484,161 @@ pub fn install_after_exit(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIGNED_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/wayfinder-update.json");
+    const MANIFEST_SIGNATURE: &str = include_str!("../tests/fixtures/wayfinder-update.json.sig");
+
+    fn fixture_curl_output(url: &OsStr, bytes: &[u8], signature: Option<&str>) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (exit_code, stdout, stderr) = match url.to_str().unwrap().strip_prefix(MANIFEST_URL) {
+            Some("") => (0, bytes, ""),
+            Some(".sig") => match signature {
+                Some(text) => (0, text.as_bytes(), ""),
+                None => (22, &[][..], "HTTP 404"),
+            },
+            _ => panic!("unexpected fixture URL: {url:?}"),
+        };
+        Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn fetch_fixture(bytes: &[u8], signature: Option<&str>) -> Result<Manifest, ManifestError> {
+        fetch_signed_manifest(|command| {
+            let url = command.get_args().last().unwrap();
+            Ok(fixture_curl_output(url, bytes, signature))
+        })
+    }
+
+    #[test]
+    fn the_signature_fetch_uses_the_same_hardened_curl_arguments() {
+        let mut requests = Vec::new();
+        fetch_signed_manifest(|command| {
+            assert_eq!(command.get_program(), "curl");
+            requests.push(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(fixture_curl_output(
+                command.get_args().last().unwrap(),
+                SIGNED_MANIFEST,
+                Some(MANIFEST_SIGNATURE),
+            ))
+        })
+        .unwrap();
+
+        let [manifest, signature] = requests.as_slice() else {
+            panic!("expected two curl requests, got {requests:?}");
+        };
+        let (manifest_url, manifest_args) = manifest.split_last().unwrap();
+        let (signature_url, signature_args) = signature.split_last().unwrap();
+        assert_eq!(manifest_url, MANIFEST_URL);
+        assert_eq!(signature_url, &format!("{MANIFEST_URL}.sig"));
+        assert_eq!(manifest_args, signature_args);
+        assert_eq!(
+            signature_args,
+            [
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--location",
+                "--max-redirs",
+                "0",
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "--max-time",
+                "10",
+                "--user-agent",
+                concat!("Wayfinder/", env!("CARGO_PKG_VERSION")),
+                "--header",
+                "Cache-Control: no-cache",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_signed_manifest_is_accepted() {
+        let manifest = fetch_fixture(SIGNED_MANIFEST, Some(MANIFEST_SIGNATURE)).unwrap();
+        assert_eq!(manifest.version, "0.9.38");
+    }
+
+    #[test]
+    fn a_changed_manifest_byte_is_rejected_before_parsing() {
+        let mut bytes = SIGNED_MANIFEST.to_vec();
+        bytes[0] = b'[';
+        assert_eq!(
+            fetch_fixture(&bytes, Some(MANIFEST_SIGNATURE)),
+            Err(ManifestError::SignatureFailed(
+                "manifest signature did not verify".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_signature_for_wayfinder_cannot_be_replayed_for_another_app() {
+        assert_eq!(
+            verify_manifest_signature("crews", SIGNED_MANIFEST, MANIFEST_SIGNATURE.as_bytes()),
+            Err("manifest signature did not verify")
+        );
+    }
+
+    #[test]
+    fn an_unknown_signing_key_is_rejected() {
+        let signature = MANIFEST_SIGNATURE.replacen(SIGNING_KEYS[0].0, "0000000000000000", 1);
+        assert_eq!(
+            fetch_fixture(SIGNED_MANIFEST, Some(&signature)),
+            Err(ManifestError::SignatureFailed(
+                "unknown manifest signing key".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_missing_signature_file_blocks_the_update() {
+        assert_eq!(
+            fetch_fixture(SIGNED_MANIFEST, None),
+            Err(ManifestError::SignatureFailed(
+                "fetching the manifest signature failed: HTTP 404".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_signature_files_are_rejected() {
+        let (header, _) = MANIFEST_SIGNATURE.rsplit_once("sig: ").unwrap();
+        for signature in [
+            MANIFEST_SIGNATURE.replace('\n', "\r\n"),
+            format!("{MANIFEST_SIGNATURE}extra\n"),
+            format!("{header}sig: ?\n"),
+            format!("{header}sig: YQ==\n"),
+        ] {
+            assert_eq!(
+                fetch_fixture(SIGNED_MANIFEST, Some(&signature)),
+                Err(ManifestError::SignatureFailed(
+                    "invalid manifest signature format".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_key_ids_match_their_public_keys() {
+        use sha2::{Digest, Sha256};
+
+        for (id, public_key) in SIGNING_KEYS {
+            let public_key = STANDARD.decode(public_key).unwrap();
+            assert_eq!(public_key.len(), 32);
+            let digest = format!("{:x}", Sha256::digest(public_key));
+            assert_eq!(id, &digest[..16]);
+        }
+    }
 
     #[test]
     fn double_digit_patches_compare_as_numbers_not_text() {

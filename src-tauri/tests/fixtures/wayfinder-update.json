@@ -1,0 +1,8 @@
+{
+  "version": "0.9.38",
+  "date": "2026-11-26",
+  "url": "https://kadaken.com/get/wayfinder",
+  "sha256": "30ea228f3a611bdae805d3ec1a6dc0196b730e30648a20f3a265697917099e92",
+  "size": 3784065,
+  "notes": "A network drive that stopped answering no longer freezes the window when you type a path. Overwrite on a folder now says plainly that it replaces the whole folder, and permission errors say which file could not be read or written. Updates download only from kadaken.com, and archive extraction can only write inside its own folder."
+}

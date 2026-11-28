@@ -1,1 +1,3 @@
 /src-tauri/src/guide-names.json export-ignore
+# The signed test fixture is verified byte for byte.
+/src-tauri/tests/fixtures/wayfinder-update.json* -text
