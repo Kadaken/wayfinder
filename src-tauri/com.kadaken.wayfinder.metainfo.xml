@@ -46,6 +46,13 @@
   </screenshots>
 
   <releases>
+    <release version="0.9.41" date="2026-11-27">
+      <description>
+        <p>Updates are signed. Wayfinder checks a Kadaken signature on the
+        update file before it reads it, so a takeover of the web host cannot
+        push an update.</p>
+      </description>
+    </release>
     <release version="0.9.40" date="2026-11-26">
       <description>
         <p>Release-audit fixes: no crash when the session bus closes, a finished

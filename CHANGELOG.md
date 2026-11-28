@@ -4,6 +4,12 @@ Dates are the day the work landed. Versions follow
 [semantic versioning](https://semver.org): until 1.0 the interface may still
 change between releases.
 
+## 0.9.41 — 27 November 2026
+
+### Security
+- Updates are signed. Wayfinder fetches `wayfinder-update.json.sig` beside the update file and checks its Ed25519 signature over the exact bytes before reading any field. The signing key never touches the web host, so someone who takes over the host cannot push an update. Both the main and the backup public key are built in.
+- A missing, malformed or wrong signature means no update is offered. The daily check logs why; a check you ask for from the menu says so in a plain note.
+
 ## 0.9.40 — 26 November 2026
 
 ### Fixed
